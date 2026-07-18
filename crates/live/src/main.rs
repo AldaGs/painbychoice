@@ -184,18 +184,26 @@ struct PropEdits {
     key_fill: bool,
 }
 
-/// A "stopwatch" toggle: filled ◆ when the property is animated, hollow ◇ when
-/// constant. Clicking it inserts a keyframe at the playhead (promoting a
-/// constant to a track). Returns whether it was clicked.
+/// A "stopwatch" toggle: a filled dot when the property is animated, a hollow
+/// ring when constant. Clicking it inserts a keyframe at the playhead
+/// (promoting a constant to a track). The indicator is *painted* rather than
+/// drawn from a glyph, since the circle/diamond glyphs are missing from egui's
+/// default font and render as tofu boxes.
 fn key_button(ui: &mut egui::Ui, animated: bool) -> bool {
-    let (glyph, color) = if animated {
-        ("◆", egui::Color32::from_rgb(255, 216, 51))
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    let c = rect.center();
+    let painter = ui.painter();
+    if animated {
+        painter.circle_filled(c, 4.0, egui::Color32::from_rgb(255, 216, 51));
     } else {
-        ("◇", egui::Color32::from_gray(140))
-    };
-    ui.add(egui::Button::new(egui::RichText::new(glyph).color(color)).frame(false))
-        .on_hover_text("Insert a keyframe at the playhead")
-        .clicked()
+        let col = if resp.hovered() {
+            egui::Color32::from_gray(200)
+        } else {
+            egui::Color32::from_gray(120)
+        };
+        painter.circle_stroke(c, 4.0, egui::Stroke::new(1.5, col));
+    }
+    resp.on_hover_text("Insert a keyframe at the playhead").clicked()
 }
 
 /// The two normalized cubic-bezier control points of the selected keyframe's
@@ -373,7 +381,7 @@ fn properties_ui(
 
             ui.add_space(6.0);
             ui.weak("Drag a field to nudge, or click to type; Enter commits.");
-            ui.weak("◆/◇ inserts a keyframe at the playhead (◇ starts animating).");
+            ui.weak("The dot button inserts a keyframe at the playhead (hollow ring = start animating).");
 
             // Easing editor for the selected keyframe's outgoing segment.
             if let Some(e) = ease {
@@ -409,10 +417,10 @@ fn transport_ui(root: &mut egui::Ui, t: f64, duration: f64, playing: bool, out: 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                if ui.button(if playing { "❚❚  Pause" } else { "▶  Play" }).clicked() {
+                if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
                     out.toggle = true;
                 }
-                if ui.button("⟲  Restart").clicked() {
+                if ui.button("Restart").clicked() {
                     out.restart = true;
                 }
                 ui.label(format!("{t:6.2}s / {duration:.2}s"));
@@ -517,7 +525,7 @@ fn dopesheet_ui(
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.strong("Timeline");
-                ui.weak("— click to seek, click a ◆ to select (Del removes), drag to move");
+                ui.weak("— click to seek, click a key to select (Del removes), drag to move");
             });
             ui.separator();
 
@@ -552,8 +560,15 @@ fn dopesheet_ui(
                     let painter = ui.painter_at(track);
                     painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
 
-                    let time_to_x = |time: f64| track.left() + (time as f32 / dur) * track.width();
-                    let x_to_time = |x: f32| ((x - track.left()) / track.width() * dur) as f64;
+                    // Inset the time axis so keys at t=0 and t=max sit inside
+                    // the track (fully visible and clickable, not clipped at
+                    // the edge).
+                    const PAD: f32 = 8.0;
+                    let x0 = track.left() + PAD;
+                    let x1 = track.right() - PAD;
+                    let span = (x1 - x0).max(1.0);
+                    let time_to_x = |time: f64| x0 + (time as f32 / dur) * span;
+                    let x_to_time = |x: f32| ((x - x0) / span * dur) as f64;
 
                     // Playhead line.
                     let px = time_to_x(t);
@@ -691,7 +706,7 @@ fn tree_ui(root: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out:
             for row in rows {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0 + row.depth as f32 * 14.0);
-                    let icon = if row.is_group { "▸" } else { "◆" };
+                    let icon = if row.is_group { "▶" } else { "•" };
                     let label = format!("{icon} {}", row.name);
                     if ui
                         .selectable_label(selected == Some(row.id), label)
