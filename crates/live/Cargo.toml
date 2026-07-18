@@ -1,0 +1,17 @@
+[package]
+name = "motion-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live GPU shell: winit window + vello renderer driving the engine in real time."
+
+[[bin]]
+name = "pbc"
+path = "src/main.rs"
+
+[dependencies]
+motion-core.workspace = true
+kurbo.workspace = true
+vello = "0.9"
+winit = "0.30"
+pollster = "0.4"
