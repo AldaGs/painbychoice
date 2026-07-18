@@ -1,15 +1,17 @@
-//! pbc — the live GPU shell.
+//! pbc — the live GPU shell with an egui overlay.
 //!
-//! Opens a window and drives the engine in real time: every frame it reads the
-//! wall clock, computes a loop time `t`, calls `motion_core::evaluate(doc, t)`,
-//! converts the resulting `Scene` into a `vello::Scene`, and rasterizes it on
-//! the GPU. This is the real-time proof of the pull-based model — scrubbing is
-//! just "evaluate at a different `t`", now at 60fps.
+//! Every frame: read the wall clock, compute a looped time `t`, call
+//! `motion_core::evaluate(doc, t)`, rasterize the resulting `Scene` with vello,
+//! then draw an egui transport bar (play/pause, restart, and a scrubbable
+//! playhead) on top. Dragging the playhead just seeks — i.e. evaluates at a
+//! different `t` — which is the whole non-linear model made interactive.
 //!
-//! Controls:  Space = play/pause   Left/Right = step   R = restart   Esc = quit
+//! Rendering order per frame:
+//!   1. vello renders the scene into its offscreen target texture,
+//!   2. we blit that target onto the swapchain surface,
+//!   3. egui renders the UI on top (LoadOp::Load, so it composites over).
 //!
-//! The engine (`motion-core`) has no idea this exists. Swapping the offline SVG
-//! backend for this GPU one required zero changes to the document model.
+//! The engine (`motion-core`) has no idea any of this exists.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use kurbo::{Affine, Stroke as KurboStroke};
 use motion_core::{demo::demo_document, evaluate, Color as MColor, Document, Scene as MScene};
 use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
+use vello::wgpu;
 use vello::{AaConfig, AaSupport, Renderer, RendererOptions, Scene as VScene};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -28,12 +31,7 @@ use winit::window::{Window, WindowId};
 
 /// Convert one core `Color` into a vello/peniko color, folding in an opacity.
 fn to_peniko(c: MColor, opacity: f64) -> Color {
-    Color::new([
-        c.r as f32,
-        c.g as f32,
-        c.b as f32,
-        (c.a * opacity) as f32,
-    ])
+    Color::new([c.r as f32, c.g as f32, c.b as f32, (c.a * opacity) as f32])
 }
 
 /// Convert an evaluated engine `Scene` into a `vello::Scene`, prepending a
@@ -43,13 +41,7 @@ fn to_vello(scene: &MScene, fit: Affine) -> VScene {
     for item in &scene.items {
         let xf = fit * item.transform;
         if let Some(fill) = item.fill {
-            vs.fill(
-                Fill::NonZero,
-                xf,
-                to_peniko(fill, item.opacity),
-                None,
-                &item.path,
-            );
+            vs.fill(Fill::NonZero, xf, to_peniko(fill, item.opacity), None, &item.path);
         }
         if let Some((color, width)) = item.stroke {
             vs.stroke(
@@ -65,11 +57,57 @@ fn to_vello(scene: &MScene, fit: Affine) -> VScene {
 }
 
 /// "Contain" fit: scale the doc uniformly to fit the window and center it.
+/// Leaves room at the bottom for the transport bar.
 fn fit_transform(doc: &Document, win_w: f64, win_h: f64) -> Affine {
-    let scale = (win_w / doc.width).min(win_h / doc.height);
+    let avail_h = (win_h - TRANSPORT_H).max(1.0);
+    let scale = (win_w / doc.width).min(avail_h / doc.height);
     let dx = (win_w - doc.width * scale) * 0.5;
-    let dy = (win_h - doc.height * scale) * 0.5;
+    let dy = (avail_h - doc.height * scale) * 0.5;
     Affine::translate((dx, dy)) * Affine::scale(scale)
+}
+
+/// Approximate height reserved for the transport panel, in physical pixels.
+const TRANSPORT_H: f64 = 56.0;
+
+/// What the transport UI reports back after a frame's interaction.
+#[derive(Default)]
+struct Transport {
+    toggle: bool,
+    restart: bool,
+    scrub_to: Option<f64>,
+}
+
+/// Build the bottom transport bar. Reads the current time / playing state and
+/// writes user intent into `out`; it never touches `App` directly, so it can't
+/// collide with the borrows in `render`.
+fn transport_ui(root: &mut egui::Ui, t: f64, duration: f64, playing: bool, out: &mut Transport) {
+    egui::Panel::bottom("transport")
+        .exact_size(TRANSPORT_H as f32)
+        .show(root, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if ui.button(if playing { "❚❚  Pause" } else { "▶  Play" }).clicked() {
+                    out.toggle = true;
+                }
+                if ui.button("⟲  Restart").clicked() {
+                    out.restart = true;
+                }
+                ui.label(format!("{t:6.2}s / {duration:.2}s"));
+
+                // Full-width playhead scrubber.
+                let mut val = t.clamp(0.0, duration);
+                ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
+                let resp = ui.add(
+                    egui::Slider::new(&mut val, 0.0..=duration)
+                        .show_value(false)
+                        .trailing_fill(true),
+                );
+                if resp.dragged() || resp.changed() {
+                    out.scrub_to = Some(val);
+                }
+            });
+        });
 }
 
 enum RenderState {
@@ -82,17 +120,20 @@ enum RenderState {
 
 struct App {
     context: RenderContext,
-    /// One renderer per wgpu device, indexed by `RenderSurface::dev_id`.
+    /// One vello renderer per wgpu device, indexed by `RenderSurface::dev_id`.
     renderers: Vec<Option<Renderer>>,
     state: RenderState,
     vscene: VScene,
     doc: Document,
 
+    // egui (created lazily in `resumed`, once we have a window + device).
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    egui_renderer: Option<egui_wgpu::Renderer>,
+
     // Playback clock.
     playing: bool,
-    /// Wall-clock anchor: `now - anchor` maps to document time when playing.
     anchor: Instant,
-    /// Frozen document time when paused / stepping.
     paused_t: f64,
 }
 
@@ -104,6 +145,9 @@ impl App {
             state: RenderState::Suspended(None),
             vscene: VScene::new(),
             doc,
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            egui_renderer: None,
             playing: true,
             anchor: Instant::now(),
             paused_t: 0.0,
@@ -127,7 +171,6 @@ impl App {
     fn seek(&mut self, t: f64) {
         let t = t.rem_euclid(self.doc.duration.max(f64::MIN_POSITIVE));
         self.paused_t = t;
-        // Re-anchor so that resuming continues from `t`.
         self.anchor = Instant::now() - std::time::Duration::from_secs_f64(t);
     }
 
@@ -136,8 +179,7 @@ impl App {
             self.paused_t = self.current_time();
             self.playing = false;
         } else {
-            self.anchor = Instant::now()
-                - std::time::Duration::from_secs_f64(self.paused_t);
+            self.anchor = Instant::now() - std::time::Duration::from_secs_f64(self.paused_t);
             self.playing = true;
         }
     }
@@ -160,16 +202,15 @@ impl ApplicationHandler for App {
             window.clone(),
             size.width.max(1),
             size.height.max(1),
-            vello::wgpu::PresentMode::AutoVsync,
+            wgpu::PresentMode::AutoVsync,
         ))
         .expect("create surface");
 
-        // Ensure a renderer exists for this surface's device.
         while self.renderers.len() <= surface.dev_id {
             self.renderers.push(None);
         }
+        let device = &self.context.devices[surface.dev_id].device;
         if self.renderers[surface.dev_id].is_none() {
-            let device = &self.context.devices[surface.dev_id].device;
             self.renderers[surface.dev_id] = Some(
                 Renderer::new(
                     device,
@@ -183,6 +224,23 @@ impl ApplicationHandler for App {
                 .expect("create renderer"),
             );
         }
+
+        // egui: input plumbing + its own wgpu renderer targeting the swapchain.
+        if self.egui_state.is_none() {
+            self.egui_state = Some(egui_winit::State::new(
+                self.egui_ctx.clone(),
+                egui::ViewportId::ROOT,
+                &window,
+                Some(window.scale_factor() as f32),
+                Some(winit::window::Theme::Dark),
+                None,
+            ));
+        }
+        self.egui_renderer = Some(egui_wgpu::Renderer::new(
+            device,
+            surface.format,
+            egui_wgpu::RendererOptions::default(),
+        ));
 
         self.state = RenderState::Active { surface, window };
     }
@@ -199,12 +257,18 @@ impl ApplicationHandler for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
-        // Grab a cheap handle to the window without holding a borrow of
-        // `self.state`, so event handlers are free to call `self` methods.
         let window = match &self.state {
             RenderState::Active { window, .. } => window.clone(),
             RenderState::Suspended(_) => return,
         };
+
+        // Let egui see every event first; if it wants the event exclusively
+        // (e.g. dragging the scrubber), don't also treat it as a canvas input.
+        let consumed = self
+            .egui_state
+            .as_mut()
+            .map(|st| st.on_window_event(&window, &event).consumed)
+            .unwrap_or(false);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -217,7 +281,9 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
 
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. }
+                if !consumed && event.state == ElementState::Pressed =>
+            {
                 let step = 1.0 / self.doc.fps.max(1.0);
                 match event.logical_key {
                     Key::Named(NamedKey::Space) => self.toggle_play(),
@@ -240,20 +306,21 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 self.render(&window);
-                if self.playing {
+                // Keep animating while playing; when paused, egui still asks
+                // for repaints while the pointer interacts with the UI.
+                if self.playing || self.egui_ctx.has_requested_repaint() {
                     window.request_redraw();
                 }
             }
-            _ => {}
+
+            // Any other event (mouse move/click for egui) → repaint.
+            _ => window.request_redraw(),
         }
     }
 }
 
 impl App {
-    /// Evaluate the document at the current time and rasterize it. Kept as its
-    /// own method so the disjoint field borrows (`state` / `context` /
-    /// `renderers` / `vscene`) don't collide with the `self`-method calls in
-    /// the event handlers.
+    /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
         let t = self.current_time();
         let scene = evaluate(&self.doc, t);
@@ -265,23 +332,51 @@ impl App {
         let fit = fit_transform(&self.doc, size.width as f64, size.height as f64);
         self.vscene = to_vello(&scene, fit);
 
+        // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
+        let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
+        let duration = self.doc.duration;
+        let playing = self.playing;
+        let mut transport = Transport::default();
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            transport_ui(ui, t, duration, playing, &mut transport);
+        });
+        // Apply the UI's intent to the playback clock.
+        if transport.toggle {
+            self.toggle_play();
+        }
+        if transport.restart {
+            self.seek(0.0);
+        }
+        if let Some(nt) = transport.scrub_to {
+            self.playing = false;
+            self.seek(nt);
+        }
+
+        self.egui_state
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(window, full_output.platform_output);
+        let ppp = self.egui_ctx.pixels_per_point();
+        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+        let tex_delta = full_output.textures_delta;
+
+        // --- GPU (disjoint field borrows only past this point). ---
         let RenderState::Active { surface, .. } = &mut self.state else {
             return;
         };
 
-        use vello::wgpu::CurrentSurfaceTexture as Cst;
+        use wgpu::CurrentSurfaceTexture as Cst;
         let surface_texture = match surface.surface.get_current_texture() {
-            Cst::Success(t) | Cst::Suboptimal(t) => t,
+            Cst::Success(tx) | Cst::Suboptimal(tx) => tx,
             _ => {
-                // Timeout / occluded / outdated / lost — skip and retry.
                 window.request_redraw();
                 return;
             }
         };
 
         let device_handle = &self.context.devices[surface.dev_id];
-        let renderer = self.renderers[surface.dev_id].as_mut().unwrap();
-        renderer
+        let vrenderer = self.renderers[surface.dev_id].as_mut().unwrap();
+        vrenderer
             .render_to_texture(
                 &device_handle.device,
                 &device_handle.queue,
@@ -296,19 +391,65 @@ impl App {
             )
             .expect("render");
 
-        // Blit vello's target texture onto the swapchain surface.
-        let mut encoder = device_handle.device.create_command_encoder(
-            &vello::wgpu::CommandEncoderDescriptor { label: Some("blit") },
-        );
-        surface.blitter.copy(
+        let egui_renderer = self.egui_renderer.as_mut().unwrap();
+        for (id, delta) in &tex_delta.set {
+            egui_renderer.update_texture(&device_handle.device, &device_handle.queue, *id, delta);
+        }
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [surface.config.width, surface.config.height],
+            pixels_per_point: ppp,
+        };
+
+        let mut encoder = device_handle
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let user_buffers = egui_renderer.update_buffers(
             &device_handle.device,
+            &device_handle.queue,
             &mut encoder,
-            &surface.target_view,
-            &surface_texture
-                .texture
-                .create_view(&vello::wgpu::TextureViewDescriptor::default()),
+            &paint_jobs,
+            &screen,
         );
-        device_handle.queue.submit([encoder.finish()]);
+
+        let surface_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 1) vello target -> swapchain (overwrites the whole surface).
+        surface
+            .blitter
+            .copy(&device_handle.device, &mut encoder, &surface.target_view, &surface_view);
+
+        // 2) egui overlay composited on top.
+        {
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surface_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            egui_renderer.render(&mut rpass, &paint_jobs, &screen);
+        }
+
+        for id in &tex_delta.free {
+            egui_renderer.free_texture(id);
+        }
+
+        device_handle
+            .queue
+            .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
     }
 }
