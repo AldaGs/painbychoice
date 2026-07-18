@@ -152,6 +152,14 @@ impl Node {
         }
         self.children.iter().find_map(|c| c.find(id))
     }
+
+    /// Mutable depth-first search for a node by id, self included.
+    pub fn find_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        if self.id == id {
+            return Some(self);
+        }
+        self.children.iter_mut().find_map(|c| c.find_mut(id))
+    }
 }
 
 /// The whole animated document: a root node plus composition settings.

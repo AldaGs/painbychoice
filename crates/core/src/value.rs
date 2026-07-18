@@ -121,6 +121,21 @@ impl<T: Animatable> Track<T> {
         &self.keys
     }
 
+    /// Insert or update a keyframe at `time`. If a key already sits at (about)
+    /// that time its value is replaced (handles preserved); otherwise a new
+    /// smoothly-eased key is inserted in sorted order. This is the "auto-key"
+    /// behavior an editor uses when the user changes an animated value.
+    pub fn set_key(&mut self, time: f64, value: T) {
+        const EPS: f64 = 1e-4;
+        if let Some(k) = self.keys.iter_mut().find(|k| (k.time - time).abs() < EPS) {
+            k.value = value;
+        } else {
+            self.keys.push(Keyframe::smooth(time, value));
+            self.keys
+                .sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+
     pub fn sample(&self, t: f64) -> T {
         match self.keys.as_slice() {
             [] => panic!("Track::sample on an empty track"),
@@ -168,6 +183,21 @@ impl<T: Animatable> Value<T> {
             Value::Const(v) => v.clone(),
             Value::Keyframed(track) => track.sample(t),
         }
+    }
+
+    /// Write `value` at time `t`. A constant is overwritten wholesale; an
+    /// animated value gets a keyframe set at `t` (auto-key). This is the single
+    /// entry point an editor uses so it never has to branch on the value kind.
+    pub fn set_at(&mut self, t: f64, value: T) {
+        match self {
+            Value::Const(v) => *v = value,
+            Value::Keyframed(track) => track.set_key(t, value),
+        }
+    }
+
+    /// Whether this value is animated (has a keyframe track).
+    pub fn is_animated(&self) -> bool {
+        matches!(self, Value::Keyframed(_))
     }
 }
 
@@ -246,6 +276,33 @@ mod tests {
         assert!((v.resolve(0.5) - 50.0).abs() < 1.0, "got {}", v.resolve(0.5));
         // ...but eased slower at the start than linear would be.
         assert!(v.resolve(0.25) < 25.0, "ease-in should lag: {}", v.resolve(0.25));
+    }
+
+    #[test]
+    fn set_at_overwrites_a_constant() {
+        let mut v = Value::constant(3.0);
+        v.set_at(1.0, 9.0);
+        assert_eq!(v.resolve(0.0), 9.0);
+        assert!(!v.is_animated());
+    }
+
+    #[test]
+    fn set_at_replaces_existing_key_and_inserts_new() {
+        let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0.0, 0.0),
+            Keyframe::linear(1.0, 100.0),
+        ]));
+        // Edit exactly on the first key: replaces its value, no new key.
+        v.set_at(0.0, 50.0);
+        assert_eq!(v.resolve(0.0), 50.0);
+        // Edit between keys: inserts a new key at that time.
+        v.set_at(0.5, 75.0);
+        assert!((v.resolve(0.5) - 75.0).abs() < 1e-6);
+        if let Value::Keyframed(track) = &v {
+            assert_eq!(track.keys().len(), 3, "a key should have been inserted");
+        } else {
+            panic!("expected keyframed");
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke};
+use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
     demo::demo_document, evaluate, Color as MColor, Document, NodeId, Scene as MScene,
 };
@@ -110,7 +110,8 @@ struct Transport {
 }
 
 /// A snapshot of the selected node's resolved properties at the current time,
-/// gathered before the egui closure so the UI never borrows `App`.
+/// gathered before the egui closure so the UI never borrows `App`. The `*_anim`
+/// flags mark properties backed by a keyframe track (edits auto-key those).
 struct NodeInfo {
     name: String,
     id: u64,
@@ -119,82 +120,150 @@ struct NodeInfo {
     scale: (f64, f64),
     opacity: f64,
     fill: Option<[f32; 3]>,
+    pos_anim: bool,
+    rot_anim: bool,
+    scale_anim: bool,
+    opacity_anim: bool,
 }
 
 impl NodeInfo {
     fn resolve(node: &motion_core::Node, t: f64) -> Self {
-        let pos = node.transform.position.resolve(t);
-        let scale = node.transform.scale.resolve(t);
+        let tr = &node.transform;
+        let pos = tr.position.resolve(t);
+        let scale = tr.scale.resolve(t);
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
             pos: (pos.x, pos.y),
-            rot: node.transform.rotation_deg.resolve(t),
+            rot: tr.rotation_deg.resolve(t),
             scale: (scale.x, scale.y),
-            opacity: node.transform.opacity.resolve(t),
+            opacity: tr.opacity.resolve(t),
             fill: node.fill.as_ref().map(|f| {
                 let c = f.resolve(t);
                 [c.r as f32, c.g as f32, c.b as f32]
             }),
+            pos_anim: tr.position.is_animated(),
+            rot_anim: tr.rotation_deg.is_animated(),
+            scale_anim: tr.scale.is_animated(),
+            opacity_anim: tr.opacity.is_animated(),
         }
     }
 }
 
-/// Right-hand properties panel. Reads a resolved `NodeInfo`; writes nothing.
-fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>) {
+/// Edits collected from the properties panel this frame. Any `Some` field is a
+/// new value the user dialed in; `None` means untouched.
+#[derive(Default)]
+struct PropEdits {
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    rot: Option<f64>,
+    scale_x: Option<f64>,
+    scale_y: Option<f64>,
+    opacity: Option<f64>,
+    fill: Option<[f32; 3]>,
+}
+
+/// A small "●" marker shown next to animated properties (edits become keys).
+fn anim_tag(ui: &mut egui::Ui, animated: bool) {
+    if animated {
+        ui.colored_label(egui::Color32::from_rgb(255, 216, 51), "●")
+            .on_hover_text("Animated — editing sets a keyframe at the playhead");
+    } else {
+        ui.label("");
+    }
+}
+
+/// Right-hand properties panel. Reads a resolved `NodeInfo` and writes any user
+/// changes into `edits`; it never touches `App`.
+fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropEdits) {
     egui::Panel::right("properties")
-        .default_size(240.0)
+        .default_size(260.0)
         .show(root, |ui| {
             ui.add_space(8.0);
             ui.heading("Properties");
             ui.separator();
-            match info {
-                None => {
-                    ui.add_space(8.0);
-                    ui.weak("Click a shape on the canvas to select it.");
+            let Some(n) = info else {
+                ui.add_space(8.0);
+                ui.weak("Click a shape on the canvas to select it.");
+                return;
+            };
+
+            egui::Grid::new("props").num_columns(3).striped(true).show(ui, |ui| {
+                ui.label("Name");
+                ui.strong(&n.name);
+                ui.label("");
+                ui.end_row();
+
+                ui.label("Node id");
+                ui.monospace(n.id.to_string());
+                ui.label("");
+                ui.end_row();
+
+                // Position (x, y) — two drag values sharing a row.
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    let mut x = n.pos.0;
+                    let mut y = n.pos.1;
+                    if ui.add(egui::DragValue::new(&mut x).speed(1.0)).changed() {
+                        edits.pos_x = Some(x);
+                    }
+                    if ui.add(egui::DragValue::new(&mut y).speed(1.0)).changed() {
+                        edits.pos_y = Some(y);
+                    }
+                });
+                anim_tag(ui, n.pos_anim);
+                ui.end_row();
+
+                ui.label("Rotation");
+                let mut rot = n.rot;
+                if ui
+                    .add(egui::DragValue::new(&mut rot).speed(0.5).suffix("°"))
+                    .changed()
+                {
+                    edits.rot = Some(rot);
                 }
-                Some(n) => {
-                    egui::Grid::new("props").num_columns(2).striped(true).show(ui, |ui| {
-                        ui.label("Name");
-                        ui.strong(&n.name);
-                        ui.end_row();
-                        ui.label("Node id");
-                        ui.monospace(n.id.to_string());
-                        ui.end_row();
-                        ui.label("Position");
-                        ui.monospace(format!("{:.1}, {:.1}", n.pos.0, n.pos.1));
-                        ui.end_row();
-                        ui.label("Rotation");
-                        ui.monospace(format!("{:.1}°", n.rot));
-                        ui.end_row();
-                        ui.label("Scale");
-                        ui.monospace(format!("{:.2}, {:.2}", n.scale.0, n.scale.1));
-                        ui.end_row();
-                        ui.label("Opacity");
-                        ui.monospace(format!("{:.0}%", n.opacity * 100.0));
-                        ui.end_row();
-                        ui.label("Fill");
-                        match n.fill {
-                            Some(c) => {
-                                let col = egui::Color32::from_rgb(
-                                    (c[0] * 255.0) as u8,
-                                    (c[1] * 255.0) as u8,
-                                    (c[2] * 255.0) as u8,
-                                );
-                                let (rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(28.0, 14.0), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 2.0, col);
-                            }
-                            None => {
-                                ui.weak("none");
-                            }
-                        }
-                        ui.end_row();
-                    });
-                    ui.add_space(6.0);
-                    ui.weak("Values resolved at the current playhead time.");
+                anim_tag(ui, n.rot_anim);
+                ui.end_row();
+
+                ui.label("Scale");
+                ui.horizontal(|ui| {
+                    let mut sx = n.scale.0;
+                    let mut sy = n.scale.1;
+                    if ui.add(egui::DragValue::new(&mut sx).speed(0.01)).changed() {
+                        edits.scale_x = Some(sx);
+                    }
+                    if ui.add(egui::DragValue::new(&mut sy).speed(0.01)).changed() {
+                        edits.scale_y = Some(sy);
+                    }
+                });
+                anim_tag(ui, n.scale_anim);
+                ui.end_row();
+
+                ui.label("Opacity");
+                let mut op = n.opacity;
+                if ui
+                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
+                    .changed()
+                {
+                    edits.opacity = Some(op);
                 }
-            }
+                anim_tag(ui, n.opacity_anim);
+                ui.end_row();
+
+                ui.label("Fill");
+                if let Some(mut rgb) = n.fill {
+                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                        edits.fill = Some(rgb);
+                    }
+                } else {
+                    ui.weak("none");
+                }
+                ui.label("");
+                ui.end_row();
+            });
+
+            ui.add_space(6.0);
+            ui.weak("● = animated. Editing an animated value keys it at the playhead.");
         });
 }
 
@@ -464,6 +533,48 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Write the panel's edits into the selected node. Returns whether anything
+    /// changed. An edit to a constant overwrites it; an edit to an animated
+    /// property sets a keyframe at time `t` (via `Value::set_at`).
+    fn apply_edits(&mut self, t: f64, e: &PropEdits) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let Some(node) = self.doc.root.find_mut(id) else {
+            return false;
+        };
+        let tr = &mut node.transform;
+        let mut changed = false;
+
+        if e.pos_x.is_some() || e.pos_y.is_some() {
+            let cur = tr.position.resolve(t);
+            let v = Vec2::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y));
+            tr.position.set_at(t, v);
+            changed = true;
+        }
+        if let Some(r) = e.rot {
+            tr.rotation_deg.set_at(t, r);
+            changed = true;
+        }
+        if e.scale_x.is_some() || e.scale_y.is_some() {
+            let cur = tr.scale.resolve(t);
+            let v = Vec2::new(e.scale_x.unwrap_or(cur.x), e.scale_y.unwrap_or(cur.y));
+            tr.scale.set_at(t, v);
+            changed = true;
+        }
+        if let Some(o) = e.opacity {
+            tr.opacity.set_at(t, o);
+            changed = true;
+        }
+        if let Some(rgb) = e.fill {
+            if let Some(fill) = node.fill.as_mut() {
+                fill.set_at(t, MColor::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64));
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
         let t = self.current_time();
@@ -494,9 +605,10 @@ impl App {
         let duration = self.doc.duration;
         let playing = self.playing;
         let mut transport = Transport::default();
+        let mut edits = PropEdits::default();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             transport_ui(ui, t, duration, playing, &mut transport);
-            properties_ui(ui, &sel_info);
+            properties_ui(ui, &sel_info, &mut edits);
         });
         // Apply the UI's intent to the playback clock.
         if transport.toggle {
@@ -508,6 +620,13 @@ impl App {
         if let Some(nt) = transport.scrub_to {
             self.playing = false;
             self.seek(nt);
+        }
+
+        // Apply property edits to the selected node, then re-evaluate so the
+        // change is visible on this very frame (no one-frame drag lag).
+        if self.apply_edits(t, &edits) {
+            let scene = evaluate(&self.doc, t);
+            self.vscene = to_vello(&scene, fit, self.selected);
         }
 
         self.egui_state
