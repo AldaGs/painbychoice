@@ -1,0 +1,15 @@
+[package]
+name = "motion-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runnable shell. For now: evaluate a demo document and write a frame to disk."
+
+[[bin]]
+name = "motion"
+path = "src/main.rs"
+
+[dependencies]
+motion-core.workspace = true
+motion-render.workspace = true
+kurbo.workspace = true

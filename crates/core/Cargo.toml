@@ -1,0 +1,14 @@
+[package]
+name = "motion-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless document model + evaluation engine. No GPU, no windowing."
+
+[dependencies]
+kurbo.workspace = true
+glam.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "motion-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Turns an evaluated Scene into pixels. SVG backend today; vello/wgpu later."
+
+[dependencies]
+motion-core.workspace = true
+kurbo.workspace = true
