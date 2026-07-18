@@ -527,6 +527,8 @@ struct TreeEdits {
     reorder: Option<(NodeId, i32)>,
     add: Option<NewShape>,
     delete: Option<NodeId>,
+    save: bool,
+    load: bool,
 }
 
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
@@ -537,6 +539,14 @@ fn tree_ui(root: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out:
         .show(root, |ui| {
             ui.add_space(8.0);
             ui.heading("Layers");
+            ui.horizontal(|ui| {
+                if ui.button("Save…").clicked() {
+                    out.save = true;
+                }
+                if ui.button("Load…").clicked() {
+                    out.load = true;
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.button("+ Rect").clicked() {
                     out.add = Some(NewShape::Rect);
@@ -971,6 +981,60 @@ impl App {
         true
     }
 
+    /// Serialize the document to a `.pbc` (JSON) file chosen via a native
+    /// save dialog. The document already derives serde, so this is the whole
+    /// file format.
+    fn save(&self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Pain By Choice", &["pbc", "json"])
+            .set_file_name("project.pbc")
+            .save_file()
+        else {
+            return;
+        };
+        match serde_json::to_string_pretty(&self.doc) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    eprintln!("save failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("serialize failed: {e}"),
+        }
+    }
+
+    /// Load a `.pbc` document via a native open dialog, replacing the current
+    /// one. Returns whether the document changed. Selection and the id counter
+    /// are reset to match the loaded tree.
+    fn load(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Pain By Choice", &["pbc", "json"])
+            .pick_file()
+        else {
+            return false;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("read failed: {e}");
+                return false;
+            }
+        };
+        match serde_json::from_str::<Document>(&text) {
+            Ok(doc) => {
+                self.next_id = max_id(&doc.root) + 1;
+                self.doc = doc;
+                self.selected = None;
+                self.selected_key = None;
+                self.seek(0.0);
+                true
+            }
+            Err(e) => {
+                eprintln!("parse failed: {e}");
+                false
+            }
+        }
+    }
+
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
         let t = self.current_time();
@@ -1075,6 +1139,12 @@ impl App {
                 self.selected_key = None;
             }
             dirty = true;
+        }
+        if tree_edits.save {
+            self.save();
+        }
+        if tree_edits.load {
+            dirty |= self.load();
         }
         if dirty {
             let scene = evaluate(&self.doc, t);
