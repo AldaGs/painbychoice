@@ -350,20 +350,35 @@ fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
     rows
 }
 
-/// What the dopesheet reports after a frame: a seek and/or a keyframe move.
+/// A keyframe's identity within a node: which property, which index.
+type KeyRef = (PropKind, usize);
+
+/// What the dopesheet reports after a frame: seek, keyframe move, and/or a
+/// change to which keyframe is selected.
 #[derive(Default)]
 struct DopeEdits {
     seek_to: Option<f64>,
     /// (property, keyframe index, new time)
     move_key: Option<(PropKind, usize, f64)>,
+    /// A diamond was clicked → select it.
+    select_key: Option<KeyRef>,
+    /// Empty track was clicked → clear the keyframe selection.
+    clear_selection: bool,
 }
 
 const DOPESHEET_H: f64 = 150.0;
 
 /// Bottom dopesheet: one row per animated property, keyframes drawn as diamonds
 /// along a shared time axis with a playhead line. Click a row's track to seek;
-/// drag a diamond to move that keyframe in time.
-fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, out: &mut DopeEdits) {
+/// click a diamond to select it (Delete removes); drag a diamond to move it.
+fn dopesheet_ui(
+    root: &mut egui::Ui,
+    rows: &[DopeRow],
+    t: f64,
+    duration: f64,
+    selected_key: Option<KeyRef>,
+    out: &mut DopeEdits,
+) {
     egui::Panel::bottom("dopesheet")
         .exact_size(DOPESHEET_H as f32)
         .show(root, |ui| {
@@ -371,7 +386,7 @@ fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, ou
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.strong("Timeline");
-                ui.weak("— click a track to seek, drag a ◆ to move a key");
+                ui.weak("— click to seek, click a ◆ to select (Del removes), drag to move");
             });
             ui.separator();
 
@@ -416,10 +431,11 @@ fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, ou
                         egui::Stroke::new(1.5, playhead_col),
                     );
 
-                    // Click on empty track → seek.
+                    // Click on empty track → seek and clear the key selection.
                     if track_resp.clicked() {
                         if let Some(p) = track_resp.interact_pointer_pos() {
                             out.seek_to = Some(x_to_time(p.x).clamp(0.0, duration));
+                            out.clear_selection = true;
                         }
                     }
 
@@ -427,7 +443,8 @@ fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, ou
                     let cy = track.center().y;
                     for (key_idx, &kt) in row.times.iter().enumerate() {
                         let kx = time_to_x(kt);
-                        let r = 5.0;
+                        let is_sel = selected_key == Some((row.kind, key_idx));
+                        let r = if is_sel { 6.5 } else { 5.0 };
                         let hit = egui::Rect::from_center_size(
                             egui::pos2(kx, cy),
                             egui::vec2(r * 2.4, r * 2.4),
@@ -435,10 +452,15 @@ fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, ou
                         let id = ui.id().with((row_idx, key_idx));
                         let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
 
-                        let col = if resp.dragged() || resp.hovered() {
+                        let col = if is_sel || resp.dragged() || resp.hovered() {
                             egui::Color32::WHITE
                         } else {
                             accent
+                        };
+                        let border = if is_sel {
+                            egui::Stroke::new(2.0, playhead_col)
+                        } else {
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(16))
                         };
                         // Diamond = a rotated square.
                         let d = [
@@ -447,16 +469,16 @@ fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, ou
                             egui::pos2(kx, cy + r),
                             egui::pos2(kx - r, cy),
                         ];
-                        painter.add(egui::Shape::convex_polygon(
-                            d.to_vec(),
-                            col,
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(16)),
-                        ));
+                        painter.add(egui::Shape::convex_polygon(d.to_vec(), col, border));
 
+                        if resp.clicked() {
+                            out.select_key = Some((row.kind, key_idx));
+                        }
                         if resp.dragged() {
                             if let Some(p) = resp.interact_pointer_pos() {
                                 let nt = x_to_time(p.x).clamp(0.0, duration);
                                 out.move_key = Some((row.kind, key_idx, nt));
+                                out.select_key = Some((row.kind, key_idx));
                             }
                         }
                     }
@@ -495,6 +517,8 @@ struct App {
     cursor: (f64, f64),
     pending_pick: Option<(f64, f64)>,
     selected: Option<NodeId>,
+    /// The keyframe selected in the dopesheet, if any.
+    selected_key: Option<KeyRef>,
 }
 
 impl App {
@@ -514,6 +538,7 @@ impl App {
             cursor: (0.0, 0.0),
             pending_pick: None,
             selected: None,
+            selected_key: None,
         }
     }
 
@@ -668,6 +693,9 @@ impl ApplicationHandler for App {
                         self.seek(t);
                     }
                     Key::Character(ref s) if s == "r" || s == "R" => self.seek(0.0),
+                    Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
+                        self.delete_selected_key();
+                    }
                     _ => {}
                 }
                 window.request_redraw();
@@ -768,6 +796,26 @@ impl App {
         true
     }
 
+    /// Remove the dopesheet-selected keyframe (Delete). A track keeps at least
+    /// one key, so this may be a no-op on the last one.
+    fn delete_selected_key(&mut self) -> bool {
+        let (Some(id), Some((kind, index))) = (self.selected, self.selected_key) else {
+            return false;
+        };
+        let Some(node) = self.doc.root.find_mut(id) else {
+            return false;
+        };
+        let tr = &mut node.transform;
+        match kind {
+            PropKind::Position => tr.position.remove_key(index),
+            PropKind::Rotation => tr.rotation_deg.remove_key(index),
+            PropKind::Scale => tr.scale.remove_key(index),
+            PropKind::Opacity => tr.opacity.remove_key(index),
+        }
+        self.selected_key = None;
+        true
+    }
+
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
         let t = self.current_time();
@@ -787,9 +835,14 @@ impl App {
             (TRANSPORT_H + DOPESHEET_H) * ppp,
         );
 
-        // Resolve any pending click into a selection (or a deselect).
+        // Resolve any pending click into a selection (or a deselect). Changing
+        // the selected node invalidates any keyframe selection.
         if let Some(px) = self.pending_pick.take() {
-            self.selected = pick(&scene, fit, px);
+            let picked = pick(&scene, fit, px);
+            if picked != self.selected {
+                self.selected = picked;
+                self.selected_key = None;
+            }
         }
 
         self.vscene = to_vello(&scene, fit, self.selected);
@@ -807,11 +860,19 @@ impl App {
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
         let mut dope = DopeEdits::default();
+        let selected_key = self.selected_key;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             transport_ui(ui, t, duration, playing, &mut transport);
-            dopesheet_ui(ui, &rows, t, duration, &mut dope);
+            dopesheet_ui(ui, &rows, t, duration, selected_key, &mut dope);
             properties_ui(ui, &sel_info, &mut edits);
         });
+
+        // Keyframe selection changes from the dopesheet.
+        if let Some(k) = dope.select_key {
+            self.selected_key = Some(k);
+        } else if dope.clear_selection {
+            self.selected_key = None;
+        }
         // Apply the UI's intent to the playback clock.
         if transport.toggle {
             self.toggle_play();
