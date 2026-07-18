@@ -121,6 +121,48 @@ impl<T: Animatable> Track<T> {
         &self.keys
     }
 
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Times of every keyframe, in order.
+    pub fn times(&self) -> Vec<f64> {
+        self.keys.iter().map(|k| k.time).collect()
+    }
+
+    /// Move keyframe `index` to `new_time`, clamped so it can't cross its
+    /// neighbours. Clamping preserves the sorted invariant `sample` relies on
+    /// and keeps the key's index stable across a drag.
+    pub fn move_key(&mut self, index: usize, new_time: f64) {
+        let n = self.keys.len();
+        if index >= n {
+            return;
+        }
+        const EPS: f64 = 1e-3;
+        let lo = if index > 0 {
+            self.keys[index - 1].time + EPS
+        } else {
+            f64::NEG_INFINITY
+        };
+        let hi = if index + 1 < n {
+            self.keys[index + 1].time - EPS
+        } else {
+            f64::INFINITY
+        };
+        self.keys[index].time = new_time.clamp(lo, hi);
+    }
+
+    /// Remove keyframe `index`. A track is never emptied below one key.
+    pub fn remove_key(&mut self, index: usize) {
+        if self.keys.len() > 1 && index < self.keys.len() {
+            self.keys.remove(index);
+        }
+    }
+
     /// Insert or update a keyframe at `time`. If a key already sits at (about)
     /// that time its value is replaced (handles preserved); otherwise a new
     /// smoothly-eased key is inserted in sorted order. This is the "auto-key"
@@ -198,6 +240,29 @@ impl<T: Animatable> Value<T> {
     /// Whether this value is animated (has a keyframe track).
     pub fn is_animated(&self) -> bool {
         matches!(self, Value::Keyframed(_))
+    }
+
+    /// Keyframe times, or empty for a constant. Lets a timeline enumerate keys
+    /// without caring about the value type `T`.
+    pub fn key_times(&self) -> Vec<f64> {
+        match self {
+            Value::Const(_) => Vec::new(),
+            Value::Keyframed(track) => track.times(),
+        }
+    }
+
+    /// Move keyframe `index` to `new_time` (no-op on a constant).
+    pub fn move_key(&mut self, index: usize, new_time: f64) {
+        if let Value::Keyframed(track) = self {
+            track.move_key(index, new_time);
+        }
+    }
+
+    /// Remove keyframe `index` (no-op on a constant).
+    pub fn remove_key(&mut self, index: usize) {
+        if let Value::Keyframed(track) = self {
+            track.remove_key(index);
+        }
     }
 }
 
@@ -303,6 +368,22 @@ mod tests {
         } else {
             panic!("expected keyframed");
         }
+    }
+
+    #[test]
+    fn move_key_clamps_between_neighbours() {
+        let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0.0, 0.0),
+            Keyframe::linear(1.0, 100.0),
+            Keyframe::linear(2.0, 0.0),
+        ]));
+        // Try to drag the middle key past the last one — it must stop short.
+        v.move_key(1, 5.0);
+        let times = v.key_times();
+        assert!(times[1] < times[2], "middle key must stay before the last");
+        assert!(times[1] > times[0], "and after the first");
+        // Order preserved, so sampling still works.
+        assert!(v.resolve(0.5).is_finite());
     }
 
     #[test]

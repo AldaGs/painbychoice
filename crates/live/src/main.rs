@@ -88,18 +88,28 @@ fn pick(scene: &MScene, fit: Affine, px: (f64, f64)) -> Option<NodeId> {
     })
 }
 
-/// "Contain" fit: scale the doc uniformly to fit the window and center it.
-/// Leaves room at the bottom for the transport bar.
-fn fit_transform(doc: &Document, win_w: f64, win_h: f64) -> Affine {
-    let avail_h = (win_h - TRANSPORT_H).max(1.0);
-    let scale = (win_w / doc.width).min(avail_h / doc.height);
-    let dx = (win_w - doc.width * scale) * 0.5;
+/// "Contain" fit into the free canvas area: scale the doc uniformly to fit the
+/// window minus the docked panels (right = properties, bottom = dopesheet +
+/// transport) and center it there. `reserved_*` are in physical pixels.
+fn fit_transform(
+    doc: &Document,
+    win_w: f64,
+    win_h: f64,
+    reserved_right: f64,
+    reserved_bottom: f64,
+) -> Affine {
+    let avail_w = (win_w - reserved_right).max(1.0);
+    let avail_h = (win_h - reserved_bottom).max(1.0);
+    let scale = (avail_w / doc.width).min(avail_h / doc.height);
+    let dx = (avail_w - doc.width * scale) * 0.5;
     let dy = (avail_h - doc.height * scale) * 0.5;
     Affine::translate((dx, dy)) * Affine::scale(scale)
 }
 
-/// Approximate height reserved for the transport panel, in physical pixels.
+/// Panel sizes, in logical points (egui space). Multiply by pixels-per-point to
+/// reserve the matching number of physical pixels for the canvas fit.
 const TRANSPORT_H: f64 = 56.0;
+const PROPS_W: f64 = 260.0;
 
 /// What the transport UI reports back after a frame's interaction.
 #[derive(Default)]
@@ -199,16 +209,16 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 ui.label("");
                 ui.end_row();
 
-                // Position (x, y) — click-to-type fields (speed 0 disables
-                // drag-to-nudge; click opens the text editor, Enter commits).
+                // Position (x, y). DragValue gives both interactions: drag to
+                // nudge, or click to type a value and commit with Enter.
                 ui.label("Position");
                 ui.horizontal(|ui| {
                     let mut x = n.pos.0;
                     let mut y = n.pos.1;
-                    if ui.add(egui::DragValue::new(&mut x).speed(0.0)).changed() {
+                    if ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed() {
                         edits.pos_x = Some(x);
                     }
-                    if ui.add(egui::DragValue::new(&mut y).speed(0.0)).changed() {
+                    if ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed() {
                         edits.pos_y = Some(y);
                     }
                 });
@@ -218,7 +228,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 ui.label("Rotation");
                 let mut rot = n.rot;
                 if ui
-                    .add(egui::DragValue::new(&mut rot).speed(0.0).suffix("°"))
+                    .add(egui::DragValue::new(&mut rot).speed(0.5).suffix("°"))
                     .changed()
                 {
                     edits.rot = Some(rot);
@@ -230,10 +240,10 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 ui.horizontal(|ui| {
                     let mut sx = n.scale.0;
                     let mut sy = n.scale.1;
-                    if ui.add(egui::DragValue::new(&mut sx).speed(0.0)).changed() {
+                    if ui.add(egui::DragValue::new(&mut sx).speed(0.01)).changed() {
                         edits.scale_x = Some(sx);
                     }
-                    if ui.add(egui::DragValue::new(&mut sy).speed(0.0)).changed() {
+                    if ui.add(egui::DragValue::new(&mut sy).speed(0.01)).changed() {
                         edits.scale_y = Some(sy);
                     }
                 });
@@ -264,7 +274,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
             });
 
             ui.add_space(6.0);
-            ui.weak("Click a field to type a value; Enter commits.");
+            ui.weak("Drag a field to nudge, or click to type; Enter commits.");
             ui.weak("● = animated. Editing an animated value keys it at the playhead.");
         });
 }
@@ -299,6 +309,159 @@ fn transport_ui(root: &mut egui::Ui, t: f64, duration: f64, playing: bool, out: 
                     out.scrub_to = Some(val);
                 }
             });
+        });
+}
+
+/// Which animated property a dopesheet row refers to. Lets the UI report a
+/// keyframe drag back to `App` without knowing the property's value type.
+#[derive(Clone, Copy, PartialEq)]
+enum PropKind {
+    Position,
+    Rotation,
+    Scale,
+    Opacity,
+}
+
+/// One dopesheet row: an animated property and the times of its keyframes.
+struct DopeRow {
+    label: &'static str,
+    kind: PropKind,
+    times: Vec<f64>,
+}
+
+/// Gather the animated properties of a node into dopesheet rows.
+fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
+    let tr = &node.transform;
+    let mut rows = Vec::new();
+    // Each property is a distinct value type, so this is spelled out rather
+    // than looped.
+    if tr.position.is_animated() {
+        rows.push(DopeRow { label: "Position", kind: PropKind::Position, times: tr.position.key_times() });
+    }
+    if tr.rotation_deg.is_animated() {
+        rows.push(DopeRow { label: "Rotation", kind: PropKind::Rotation, times: tr.rotation_deg.key_times() });
+    }
+    if tr.scale.is_animated() {
+        rows.push(DopeRow { label: "Scale", kind: PropKind::Scale, times: tr.scale.key_times() });
+    }
+    if tr.opacity.is_animated() {
+        rows.push(DopeRow { label: "Opacity", kind: PropKind::Opacity, times: tr.opacity.key_times() });
+    }
+    rows
+}
+
+/// What the dopesheet reports after a frame: a seek and/or a keyframe move.
+#[derive(Default)]
+struct DopeEdits {
+    seek_to: Option<f64>,
+    /// (property, keyframe index, new time)
+    move_key: Option<(PropKind, usize, f64)>,
+}
+
+const DOPESHEET_H: f64 = 150.0;
+
+/// Bottom dopesheet: one row per animated property, keyframes drawn as diamonds
+/// along a shared time axis with a playhead line. Click a row's track to seek;
+/// drag a diamond to move that keyframe in time.
+fn dopesheet_ui(root: &mut egui::Ui, rows: &[DopeRow], t: f64, duration: f64, out: &mut DopeEdits) {
+    egui::Panel::bottom("dopesheet")
+        .exact_size(DOPESHEET_H as f32)
+        .show(root, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.strong("Timeline");
+                ui.weak("— click a track to seek, drag a ◆ to move a key");
+            });
+            ui.separator();
+
+            if rows.is_empty() {
+                ui.add_space(8.0);
+                ui.weak("Select a node with animated properties to see its keyframes.");
+                return;
+            }
+
+            const LABEL_W: f32 = 80.0;
+            const ROW_H: f32 = 22.0;
+            let dur = duration.max(f64::MIN_POSITIVE) as f32;
+            let accent = egui::Color32::from_rgb(255, 216, 51);
+            let playhead_col = egui::Color32::from_rgb(240, 90, 90);
+
+            for (row_idx, row) in rows.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(LABEL_W, ROW_H),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(row.label);
+                        },
+                    );
+
+                    // The track: full remaining width, fixed height.
+                    let (track, track_resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width() - 8.0, ROW_H),
+                        egui::Sense::click(),
+                    );
+                    let painter = ui.painter_at(track);
+                    painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
+
+                    let time_to_x = |time: f64| track.left() + (time as f32 / dur) * track.width();
+                    let x_to_time = |x: f32| ((x - track.left()) / track.width() * dur) as f64;
+
+                    // Playhead line.
+                    let px = time_to_x(t);
+                    painter.line_segment(
+                        [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+                        egui::Stroke::new(1.5, playhead_col),
+                    );
+
+                    // Click on empty track → seek.
+                    if track_resp.clicked() {
+                        if let Some(p) = track_resp.interact_pointer_pos() {
+                            out.seek_to = Some(x_to_time(p.x).clamp(0.0, duration));
+                        }
+                    }
+
+                    // Keyframe diamonds (interactive, drawn on top).
+                    let cy = track.center().y;
+                    for (key_idx, &kt) in row.times.iter().enumerate() {
+                        let kx = time_to_x(kt);
+                        let r = 5.0;
+                        let hit = egui::Rect::from_center_size(
+                            egui::pos2(kx, cy),
+                            egui::vec2(r * 2.4, r * 2.4),
+                        );
+                        let id = ui.id().with((row_idx, key_idx));
+                        let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+
+                        let col = if resp.dragged() || resp.hovered() {
+                            egui::Color32::WHITE
+                        } else {
+                            accent
+                        };
+                        // Diamond = a rotated square.
+                        let d = [
+                            egui::pos2(kx, cy - r),
+                            egui::pos2(kx + r, cy),
+                            egui::pos2(kx, cy + r),
+                            egui::pos2(kx - r, cy),
+                        ];
+                        painter.add(egui::Shape::convex_polygon(
+                            d.to_vec(),
+                            col,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(16)),
+                        ));
+
+                        if resp.dragged() {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let nt = x_to_time(p.x).clamp(0.0, duration);
+                                out.move_key = Some((row.kind, key_idx, nt));
+                            }
+                        }
+                    }
+                });
+            }
         });
 }
 
@@ -587,6 +750,24 @@ impl App {
         changed
     }
 
+    /// Move a keyframe of the selected node's property (dopesheet drag).
+    fn move_keyframe(&mut self, kind: PropKind, index: usize, new_time: f64) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let Some(node) = self.doc.root.find_mut(id) else {
+            return false;
+        };
+        let tr = &mut node.transform;
+        match kind {
+            PropKind::Position => tr.position.move_key(index, new_time),
+            PropKind::Rotation => tr.rotation_deg.move_key(index, new_time),
+            PropKind::Scale => tr.scale.move_key(index, new_time),
+            PropKind::Opacity => tr.opacity.move_key(index, new_time),
+        }
+        true
+    }
+
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
         let t = self.current_time();
@@ -596,7 +777,15 @@ impl App {
         }
 
         let size = window.inner_size();
-        let fit = fit_transform(&self.doc, size.width as f64, size.height as f64);
+        // egui panel sizes are in points; convert to physical pixels for the fit.
+        let ppp = window.scale_factor();
+        let fit = fit_transform(
+            &self.doc,
+            size.width as f64,
+            size.height as f64,
+            PROPS_W * ppp,
+            (TRANSPORT_H + DOPESHEET_H) * ppp,
+        );
 
         // Resolve any pending click into a selection (or a deselect).
         if let Some(px) = self.pending_pick.take() {
@@ -607,10 +796,9 @@ impl App {
 
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
-        let sel_info = self
-            .selected
-            .and_then(|id| self.doc.root.find(id))
-            .map(|node| NodeInfo::resolve(node, t));
+        let sel_node = self.selected.and_then(|id| self.doc.root.find(id));
+        let sel_info = sel_node.map(|node| NodeInfo::resolve(node, t));
+        let rows = sel_node.map(dope_rows).unwrap_or_default();
 
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
@@ -618,8 +806,10 @@ impl App {
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
+        let mut dope = DopeEdits::default();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             transport_ui(ui, t, duration, playing, &mut transport);
+            dopesheet_ui(ui, &rows, t, duration, &mut dope);
             properties_ui(ui, &sel_info, &mut edits);
         });
         // Apply the UI's intent to the playback clock.
@@ -629,14 +819,18 @@ impl App {
         if transport.restart {
             self.seek(0.0);
         }
-        if let Some(nt) = transport.scrub_to {
+        if let Some(nt) = transport.scrub_to.or(dope.seek_to) {
             self.playing = false;
             self.seek(nt);
         }
 
-        // Apply property edits to the selected node, then re-evaluate so the
-        // change is visible on this very frame (no one-frame drag lag).
-        if self.apply_edits(t, &edits) {
+        // Apply property edits + keyframe drags to the selected node, then
+        // re-evaluate so the change is visible on this very frame.
+        let mut dirty = self.apply_edits(t, &edits);
+        if let Some((kind, idx, nt)) = dope.move_key {
+            dirty |= self.move_keyframe(kind, idx, nt);
+        }
+        if dirty {
             let scene = evaluate(&self.doc, t);
             self.vscene = to_vello(&scene, fit, self.selected);
         }
