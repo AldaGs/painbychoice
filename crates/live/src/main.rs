@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate, Color as MColor, Document, Node as MNode, NodeId,
+    demo::demo_document, evaluate, Color as MColor, Document, Handle, Node as MNode, NodeId,
     Scene as MScene, Shape as MShape, Transform, Value,
 };
 use vello::peniko::{Color, Fill};
@@ -137,6 +137,7 @@ struct NodeInfo {
     rot_anim: bool,
     scale_anim: bool,
     opacity_anim: bool,
+    fill_anim: bool,
 }
 
 impl NodeInfo {
@@ -159,6 +160,7 @@ impl NodeInfo {
             rot_anim: tr.rotation_deg.is_animated(),
             scale_anim: tr.scale.is_animated(),
             opacity_anim: tr.opacity.is_animated(),
+            fill_anim: node.fill.as_ref().is_some_and(|f| f.is_animated()),
         }
     }
 }
@@ -174,21 +176,113 @@ struct PropEdits {
     scale_y: Option<f64>,
     opacity: Option<f64>,
     fill: Option<[f32; 3]>,
+    // Insert-keyframe-at-playhead requests (the "stopwatch").
+    key_pos: bool,
+    key_rot: bool,
+    key_scale: bool,
+    key_opacity: bool,
+    key_fill: bool,
 }
 
-/// A small "●" marker shown next to animated properties (edits become keys).
-fn anim_tag(ui: &mut egui::Ui, animated: bool) {
-    if animated {
-        ui.colored_label(egui::Color32::from_rgb(255, 216, 51), "●")
-            .on_hover_text("Animated — editing sets a keyframe at the playhead");
+/// A "stopwatch" toggle: filled ◆ when the property is animated, hollow ◇ when
+/// constant. Clicking it inserts a keyframe at the playhead (promoting a
+/// constant to a track). Returns whether it was clicked.
+fn key_button(ui: &mut egui::Ui, animated: bool) -> bool {
+    let (glyph, color) = if animated {
+        ("◆", egui::Color32::from_rgb(255, 216, 51))
     } else {
-        ui.label("");
+        ("◇", egui::Color32::from_gray(140))
+    };
+    ui.add(egui::Button::new(egui::RichText::new(glyph).color(color)).frame(false))
+        .on_hover_text("Insert a keyframe at the playhead")
+        .clicked()
+}
+
+/// The two normalized cubic-bezier control points of the selected keyframe's
+/// outgoing timing segment (`cubic-bezier(p1, p2)` with endpoints 0,0 and 1,1).
+struct EaseInfo {
+    p1: (f32, f32),
+    p2: (f32, f32),
+}
+
+/// A CSS-style cubic-bezier editor. Draws the timing curve in a unit square and
+/// lets the two control points be dragged. New handles are reported in `out`.
+fn ease_editor(ui: &mut egui::Ui, ease: &EaseInfo, out: &mut Option<((f32, f32), (f32, f32))>) {
+    let sz = (ui.available_width() - 8.0).clamp(80.0, 180.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    // value (x right, y up) in [0,1] → screen (y is down).
+    let map = |v: (f32, f32)| {
+        egui::pos2(rect.left() + v.0 * rect.width(), rect.bottom() - v.1 * rect.height())
+    };
+    let unmap = |p: egui::Pos2| {
+        (
+            ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+            ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0),
+        )
+    };
+
+    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+    // Reference diagonal (linear).
+    painter.line_segment(
+        [map((0.0, 0.0)), map((1.0, 1.0))],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+    );
+
+    // Drag the control points first, so the curve draws with fresh values.
+    let mut p1 = ease.p1;
+    let mut p2 = ease.p2;
+    let mut changed = false;
+    for (i, hp) in [&mut p1, &mut p2].into_iter().enumerate() {
+        let sp = map(*hp);
+        let hit = egui::Rect::from_center_size(sp, egui::vec2(16.0, 16.0));
+        let resp = ui.interact(hit, ui.id().with(("ease_handle", i)), egui::Sense::drag());
+        if resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                *hp = unmap(p);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        *out = Some((p1, p2));
+    }
+
+    // Handle guide lines.
+    let accent = egui::Color32::from_rgb(255, 216, 51);
+    painter.line_segment([map((0.0, 0.0)), map(p1)], egui::Stroke::new(1.0, accent));
+    painter.line_segment([map((1.0, 1.0)), map(p2)], egui::Stroke::new(1.0, accent));
+
+    // The timing curve itself.
+    let bez = |a: f32, b: f32, s: f32| {
+        let mt = 1.0 - s;
+        3.0 * mt * mt * s * a + 3.0 * mt * s * s * b + s * s * s
+    };
+    let curve: Vec<egui::Pos2> = (0..=48)
+        .map(|i| {
+            let s = i as f32 / 48.0;
+            map((bez(p1.0, p2.0, s), bez(p1.1, p2.1, s)))
+        })
+        .collect();
+    painter.add(egui::Shape::line(curve, egui::Stroke::new(2.0, egui::Color32::WHITE)));
+
+    // Control-point knobs.
+    for hp in [p1, p2] {
+        painter.circle_filled(map(hp), 4.0, accent);
     }
 }
 
 /// Right-hand properties panel. Reads a resolved `NodeInfo` and writes any user
-/// changes into `edits`; it never touches `App`.
-fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropEdits) {
+/// changes into `edits`; it never touches `App`. `ease` is the selected key's
+/// segment (if any) and edits go to `ease_out`.
+fn properties_ui(
+    root: &mut egui::Ui,
+    info: &Option<NodeInfo>,
+    edits: &mut PropEdits,
+    ease: &Option<EaseInfo>,
+    ease_out: &mut Option<((f32, f32), (f32, f32))>,
+) {
     egui::Panel::right("properties")
         .default_size(260.0)
         .show(root, |ui| {
@@ -225,7 +319,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                         edits.pos_y = Some(y);
                     }
                 });
-                anim_tag(ui, n.pos_anim);
+                edits.key_pos |= key_button(ui, n.pos_anim);
                 ui.end_row();
 
                 ui.label("Rotation");
@@ -236,7 +330,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 {
                     edits.rot = Some(rot);
                 }
-                anim_tag(ui, n.rot_anim);
+                edits.key_rot |= key_button(ui, n.rot_anim);
                 ui.end_row();
 
                 ui.label("Scale");
@@ -250,7 +344,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                         edits.scale_y = Some(sy);
                     }
                 });
-                anim_tag(ui, n.scale_anim);
+                edits.key_scale |= key_button(ui, n.scale_anim);
                 ui.end_row();
 
                 ui.label("Opacity");
@@ -261,7 +355,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 {
                     edits.opacity = Some(op);
                 }
-                anim_tag(ui, n.opacity_anim);
+                edits.key_opacity |= key_button(ui, n.opacity_anim);
                 ui.end_row();
 
                 ui.label("Fill");
@@ -269,16 +363,39 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                     if ui.color_edit_button_rgb(&mut rgb).changed() {
                         edits.fill = Some(rgb);
                     }
+                    edits.key_fill |= key_button(ui, n.fill_anim);
                 } else {
                     ui.weak("none");
+                    ui.label("");
                 }
-                ui.label("");
                 ui.end_row();
             });
 
             ui.add_space(6.0);
             ui.weak("Drag a field to nudge, or click to type; Enter commits.");
-            ui.weak("● = animated. Editing an animated value keys it at the playhead.");
+            ui.weak("◆/◇ inserts a keyframe at the playhead (◇ starts animating).");
+
+            // Easing editor for the selected keyframe's outgoing segment.
+            if let Some(e) = ease {
+                ui.separator();
+                ui.strong("Easing");
+                ui.weak("Timing of the selected key's outgoing segment.");
+                ui.horizontal(|ui| {
+                    if ui.small_button("Linear").clicked() {
+                        *ease_out = Some(((1.0 / 3.0, 1.0 / 3.0), (2.0 / 3.0, 2.0 / 3.0)));
+                    }
+                    if ui.small_button("Smooth").clicked() {
+                        *ease_out = Some(((0.42, 0.0), (0.58, 1.0)));
+                    }
+                    if ui.small_button("Ease In").clicked() {
+                        *ease_out = Some(((0.42, 0.0), (1.0, 1.0)));
+                    }
+                    if ui.small_button("Ease Out").clicked() {
+                        *ease_out = Some(((0.0, 0.0), (0.58, 1.0)));
+                    }
+                });
+                ease_editor(ui, e, ease_out);
+            }
         });
 }
 
@@ -355,6 +472,17 @@ fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
 
 /// A keyframe's identity within a node: which property, which index.
 type KeyRef = (PropKind, usize);
+
+/// Read the outgoing-segment handles for a given property + keyframe index.
+fn segment_handles_of(node: &MNode, kind: PropKind, index: usize) -> Option<(Handle, Handle)> {
+    let tr = &node.transform;
+    match kind {
+        PropKind::Position => tr.position.segment_handles(index),
+        PropKind::Rotation => tr.rotation_deg.segment_handles(index),
+        PropKind::Scale => tr.scale.segment_handles(index),
+        PropKind::Opacity => tr.opacity.segment_handles(index),
+    }
+}
 
 /// What the dopesheet reports after a frame: seek, keyframe move, and/or a
 /// change to which keyframe is selected.
@@ -885,7 +1013,52 @@ impl App {
                 changed = true;
             }
         }
+
+        // Stopwatch clicks: insert a keyframe at the playhead (promoting a
+        // constant to a track the first time).
+        if e.key_pos {
+            tr.position.insert_key(t);
+            changed = true;
+        }
+        if e.key_rot {
+            tr.rotation_deg.insert_key(t);
+            changed = true;
+        }
+        if e.key_scale {
+            tr.scale.insert_key(t);
+            changed = true;
+        }
+        if e.key_opacity {
+            tr.opacity.insert_key(t);
+            changed = true;
+        }
+        if e.key_fill {
+            if let Some(fill) = node.fill.as_mut() {
+                fill.insert_key(t);
+                changed = true;
+            }
+        }
         changed
+    }
+
+    /// Set the easing handles for the selected keyframe's outgoing segment.
+    fn set_ease(&mut self, kind: PropKind, index: usize, p1: (f32, f32), p2: (f32, f32)) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let Some(node) = self.doc.root.find_mut(id) else {
+            return false;
+        };
+        let out = Handle::new(p1.0 as f64, p1.1 as f64);
+        let next_in = Handle::new(p2.0 as f64, p2.1 as f64);
+        let tr = &mut node.transform;
+        match kind {
+            PropKind::Position => tr.position.set_segment_handles(index, out, next_in),
+            PropKind::Rotation => tr.rotation_deg.set_segment_handles(index, out, next_in),
+            PropKind::Scale => tr.scale.set_segment_handles(index, out, next_in),
+            PropKind::Opacity => tr.opacity.set_segment_handles(index, out, next_in),
+        }
+        true
     }
 
     /// Move a keyframe of the selected node's property (dopesheet drag).
@@ -1073,6 +1246,17 @@ impl App {
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
 
+        // The selected keyframe's outgoing easing segment, if it has one.
+        let ease_info = match (sel_node, self.selected_key) {
+            (Some(node), Some((kind, idx))) => {
+                segment_handles_of(node, kind, idx).map(|(p1, p2)| EaseInfo {
+                    p1: (p1.x as f32, p1.y as f32),
+                    p2: (p2.x as f32, p2.y as f32),
+                })
+            }
+            _ => None,
+        };
+
         // Flatten the scene tree for the layers panel.
         let mut tree = Vec::new();
         tree_rows(&self.doc.root, 0, &mut tree);
@@ -1087,11 +1271,12 @@ impl App {
         let mut tree_edits = TreeEdits::default();
         let selected_key = self.selected_key;
         let selected_node = self.selected;
+        let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             tree_ui(ui, &tree, selected_node, &mut tree_edits);
             transport_ui(ui, t, duration, playing, &mut transport);
             dopesheet_ui(ui, &rows, t, duration, selected_key, &mut dope);
-            properties_ui(ui, &sel_info, &mut edits);
+            properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out);
         });
 
         // Layers panel: selection + reorder.
@@ -1125,6 +1310,9 @@ impl App {
         let mut dirty = self.apply_edits(t, &edits);
         if let Some((kind, idx, nt)) = dope.move_key {
             dirty |= self.move_keyframe(kind, idx, nt);
+        }
+        if let (Some((kind, idx)), Some((p1, p2))) = (self.selected_key, ease_out) {
+            dirty |= self.set_ease(kind, idx, p1, p2);
         }
         if let Some((id, delta)) = tree_edits.reorder {
             dirty |= self.doc.root.reorder_child(id, delta);

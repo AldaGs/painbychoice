@@ -163,6 +163,24 @@ impl<T: Animatable> Track<T> {
         }
     }
 
+    /// The timing handles governing the segment leaving keyframe `index`
+    /// (its out-handle and the next key's in-handle). `None` past the last key.
+    pub fn segment_handles(&self, index: usize) -> Option<(Handle, Handle)> {
+        if index + 1 < self.keys.len() {
+            Some((self.keys[index].out_handle, self.keys[index + 1].in_handle))
+        } else {
+            None
+        }
+    }
+
+    /// Set the handles for the segment leaving keyframe `index`.
+    pub fn set_segment_handles(&mut self, index: usize, out: Handle, next_in: Handle) {
+        if index + 1 < self.keys.len() {
+            self.keys[index].out_handle = out;
+            self.keys[index + 1].in_handle = next_in;
+        }
+    }
+
     /// Insert or update a keyframe at `time`. If a key already sits at (about)
     /// that time its value is replaced (handles preserved); otherwise a new
     /// smoothly-eased key is inserted in sorted order. This is the "auto-key"
@@ -262,6 +280,35 @@ impl<T: Animatable> Value<T> {
     pub fn remove_key(&mut self, index: usize) {
         if let Value::Keyframed(track) = self {
             track.remove_key(index);
+        }
+    }
+
+    /// Insert a keyframe at time `t`, holding the value the property currently
+    /// resolves to. A constant is promoted to a one-key track (this is how a
+    /// property *starts* being animated); an existing track gets a key at `t`.
+    pub fn insert_key(&mut self, t: f64) {
+        if let Value::Const(v) = self {
+            let v = v.clone();
+            *self = Value::Keyframed(Track::new(vec![Keyframe::smooth(t, v)]));
+        } else if let Value::Keyframed(track) = self {
+            let cur = track.sample(t);
+            track.set_key(t, cur);
+        }
+    }
+
+    /// Handles for the segment leaving keyframe `index` (out of this key, in of
+    /// the next). `None` for a constant or the last key.
+    pub fn segment_handles(&self, index: usize) -> Option<(Handle, Handle)> {
+        match self {
+            Value::Const(_) => None,
+            Value::Keyframed(track) => track.segment_handles(index),
+        }
+    }
+
+    /// Set the segment handles leaving keyframe `index` (no-op on a constant).
+    pub fn set_segment_handles(&mut self, index: usize, out: Handle, next_in: Handle) {
+        if let Value::Keyframed(track) = self {
+            track.set_segment_handles(index, out, next_in);
         }
     }
 }
@@ -368,6 +415,34 @@ mod tests {
         } else {
             panic!("expected keyframed");
         }
+    }
+
+    #[test]
+    fn insert_key_promotes_constant_then_adds() {
+        let mut v = Value::constant(7.0);
+        assert!(!v.is_animated());
+        v.insert_key(1.0);
+        assert!(v.is_animated(), "constant should become a track");
+        assert_eq!(v.key_times(), vec![1.0]);
+        assert_eq!(v.resolve(1.0), 7.0, "the held value carries over");
+        // A second insert at a new time adds a key holding the resolved value.
+        v.insert_key(3.0);
+        assert_eq!(v.key_times().len(), 2);
+    }
+
+    #[test]
+    fn segment_handles_round_trip() {
+        let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0.0, 0.0),
+            Keyframe::linear(1.0, 10.0),
+        ]));
+        let (out, inn) = v.segment_handles(0).unwrap();
+        assert!((out.x - Handle::LINEAR_OUT.x).abs() < 1e-9);
+        v.set_segment_handles(0, Handle::new(0.9, 0.1), Handle::new(0.1, 0.9));
+        let (out2, in2) = v.segment_handles(0).unwrap();
+        assert!((out2.x - 0.9).abs() < 1e-9 && (in2.y - 0.9).abs() < 1e-9);
+        assert!(v.segment_handles(1).is_none(), "no segment past the last key");
+        let _ = inn;
     }
 
     #[test]
