@@ -30,14 +30,26 @@ back to the node that produced it — for selection and debugging.
 ## Run it
 
 ```bash
-cargo test --workspace     # 8 tests: easing, tracks, transform composition, json round-trip
-cargo run --bin motion     # writes out/frame_00.svg .. frame_08.svg — scrub by opening them
+cargo test --workspace     # engine tests: easing, tracks, keyframe ops, hit-testing
+cargo run -p motion-live   # the live GPU editor (window)
+cargo run --bin motion     # offline: writes out/frame_00.svg .. frame_08.svg
 ```
+
+## Live editor (`pbc`)
+
+`crates/live` is a winit + vello + egui shell over the engine:
+
+- **Canvas** — vello rasterizes `evaluate(doc, t)` every frame; click a shape to select it.
+- **Transport** — play/pause, restart, scrubbable playhead.
+- **Layers** (left) — the scene tree; select, reorder (▲/▼), add (Rect/Ellipse/Group), delete, Save…/Load….
+- **Properties** (right) — resolved values for the selection; drag or type to edit. Editing an animated value keys it at the playhead.
+- **Timeline / dopesheet** (bottom) — keyframes as diamonds per property; click to seek, click a ◆ to select (Del removes), drag to retime.
+
+Save/Load round-trips the whole document to `.pbc` (JSON via serde).
 
 ## Roadmap (next)
 
-1. GPU backend: `render` gains a vello-on-wgpu path behind the same `Scene`.
-2. App shell: `winit` window + `egui` panels, Blender-style splittable layout.
-3. Canvas view + playback (calls `evaluate` in a loop).
-4. Editors: selection, properties panel, timeline, interactive keyframing.
-5. Node graph + expression IR (`Value::Expr` / `Value::Parametric`).
+1. Keyframe easing handles editable in the timeline (currently linear/smooth presets).
+2. More shape params + stroke editing in the properties panel.
+3. Blender-style splittable/dockable panels (see EBN's `layoutTree`).
+4. Node graph + expression IR (`Value::Expr` / `Value::Parametric`).
