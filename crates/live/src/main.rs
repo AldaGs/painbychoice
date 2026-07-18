@@ -17,8 +17,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kurbo::{Affine, Stroke as KurboStroke};
-use motion_core::{demo::demo_document, evaluate, Color as MColor, Document, Scene as MScene};
+use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke};
+use motion_core::{
+    demo::demo_document, evaluate, Color as MColor, Document, NodeId, Scene as MScene,
+};
 use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -35,8 +37,9 @@ fn to_peniko(c: MColor, opacity: f64) -> Color {
 }
 
 /// Convert an evaluated engine `Scene` into a `vello::Scene`, prepending a
-/// global transform that fits the composition into the window.
-fn to_vello(scene: &MScene, fit: Affine) -> VScene {
+/// global transform that fits the composition into the window. The selected
+/// node (if any) gets a bright outline drawn last, so it sits on top.
+fn to_vello(scene: &MScene, fit: Affine, selected: Option<NodeId>) -> VScene {
     let mut vs = VScene::new();
     for item in &scene.items {
         let xf = fit * item.transform;
@@ -53,7 +56,36 @@ fn to_vello(scene: &MScene, fit: Affine) -> VScene {
             );
         }
     }
+    // Selection outline on top of everything.
+    if let Some(sel) = selected {
+        if let Some(item) = scene.items.iter().find(|i| i.source == sel) {
+            let xf = fit * item.transform;
+            // Width is in the item's local space; keep it visible but modest.
+            vs.stroke(
+                &KurboStroke::new(4.0),
+                xf,
+                Color::new([1.0, 0.85, 0.2, 1.0]),
+                None,
+                &item.path,
+            );
+        }
+    }
     vs
+}
+
+/// Pick the front-most scene item under a point given in physical pixels.
+/// Returns the `NodeId` that produced it, or `None` for empty space.
+fn pick(scene: &MScene, fit: Affine, px: (f64, f64)) -> Option<NodeId> {
+    let comp_point = fit.inverse() * Point::new(px.0, px.1);
+    // Iterate back-to-front: the last item drawn is on top.
+    scene.items.iter().rev().find_map(|item| {
+        let local = item.transform.inverse() * comp_point;
+        if item.fill.is_some() && item.path.contains(local) {
+            Some(item.source)
+        } else {
+            None
+        }
+    })
 }
 
 /// "Contain" fit: scale the doc uniformly to fit the window and center it.
@@ -75,6 +107,95 @@ struct Transport {
     toggle: bool,
     restart: bool,
     scrub_to: Option<f64>,
+}
+
+/// A snapshot of the selected node's resolved properties at the current time,
+/// gathered before the egui closure so the UI never borrows `App`.
+struct NodeInfo {
+    name: String,
+    id: u64,
+    pos: (f64, f64),
+    rot: f64,
+    scale: (f64, f64),
+    opacity: f64,
+    fill: Option<[f32; 3]>,
+}
+
+impl NodeInfo {
+    fn resolve(node: &motion_core::Node, t: f64) -> Self {
+        let pos = node.transform.position.resolve(t);
+        let scale = node.transform.scale.resolve(t);
+        NodeInfo {
+            name: node.name.clone(),
+            id: node.id.0,
+            pos: (pos.x, pos.y),
+            rot: node.transform.rotation_deg.resolve(t),
+            scale: (scale.x, scale.y),
+            opacity: node.transform.opacity.resolve(t),
+            fill: node.fill.as_ref().map(|f| {
+                let c = f.resolve(t);
+                [c.r as f32, c.g as f32, c.b as f32]
+            }),
+        }
+    }
+}
+
+/// Right-hand properties panel. Reads a resolved `NodeInfo`; writes nothing.
+fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>) {
+    egui::Panel::right("properties")
+        .default_size(240.0)
+        .show(root, |ui| {
+            ui.add_space(8.0);
+            ui.heading("Properties");
+            ui.separator();
+            match info {
+                None => {
+                    ui.add_space(8.0);
+                    ui.weak("Click a shape on the canvas to select it.");
+                }
+                Some(n) => {
+                    egui::Grid::new("props").num_columns(2).striped(true).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.strong(&n.name);
+                        ui.end_row();
+                        ui.label("Node id");
+                        ui.monospace(n.id.to_string());
+                        ui.end_row();
+                        ui.label("Position");
+                        ui.monospace(format!("{:.1}, {:.1}", n.pos.0, n.pos.1));
+                        ui.end_row();
+                        ui.label("Rotation");
+                        ui.monospace(format!("{:.1}°", n.rot));
+                        ui.end_row();
+                        ui.label("Scale");
+                        ui.monospace(format!("{:.2}, {:.2}", n.scale.0, n.scale.1));
+                        ui.end_row();
+                        ui.label("Opacity");
+                        ui.monospace(format!("{:.0}%", n.opacity * 100.0));
+                        ui.end_row();
+                        ui.label("Fill");
+                        match n.fill {
+                            Some(c) => {
+                                let col = egui::Color32::from_rgb(
+                                    (c[0] * 255.0) as u8,
+                                    (c[1] * 255.0) as u8,
+                                    (c[2] * 255.0) as u8,
+                                );
+                                let (rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(28.0, 14.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 2.0, col);
+                            }
+                            None => {
+                                ui.weak("none");
+                            }
+                        }
+                        ui.end_row();
+                    });
+                    ui.add_space(6.0);
+                    ui.weak("Values resolved at the current playhead time.");
+                }
+            }
+        });
 }
 
 /// Build the bottom transport bar. Reads the current time / playing state and
@@ -135,6 +256,11 @@ struct App {
     playing: bool,
     anchor: Instant,
     paused_t: f64,
+
+    // Selection / picking (physical-pixel coordinates).
+    cursor: (f64, f64),
+    pending_pick: Option<(f64, f64)>,
+    selected: Option<NodeId>,
 }
 
 impl App {
@@ -151,6 +277,9 @@ impl App {
             playing: true,
             anchor: Instant::now(),
             paused_t: 0.0,
+            cursor: (0.0, 0.0),
+            pending_pick: None,
+            selected: None,
         }
     }
 
@@ -304,6 +433,21 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+            }
+
+            WindowEvent::MouseInput { state, button, .. }
+                if !consumed
+                    && state == ElementState::Pressed
+                    && button == winit::event::MouseButton::Left =>
+            {
+                // Defer the hit-test to render(), where the evaluated scene and
+                // fit transform for this exact frame are in hand.
+                self.pending_pick = Some(self.cursor);
+                window.request_redraw();
+            }
+
             WindowEvent::RedrawRequested => {
                 self.render(&window);
                 // Keep animating while playing; when paused, egui still asks
@@ -330,7 +474,20 @@ impl App {
 
         let size = window.inner_size();
         let fit = fit_transform(&self.doc, size.width as f64, size.height as f64);
-        self.vscene = to_vello(&scene, fit);
+
+        // Resolve any pending click into a selection (or a deselect).
+        if let Some(px) = self.pending_pick.take() {
+            self.selected = pick(&scene, fit, px);
+        }
+
+        self.vscene = to_vello(&scene, fit, self.selected);
+
+        // Snapshot the selected node's properties before the UI closure so the
+        // egui code borrows a plain struct, never `self`.
+        let sel_info = self
+            .selected
+            .and_then(|id| self.doc.root.find(id))
+            .map(|node| NodeInfo::resolve(node, t));
 
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
@@ -339,6 +496,7 @@ impl App {
         let mut transport = Transport::default();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             transport_ui(ui, t, duration, playing, &mut transport);
+            properties_ui(ui, &sel_info);
         });
         // Apply the UI's intent to the playback clock.
         if transport.toggle {
@@ -451,6 +609,37 @@ impl App {
             .queue
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A click on the demo square (centered at t=0) should select it, and a
+    /// click far outside should deselect. Fit is identity here so physical
+    /// pixels equal composition coordinates.
+    #[test]
+    fn pick_hits_shape_and_misses_empty_space() {
+        let doc = demo_document();
+        let scene = evaluate(&doc, 0.0);
+        let fit = Affine::IDENTITY;
+
+        // The square sits at (300, 540) at t=0 with a 200x200 body.
+        assert_eq!(pick(&scene, fit, (300.0, 540.0)), Some(NodeId(1)));
+        // Empty corner — nothing there.
+        assert_eq!(pick(&scene, fit, (5.0, 5.0)), None);
+    }
+
+    #[test]
+    fn pick_prefers_front_most_item() {
+        // The dot is a child drawn after the square, so where they overlap the
+        // dot (front-most) wins. At t=0 the dot is above the square center.
+        let doc = demo_document();
+        let scene = evaluate(&doc, 0.0);
+        let fit = Affine::IDENTITY;
+        // Dot center: square pos (300,540) + child offset (0,-120) = (300,420).
+        assert_eq!(pick(&scene, fit, (300.0, 420.0)), Some(NodeId(2)));
     }
 }
 

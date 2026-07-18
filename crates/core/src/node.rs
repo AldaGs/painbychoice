@@ -144,6 +144,14 @@ impl Node {
         self.children.push(child);
         self
     }
+
+    /// Depth-first search for a node by id, self included.
+    pub fn find(&self, id: NodeId) -> Option<&Node> {
+        if self.id == id {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.find(id))
+    }
 }
 
 /// The whole animated document: a root node plus composition settings.
