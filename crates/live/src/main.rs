@@ -468,6 +468,12 @@ impl ApplicationHandler for App {
             .map(|st| st.on_window_event(&window, &event).consumed)
             .unwrap_or(false);
 
+        // Whether the pointer is over any egui panel/widget. Combined with
+        // `consumed` this decides if a click belongs to the UI rather than the
+        // canvas. Both read egui's last frame, so we keep that frame fresh by
+        // repainting on pointer motion (see CursorMoved below).
+        let over_ui = consumed || self.egui_ctx.is_pointer_over_egui();
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -504,10 +510,14 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                // Repaint so egui's hover/consumed state stays current even
+                // while paused — otherwise the next click is judged against a
+                // stale frame and canvas picking fires over the UI.
+                window.request_redraw();
             }
 
             WindowEvent::MouseInput { state, button, .. }
-                if !consumed
+                if !over_ui
                     && state == ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
