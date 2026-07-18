@@ -199,15 +199,16 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 ui.label("");
                 ui.end_row();
 
-                // Position (x, y) — two drag values sharing a row.
+                // Position (x, y) — click-to-type fields (speed 0 disables
+                // drag-to-nudge; click opens the text editor, Enter commits).
                 ui.label("Position");
                 ui.horizontal(|ui| {
                     let mut x = n.pos.0;
                     let mut y = n.pos.1;
-                    if ui.add(egui::DragValue::new(&mut x).speed(1.0)).changed() {
+                    if ui.add(egui::DragValue::new(&mut x).speed(0.0)).changed() {
                         edits.pos_x = Some(x);
                     }
-                    if ui.add(egui::DragValue::new(&mut y).speed(1.0)).changed() {
+                    if ui.add(egui::DragValue::new(&mut y).speed(0.0)).changed() {
                         edits.pos_y = Some(y);
                     }
                 });
@@ -217,7 +218,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 ui.label("Rotation");
                 let mut rot = n.rot;
                 if ui
-                    .add(egui::DragValue::new(&mut rot).speed(0.5).suffix("°"))
+                    .add(egui::DragValue::new(&mut rot).speed(0.0).suffix("°"))
                     .changed()
                 {
                     edits.rot = Some(rot);
@@ -229,10 +230,10 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
                 ui.horizontal(|ui| {
                     let mut sx = n.scale.0;
                     let mut sy = n.scale.1;
-                    if ui.add(egui::DragValue::new(&mut sx).speed(0.01)).changed() {
+                    if ui.add(egui::DragValue::new(&mut sx).speed(0.0)).changed() {
                         edits.scale_x = Some(sx);
                     }
-                    if ui.add(egui::DragValue::new(&mut sy).speed(0.01)).changed() {
+                    if ui.add(egui::DragValue::new(&mut sy).speed(0.0)).changed() {
                         edits.scale_y = Some(sy);
                     }
                 });
@@ -263,6 +264,7 @@ fn properties_ui(root: &mut egui::Ui, info: &Option<NodeInfo>, edits: &mut PropE
             });
 
             ui.add_space(6.0);
+            ui.weak("Click a field to type a value; Enter commits.");
             ui.weak("● = animated. Editing an animated value keys it at the playhead.");
         });
 }
