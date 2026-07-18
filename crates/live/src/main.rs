@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate, Color as MColor, Document, NodeId, Scene as MScene,
+    demo::demo_document, evaluate, Color as MColor, Document, Node as MNode, NodeId,
+    Scene as MScene, Shape as MShape, Transform, Value,
 };
 use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
@@ -510,12 +511,22 @@ fn tree_rows(node: &motion_core::Node, depth: usize, out: &mut Vec<TreeRow>) {
     }
 }
 
-/// What the layers panel reports: a selection and/or a reorder request.
+/// A shape the "add" tools can create.
+#[derive(Clone, Copy)]
+enum NewShape {
+    Rect,
+    Ellipse,
+    Group,
+}
+
+/// What the layers panel reports: selection, reorder, add, and/or delete.
 #[derive(Default)]
 struct TreeEdits {
     select: Option<NodeId>,
     /// (node, delta) — move among siblings (-1 up, +1 down).
     reorder: Option<(NodeId, i32)>,
+    add: Option<NewShape>,
+    delete: Option<NodeId>,
 }
 
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
@@ -526,6 +537,18 @@ fn tree_ui(root: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out:
         .show(root, |ui| {
             ui.add_space(8.0);
             ui.heading("Layers");
+            ui.horizontal(|ui| {
+                if ui.button("+ Rect").clicked() {
+                    out.add = Some(NewShape::Rect);
+                }
+                if ui.button("+ Ellipse").clicked() {
+                    out.add = Some(NewShape::Ellipse);
+                }
+                if ui.button("+ Group").clicked() {
+                    out.add = Some(NewShape::Group);
+                }
+            });
+            ui.weak("Adds into the selected node, else the root.");
             ui.separator();
             for row in rows {
                 ui.horizontal(|ui| {
@@ -538,13 +561,16 @@ fn tree_ui(root: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out:
                     {
                         out.select = Some(row.id);
                     }
-                    // Reorder controls (not meaningful for the root).
+                    // Reorder + delete (not meaningful for the root).
                     if row.depth > 0 {
                         if ui.small_button("▲").clicked() {
                             out.reorder = Some((row.id, -1));
                         }
                         if ui.small_button("▼").clicked() {
                             out.reorder = Some((row.id, 1));
+                        }
+                        if ui.small_button("✕").clicked() {
+                            out.delete = Some(row.id);
                         }
                     }
                 });
@@ -584,10 +610,18 @@ struct App {
     selected: Option<NodeId>,
     /// The keyframe selected in the dopesheet, if any.
     selected_key: Option<KeyRef>,
+    /// Next unused node id, for shapes created in-app.
+    next_id: u64,
+}
+
+/// The largest node id in a subtree, for seeding the id counter.
+fn max_id(node: &MNode) -> u64 {
+    node.children.iter().fold(node.id.0, |m, c| m.max(max_id(c)))
 }
 
 impl App {
     fn new(doc: Document) -> Self {
+        let next_id = max_id(&doc.root) + 1;
         Self {
             context: RenderContext::new(),
             renderers: Vec::new(),
@@ -604,6 +638,7 @@ impl App {
             pending_pick: None,
             selected: None,
             selected_key: None,
+            next_id,
         }
     }
 
@@ -881,6 +916,61 @@ impl App {
         true
     }
 
+    /// Create a new shape/group, parent it under the selected node (or the
+    /// root), select it, and return `true` (the doc changed).
+    fn add_node(&mut self, kind: NewShape) -> bool {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let center = Vec2::new(self.doc.width / 2.0, self.doc.height / 2.0);
+        let at_center = Transform {
+            position: Value::constant(center),
+            ..Transform::default()
+        };
+        // A rotating palette so new shapes are visually distinct.
+        let palette = [
+            MColor::rgb(0.90, 0.25, 0.25),
+            MColor::rgb(0.25, 0.65, 0.95),
+            MColor::rgb(0.35, 0.80, 0.45),
+            MColor::rgb(0.95, 0.75, 0.20),
+            MColor::rgb(0.70, 0.45, 0.90),
+        ];
+        let fill = palette[(id as usize) % palette.len()];
+
+        let node = match kind {
+            NewShape::Rect => MNode::shape(
+                id,
+                format!("Rect {id}"),
+                MShape::Rect {
+                    size: Value::constant(Vec2::new(200.0, 200.0)),
+                    radius: Value::constant(0.0),
+                },
+            )
+            .with_fill(fill)
+            .with_transform(at_center),
+            NewShape::Ellipse => MNode::shape(
+                id,
+                format!("Ellipse {id}"),
+                MShape::Ellipse { size: Value::constant(Vec2::new(200.0, 200.0)) },
+            )
+            .with_fill(fill)
+            .with_transform(at_center),
+            NewShape::Group => MNode::group(id, format!("Group {id}")).with_transform(at_center),
+        };
+
+        // Parent under the selected node if it still exists, else the root.
+        let target = self.selected.filter(|sid| self.doc.root.find(*sid).is_some());
+        let parent = match target {
+            Some(sid) => self.doc.root.find_mut(sid).unwrap(),
+            None => &mut self.doc.root,
+        };
+        parent.children.push(node);
+
+        self.selected = Some(NodeId(id));
+        self.selected_key = None;
+        true
+    }
+
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
         let t = self.current_time();
@@ -974,6 +1064,17 @@ impl App {
         }
         if let Some((id, delta)) = tree_edits.reorder {
             dirty |= self.doc.root.reorder_child(id, delta);
+        }
+        if let Some(kind) = tree_edits.add {
+            dirty |= self.add_node(kind);
+        }
+        if let Some(id) = tree_edits.delete {
+            self.doc.root.remove(id);
+            if self.selected == Some(id) {
+                self.selected = None;
+                self.selected_key = None;
+            }
+            dirty = true;
         }
         if dirty {
             let scene = evaluate(&self.doc, t);
