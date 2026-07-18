@@ -95,13 +95,14 @@ fn fit_transform(
     doc: &Document,
     win_w: f64,
     win_h: f64,
+    reserved_left: f64,
     reserved_right: f64,
     reserved_bottom: f64,
 ) -> Affine {
-    let avail_w = (win_w - reserved_right).max(1.0);
+    let avail_w = (win_w - reserved_left - reserved_right).max(1.0);
     let avail_h = (win_h - reserved_bottom).max(1.0);
     let scale = (avail_w / doc.width).min(avail_h / doc.height);
-    let dx = (avail_w - doc.width * scale) * 0.5;
+    let dx = reserved_left + (avail_w - doc.width * scale) * 0.5;
     let dy = (avail_h - doc.height * scale) * 0.5;
     Affine::translate((dx, dy)) * Affine::scale(scale)
 }
@@ -110,6 +111,7 @@ fn fit_transform(
 /// reserve the matching number of physical pixels for the canvas fit.
 const TRANSPORT_H: f64 = 56.0;
 const PROPS_W: f64 = 260.0;
+const TREE_W: f64 = 190.0;
 
 /// What the transport UI reports back after a frame's interaction.
 #[derive(Default)]
@@ -487,6 +489,69 @@ fn dopesheet_ui(
         });
 }
 
+/// A flattened scene-tree row for the layers panel.
+struct TreeRow {
+    id: NodeId,
+    name: String,
+    depth: usize,
+    is_group: bool,
+}
+
+/// Flatten the scene graph depth-first into indented rows.
+fn tree_rows(node: &motion_core::Node, depth: usize, out: &mut Vec<TreeRow>) {
+    out.push(TreeRow {
+        id: node.id,
+        name: node.name.clone(),
+        depth,
+        is_group: node.shape.is_none(),
+    });
+    for c in &node.children {
+        tree_rows(c, depth + 1, out);
+    }
+}
+
+/// What the layers panel reports: a selection and/or a reorder request.
+#[derive(Default)]
+struct TreeEdits {
+    select: Option<NodeId>,
+    /// (node, delta) — move among siblings (-1 up, +1 down).
+    reorder: Option<(NodeId, i32)>,
+}
+
+/// Left layers panel: the scene graph as a clickable, indented list. Clicking a
+/// row selects that node; the ▲/▼ buttons restack it among its siblings.
+fn tree_ui(root: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+    egui::Panel::left("layers")
+        .exact_size(TREE_W as f32)
+        .show(root, |ui| {
+            ui.add_space(8.0);
+            ui.heading("Layers");
+            ui.separator();
+            for row in rows {
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0 + row.depth as f32 * 14.0);
+                    let icon = if row.is_group { "▸" } else { "◆" };
+                    let label = format!("{icon} {}", row.name);
+                    if ui
+                        .selectable_label(selected == Some(row.id), label)
+                        .clicked()
+                    {
+                        out.select = Some(row.id);
+                    }
+                    // Reorder controls (not meaningful for the root).
+                    if row.depth > 0 {
+                        if ui.small_button("▲").clicked() {
+                            out.reorder = Some((row.id, -1));
+                        }
+                        if ui.small_button("▼").clicked() {
+                            out.reorder = Some((row.id, 1));
+                        }
+                    }
+                });
+            }
+        });
+}
+
 enum RenderState {
     Active {
         surface: RenderSurface<'static>,
@@ -831,6 +896,7 @@ impl App {
             &self.doc,
             size.width as f64,
             size.height as f64,
+            TREE_W * ppp,
             PROPS_W * ppp,
             (TRANSPORT_H + DOPESHEET_H) * ppp,
         );
@@ -853,6 +919,10 @@ impl App {
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
 
+        // Flatten the scene tree for the layers panel.
+        let mut tree = Vec::new();
+        tree_rows(&self.doc.root, 0, &mut tree);
+
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
         let duration = self.doc.duration;
@@ -860,12 +930,23 @@ impl App {
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
         let mut dope = DopeEdits::default();
+        let mut tree_edits = TreeEdits::default();
         let selected_key = self.selected_key;
+        let selected_node = self.selected;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            tree_ui(ui, &tree, selected_node, &mut tree_edits);
             transport_ui(ui, t, duration, playing, &mut transport);
             dopesheet_ui(ui, &rows, t, duration, selected_key, &mut dope);
             properties_ui(ui, &sel_info, &mut edits);
         });
+
+        // Layers panel: selection + reorder.
+        if let Some(id) = tree_edits.select {
+            if Some(id) != self.selected {
+                self.selected = Some(id);
+                self.selected_key = None;
+            }
+        }
 
         // Keyframe selection changes from the dopesheet.
         if let Some(k) = dope.select_key {
@@ -890,6 +971,9 @@ impl App {
         let mut dirty = self.apply_edits(t, &edits);
         if let Some((kind, idx, nt)) = dope.move_key {
             dirty |= self.move_keyframe(kind, idx, nt);
+        }
+        if let Some((id, delta)) = tree_edits.reorder {
+            dirty |= self.doc.root.reorder_child(id, delta);
         }
         if dirty {
             let scene = evaluate(&self.doc, t);

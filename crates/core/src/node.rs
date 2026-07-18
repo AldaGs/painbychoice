@@ -160,6 +160,31 @@ impl Node {
         }
         self.children.iter_mut().find_map(|c| c.find_mut(id))
     }
+
+    /// Move the child with `id` among its siblings by `delta` (e.g. -1 up, +1
+    /// down), clamped to the ends. Searches the whole subtree for the parent.
+    /// Returns whether a move happened. Child order is also draw order, so this
+    /// restacks the node visually.
+    pub fn reorder_child(&mut self, id: NodeId, delta: i32) -> bool {
+        if let Some(i) = self.children.iter().position(|c| c.id == id) {
+            let j = (i as i32 + delta).clamp(0, self.children.len() as i32 - 1) as usize;
+            if i != j {
+                self.children.swap(i, j);
+                return true;
+            }
+            return false;
+        }
+        self.children.iter_mut().any(|c| c.reorder_child(id, delta))
+    }
+
+    /// Remove the node with `id` from this subtree (cannot remove `self`).
+    /// Returns the removed node, or `None` if not found.
+    pub fn remove(&mut self, id: NodeId) -> Option<Node> {
+        if let Some(i) = self.children.iter().position(|c| c.id == id) {
+            return Some(self.children.remove(i));
+        }
+        self.children.iter_mut().find_map(|c| c.remove(id))
+    }
 }
 
 /// The whole animated document: a root node plus composition settings.
