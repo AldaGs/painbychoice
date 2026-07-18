@@ -38,10 +38,25 @@ fn to_peniko(c: MColor, opacity: f64) -> Color {
 }
 
 /// Convert an evaluated engine `Scene` into a `vello::Scene`, prepending a
-/// global transform that fits the composition into the window. The selected
-/// node (if any) gets a bright outline drawn last, so it sits on top.
-fn to_vello(scene: &MScene, fit: Affine, selected: Option<NodeId>) -> VScene {
+/// global transform that fits the composition into the window. The composition
+/// bounds are drawn first (so the editable frame is visible), then the shapes,
+/// then the selection outline on top.
+fn to_vello(scene: &MScene, fit: Affine, comp: (f64, f64), selected: Option<NodeId>) -> VScene {
     let mut vs = VScene::new();
+
+    // Composition frame: a slightly lighter fill plus a border, so the comp
+    // bounds stand out from the letterbox and resolution changes are visible.
+    let comp_rect = kurbo::Rect::new(0.0, 0.0, comp.0, comp.1);
+    vs.fill(Fill::NonZero, fit, Color::new([0.14, 0.15, 0.18, 1.0]), None, &comp_rect);
+    let scale = fit.as_coeffs()[0].abs().max(1e-6);
+    vs.stroke(
+        &KurboStroke::new(1.5 / scale),
+        fit,
+        Color::new([0.35, 0.37, 0.42, 1.0]),
+        None,
+        &comp_rect,
+    );
+
     for item in &scene.items {
         let xf = fit * item.transform;
         if let Some(fill) = item.fill {
@@ -98,13 +113,14 @@ fn fit_transform(
     win_h: f64,
     reserved_left: f64,
     reserved_right: f64,
+    reserved_top: f64,
     reserved_bottom: f64,
 ) -> Affine {
     let avail_w = (win_w - reserved_left - reserved_right).max(1.0);
-    let avail_h = (win_h - reserved_bottom).max(1.0);
+    let avail_h = (win_h - reserved_top - reserved_bottom).max(1.0);
     let scale = (avail_w / doc.width).min(avail_h / doc.height);
     let dx = reserved_left + (avail_w - doc.width * scale) * 0.5;
-    let dy = (avail_h - doc.height * scale) * 0.5;
+    let dy = reserved_top + (avail_h - doc.height * scale) * 0.5;
     Affine::translate((dx, dy)) * Affine::scale(scale)
 }
 
@@ -113,6 +129,60 @@ fn fit_transform(
 const TRANSPORT_H: f64 = 56.0;
 const PROPS_W: f64 = 260.0;
 const TREE_W: f64 = 190.0;
+const COMP_H: f64 = 34.0;
+
+/// Composition-settings edits from the top bar. Any `Some` is a new value.
+#[derive(Default)]
+struct CompEdits {
+    width: Option<f64>,
+    height: Option<f64>,
+    fps: Option<f64>,
+    duration: Option<f64>,
+}
+
+/// Top composition bar: editable resolution, fps, and duration. These drive the
+/// canvas fit, the playback clock, the frame step, and the timeline mapping —
+/// so editing them here reshapes the whole comp. Reports edits into `out`.
+fn comp_ui(root: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, out: &mut CompEdits) {
+    egui::Panel::top("comp")
+        .exact_size(COMP_H as f32)
+        .show(root, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.strong("Composition");
+                ui.separator();
+
+                ui.label("Size");
+                let mut w = width;
+                if ui.add(egui::DragValue::new(&mut w).speed(1.0).range(1.0..=16384.0)).changed() {
+                    out.width = Some(w);
+                }
+                ui.label("×");
+                let mut h = height;
+                if ui.add(egui::DragValue::new(&mut h).speed(1.0).range(1.0..=16384.0)).changed() {
+                    out.height = Some(h);
+                }
+                ui.separator();
+
+                ui.label("FPS");
+                let mut f = fps;
+                if ui.add(egui::DragValue::new(&mut f).speed(0.5).range(1.0..=240.0)).changed() {
+                    out.fps = Some(f);
+                }
+                ui.separator();
+
+                ui.label("Duration");
+                let mut dur = duration;
+                if ui
+                    .add(egui::DragValue::new(&mut dur).speed(0.1).range(0.1..=3600.0).suffix(" s"))
+                    .changed()
+                {
+                    out.duration = Some(dur);
+                }
+            });
+        });
+}
 
 /// What the transport UI reports back after a frame's interaction.
 #[derive(Default)]
@@ -1240,6 +1310,7 @@ impl App {
             size.height as f64,
             TREE_W * ppp,
             PROPS_W * ppp,
+            COMP_H * ppp,
             (TRANSPORT_H + DOPESHEET_H) * ppp,
         );
 
@@ -1253,7 +1324,7 @@ impl App {
             }
         }
 
-        self.vscene = to_vello(&scene, fit, self.selected);
+        self.vscene = to_vello(&scene, fit, (self.doc.width, self.doc.height), self.selected);
 
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
@@ -1287,12 +1358,29 @@ impl App {
         let selected_key = self.selected_key;
         let selected_node = self.selected;
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
+        let mut comp = CompEdits::default();
+        let (doc_w, doc_h, doc_fps) = (self.doc.width, self.doc.height, self.doc.fps);
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp);
             tree_ui(ui, &tree, selected_node, &mut tree_edits);
             transport_ui(ui, t, duration, playing, &mut transport);
             dopesheet_ui(ui, &rows, t, duration, selected_key, &mut dope);
             properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out);
         });
+
+        // Composition settings.
+        if let Some(w) = comp.width {
+            self.doc.width = w.max(1.0);
+        }
+        if let Some(h) = comp.height {
+            self.doc.height = h.max(1.0);
+        }
+        if let Some(f) = comp.fps {
+            self.doc.fps = f.max(1.0);
+        }
+        if let Some(d) = comp.duration {
+            self.doc.duration = d.max(0.1);
+        }
 
         // Layers panel: selection + reorder.
         if let Some(id) = tree_edits.select {
@@ -1351,7 +1439,7 @@ impl App {
         }
         if dirty {
             let scene = evaluate(&self.doc, t);
-            self.vscene = to_vello(&scene, fit, self.selected);
+            self.vscene = to_vello(&scene, fit, (self.doc.width, self.doc.height), self.selected);
         }
 
         self.egui_state
