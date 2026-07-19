@@ -438,10 +438,25 @@ IR 🚧 → …**. Next up:
      the result is a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`).
      `eval_script` runs on a thread-local engine; a bad script resolves to a
      neutral fallback (never breaks the frame) and the editor shows the error
-     live. **Deliberately time-only for now**: the general `value("A", "prop")`
-     cross-reference needs an `unsafe` thread-local bridge to reach `&mut EvalCtx`
-     from a `'static` Rhai fn (this crate has no `unsafe`), so it — and `wiggle`
-     — are the next scripting step. Use `ref` nodes for cross-property links today.
+     live.
+   - ~~**The scripting bridge** — `value()` / `wiggle()`.~~ ✅ Done. Rhai's
+     registered functions must be `'static`, so a script had no way to reach the
+     `&mut EvalCtx` of the evaluation that called it. `mod bridge` in
+     `core/src/expr.rs` parks that borrow in a **thread-local raw pointer** for
+     exactly the span of one `eval_with_scope` — **the crate's only `unsafe`**,
+     kept tiny so its three soundness rules can be checked by reading it: the
+     guard clears the pointer on drop (lifetime), `with_ctx` *takes* it out for
+     the callback so a second `&mut` can't coexist (aliasing), and it's
+     thread-local so it can't escape (threads). A nested script re-parks through
+     `enter` from the inner borrow, which is the correct nesting order.
+     On top of it: **`value("A", "opacity")`** and **`value_at("A", "opacity",
+     frame - 10)`** — by node *name*, first match in tree order — routed through
+     the same memoized, cycle-guarded `resolve_prop` as `Expr::Ref`, so a
+     self-reference warns and falls back instead of recursing until the stack
+     goes; and **`wiggle(freq, amp[, seed])`**, smoothstep value noise that is
+     deterministic per frame (scrubbing is stable, a render matches the preview)
+     with a seed so x and y are independent streams. Confirmed working in a live
+     session.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
