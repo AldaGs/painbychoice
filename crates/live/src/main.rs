@@ -2117,6 +2117,8 @@ enum GraphOp {
     SetLit { kind: PropKind, path: Vec<usize>, value: ExprValue },
     /// Set the reference at `path`.
     SetRef { kind: PropKind, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
+    /// Set the script source at `path`.
+    SetScript { kind: PropKind, path: Vec<usize>, src: String },
 }
 
 #[derive(Default)]
@@ -2180,7 +2182,7 @@ fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
 
 /// The expression/node-graph panel: for the selected node, promote a property to
 /// an expression, edit its tree on a node canvas, or bake it back to a constant.
-fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
+fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, out: &mut GraphEdits) {
     ui.add_space(8.0);
     ui.heading("Graph");
     let Some(info) = info else {
@@ -2211,7 +2213,7 @@ fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
                     }
                 });
                 if let Some(expr) = &prop.expr {
-                    expr_canvas(ui, expr, info.node_id, prop.kind, &info.nodes, out);
+                    expr_canvas(ui, expr, info.node_id, prop.kind, frame, &info.nodes, out);
                     ui.separator();
                 }
             }
@@ -2229,11 +2231,13 @@ type GraphPositions = std::collections::HashMap<Vec<usize>, egui::Vec2>;
 /// inside each box. Every editor control reports a [`GraphOp`] against the
 /// node's tree-path; dragging updates only the (ephemeral) position memory —
 /// neither mutates the document here.
+#[allow(clippy::too_many_arguments)]
 fn expr_canvas(
     ui: &mut egui::Ui,
     expr: &Expr,
     node_id: NodeId,
     kind: PropKind,
+    frame: f64,
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
 ) {
@@ -2294,7 +2298,7 @@ fn expr_canvas(
             egui::StrokeKind::Inside,
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
-        expr_box(&mut child, node, kind, &b.path, nodes, out);
+        expr_box(&mut child, node, kind, frame, &b.path, nodes, out);
     }
 
     ui.data_mut(|d| d.insert_temp(mem_id, positions));
@@ -2303,10 +2307,12 @@ fn expr_canvas(
 /// The controls inside one canvas box: a kind picker, and a compact editor for a
 /// `Lit`/`Ref`. Operators (`Add`/`Mul`/`Neg`) show only their kind — their
 /// inputs are separate boxes wired in.
+#[allow(clippy::too_many_arguments)]
 fn expr_box(
     ui: &mut egui::Ui,
     expr: &Expr,
     kind: PropKind,
+    frame: f64,
     path: &[usize],
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
@@ -2327,7 +2333,39 @@ fn expr_box(
         Expr::Ref { node, prop, time_offset } => {
             ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
         }
+        Expr::Script(src) => script_editor(ui, src, frame, kind, path, out),
         _ => {}
+    }
+}
+
+/// A one-line Rhai editor with live feedback: below the field, the value the
+/// script currently evaluates to, or the error (in red) if it doesn't compile.
+fn script_editor(
+    ui: &mut egui::Ui,
+    src: &str,
+    frame: f64,
+    kind: PropKind,
+    path: &[usize],
+    out: &mut GraphEdits,
+) {
+    let mut text = src.to_string();
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .hint_text("frame * 2.0")
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
+    if resp.changed() {
+        out.op = Some(GraphOp::SetScript { kind, path: path.to_vec(), src: text.clone() });
+    }
+    match motion_core::eval_script(&text, frame) {
+        Ok(v) => {
+            ui.weak(format!("= {v}"));
+        }
+        Err(e) => {
+            let msg = e.lines().next().unwrap_or("error").to_string();
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), msg);
+        }
     }
 }
 
@@ -2451,6 +2489,9 @@ fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, frame: i64)
             edit_expr(doc, selected, kind, &path, |e| {
                 *e = Expr::Ref { node, prop, time_offset: offset }
             });
+        }
+        GraphOp::SetScript { kind, path, src } => {
+            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Script(src));
         }
     }
 }
@@ -3328,7 +3369,7 @@ impl App {
                     Editor::Properties => {
                         properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
                     }
-                    Editor::Graph => graph_ui(ui, &graph_info, &mut graph_edits),
+                    Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
                     // vello paints here; egui only measures the hole.
                     Editor::Canvas => canvas_pts = Some(ui.max_rect()),
                 },
@@ -4162,6 +4203,26 @@ mod tests {
         assert_eq!(box_at_path(&boxes, &[1]).row, 1.5, "Mul centred over its two inputs");
         assert_eq!(box_at_path(&boxes, &[]).row, 0.75, "root centred over its span");
         assert_eq!(box_at_path(&boxes, &[1, 1]).depth, 2, "deepest column");
+    }
+
+    #[test]
+    fn set_script_drives_a_property_from_the_frame() {
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Script },
+            0,
+        );
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetScript { kind: PropKind::Opacity, path: vec![], src: "frame + 0.25".into() },
+            0,
+        );
+        // resolved_opacity samples at frame 0, so the script yields 0.25.
+        assert!((resolved_opacity(&doc, id) - 0.25).abs() < 1e-9);
     }
 
     #[test]

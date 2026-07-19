@@ -9,6 +9,7 @@ description = "Headless document model + evaluation engine. No GPU, no windowing
 kurbo.workspace = true
 glam.workspace = true
 serde.workspace = true
+rhai.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -177,7 +177,8 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   (+provenance).
 - `core/src/expr.rs` — expressions: `EvalCtx` (the resolve context: frame, doc,
   cache, warnings), `ExprValue` + `From`/`ToExpr`, the `Expr` IR, `PropPath`,
-  and `eval_expr` with the memo + cycle-detecting `ResolveCache`.
+  `eval_expr` with the memo + cycle-detecting `ResolveCache`, and `eval_script`
+  (Rhai, on a thread-local engine) for `Expr::Script` nodes.
 - `core/src/demo.rs` — the demo document loaded on launch.
 - `live/src/main.rs` — everything UI. `App::render` is the per-frame heart:
   evaluate → hit-test → gather snapshots → run egui → apply `*Edits` → GPU. Panel
@@ -407,8 +408,15 @@ IR (next) → …**. Next up:
      the dock. Boxes start on the tidy-tree layout and can be **dragged** to
      rearrange; positions are remembered per (node, property) in egui memory
      (ephemeral view state, not saved with the document).
-   - **Rhai scripting** (text expressions) — lowers to the IR that's now in place.
-     Its real cost is the `EvalCtx`-callback bridge, not the syntax.
+   - ~~**Rhai scripting** (first cut).~~ ✅ Done. A `script` node kind holds Rhai
+     source (`Expr::Script`), evaluated each frame with `frame`/`time` in scope;
+     the result is a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`).
+     `eval_script` runs on a thread-local engine; a bad script resolves to a
+     neutral fallback (never breaks the frame) and the editor shows the error
+     live. **Deliberately time-only for now**: the general `value("A", "prop")`
+     cross-reference needs an `unsafe` thread-local bridge to reach `&mut EvalCtx`
+     from a `'static` Rhai fn (this crate has no `unsafe`), so it — and `wiggle`
+     — are the next scripting step. Use `ref` nodes for cross-property links today.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
