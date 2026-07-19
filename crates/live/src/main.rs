@@ -104,32 +104,170 @@ fn pick(scene: &MScene, fit: Affine, px: (f64, f64)) -> Option<NodeId> {
     })
 }
 
-/// "Contain" fit into the free canvas area: scale the doc uniformly to fit the
-/// window minus the docked panels (right = properties, bottom = dopesheet +
-/// transport) and center it there. `reserved_*` are in physical pixels.
-fn fit_transform(
-    doc: &Document,
-    win_w: f64,
-    win_h: f64,
-    reserved_left: f64,
-    reserved_right: f64,
-    reserved_top: f64,
-    reserved_bottom: f64,
-) -> Affine {
-    let avail_w = (win_w - reserved_left - reserved_right).max(1.0);
-    let avail_h = (win_h - reserved_top - reserved_bottom).max(1.0);
+/// "Contain" fit into the canvas area: scale the doc uniformly to fit `area`
+/// and center it there. `area` is in **physical pixels** — the canvas leaf's
+/// rect from the layout tree, scaled by pixels-per-point.
+///
+/// This used to subtract hardcoded panel sizes from the window. It couldn't
+/// survive dockable panels: the moment a splitter moves, constants and reality
+/// disagree and the canvas drifts out from under the cursor (which also breaks
+/// click-picking, since `pick` inverts this very transform).
+fn fit_transform(doc: &Document, area: kurbo::Rect) -> Affine {
+    let avail_w = area.width().max(1.0);
+    let avail_h = area.height().max(1.0);
     let scale = (avail_w / doc.width).min(avail_h / doc.height);
-    let dx = reserved_left + (avail_w - doc.width * scale) * 0.5;
-    let dy = reserved_top + (avail_h - doc.height * scale) * 0.5;
+    let dx = area.x0 + (avail_w - doc.width * scale) * 0.5;
+    let dy = area.y0 + (avail_h - doc.height * scale) * 0.5;
     Affine::translate((dx, dy)) * Affine::scale(scale)
 }
 
-/// Panel sizes, in logical points (egui space). Multiply by pixels-per-point to
-/// reserve the matching number of physical pixels for the canvas fit.
-const TRANSPORT_H: f64 = 56.0;
-const PROPS_W: f64 = 260.0;
-const TREE_W: f64 = 190.0;
-const COMP_H: f64 = 34.0;
+/// Default panel sizes, in logical points (egui space). These now seed the
+/// layout tree rather than being read back by the canvas fit — see [`Dock`].
+const TRANSPORT_H: f32 = 56.0;
+const PROPS_W: f32 = 260.0;
+const TREE_W: f32 = 190.0;
+const COMP_H: f32 = 34.0;
+
+/// Which editor an area of the layout shows.
+///
+/// The canvas is one of these even though vello draws it, not egui: it has to
+/// occupy a leaf so the layout tree knows where the leftover space is. Its leaf
+/// draws nothing and merely reports its rect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Editor {
+    Canvas,
+    Comp,
+    Layers,
+    Properties,
+    Transport,
+    Dopesheet,
+}
+
+/// Which edge of an area a split pins its first child to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// The panel layout: a binary tree of splits with editors at the leaves.
+///
+/// Borrowed from the EBN project's `layoutTree`. A split pins its `first` child
+/// to `side` at `size` points and gives `second` everything left over, so the
+/// nesting order *is* the outermost-to-innermost panel order — which is exactly
+/// how egui's panels already compose, letting the whole tree render by
+/// recursion into a plain `Ui`.
+///
+/// This shape is deliberately serialization-ready: `size` lives here rather than
+/// only in egui's panel memory, so a future "save this layout" (named presets,
+/// and per-project layouts) is a `serde` derive away and needs no new plumbing.
+enum Dock {
+    Leaf(Editor),
+    Split {
+        side: DockSide,
+        /// Outer size of `first` along the split axis, in points. Written back
+        /// from the real panel rect each frame so a splitter drag sticks.
+        size: f32,
+        /// Toolbars (comp bar, transport) are fixed; content panels resize.
+        resizable: bool,
+        first: Box<Dock>,
+        second: Box<Dock>,
+    },
+}
+
+impl Dock {
+    fn split(side: DockSide, size: f32, resizable: bool, first: Editor, second: Dock) -> Dock {
+        Dock::Split {
+            side,
+            size,
+            resizable,
+            first: Box::new(Dock::Leaf(first)),
+            second: Box::new(second),
+        }
+    }
+
+    /// The stock arrangement, reproducing the pre-dock fixed layout: comp bar on
+    /// top, layers left, transport and dopesheet stacked at the bottom,
+    /// properties right, canvas in what remains.
+    ///
+    /// The first of what will be several named layouts; keeping it a plain
+    /// constructor (rather than the only possible tree) is what makes adding
+    /// presets later a matter of writing more of these.
+    fn default_layout() -> Dock {
+        use DockSide::*;
+        Dock::split(
+            Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                Left,
+                TREE_W,
+                true,
+                Editor::Layers,
+                Dock::split(
+                    Bottom,
+                    TRANSPORT_H,
+                    false,
+                    Editor::Transport,
+                    Dock::split(
+                        Bottom,
+                        DOPESHEET_H,
+                        true,
+                        Editor::Dopesheet,
+                        Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
+                    ),
+                ),
+            ),
+        )
+    }
+}
+
+/// Render a layout tree into `ui`, calling `draw` for each leaf.
+///
+/// `next_id` just hands every panel a distinct egui id; egui keys its persistent
+/// panel state (including the size a user dragged a splitter to) off that, so
+/// the ids must stay stable frame to frame — which they are, since the walk
+/// order is the tree's own structure.
+fn show_dock(
+    node: &mut Dock,
+    ui: &mut egui::Ui,
+    next_id: &mut u32,
+    draw: &mut dyn FnMut(Editor, &mut egui::Ui),
+) {
+    match node {
+        Dock::Leaf(editor) => draw(*editor, ui),
+        Dock::Split { side, size, resizable, first, second } => {
+            let id = egui::Id::new(("dock", *next_id));
+            *next_id += 1;
+            let panel = match side {
+                DockSide::Left => egui::Panel::left(id),
+                DockSide::Right => egui::Panel::right(id),
+                DockSide::Top => egui::Panel::top(id),
+                DockSide::Bottom => egui::Panel::bottom(id),
+            };
+            let panel = if *resizable {
+                panel.resizable(true).default_size(*size).min_size(48.0)
+            } else {
+                panel.exact_size(*size)
+            };
+            let resp = panel.show(ui, |ui| show_dock(first, ui, next_id, draw));
+            // Read the size back so the tree — not egui's private panel memory —
+            // stays the source of truth for what the layout currently is.
+            let r = resp.response.rect;
+            *size = match side {
+                DockSide::Left | DockSide::Right => r.width(),
+                DockSide::Top | DockSide::Bottom => r.height(),
+            };
+            // The remaining space is the second child's area. Recursing here
+            // (rather than into a sibling panel) is what makes the nesting
+            // depth-first and the geometry exact.
+            show_dock(second, ui, next_id, draw);
+        }
+    }
+}
 
 /// Composition-settings edits from the top bar. Any `Some` is a new value.
 #[derive(Default)]
@@ -143,45 +281,41 @@ struct CompEdits {
 /// Top composition bar: editable resolution, fps, and duration. These drive the
 /// canvas fit, the playback clock, the frame step, and the timeline mapping —
 /// so editing them here reshapes the whole comp. Reports edits into `out`.
-fn comp_ui(root: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, out: &mut CompEdits) {
-    egui::Panel::top("comp")
-        .exact_size(COMP_H as f32)
-        .show(root, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.strong("Composition");
-                ui.separator();
+fn comp_ui(ui: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, out: &mut CompEdits) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.strong("Composition");
+        ui.separator();
 
-                ui.label("Size");
-                let mut w = width;
-                if ui.add(egui::DragValue::new(&mut w).speed(1.0).range(1.0..=16384.0)).changed() {
-                    out.width = Some(w);
-                }
-                ui.label("×");
-                let mut h = height;
-                if ui.add(egui::DragValue::new(&mut h).speed(1.0).range(1.0..=16384.0)).changed() {
-                    out.height = Some(h);
-                }
-                ui.separator();
+        ui.label("Size");
+        let mut w = width;
+        if ui.add(egui::DragValue::new(&mut w).speed(1.0).range(1.0..=16384.0)).changed() {
+            out.width = Some(w);
+        }
+        ui.label("×");
+        let mut h = height;
+        if ui.add(egui::DragValue::new(&mut h).speed(1.0).range(1.0..=16384.0)).changed() {
+            out.height = Some(h);
+        }
+        ui.separator();
 
-                ui.label("FPS");
-                let mut f = fps;
-                if ui.add(egui::DragValue::new(&mut f).speed(0.5).range(1.0..=240.0)).changed() {
-                    out.fps = Some(f);
-                }
-                ui.separator();
+        ui.label("FPS");
+        let mut f = fps;
+        if ui.add(egui::DragValue::new(&mut f).speed(0.5).range(1.0..=240.0)).changed() {
+            out.fps = Some(f);
+        }
+        ui.separator();
 
-                ui.label("Duration");
-                let mut dur = duration;
-                if ui
-                    .add(egui::DragValue::new(&mut dur).speed(0.1).range(0.1..=3600.0).suffix(" s"))
-                    .changed()
-                {
-                    out.duration = Some(dur);
-                }
-            });
-        });
+        ui.label("Duration");
+        let mut dur = duration;
+        if ui
+            .add(egui::DragValue::new(&mut dur).speed(0.1).range(0.1..=3600.0).suffix(" s"))
+            .changed()
+        {
+            out.duration = Some(dur);
+        }
+    });
 }
 
 /// What the transport UI reports back after a frame's interaction.
@@ -407,264 +541,256 @@ fn ease_editor(ui: &mut egui::Ui, ease: &EaseInfo, out: &mut Option<((f32, f32),
 /// changes into `edits`; it never touches `App`. `ease` is the selected key's
 /// segment (if any) and edits go to `ease_out`.
 fn properties_ui(
-    root: &mut egui::Ui,
+    ui: &mut egui::Ui,
     info: &Option<NodeInfo>,
     edits: &mut PropEdits,
     ease: &Option<EaseInfo>,
     ease_out: &mut Option<((f32, f32), (f32, f32))>,
 ) {
-    egui::Panel::right("properties")
-        .default_size(260.0)
-        .show(root, |ui| {
-            ui.add_space(8.0);
-            ui.heading("Properties");
-            ui.separator();
-            let Some(n) = info else {
-                ui.add_space(8.0);
-                ui.weak("Click a shape on the canvas to select it.");
-                return;
-            };
+    ui.add_space(8.0);
+    ui.heading("Properties");
+    ui.separator();
+    let Some(n) = info else {
+        ui.add_space(8.0);
+        ui.weak("Click a shape on the canvas to select it.");
+        return;
+    };
 
-            egui::Grid::new("props").num_columns(3).striped(true).show(ui, |ui| {
-                ui.label("Name");
-                ui.strong(&n.name);
-                ui.label("");
-                ui.end_row();
+    egui::Grid::new("props").num_columns(3).striped(true).show(ui, |ui| {
+        ui.label("Name");
+        ui.strong(&n.name);
+        ui.label("");
+        ui.end_row();
 
-                ui.label("Node id");
-                ui.monospace(n.id.to_string());
-                ui.label("");
-                ui.end_row();
+        ui.label("Node id");
+        ui.monospace(n.id.to_string());
+        ui.label("");
+        ui.end_row();
 
-                // Position (x, y). DragValue gives both interactions: drag to
-                // nudge, or click to type a value and commit with Enter.
-                ui.label("Position");
-                ui.horizontal(|ui| {
-                    let mut x = n.pos.0;
-                    let mut y = n.pos.1;
-                    if ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed() {
-                        edits.pos_x = Some(x);
-                    }
-                    if ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed() {
-                        edits.pos_y = Some(y);
-                    }
-                });
-                if key_button(ui, n.pos_anim) {
-                    edits.key.insert(PropKind::Position);
-                }
-                ui.end_row();
-
-                ui.label("Rotation");
-                let mut rot = n.rot;
-                if ui
-                    .add(egui::DragValue::new(&mut rot).speed(0.5).suffix("°"))
-                    .changed()
-                {
-                    edits.rot = Some(rot);
-                }
-                if key_button(ui, n.rot_anim) {
-                    edits.key.insert(PropKind::Rotation);
-                }
-                ui.end_row();
-
-                ui.label("Scale");
-                ui.horizontal(|ui| {
-                    let mut sx = n.scale.0;
-                    let mut sy = n.scale.1;
-                    if ui.add(egui::DragValue::new(&mut sx).speed(0.01)).changed() {
-                        edits.scale_x = Some(sx);
-                    }
-                    if ui.add(egui::DragValue::new(&mut sy).speed(0.01)).changed() {
-                        edits.scale_y = Some(sy);
-                    }
-                });
-                if key_button(ui, n.scale_anim) {
-                    edits.key.insert(PropKind::Scale);
-                }
-                ui.end_row();
-
-                ui.label("Opacity");
-                let mut op = n.opacity;
-                if ui
-                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
-                    .changed()
-                {
-                    edits.opacity = Some(op);
-                }
-                if key_button(ui, n.opacity_anim) {
-                    edits.key.insert(PropKind::Opacity);
-                }
-                ui.end_row();
-
-                ui.label("Fill");
-                if let Some(mut rgb) = n.fill {
-                    if ui.color_edit_button_rgb(&mut rgb).changed() {
-                        edits.fill = Some(rgb);
-                    }
-                    if key_button(ui, n.fill_anim) {
-                        edits.key.insert(PropKind::Fill);
-                    }
-                } else {
-                    ui.weak("none");
-                    ui.label("");
-                }
-                ui.end_row();
-
-                // --- Stroke. Optional, so the row doubles as its add/remove
-                // control: a node without one gets a "+ add" button rather
-                // than disabled widgets. ---
-                ui.label("Stroke");
-                if let Some((mut rgb, _)) = n.stroke {
-                    ui.horizontal(|ui| {
-                        if ui.color_edit_button_rgb(&mut rgb).changed() {
-                            edits.stroke_color = Some(rgb);
-                        }
-                        if ui.small_button("✕").on_hover_text("Remove stroke").clicked() {
-                            edits.remove_stroke = true;
-                        }
-                    });
-                    if key_button(ui, n.stroke_color_anim) {
-                        edits.key.insert(PropKind::StrokeColor);
-                    }
-                } else {
-                    if ui.small_button("+ add").clicked() {
-                        edits.add_stroke = true;
-                    }
-                    ui.label("");
-                }
-                ui.end_row();
-
-                if let Some((_, w)) = n.stroke {
-                    ui.label("Stroke W");
-                    let mut w = w;
-                    if ui
-                        .add(egui::DragValue::new(&mut w).speed(0.1).range(0.0..=f64::MAX))
-                        .changed()
-                    {
-                        edits.stroke_width = Some(w);
-                    }
-                    if key_button(ui, n.stroke_width_anim) {
-                        edits.key.insert(PropKind::StrokeWidth);
-                    }
-                    ui.end_row();
-                }
-
-                // --- Parametric geometry. Absent for groups and for imported
-                // `Path` shapes, whose geometry isn't expressed as parameters. ---
-                if let Some((w, h)) = n.size {
-                    ui.label("Size");
-                    ui.horizontal(|ui| {
-                        let (mut w, mut h) = (w, h);
-                        if ui
-                            .add(egui::DragValue::new(&mut w).speed(0.5).range(0.0..=f64::MAX))
-                            .changed()
-                        {
-                            edits.size_x = Some(w);
-                        }
-                        if ui
-                            .add(egui::DragValue::new(&mut h).speed(0.5).range(0.0..=f64::MAX))
-                            .changed()
-                        {
-                            edits.size_y = Some(h);
-                        }
-                    });
-                    if key_button(ui, n.size_anim) {
-                        edits.key.insert(PropKind::ShapeSize);
-                    }
-                    ui.end_row();
-                }
-
-                if let Some(r) = n.radius {
-                    ui.label("Radius");
-                    let mut r = r;
-                    if ui
-                        .add(egui::DragValue::new(&mut r).speed(0.5).range(0.0..=f64::MAX))
-                        .changed()
-                    {
-                        edits.radius = Some(r);
-                    }
-                    if key_button(ui, n.radius_anim) {
-                        edits.key.insert(PropKind::ShapeRadius);
-                    }
-                    ui.end_row();
-                }
-            });
-
-            ui.add_space(6.0);
-            ui.weak("Drag a field to nudge, or click to type; Enter commits.");
-            ui.weak("The dot button inserts a keyframe at the playhead (hollow ring = start animating).");
-
-            // Easing editor for the selected keyframe's outgoing segment.
-            if let Some(e) = ease {
-                ui.separator();
-                ui.strong("Easing");
-                ui.weak("Timing of the selected key's outgoing segment.");
-                ui.horizontal(|ui| {
-                    if ui.small_button("Linear").clicked() {
-                        *ease_out = Some(((1.0 / 3.0, 1.0 / 3.0), (2.0 / 3.0, 2.0 / 3.0)));
-                    }
-                    if ui.small_button("Smooth").clicked() {
-                        *ease_out = Some(((0.42, 0.0), (0.58, 1.0)));
-                    }
-                    if ui.small_button("Ease In").clicked() {
-                        *ease_out = Some(((0.42, 0.0), (1.0, 1.0)));
-                    }
-                    if ui.small_button("Ease Out").clicked() {
-                        *ease_out = Some(((0.0, 0.0), (0.58, 1.0)));
-                    }
-                });
-                ease_editor(ui, e, ease_out);
+        // Position (x, y). DragValue gives both interactions: drag to
+        // nudge, or click to type a value and commit with Enter.
+        ui.label("Position");
+        ui.horizontal(|ui| {
+            let mut x = n.pos.0;
+            let mut y = n.pos.1;
+            if ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed() {
+                edits.pos_x = Some(x);
+            }
+            if ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed() {
+                edits.pos_y = Some(y);
             }
         });
+        if key_button(ui, n.pos_anim) {
+            edits.key.insert(PropKind::Position);
+        }
+        ui.end_row();
+
+        ui.label("Rotation");
+        let mut rot = n.rot;
+        if ui
+            .add(egui::DragValue::new(&mut rot).speed(0.5).suffix("°"))
+            .changed()
+        {
+            edits.rot = Some(rot);
+        }
+        if key_button(ui, n.rot_anim) {
+            edits.key.insert(PropKind::Rotation);
+        }
+        ui.end_row();
+
+        ui.label("Scale");
+        ui.horizontal(|ui| {
+            let mut sx = n.scale.0;
+            let mut sy = n.scale.1;
+            if ui.add(egui::DragValue::new(&mut sx).speed(0.01)).changed() {
+                edits.scale_x = Some(sx);
+            }
+            if ui.add(egui::DragValue::new(&mut sy).speed(0.01)).changed() {
+                edits.scale_y = Some(sy);
+            }
+        });
+        if key_button(ui, n.scale_anim) {
+            edits.key.insert(PropKind::Scale);
+        }
+        ui.end_row();
+
+        ui.label("Opacity");
+        let mut op = n.opacity;
+        if ui
+            .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
+            .changed()
+        {
+            edits.opacity = Some(op);
+        }
+        if key_button(ui, n.opacity_anim) {
+            edits.key.insert(PropKind::Opacity);
+        }
+        ui.end_row();
+
+        ui.label("Fill");
+        if let Some(mut rgb) = n.fill {
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                edits.fill = Some(rgb);
+            }
+            if key_button(ui, n.fill_anim) {
+                edits.key.insert(PropKind::Fill);
+            }
+        } else {
+            ui.weak("none");
+            ui.label("");
+        }
+        ui.end_row();
+
+        // --- Stroke. Optional, so the row doubles as its add/remove
+        // control: a node without one gets a "+ add" button rather
+        // than disabled widgets. ---
+        ui.label("Stroke");
+        if let Some((mut rgb, _)) = n.stroke {
+            ui.horizontal(|ui| {
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    edits.stroke_color = Some(rgb);
+                }
+                if ui.small_button("✕").on_hover_text("Remove stroke").clicked() {
+                    edits.remove_stroke = true;
+                }
+            });
+            if key_button(ui, n.stroke_color_anim) {
+                edits.key.insert(PropKind::StrokeColor);
+            }
+        } else {
+            if ui.small_button("+ add").clicked() {
+                edits.add_stroke = true;
+            }
+            ui.label("");
+        }
+        ui.end_row();
+
+        if let Some((_, w)) = n.stroke {
+            ui.label("Stroke W");
+            let mut w = w;
+            if ui
+                .add(egui::DragValue::new(&mut w).speed(0.1).range(0.0..=f64::MAX))
+                .changed()
+            {
+                edits.stroke_width = Some(w);
+            }
+            if key_button(ui, n.stroke_width_anim) {
+                edits.key.insert(PropKind::StrokeWidth);
+            }
+            ui.end_row();
+        }
+
+        // --- Parametric geometry. Absent for groups and for imported
+        // `Path` shapes, whose geometry isn't expressed as parameters. ---
+        if let Some((w, h)) = n.size {
+            ui.label("Size");
+            ui.horizontal(|ui| {
+                let (mut w, mut h) = (w, h);
+                if ui
+                    .add(egui::DragValue::new(&mut w).speed(0.5).range(0.0..=f64::MAX))
+                    .changed()
+                {
+                    edits.size_x = Some(w);
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut h).speed(0.5).range(0.0..=f64::MAX))
+                    .changed()
+                {
+                    edits.size_y = Some(h);
+                }
+            });
+            if key_button(ui, n.size_anim) {
+                edits.key.insert(PropKind::ShapeSize);
+            }
+            ui.end_row();
+        }
+
+        if let Some(r) = n.radius {
+            ui.label("Radius");
+            let mut r = r;
+            if ui
+                .add(egui::DragValue::new(&mut r).speed(0.5).range(0.0..=f64::MAX))
+                .changed()
+            {
+                edits.radius = Some(r);
+            }
+            if key_button(ui, n.radius_anim) {
+                edits.key.insert(PropKind::ShapeRadius);
+            }
+            ui.end_row();
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.weak("Drag a field to nudge, or click to type; Enter commits.");
+    ui.weak("The dot button inserts a keyframe at the playhead (hollow ring = start animating).");
+
+    // Easing editor for the selected keyframe's outgoing segment.
+    if let Some(e) = ease {
+        ui.separator();
+        ui.strong("Easing");
+        ui.weak("Timing of the selected key's outgoing segment.");
+        ui.horizontal(|ui| {
+            if ui.small_button("Linear").clicked() {
+                *ease_out = Some(((1.0 / 3.0, 1.0 / 3.0), (2.0 / 3.0, 2.0 / 3.0)));
+            }
+            if ui.small_button("Smooth").clicked() {
+                *ease_out = Some(((0.42, 0.0), (0.58, 1.0)));
+            }
+            if ui.small_button("Ease In").clicked() {
+                *ease_out = Some(((0.42, 0.0), (1.0, 1.0)));
+            }
+            if ui.small_button("Ease Out").clicked() {
+                *ease_out = Some(((0.0, 0.0), (0.58, 1.0)));
+            }
+        });
+        ease_editor(ui, e, ease_out);
+    }
 }
 
 /// Build the bottom transport bar. Reads the current time / playing state and
 /// writes user intent into `out`; it never touches `App` directly, so it can't
 /// collide with the borrows in `render`.
 fn transport_ui(
-    root: &mut egui::Ui,
+    ui: &mut egui::Ui,
     frame: i64,
     last_frame: i64,
     tb: motion_core::Timebase,
     playing: bool,
     out: &mut Transport,
 ) {
-    egui::Panel::bottom("transport")
-        .exact_size(TRANSPORT_H as f32)
-        .show(root, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
-                    out.toggle = true;
-                }
-                if ui.button("Restart").clicked() {
-                    out.restart = true;
-                }
-                // Frame-domain readout: hh:mm:ss.ff plus the raw frame number,
-                // monospaced so the digits don't jitter during playback.
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}  [{frame}/{last_frame}]",
-                        tb.timecode(frame as f64)
-                    ))
-                    .monospace(),
-                );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+            out.toggle = true;
+        }
+        if ui.button("Restart").clicked() {
+            out.restart = true;
+        }
+        // Frame-domain readout: hh:mm:ss.ff plus the raw frame number,
+        // monospaced so the digits don't jitter during playback.
+        ui.label(
+            egui::RichText::new(format!(
+                "{}  [{frame}/{last_frame}]",
+                tb.timecode(frame as f64)
+            ))
+            .monospace(),
+        );
 
-                // Full-width playhead scrubber. An integer slider, so dragging
-                // it can only produce whole frames — snapping for free.
-                let mut val = frame.clamp(0, last_frame);
-                ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
-                let resp = ui.add(
-                    egui::Slider::new(&mut val, 0..=last_frame.max(1))
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                if resp.dragged() || resp.changed() {
-                    out.scrub_to = Some(val);
-                }
-            });
-        });
+        // Full-width playhead scrubber. An integer slider, so dragging
+        // it can only produce whole frames — snapping for free.
+        let mut val = frame.clamp(0, last_frame);
+        ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
+        let resp = ui.add(
+            egui::Slider::new(&mut val, 0..=last_frame.max(1))
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        if resp.dragged() || resp.changed() {
+            out.scrub_to = Some(val);
+        }
+    });
 }
 
 /// Which animated property a dopesheet row refers to. Lets the UI report a
@@ -1063,7 +1189,7 @@ fn edge_pan_intensity(x: f32, left: f32, right: f32, edge: f32) -> f32 {
     }
 }
 
-const DOPESHEET_H: f64 = 178.0;
+const DOPESHEET_H: f32 = 178.0;
 const RULER_H: f32 = 20.0;
 /// Width of the auto-pan zone at each end of the track, in points.
 const EDGE_PAN_W: f32 = 36.0;
@@ -1072,7 +1198,7 @@ const EDGE_PAN_W: f32 = 36.0;
 /// along a shared time axis with a playhead line. Click a row's track to seek;
 /// click a diamond to select it (Delete removes); drag a diamond to move it.
 fn dopesheet_ui(
-    root: &mut egui::Ui,
+    ui: &mut egui::Ui,
     rows: &[DopeRow],
     frame: f64,
     last_frame: i64,
@@ -1081,337 +1207,333 @@ fn dopesheet_ui(
     selected_keys: &KeySelection,
     out: &mut DopeEdits,
 ) {
-    egui::Panel::bottom("dopesheet")
-        .exact_size(DOPESHEET_H as f32)
-        .show(root, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.strong("Timeline");
-                ui.weak(
-                    "— ctrl+click or drag a box to multi-select, drag to move them \
-                     together, ctrl+C/V copies, Del removes",
-                );
-            });
-            ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.strong("Timeline");
+        ui.weak(
+            "— ctrl+click or drag a box to multi-select, drag to move them \
+             together, ctrl+C/V copies, Del removes",
+        );
+    });
+    ui.separator();
 
-            const LABEL_W: f32 = 80.0;
-            const ROW_H: f32 = 22.0;
-            let accent = egui::Color32::from_rgb(255, 216, 51);
-            let playhead_col = egui::Color32::from_rgb(240, 90, 90);
-            // Set by any drag on the timeline (ruler scrub or keyframe drag).
-            // Gates the edge auto-pan below.
-            let mut dragging = false;
+    const LABEL_W: f32 = 80.0;
+    const ROW_H: f32 = 22.0;
+    let accent = egui::Color32::from_rgb(255, 216, 51);
+    let playhead_col = egui::Color32::from_rgb(240, 90, 90);
+    // Set by any drag on the timeline (ruler scrub or keyframe drag).
+    // Gates the edge auto-pan below.
+    let mut dragging = false;
 
-            // --- Ruler. Allocated with the same layout as a property row, so
-            // its axis geometry is exactly the rows' axis geometry. ---
-            let mut axis = None;
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(LABEL_W, RULER_H),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.weak("Frame");
-                    },
-                );
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width() - 8.0, RULER_H),
-                    egui::Sense::click_and_drag(),
-                );
-                let a = Axis::new(rect, view);
-                axis = Some(a);
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+    // --- Ruler. Allocated with the same layout as a property row, so
+    // its axis geometry is exactly the rows' axis geometry. ---
+    let mut axis = None;
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(LABEL_W, RULER_H),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.weak("Frame");
+            },
+        );
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width() - 8.0, RULER_H),
+            egui::Sense::click_and_drag(),
+        );
+        let a = Axis::new(rect, view);
+        axis = Some(a);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
 
-                // Ticks. Minor ticks appear only once frames are far enough
-                // apart to be legible as individual frames.
-                let step = tick_step(a.px_per_frame(), tb.fps(), 58.0);
-                let minor = if a.px_per_frame() >= 6.0 { 1 } else { 0 };
-                let first = view.start.floor() as i64;
-                let last = (view.start + view.visible).ceil() as i64;
+        // Ticks. Minor ticks appear only once frames are far enough
+        // apart to be legible as individual frames.
+        let step = tick_step(a.px_per_frame(), tb.fps(), 58.0);
+        let minor = if a.px_per_frame() >= 6.0 { 1 } else { 0 };
+        let first = view.start.floor() as i64;
+        let last = (view.start + view.visible).ceil() as i64;
 
-                if minor > 0 {
-                    let mut f = first;
-                    while f <= last {
-                        if f % step != 0 {
-                            let x = a.frame_to_x(f as f64);
-                            painter.line_segment(
-                                [
-                                    egui::pos2(x, rect.bottom() - 4.0),
-                                    egui::pos2(x, rect.bottom()),
-                                ],
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
-                            );
-                        }
-                        f += 1;
-                    }
-                }
-
-                let mut f = (first.div_euclid(step)) * step;
-                while f <= last {
-                    if f >= 0 {
-                        let x = a.frame_to_x(f as f64);
-                        painter.line_segment(
-                            [egui::pos2(x, rect.top() + 3.0), egui::pos2(x, rect.bottom())],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
-                        );
-                        painter.text(
-                            egui::pos2(x + 3.0, rect.top() + 1.0),
-                            egui::Align2::LEFT_TOP,
-                            tb.timecode(f as f64),
-                            egui::FontId::monospace(9.0),
-                            egui::Color32::from_gray(165),
-                        );
-                    }
-                    f += step;
-                }
-
-                // Playhead marker on the ruler.
-                let px = a.frame_to_x(frame);
-                painter.line_segment(
-                    [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
-                    egui::Stroke::new(1.5, playhead_col),
-                );
-
-                // Dragging or clicking the ruler scrubs.
-                if resp.clicked() || resp.dragged() {
-                    if let Some(p) = resp.interact_pointer_pos() {
-                        out.seek_to = Some(a.x_to_frame(p.x).clamp(0, last_frame));
-                    }
-                }
-                dragging |= resp.dragged();
-            });
-
-            let axis = axis.expect("ruler always allocates the axis");
-
-            // --- Zoom / pan. Scroll anywhere over the panel; zoom keeps the
-            // frame under the cursor pinned, which is what makes it feel like
-            // zooming rather than jumping. ---
-            let panel_rect = ui.max_rect();
-            let (scroll, hover) =
-                ui.input(|i| (i.smooth_scroll_delta, i.pointer.hover_pos()));
-            if let Some(p) = hover.filter(|p| panel_rect.contains(*p)) {
-                // egui rewrites a shift+wheel gesture into a *horizontal*
-                // scroll, so the shift modifier is already gone by the time we
-                // see it — a nonzero x delta is the pan signal, not `shift`.
-                // (Trackpad sideways swipes land here too, which is right.)
-                let next = if scroll.x != 0.0 {
-                    // Pan: one notch moves a tenth of the window.
-                    Some(TimelineView {
-                        start: view.start - (scroll.x as f64 / 120.0) * view.visible * 0.1,
-                        visible: view.visible,
-                    })
-                } else if scroll.y != 0.0 {
-                    let factor = (0.9f64).powf(scroll.y as f64 / 120.0);
-                    let anchor = axis.x_to_frame_exact(p.x);
-                    let visible = view.visible * factor;
-                    // Keep `anchor` under the cursor at the new scale.
-                    let ratio = (anchor - view.start) / view.visible.max(1e-9);
-                    Some(TimelineView { start: anchor - ratio * visible, visible })
-                } else {
-                    None
-                };
-                if let Some(next) = next {
-                    out.set_view = Some(next.clamped(last_frame));
-                }
-            }
-
-            // --- Box-select. A drag that *starts* on empty track (rather than
-            // on a diamond, which grabs the press first) draws a marquee; every
-            // key inside it becomes the selection.
-            //
-            // The rect has to be known before the rows loop, but only a row's
-            // response can tell us the drag began on a track — so the "a
-            // marquee is live" flag round-trips through egui memory and is read
-            // on the following frame. The one-frame lag is invisible: the
-            // marquee has no area worth hit-testing until the pointer has
-            // actually moved. ---
-            let marquee_id = ui.id().with("marquee");
-            let mut marquee_active: bool =
-                ui.ctx().data(|d| d.get_temp(marquee_id).unwrap_or(false));
-            let (press, latest, any_down) = ui.input(|i| {
-                (i.pointer.press_origin(), i.pointer.latest_pos(), i.pointer.any_down())
-            });
-            if marquee_active && !any_down {
-                // Released: the last live report already produced the selection.
-                marquee_active = false;
-                ui.ctx().data_mut(|d| d.insert_temp(marquee_id, false));
-            }
-            let marquee = match (marquee_active, press, latest) {
-                (true, Some(a), Some(b)) => Some(egui::Rect::from_two_pos(a, b)),
-                _ => None,
-            };
-            let mut marquee_hits = KeySelection::new();
-
-            // No early return: the rows loop is a no-op on an empty slice, and
-            // returning here would skip the edge auto-pan below (which should
-            // still work while scrubbing the ruler with nothing selected).
-            if rows.is_empty() {
-                ui.add_space(8.0);
-                ui.weak("Select a node with animated properties to see its keyframes.");
-            }
-
-            for (row_idx, row) in rows.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(LABEL_W, ROW_H),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(row.label);
-                        },
-                    );
-
-                    // The track: full remaining width, fixed height.
-                    let (track, track_resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width() - 8.0, ROW_H),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if track_resp.drag_started() {
-                        ui.ctx().data_mut(|d| d.insert_temp(marquee_id, true));
-                    }
-                    let painter = ui.painter_at(track);
-                    painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
-
-                    let frame_to_x = |f: f64| axis.frame_to_x(f);
-                    let x_to_frame = |x: f32| axis.x_to_frame(x);
-
-                    // Playhead line.
-                    let px = frame_to_x(frame);
+        if minor > 0 {
+            let mut f = first;
+            while f <= last {
+                if f % step != 0 {
+                    let x = a.frame_to_x(f as f64);
                     painter.line_segment(
-                        [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
-                        egui::Stroke::new(1.5, playhead_col),
+                        [
+                            egui::pos2(x, rect.bottom() - 4.0),
+                            egui::pos2(x, rect.bottom()),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
                     );
-
-                    // Click on empty track → seek and clear the key selection.
-                    if track_resp.clicked() {
-                        if let Some(p) = track_resp.interact_pointer_pos() {
-                            out.seek_to = Some(x_to_frame(p.x).clamp(0, last_frame));
-                            out.clear_selection = true;
-                        }
-                    }
-
-                    // Keyframe diamonds (interactive, drawn on top).
-                    let cy = track.center().y;
-                    for (key_idx, &kf) in row.frames.iter().enumerate() {
-                        let kx = frame_to_x(kf as f64);
-                        // Skip keys scrolled out of the window — otherwise
-                        // their hit rects stay live outside the visible track.
-                        if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
-                            continue;
-                        }
-                        if let Some(m) = marquee {
-                            if m.contains(egui::pos2(kx, cy)) {
-                                marquee_hits.insert((row.kind, key_idx));
-                            }
-                        }
-                        let is_sel = selected_keys.contains(&(row.kind, key_idx));
-                        let r = if is_sel { 6.5 } else { 5.0 };
-                        let hit = egui::Rect::from_center_size(
-                            egui::pos2(kx, cy),
-                            egui::vec2(r * 2.4, r * 2.4),
-                        );
-                        let id = ui.id().with((row_idx, key_idx));
-                        let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
-
-                        let col = if is_sel || resp.dragged() || resp.hovered() {
-                            egui::Color32::WHITE
-                        } else {
-                            accent
-                        };
-                        let border = if is_sel {
-                            egui::Stroke::new(2.0, playhead_col)
-                        } else {
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(16))
-                        };
-                        // Diamond = a rotated square.
-                        let d = [
-                            egui::pos2(kx, cy - r),
-                            egui::pos2(kx + r, cy),
-                            egui::pos2(kx, cy + r),
-                            egui::pos2(kx - r, cy),
-                        ];
-                        painter.add(egui::Shape::convex_polygon(d.to_vec(), col, border));
-
-                        if resp.clicked() {
-                            // Ctrl/⌘ or shift extends; a plain click replaces.
-                            let mods = ui.input(|i| i.modifiers);
-                            if mods.command || mods.shift {
-                                out.toggle_key = Some((row.kind, key_idx));
-                            } else {
-                                out.select_key = Some((row.kind, key_idx));
-                            }
-                        }
-                        if resp.dragged() {
-                            dragging = true;
-                            if let Some(p) = resp.interact_pointer_pos() {
-                                // Dragging an unselected key selects it first,
-                                // so the drag acts on what's under the cursor.
-                                if !is_sel {
-                                    out.select_key = Some((row.kind, key_idx));
-                                }
-                                // Report a *delta* from this key's current
-                                // frame, so the whole selection can move as a
-                                // block. Recomputed each frame, so a clamped
-                                // drag catches up once room appears.
-                                let target = x_to_frame(p.x).clamp(0, last_frame);
-                                let delta = target - kf;
-                                if delta != 0 {
-                                    out.move_by = Some(delta);
-                                }
-                            }
-                        }
-                    }
-                });
+                }
+                f += 1;
             }
+        }
 
-            // Report and draw the marquee. Reported even when empty, so
-            // dragging a box over nothing clears the selection like a click on
-            // empty track does.
-            if let Some(m) = marquee {
-                dragging = true;
-                out.box_select = Some(std::mem::take(&mut marquee_hits));
-                let painter = ui.painter_at(ui.max_rect());
-                painter.rect_filled(m, 2.0, egui::Color32::from_white_alpha(18));
-                painter.rect_stroke(
-                    m,
-                    2.0,
-                    egui::Stroke::new(1.0, accent),
-                    egui::StrokeKind::Inside,
+        let mut f = (first.div_euclid(step)) * step;
+        while f <= last {
+            if f >= 0 {
+                let x = a.frame_to_x(f as f64);
+                painter.line_segment(
+                    [egui::pos2(x, rect.top() + 3.0), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                );
+                painter.text(
+                    egui::pos2(x + 3.0, rect.top() + 1.0),
+                    egui::Align2::LEFT_TOP,
+                    tb.timecode(f as f64),
+                    egui::FontId::monospace(9.0),
+                    egui::Color32::from_gray(165),
                 );
             }
+            f += step;
+        }
 
-            // --- Edge auto-pan. While dragging (scrubbing the ruler or moving
-            // a keyframe), holding the pointer near either end of the track
-            // scrolls the window that way — so you can drag a key past the
-            // visible range without letting go. Deliberately drag-only: doing
-            // this on plain hover would scroll the timeline out from under the
-            // pointer whenever it drifted near an edge. ---
-            if dragging {
-                if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
-                    let intensity = edge_pan_intensity(
-                        p.x,
-                        axis.x0,
-                        axis.x0 + axis.span,
-                        EDGE_PAN_W,
-                    );
-                    if intensity != 0.0 {
-                        // Time-based so the speed doesn't depend on frame rate;
-                        // clamped in case a slow frame produces a huge dt.
-                        let dt = (ui.input(|i| i.stable_dt) as f64).min(0.05);
-                        let delta = intensity as f64 * view.visible * 0.8 * dt;
-                        out.set_view = Some(
-                            TimelineView { start: view.start + delta, visible: view.visible }
-                                .clamped(last_frame),
-                        );
-                        // Redraw is event-driven, so without this the pan stops
-                        // the moment the pointer stops moving.
-                        ui.ctx().request_repaint();
+        // Playhead marker on the ruler.
+        let px = a.frame_to_x(frame);
+        painter.line_segment(
+            [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+            egui::Stroke::new(1.5, playhead_col),
+        );
+
+        // Dragging or clicking the ruler scrubs.
+        if resp.clicked() || resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                out.seek_to = Some(a.x_to_frame(p.x).clamp(0, last_frame));
+            }
+        }
+        dragging |= resp.dragged();
+    });
+
+    let axis = axis.expect("ruler always allocates the axis");
+
+    // --- Zoom / pan. Scroll anywhere over the panel; zoom keeps the
+    // frame under the cursor pinned, which is what makes it feel like
+    // zooming rather than jumping. ---
+    let panel_rect = ui.max_rect();
+    let (scroll, hover) =
+        ui.input(|i| (i.smooth_scroll_delta, i.pointer.hover_pos()));
+    if let Some(p) = hover.filter(|p| panel_rect.contains(*p)) {
+        // egui rewrites a shift+wheel gesture into a *horizontal*
+        // scroll, so the shift modifier is already gone by the time we
+        // see it — a nonzero x delta is the pan signal, not `shift`.
+        // (Trackpad sideways swipes land here too, which is right.)
+        let next = if scroll.x != 0.0 {
+            // Pan: one notch moves a tenth of the window.
+            Some(TimelineView {
+                start: view.start - (scroll.x as f64 / 120.0) * view.visible * 0.1,
+                visible: view.visible,
+            })
+        } else if scroll.y != 0.0 {
+            let factor = (0.9f64).powf(scroll.y as f64 / 120.0);
+            let anchor = axis.x_to_frame_exact(p.x);
+            let visible = view.visible * factor;
+            // Keep `anchor` under the cursor at the new scale.
+            let ratio = (anchor - view.start) / view.visible.max(1e-9);
+            Some(TimelineView { start: anchor - ratio * visible, visible })
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            out.set_view = Some(next.clamped(last_frame));
+        }
+    }
+
+    // --- Box-select. A drag that *starts* on empty track (rather than
+    // on a diamond, which grabs the press first) draws a marquee; every
+    // key inside it becomes the selection.
+    //
+    // The rect has to be known before the rows loop, but only a row's
+    // response can tell us the drag began on a track — so the "a
+    // marquee is live" flag round-trips through egui memory and is read
+    // on the following frame. The one-frame lag is invisible: the
+    // marquee has no area worth hit-testing until the pointer has
+    // actually moved. ---
+    let marquee_id = ui.id().with("marquee");
+    let mut marquee_active: bool =
+        ui.ctx().data(|d| d.get_temp(marquee_id).unwrap_or(false));
+    let (press, latest, any_down) = ui.input(|i| {
+        (i.pointer.press_origin(), i.pointer.latest_pos(), i.pointer.any_down())
+    });
+    if marquee_active && !any_down {
+        // Released: the last live report already produced the selection.
+        marquee_active = false;
+        ui.ctx().data_mut(|d| d.insert_temp(marquee_id, false));
+    }
+    let marquee = match (marquee_active, press, latest) {
+        (true, Some(a), Some(b)) => Some(egui::Rect::from_two_pos(a, b)),
+        _ => None,
+    };
+    let mut marquee_hits = KeySelection::new();
+
+    // No early return: the rows loop is a no-op on an empty slice, and
+    // returning here would skip the edge auto-pan below (which should
+    // still work while scrubbing the ruler with nothing selected).
+    if rows.is_empty() {
+        ui.add_space(8.0);
+        ui.weak("Select a node with animated properties to see its keyframes.");
+    }
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(LABEL_W, ROW_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(row.label);
+                },
+            );
+
+            // The track: full remaining width, fixed height.
+            let (track, track_resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width() - 8.0, ROW_H),
+                egui::Sense::click_and_drag(),
+            );
+            if track_resp.drag_started() {
+                ui.ctx().data_mut(|d| d.insert_temp(marquee_id, true));
+            }
+            let painter = ui.painter_at(track);
+            painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
+
+            let frame_to_x = |f: f64| axis.frame_to_x(f);
+            let x_to_frame = |x: f32| axis.x_to_frame(x);
+
+            // Playhead line.
+            let px = frame_to_x(frame);
+            painter.line_segment(
+                [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+                egui::Stroke::new(1.5, playhead_col),
+            );
+
+            // Click on empty track → seek and clear the key selection.
+            if track_resp.clicked() {
+                if let Some(p) = track_resp.interact_pointer_pos() {
+                    out.seek_to = Some(x_to_frame(p.x).clamp(0, last_frame));
+                    out.clear_selection = true;
+                }
+            }
+
+            // Keyframe diamonds (interactive, drawn on top).
+            let cy = track.center().y;
+            for (key_idx, &kf) in row.frames.iter().enumerate() {
+                let kx = frame_to_x(kf as f64);
+                // Skip keys scrolled out of the window — otherwise
+                // their hit rects stay live outside the visible track.
+                if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
+                    continue;
+                }
+                if let Some(m) = marquee {
+                    if m.contains(egui::pos2(kx, cy)) {
+                        marquee_hits.insert((row.kind, key_idx));
+                    }
+                }
+                let is_sel = selected_keys.contains(&(row.kind, key_idx));
+                let r = if is_sel { 6.5 } else { 5.0 };
+                let hit = egui::Rect::from_center_size(
+                    egui::pos2(kx, cy),
+                    egui::vec2(r * 2.4, r * 2.4),
+                );
+                let id = ui.id().with((row_idx, key_idx));
+                let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+
+                let col = if is_sel || resp.dragged() || resp.hovered() {
+                    egui::Color32::WHITE
+                } else {
+                    accent
+                };
+                let border = if is_sel {
+                    egui::Stroke::new(2.0, playhead_col)
+                } else {
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(16))
+                };
+                // Diamond = a rotated square.
+                let d = [
+                    egui::pos2(kx, cy - r),
+                    egui::pos2(kx + r, cy),
+                    egui::pos2(kx, cy + r),
+                    egui::pos2(kx - r, cy),
+                ];
+                painter.add(egui::Shape::convex_polygon(d.to_vec(), col, border));
+
+                if resp.clicked() {
+                    // Ctrl/⌘ or shift extends; a plain click replaces.
+                    let mods = ui.input(|i| i.modifiers);
+                    if mods.command || mods.shift {
+                        out.toggle_key = Some((row.kind, key_idx));
+                    } else {
+                        out.select_key = Some((row.kind, key_idx));
+                    }
+                }
+                if resp.dragged() {
+                    dragging = true;
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        // Dragging an unselected key selects it first,
+                        // so the drag acts on what's under the cursor.
+                        if !is_sel {
+                            out.select_key = Some((row.kind, key_idx));
+                        }
+                        // Report a *delta* from this key's current
+                        // frame, so the whole selection can move as a
+                        // block. Recomputed each frame, so a clamped
+                        // drag catches up once room appears.
+                        let target = x_to_frame(p.x).clamp(0, last_frame);
+                        let delta = target - kf;
+                        if delta != 0 {
+                            out.move_by = Some(delta);
+                        }
                     }
                 }
             }
         });
+    }
+
+    // Report and draw the marquee. Reported even when empty, so
+    // dragging a box over nothing clears the selection like a click on
+    // empty track does.
+    if let Some(m) = marquee {
+        dragging = true;
+        out.box_select = Some(std::mem::take(&mut marquee_hits));
+        let painter = ui.painter_at(ui.max_rect());
+        painter.rect_filled(m, 2.0, egui::Color32::from_white_alpha(18));
+        painter.rect_stroke(
+            m,
+            2.0,
+            egui::Stroke::new(1.0, accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // --- Edge auto-pan. While dragging (scrubbing the ruler or moving
+    // a keyframe), holding the pointer near either end of the track
+    // scrolls the window that way — so you can drag a key past the
+    // visible range without letting go. Deliberately drag-only: doing
+    // this on plain hover would scroll the timeline out from under the
+    // pointer whenever it drifted near an edge. ---
+    if dragging {
+        if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+            let intensity = edge_pan_intensity(
+                p.x,
+                axis.x0,
+                axis.x0 + axis.span,
+                EDGE_PAN_W,
+            );
+            if intensity != 0.0 {
+                // Time-based so the speed doesn't depend on frame rate;
+                // clamped in case a slow frame produces a huge dt.
+                let dt = (ui.input(|i| i.stable_dt) as f64).min(0.05);
+                let delta = intensity as f64 * view.visible * 0.8 * dt;
+                out.set_view = Some(
+                    TimelineView { start: view.start + delta, visible: view.visible }
+                        .clamped(last_frame),
+                );
+                // Redraw is event-driven, so without this the pan stops
+                // the moment the pointer stops moving.
+                ui.ctx().request_repaint();
+            }
+        }
+    }
 }
 
 /// A flattened scene-tree row for the layers panel.
@@ -1457,59 +1579,55 @@ struct TreeEdits {
 
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
 /// row selects that node; the ▲/▼ buttons restack it among its siblings.
-fn tree_ui(root: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
-    egui::Panel::left("layers")
-        .exact_size(TREE_W as f32)
-        .show(root, |ui| {
-            ui.add_space(8.0);
-            ui.heading("Layers");
-            ui.horizontal(|ui| {
-                if ui.button("Save…").clicked() {
-                    out.save = true;
+fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+    ui.add_space(8.0);
+    ui.heading("Layers");
+    ui.horizontal(|ui| {
+        if ui.button("Save…").clicked() {
+            out.save = true;
+        }
+        if ui.button("Load…").clicked() {
+            out.load = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("+ Rect").clicked() {
+            out.add = Some(NewShape::Rect);
+        }
+        if ui.button("+ Ellipse").clicked() {
+            out.add = Some(NewShape::Ellipse);
+        }
+        if ui.button("+ Group").clicked() {
+            out.add = Some(NewShape::Group);
+        }
+    });
+    ui.weak("Adds into the selected node, else the root.");
+    ui.separator();
+    for row in rows {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0 + row.depth as f32 * 14.0);
+            let icon = if row.is_group { "▶" } else { "•" };
+            let label = format!("{icon} {}", row.name);
+            if ui
+                .selectable_label(selected == Some(row.id), label)
+                .clicked()
+            {
+                out.select = Some(row.id);
+            }
+            // Reorder + delete (not meaningful for the root).
+            if row.depth > 0 {
+                if ui.small_button("▲").clicked() {
+                    out.reorder = Some((row.id, -1));
                 }
-                if ui.button("Load…").clicked() {
-                    out.load = true;
+                if ui.small_button("▼").clicked() {
+                    out.reorder = Some((row.id, 1));
                 }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("+ Rect").clicked() {
-                    out.add = Some(NewShape::Rect);
+                if ui.small_button("✕").clicked() {
+                    out.delete = Some(row.id);
                 }
-                if ui.button("+ Ellipse").clicked() {
-                    out.add = Some(NewShape::Ellipse);
-                }
-                if ui.button("+ Group").clicked() {
-                    out.add = Some(NewShape::Group);
-                }
-            });
-            ui.weak("Adds into the selected node, else the root.");
-            ui.separator();
-            for row in rows {
-                ui.horizontal(|ui| {
-                    ui.add_space(6.0 + row.depth as f32 * 14.0);
-                    let icon = if row.is_group { "▶" } else { "•" };
-                    let label = format!("{icon} {}", row.name);
-                    if ui
-                        .selectable_label(selected == Some(row.id), label)
-                        .clicked()
-                    {
-                        out.select = Some(row.id);
-                    }
-                    // Reorder + delete (not meaningful for the root).
-                    if row.depth > 0 {
-                        if ui.small_button("▲").clicked() {
-                            out.reorder = Some((row.id, -1));
-                        }
-                        if ui.small_button("▼").clicked() {
-                            out.reorder = Some((row.id, 1));
-                        }
-                        if ui.small_button("✕").clicked() {
-                            out.delete = Some(row.id);
-                        }
-                    }
-                });
             }
         });
+    }
 }
 
 enum RenderState {
@@ -1548,6 +1666,11 @@ struct App {
     key_clipboard: Option<KeyClipboard>,
     /// The timeline's visible frame window (zoom / pan).
     view: TimelineView,
+    /// The panel layout.
+    dock: Dock,
+    /// Canvas area in physical pixels, measured from the layout tree's canvas
+    /// leaf during the last UI pass. `None` until the first pass has run.
+    canvas_rect: Option<kurbo::Rect>,
     /// Next unused node id, for shapes created in-app.
     next_id: u64,
 }
@@ -1579,6 +1702,8 @@ impl App {
             selected_keys: KeySelection::new(),
             key_clipboard: None,
             view,
+            dock: Dock::default_layout(),
+            canvas_rect: None,
             next_id,
         }
     }
@@ -2193,17 +2318,19 @@ impl App {
         }
 
         let size = window.inner_size();
-        // egui panel sizes are in points; convert to physical pixels for the fit.
+        // egui works in points; the canvas fit works in physical pixels.
         let ppp = window.scale_factor();
-        let fit = fit_transform(
-            &self.doc,
-            size.width as f64,
-            size.height as f64,
-            TREE_W * ppp,
-            PROPS_W * ppp,
-            COMP_H * ppp,
-            (TRANSPORT_H + DOPESHEET_H) * ppp,
-        );
+        // The canvas area comes from the layout tree's canvas leaf, measured
+        // during *last* frame's UI pass — the rect isn't known until the panels
+        // have laid out, and the fit is needed before this frame's UI runs (to
+        // pick and to build the vello scene). One frame stale only while a
+        // splitter or the window is actively being dragged, and it self-corrects
+        // on the next repaint, which a drag guarantees.
+        let canvas = self.canvas_rect.unwrap_or_else(|| {
+            // First frame: nothing measured yet, so fill the window.
+            kurbo::Rect::new(0.0, 0.0, size.width as f64, size.height as f64)
+        });
+        let fit = fit_transform(&self.doc, canvas);
 
         // Resolve any pending click into a selection (or a deselect). Changing
         // the selected node invalidates any keyframe selection.
@@ -2260,12 +2387,44 @@ impl App {
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let mut comp = CompEdits::default();
         let (doc_w, doc_h, doc_fps) = (self.doc.width, self.doc.height, self.doc.fps);
+        // Panels are drawn by walking the layout tree; each leaf dispatches to
+        // the matching editor. Nothing here knows *where* a panel is — that's
+        // the tree's business, which is the whole point of the refactor.
+        let dock = &mut self.dock;
+        let mut canvas_pts: Option<egui::Rect> = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp);
-            tree_ui(ui, &tree, selected_node, &mut tree_edits);
-            transport_ui(ui, frame, last_frame, timebase, playing, &mut transport);
-            dopesheet_ui(ui, &rows, t, last_frame, timebase, view, &selected_keys, &mut dope);
-            properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out);
+            let mut next_id = 0;
+            show_dock(dock, ui, &mut next_id, &mut |editor, ui| match editor {
+                Editor::Comp => comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp),
+                Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
+                Editor::Transport => {
+                    transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
+                }
+                Editor::Dopesheet => dopesheet_ui(
+                    ui,
+                    &rows,
+                    t,
+                    last_frame,
+                    timebase,
+                    view,
+                    &selected_keys,
+                    &mut dope,
+                ),
+                Editor::Properties => {
+                    properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
+                }
+                // vello paints here; egui only measures the hole.
+                Editor::Canvas => canvas_pts = Some(ui.max_rect()),
+            });
+        });
+        // Points → physical pixels for the next frame's fit.
+        self.canvas_rect = canvas_pts.map(|r| {
+            kurbo::Rect::new(
+                r.min.x as f64 * ppp,
+                r.min.y as f64 * ppp,
+                r.max.x as f64 * ppp,
+                r.max.y as f64 * ppp,
+            )
         });
 
         // Composition settings.
@@ -2674,6 +2833,76 @@ mod tests {
         let fit = Affine::IDENTITY;
         // Dot center: square pos (300,540) + child offset (0,-120) = (300,420).
         assert_eq!(pick(&scene, fit, (300.0, 420.0)), Some(NodeId(2)));
+    }
+
+    #[test]
+    fn fit_centers_and_letterboxes_inside_the_canvas_rect() {
+        let doc = Document::new(100.0, 100.0, MNode::group(0, "root"));
+        // A wide area: the square doc is limited by height and centered on x.
+        let fit = fit_transform(&doc, kurbo::Rect::new(0.0, 0.0, 300.0, 100.0));
+        assert_eq!(fit * Point::new(0.0, 0.0), Point::new(100.0, 0.0));
+        assert_eq!(fit * Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+    }
+
+    #[test]
+    fn fit_respects_a_canvas_rect_that_does_not_start_at_the_origin() {
+        // The regression the layout tree exists to prevent: with panels around
+        // it the canvas is an *offset* rect, and picking inverts this transform
+        // — an ignored origin puts every click in the wrong place.
+        let doc = Document::new(100.0, 100.0, MNode::group(0, "root"));
+        let area = kurbo::Rect::new(190.0, 34.0, 290.0, 134.0);
+        let fit = fit_transform(&doc, area);
+        assert_eq!(fit * Point::new(0.0, 0.0), Point::new(190.0, 34.0));
+        assert_eq!(fit * Point::new(50.0, 50.0), Point::new(240.0, 84.0));
+        // And a click there inverts back to the doc's center.
+        let back = fit.inverse() * Point::new(240.0, 84.0);
+        assert!((back.x - 50.0).abs() < 1e-9 && (back.y - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_default_layout_shows_every_editor_exactly_once() {
+        // A leaf reachable in the tree is a panel that renders; one that isn't
+        // is a panel that silently vanished. Cheap invariant, easy to break
+        // while rearranging the default.
+        fn walk(d: &Dock, out: &mut Vec<Editor>) {
+            match d {
+                Dock::Leaf(e) => out.push(*e),
+                Dock::Split { first, second, .. } => {
+                    walk(first, out);
+                    walk(second, out);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&Dock::default_layout(), &mut found);
+        for e in [
+            Editor::Comp,
+            Editor::Layers,
+            Editor::Transport,
+            Editor::Dopesheet,
+            Editor::Properties,
+            Editor::Canvas,
+        ] {
+            assert_eq!(found.iter().filter(|f| **f == e).count(), 1, "{e:?}");
+        }
+        assert_eq!(found.len(), 6, "no extra leaves");
+    }
+
+    #[test]
+    fn the_canvas_is_the_innermost_leaf() {
+        // It has to be: every other panel takes a fixed edge, and the canvas is
+        // whatever is left. If some editor ends up nested *inside* the canvas
+        // leaf's remainder, the canvas rect measures the wrong hole.
+        let mut d = Dock::default_layout();
+        loop {
+            match d {
+                Dock::Split { second, .. } => d = *second,
+                Dock::Leaf(e) => {
+                    assert_eq!(e, Editor::Canvas, "innermost leaf must be the canvas");
+                    break;
+                }
+            }
+        }
     }
 
     /// A rect with every optional property present.

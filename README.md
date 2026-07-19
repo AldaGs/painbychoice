@@ -143,7 +143,9 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
 - `live/src/main.rs` — everything UI. `App::render` is the per-frame heart:
   evaluate → hit-test → gather snapshots → run egui → apply `*Edits` → GPU. Panel
   fns: `comp_ui`, `tree_ui`, `transport_ui`, `dopesheet_ui`, `properties_ui`,
-  `ease_editor`, `key_button`. Layout: `fit_transform` + the `*_H`/`*_W` consts.
+  `ease_editor`, `key_button`. Each panel fn renders into a `&mut Ui` it is
+  handed — it does **not** create its own `egui::Panel`; placement is the
+  layout tree's job (see below).
   Timeline mapping: `TimelineView` (the visible frame window) + `Axis`
   (frame↔pixel), built once by the ruler and reused by every row so they cannot
   drift out of alignment.
@@ -154,6 +156,36 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   **`prop_of` / `prop_of_mut`** are the single place `PropKind` is matched:
   they hand back a `PropRef`/`PropRefMut` (Vec2 | Num | Color) and every
   keyframe op goes through that. See below.
+
+### The panel layout tree
+
+`Dock` is a binary tree — `Split { side, size, resizable, first, second }` with
+`Editor` leaves — borrowed from EBN's `layoutTree`. A split pins `first` to one
+edge at `size` points and gives `second` the remainder, so the tree's nesting
+*is* egui's outermost-to-innermost panel order, and `show_dock` renders the whole
+thing by recursing into a plain `Ui`. `Dock::default_layout()` builds the stock
+arrangement; adding named presets means writing more constructors.
+
+Two things are load-bearing:
+
+- **The canvas is a leaf.** vello paints it, not egui, but it must occupy a leaf
+  so the tree knows where the leftover hole is. It has to be the *innermost*
+  one (there's a test): every other panel claims an edge, the canvas is what
+  remains.
+- **`fit_transform` takes that leaf's measured rect**, not the window minus
+  hardcoded panel sizes. The constants version could not survive a draggable
+  splitter: `pick` inverts this transform, so stale geometry doesn't just
+  misdraw the canvas, it sends every click to the wrong shape.
+
+`size` is stored in the tree (and written back from the real panel rect each
+frame) rather than living only in egui's panel memory — that's what keeps the
+tree the source of truth, so saving layouts is a `serde` derive rather than a
+scrape of egui internals.
+
+**Known wrinkle:** the canvas rect is measured during the UI pass, but the fit is
+needed *before* it (to pick, and to build the vello scene), so the fit uses the
+previous frame's rect. Stale only while a splitter or the window is actively
+dragged, and self-correcting on the repaint a drag guarantees.
 
 ### Adding an animatable property
 
@@ -208,7 +240,7 @@ round onto the same frame collapse to one.
 ## Roadmap (agreed order)
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
-UX ✅ → shape/stroke params ✅ → dockable panels → …**. Next up:
+UX ✅ → shape/stroke params ✅ → dockable panels 🚧 → …**. Next up:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -240,8 +272,17 @@ UX ✅ → shape/stroke params ✅ → dockable panels → …**. Next up:
      uncreatable-to-manage, invisible to select/retime/delete. Rather than add a
      fifth special case, `PropKind` became the single enumeration of animatable
      properties behind `prop_of`/`prop_of_mut`.
-4. **Blender-style splittable/dockable panels (next)** (see EBN's `layoutTree`
-   idea).
+4. **Blender-style splittable/dockable panels** — 🚧 in progress. The layout
+   tree + draggable splitters are done (see *The panel layout tree* above), and
+   the canvas fit now derives from the tree instead of hardcoded panel sizes.
+   Still to come, in order:
+   - **Split / join areas** (Blender's drag-a-border-corner) and a per-area
+     dropdown to change which `Editor` an area shows.
+   - **Layout presets**: several named defaults plus user-made ones. The tree is
+     already serialization-ready (`size` lives in the tree, and
+     `default_layout()` is just one constructor among future many).
+   - **Save the layout into the project** once it's been changed, so a `.pbc`
+     reopens the way it was left.
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
 
