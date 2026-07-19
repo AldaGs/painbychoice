@@ -393,20 +393,21 @@ IR (next) → …**. Next up:
      tiny IR (`Lit`, `Ref { node, prop, time_offset }`, `Add`/`Mul`/`Neg`), and a
      `ResolveCache` on `EvalCtx` doing per-frame memoization + cycle detection (a
      cycle → a `scene.warnings` entry + a neutral fallback, never a hang).
-   - ~~**Node-graph panel (first cut).**~~ ✅ Done. A new `Editor::Graph`
-     (summonable into any content area via the split/join picker — no default-
-     layout change) lets you drive the selected node's properties with
-     expressions: **`= fx`** promotes a property (seeded from its current value),
-     **bake** freezes it back to a constant, and the expression is edited as a
-     structured tree — a kind picker per node (`value`/`ref`/`add`/`mul`/`neg`)
-     with kind-specific editors, changing one node's kind grows the tree. Edits
-     are deferred `GraphOp`s addressed by `(property, tree-path)` and applied
-     after the UI pass, the same discipline as the dock. It's an indented outline,
-     not yet a free node canvas — that's the next refinement over the same model
-     (`Expr::at_mut`/`seed`/`kind`, all unit-tested).
-   - **A free node canvas** (draggable boxes + wires) over the same `Expr` model,
-     and **Rhai scripting** (text expressions) — both lower to the IR that's now
-     in place. Rhai's real cost is the `EvalCtx`-callback bridge, not syntax.
+   - ~~**Node-graph panel.**~~ ✅ Done. A new `Editor::Graph` (summonable into any
+     content area via the split/join picker — no default-layout change) lets you
+     drive the selected node's properties with expressions: **`= fx`** promotes a
+     property (seeded from its current value), **bake** freezes it back to a
+     constant, and the expression is edited on a **node canvas** — boxes wired
+     parent↔child, each with a kind picker (`value`/`ref`/`add`/`mul`/`neg`) and a
+     compact editor; changing one node's kind grows the tree (operators seed
+     neutral inputs). Layout is a tidy-tree auto-placement (`layout_expr`, a
+     tested pure function); edits are deferred `GraphOp`s addressed by
+     `(property, tree-path)` and applied after the UI pass by `apply_graph_op`
+     (a free function, so the whole flow is unit-tested) — the same discipline as
+     the dock. Boxes are auto-placed for now; free dragging + a canvas pan are the
+     next refinement over the same model.
+   - **Rhai scripting** (text expressions) — lowers to the IR that's now in place.
+     Its real cost is the `EvalCtx`-callback bridge, not the syntax.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the

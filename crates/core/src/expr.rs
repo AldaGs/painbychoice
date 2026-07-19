@@ -227,6 +227,20 @@ impl Expr {
         }
     }
 
+    /// Borrow the subtree at `path` (a sequence of child slots). `None` for an
+    /// out-of-range slot.
+    pub fn at(&self, path: &[usize]) -> Option<&Expr> {
+        let Some((&slot, rest)) = path.split_first() else {
+            return Some(self);
+        };
+        let child = match (self, slot) {
+            (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_ref(),
+            (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_ref(),
+            _ => return None,
+        };
+        child.at(rest)
+    }
+
     /// Borrow the subtree at `path` (a sequence of child slots from this node).
     /// An out-of-range slot yields `None`, so a stale editor path no-ops.
     pub fn at_mut(&mut self, path: &[usize]) -> Option<&mut Expr> {

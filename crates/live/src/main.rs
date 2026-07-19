@@ -2122,8 +2122,62 @@ struct GraphEdits {
     op: Option<GraphOp>,
 }
 
+// Canvas geometry (logical points). A node box sits at
+// (depth·COL_W, row·ROW_H) inside the scrolled content.
+const GRAPH_COL_W: f32 = 150.0;
+const GRAPH_ROW_H: f32 = 58.0;
+const GRAPH_BOX_W: f32 = 132.0;
+const GRAPH_BOX_H: f32 = 46.0;
+const GRAPH_MARGIN: f32 = 10.0;
+
+/// A node's slot in the auto-laid-out expression tree: its `path`, tree `depth`
+/// (its column), and a vertical `row` (leaves take successive rows; a parent
+/// centres over its children). Positionless — pixels are `depth`/`row` × the
+/// canvas spacing — so the layout is a pure function of the tree, and tested.
+struct ExprBox {
+    path: Vec<usize>,
+    depth: usize,
+    row: f32,
+}
+
+/// Lay an expression tree out as a tidy tree: root on the left, children to the
+/// right, leaves stacked top-to-bottom and parents centred over their span.
+fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
+    fn rec(
+        expr: &Expr,
+        path: &mut Vec<usize>,
+        depth: usize,
+        next_row: &mut f32,
+        out: &mut Vec<ExprBox>,
+    ) -> f32 {
+        let arity = expr.arity();
+        let row = if arity == 0 {
+            let r = *next_row;
+            *next_row += 1.0;
+            r
+        } else {
+            let (mut first, mut last) = (0.0, 0.0);
+            for slot in 0..arity {
+                path.push(slot);
+                let cr = rec(child_ref(expr, slot).unwrap(), path, depth + 1, next_row, out);
+                path.pop();
+                if slot == 0 {
+                    first = cr;
+                }
+                last = cr;
+            }
+            (first + last) / 2.0
+        };
+        out.push(ExprBox { path: path.clone(), depth, row });
+        row
+    }
+    let mut out = Vec::new();
+    rec(expr, &mut Vec::new(), 0, &mut 0.0, &mut out);
+    out
+}
+
 /// The expression/node-graph panel: for the selected node, promote a property to
-/// an expression and edit its tree, or bake it back to a constant.
+/// an expression, edit its tree on a node canvas, or bake it back to a constant.
 fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
     ui.add_space(8.0);
     ui.heading("Graph");
@@ -2133,71 +2187,116 @@ fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
     };
     ui.weak(format!("Node: {}", info.node_name));
     ui.separator();
-    for prop in &info.props {
-        ui.horizontal(|ui| {
-            ui.strong(prop.label);
-            if prop.is_expr {
-                if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
-                    out.op = Some(GraphOp::Bake(prop.kind));
+    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        for prop in &info.props {
+            ui.horizontal(|ui| {
+                ui.strong(prop.label);
+                if prop.is_expr {
+                    if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
+                        out.op = Some(GraphOp::Bake(prop.kind));
+                    }
+                    if let Some(printed) = &prop.printed {
+                        ui.weak(format!("= {printed}"));
+                    }
+                } else if ui
+                    .small_button("= fx")
+                    .on_hover_text("Drive with an expression")
+                    .clicked()
+                {
+                    out.op = Some(GraphOp::Promote(prop.kind));
                 }
-            } else if ui
-                .small_button("= fx")
-                .on_hover_text("Drive with an expression")
-                .clicked()
-            {
-                out.op = Some(GraphOp::Promote(prop.kind));
+            });
+            if let Some(expr) = &prop.expr {
+                expr_canvas(ui, expr, prop.kind, &info.nodes, out);
+                ui.separator();
             }
-        });
-        if let Some(expr) = &prop.expr {
-            if let Some(printed) = &prop.printed {
-                ui.weak(format!("= {printed}"));
-            }
-            let mut path = Vec::new();
-            expr_editor(ui, expr, prop.kind, &mut path, &info.nodes, out);
-            ui.separator();
         }
-    }
+    });
 }
 
-/// Render one expression node (a kind picker plus kind-specific editors) and
-/// recurse into its children, indenting by depth. Every control reports a
-/// [`GraphOp`] against this node's `path` rather than mutating in place.
-fn expr_editor(
+/// Draw one property's expression as a node canvas: boxes at their laid-out
+/// positions, wires from each node's output (right) to its parent's input
+/// (left), and a compact editor inside each box. Every control reports a
+/// [`GraphOp`] against the node's tree-path; nothing mutates here.
+fn expr_canvas(
     ui: &mut egui::Ui,
     expr: &Expr,
     kind: PropKind,
-    path: &mut Vec<usize>,
+    nodes: &[(u64, String)],
+    out: &mut GraphEdits,
+) {
+    let boxes = layout_expr(expr);
+    let cols = boxes.iter().map(|b| b.depth).max().unwrap_or(0) + 1;
+    let rows = boxes.iter().map(|b| b.row).fold(0.0, f32::max) + 1.0;
+    let content = egui::vec2(
+        cols as f32 * GRAPH_COL_W + GRAPH_MARGIN,
+        rows * GRAPH_ROW_H + GRAPH_MARGIN,
+    );
+    let (area, _) = ui.allocate_exact_size(content, egui::Sense::hover());
+    let origin = area.min + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN);
+    let box_at = |b: &ExprBox| {
+        egui::Rect::from_min_size(
+            egui::pos2(origin.x + b.depth as f32 * GRAPH_COL_W, origin.y + b.row * GRAPH_ROW_H),
+            egui::vec2(GRAPH_BOX_W, GRAPH_BOX_H),
+        )
+    };
+
+    // Wires under the boxes: each node's left-centre to its parent's right-centre.
+    let wire = ui.visuals().weak_text_color();
+    for b in &boxes {
+        if let Some((_, parent_path)) = b.path.split_last() {
+            if let Some(pb) = boxes.iter().find(|x| x.path == parent_path) {
+                let child_in = box_at(b).left_center();
+                let parent_out = box_at(pb).right_center();
+                ui.painter().line_segment([parent_out, child_in], egui::Stroke::new(1.5, wire));
+            }
+        }
+    }
+
+    // Boxes on top, each an inline editor placed at its rect.
+    for b in &boxes {
+        let rect = box_at(b);
+        let node = expr.at(&b.path).unwrap_or(expr);
+        ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
+        expr_box(&mut child, node, kind, &b.path, nodes, out);
+    }
+}
+
+/// The controls inside one canvas box: a kind picker, and a compact editor for a
+/// `Lit`/`Ref`. Operators (`Add`/`Mul`/`Neg`) show only their kind — their
+/// inputs are separate boxes wired in.
+fn expr_box(
+    ui: &mut egui::Ui,
+    expr: &Expr,
+    kind: PropKind,
+    path: &[usize],
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
 ) {
     let cur = expr.kind();
-    ui.horizontal(|ui| {
-        ui.add_space(8.0 + path.len() as f32 * 14.0);
-        egui::ComboBox::from_id_salt(("ek", kind.label(), path.as_slice()))
-            .width(52.0)
-            .selected_text(cur.label())
-            .show_ui(ui, |ui| {
-                for k in ExprKind::ALL {
-                    if ui.selectable_label(k == cur, k.label()).clicked() && k != cur {
-                        out.op = Some(GraphOp::SetKind { kind, path: path.clone(), new: k });
-                    }
+    egui::ComboBox::from_id_salt(("ek", kind.label(), path))
+        .width(60.0)
+        .selected_text(cur.label())
+        .show_ui(ui, |ui| {
+            for k in ExprKind::ALL {
+                if ui.selectable_label(k == cur, k.label()).clicked() && k != cur {
+                    out.op = Some(GraphOp::SetKind { kind, path: path.to_vec(), new: k });
                 }
-            });
-        match expr {
-            Expr::Lit(v) => lit_editor(ui, *v, kind, path, out),
-            Expr::Ref { node, prop, time_offset } => {
-                ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
             }
-            _ => {}
+        });
+    match expr {
+        Expr::Lit(v) => lit_editor(ui, *v, kind, path, out),
+        Expr::Ref { node, prop, time_offset } => {
+            ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
         }
-    });
-    // Children occupy slots 0.. in order; recurse with the slot pushed on `path`.
-    for slot in 0..expr.arity() {
-        if let Some(child) = child_ref(expr, slot) {
-            path.push(slot);
-            expr_editor(ui, child, kind, path, nodes, out);
-            path.pop();
-        }
+        _ => {}
     }
 }
 
@@ -3993,6 +4092,45 @@ mod tests {
             0,
         );
         assert!((resolved_opacity(&doc, id) - 0.5).abs() < 1e-9);
+    }
+
+    fn box_at_path<'a>(boxes: &'a [ExprBox], path: &[usize]) -> &'a ExprBox {
+        boxes.iter().find(|b| b.path == path).expect("box for path")
+    }
+
+    #[test]
+    fn layout_places_leaves_in_rows_and_centres_parents() {
+        // A single leaf: one box at the origin.
+        let single = layout_expr(&Expr::num(1.0));
+        assert_eq!(single.len(), 1);
+        assert_eq!((single[0].depth, single[0].row), (0, 0.0));
+
+        // Add(Lit, Lit): two leaves stacked, the operator centred between them.
+        let add = layout_expr(&Expr::Add(Box::new(Expr::num(1.0)), Box::new(Expr::num(2.0))));
+        assert_eq!(add.len(), 3);
+        assert_eq!(box_at_path(&add, &[]).depth, 0);
+        assert_eq!(box_at_path(&add, &[0]).row, 0.0);
+        assert_eq!(box_at_path(&add, &[1]).row, 1.0);
+        assert_eq!(box_at_path(&add, &[]).row, 0.5, "operator centred over its inputs");
+        assert_eq!(box_at_path(&add, &[0]).depth, 1, "inputs one column right");
+    }
+
+    #[test]
+    fn layout_handles_a_nested_tree() {
+        // Add(Lit, Mul(Lit, Lit)): three leaves in rows 0,1,2; Mul centred on
+        // 1.5; root centred on (0 + 1.5)/2 = 0.75.
+        let e = Expr::Add(
+            Box::new(Expr::num(1.0)),
+            Box::new(Expr::Mul(Box::new(Expr::num(2.0)), Box::new(Expr::num(3.0)))),
+        );
+        let boxes = layout_expr(&e);
+        assert_eq!(boxes.len(), 5);
+        assert_eq!(box_at_path(&boxes, &[0]).row, 0.0);
+        assert_eq!(box_at_path(&boxes, &[1, 0]).row, 1.0);
+        assert_eq!(box_at_path(&boxes, &[1, 1]).row, 2.0);
+        assert_eq!(box_at_path(&boxes, &[1]).row, 1.5, "Mul centred over its two inputs");
+        assert_eq!(box_at_path(&boxes, &[]).row, 0.75, "root centred over its span");
+        assert_eq!(box_at_path(&boxes, &[1, 1]).depth, 2, "deepest column");
     }
 
     #[test]
