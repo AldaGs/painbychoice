@@ -529,7 +529,7 @@ fn transport_ui(
 
 /// Which animated property a dopesheet row refers to. Lets the UI report a
 /// keyframe drag back to `App` without knowing the property's value type.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PropKind {
     Position,
     Rotation,
@@ -568,6 +568,29 @@ fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
 /// A keyframe's identity within a node: which property, which index.
 type KeyRef = (PropKind, usize);
 
+/// The dopesheet's keyframe selection. A `BTreeSet` so iteration order is
+/// deterministic and indices come out sorted — which the group-move code
+/// below relies on when it batches a selection per property.
+type KeySelection = std::collections::BTreeSet<KeyRef>;
+
+/// Bucket a selection into one `(property, sorted indices)` entry per property.
+///
+/// Relies on `BTreeSet<(PropKind, usize)>` ordering by property first: entries
+/// for the same property are therefore *contiguous*, so a single pass that
+/// extends the last bucket is enough. If `PropKind`'s `Ord` ever stops being
+/// the primary key this silently starts producing duplicate buckets — hence
+/// the test.
+fn group_selection_by_prop(sel: &KeySelection) -> Vec<(PropKind, Vec<usize>)> {
+    let mut out: Vec<(PropKind, Vec<usize>)> = Vec::new();
+    for &(kind, index) in sel.iter() {
+        match out.last_mut() {
+            Some((k, idxs)) if *k == kind => idxs.push(index),
+            _ => out.push((kind, vec![index])),
+        }
+    }
+    out
+}
+
 /// Read the outgoing-segment handles for a given property + keyframe index.
 fn segment_handles_of(node: &MNode, kind: PropKind, index: usize) -> Option<(Handle, Handle)> {
     let tr = &node.transform;
@@ -585,10 +608,12 @@ fn segment_handles_of(node: &MNode, kind: PropKind, index: usize) -> Option<(Han
 struct DopeEdits {
     /// Frame to seek to. Already snapped to the grid.
     seek_to: Option<i64>,
-    /// (property, keyframe index, new frame)
-    move_key: Option<(PropKind, usize, i64)>,
-    /// A diamond was clicked → select it.
+    /// Drag delta in frames, applied to the whole selection as a rigid block.
+    move_by: Option<i64>,
+    /// A diamond was clicked → make it the selection.
     select_key: Option<KeyRef>,
+    /// A diamond was ctrl/shift-clicked → add or remove it from the selection.
+    toggle_key: Option<KeyRef>,
     /// Empty track was clicked → clear the keyframe selection.
     clear_selection: bool,
     /// Zoom / pan produced a new visible window.
@@ -711,7 +736,7 @@ fn dopesheet_ui(
     last_frame: i64,
     tb: motion_core::Timebase,
     view: TimelineView,
-    selected_key: Option<KeyRef>,
+    selected_keys: &KeySelection,
     out: &mut DopeEdits,
 ) {
     egui::Panel::bottom("dopesheet")
@@ -721,7 +746,9 @@ fn dopesheet_ui(
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.strong("Timeline");
-                ui.weak("— scroll to zoom, shift+scroll to pan, drag to an edge to auto-pan");
+                ui.weak(
+                    "— ctrl+click to multi-select, drag to move them together, Del removes",
+                );
             });
             ui.separator();
 
@@ -901,7 +928,7 @@ fn dopesheet_ui(
                         if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
                             continue;
                         }
-                        let is_sel = selected_key == Some((row.kind, key_idx));
+                        let is_sel = selected_keys.contains(&(row.kind, key_idx));
                         let r = if is_sel { 6.5 } else { 5.0 };
                         let hit = egui::Rect::from_center_size(
                             egui::pos2(kx, cy),
@@ -930,14 +957,31 @@ fn dopesheet_ui(
                         painter.add(egui::Shape::convex_polygon(d.to_vec(), col, border));
 
                         if resp.clicked() {
-                            out.select_key = Some((row.kind, key_idx));
+                            // Ctrl/⌘ or shift extends; a plain click replaces.
+                            let mods = ui.input(|i| i.modifiers);
+                            if mods.command || mods.shift {
+                                out.toggle_key = Some((row.kind, key_idx));
+                            } else {
+                                out.select_key = Some((row.kind, key_idx));
+                            }
                         }
                         if resp.dragged() {
                             dragging = true;
                             if let Some(p) = resp.interact_pointer_pos() {
-                                let nf = x_to_frame(p.x).clamp(0, last_frame);
-                                out.move_key = Some((row.kind, key_idx, nf));
-                                out.select_key = Some((row.kind, key_idx));
+                                // Dragging an unselected key selects it first,
+                                // so the drag acts on what's under the cursor.
+                                if !is_sel {
+                                    out.select_key = Some((row.kind, key_idx));
+                                }
+                                // Report a *delta* from this key's current
+                                // frame, so the whole selection can move as a
+                                // block. Recomputed each frame, so a clamped
+                                // drag catches up once room appears.
+                                let target = x_to_frame(p.x).clamp(0, last_frame);
+                                let delta = target - kf;
+                                if delta != 0 {
+                                    out.move_by = Some(delta);
+                                }
                             }
                         }
                     }
@@ -1104,8 +1148,8 @@ struct App {
     cursor: (f64, f64),
     pending_pick: Option<(f64, f64)>,
     selected: Option<NodeId>,
-    /// The keyframe selected in the dopesheet, if any.
-    selected_key: Option<KeyRef>,
+    /// The keyframes selected in the dopesheet. Empty = nothing selected.
+    selected_keys: KeySelection,
     /// The timeline's visible frame window (zoom / pan).
     view: TimelineView,
     /// Next unused node id, for shapes created in-app.
@@ -1136,7 +1180,7 @@ impl App {
             cursor: (0.0, 0.0),
             pending_pick: None,
             selected: None,
-            selected_key: None,
+            selected_keys: KeySelection::new(),
             view,
             next_id,
         }
@@ -1318,7 +1362,7 @@ impl ApplicationHandler for App {
                     }
                     Key::Character(ref s) if s == "r" || s == "R" => self.seek_frame(0),
                     Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                        self.delete_selected_key();
+                        self.delete_selected_keys();
                     }
                     _ => {}
                 }
@@ -1448,41 +1492,110 @@ impl App {
         true
     }
 
-    /// Move a keyframe of the selected node's property (dopesheet drag).
-    fn move_keyframe(&mut self, kind: PropKind, index: usize, new_frame: i64) -> bool {
+    /// Remove every dopesheet-selected keyframe (Delete). A track keeps at
+    /// least one key, so this may be a partial no-op.
+    fn delete_selected_keys(&mut self) -> bool {
         let Some(id) = self.selected else {
             return false;
         };
+        if self.selected_keys.is_empty() {
+            return false;
+        }
         let Some(node) = self.doc.root.find_mut(id) else {
             return false;
         };
         let tr = &mut node.transform;
-        match kind {
-            PropKind::Position => tr.position.move_key(index, new_frame),
-            PropKind::Rotation => tr.rotation_deg.move_key(index, new_frame),
-            PropKind::Scale => tr.scale.move_key(index, new_frame),
-            PropKind::Opacity => tr.opacity.move_key(index, new_frame),
+        // Descending index order: removing a key shifts every later index
+        // down, so deleting from the back keeps the remaining ones valid.
+        for &(kind, index) in self.selected_keys.iter().rev() {
+            match kind {
+                PropKind::Position => tr.position.remove_key(index),
+                PropKind::Rotation => tr.rotation_deg.remove_key(index),
+                PropKind::Scale => tr.scale.remove_key(index),
+                PropKind::Opacity => tr.opacity.remove_key(index),
+            }
         }
+        self.selected_keys.clear();
         true
     }
 
-    /// Remove the dopesheet-selected keyframe (Delete). A track keeps at least
-    /// one key, so this may be a no-op on the last one.
-    fn delete_selected_key(&mut self) -> bool {
-        let (Some(id), Some((kind, index))) = (self.selected, self.selected_key) else {
+    /// Move every selected keyframe by `delta` frames as one rigid block.
+    ///
+    /// Each property is a separate `Track`, so the limits are intersected
+    /// across all of them *before* anything moves — otherwise a track that
+    /// clamps early would slide out of sync with the others and the selection
+    /// would deform instead of translating.
+    fn move_selected_keys(&mut self, delta: i64) -> bool {
+        let Some(id) = self.selected else {
             return false;
         };
+        if self.selected_keys.is_empty() || delta == 0 {
+            return false;
+        }
         let Some(node) = self.doc.root.find_mut(id) else {
             return false;
         };
-        let tr = &mut node.transform;
-        match kind {
-            PropKind::Position => tr.position.remove_key(index),
-            PropKind::Rotation => tr.rotation_deg.remove_key(index),
-            PropKind::Scale => tr.scale.remove_key(index),
-            PropKind::Opacity => tr.opacity.remove_key(index),
+
+        let per_prop = group_selection_by_prop(&self.selected_keys);
+        let tr = &node.transform;
+
+        // Intersect the allowed delta across every affected track.
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        for (kind, idxs) in &per_prop {
+            let limits = match kind {
+                PropKind::Position => tr.position.move_keys_limits(idxs),
+                PropKind::Rotation => tr.rotation_deg.move_keys_limits(idxs),
+                PropKind::Scale => tr.scale.move_keys_limits(idxs),
+                PropKind::Opacity => tr.opacity.move_keys_limits(idxs),
+            };
+            if let Some((l, h)) = limits {
+                lo = lo.max(l);
+                hi = hi.min(h);
+            }
         }
-        self.selected_key = None;
+        if lo > hi {
+            return false; // the block is boxed in somewhere
+        }
+        // Also keep the whole selection inside the composition.
+        let last = self.doc.duration_frames().max(1);
+        let node = self.doc.root.find_mut(id).expect("checked above");
+        let tr = &mut node.transform;
+        let mut min_frame = i64::MAX;
+        let mut max_frame = i64::MIN;
+        for (kind, idxs) in &per_prop {
+            let frames = match kind {
+                PropKind::Position => tr.position.key_frames(),
+                PropKind::Rotation => tr.rotation_deg.key_frames(),
+                PropKind::Scale => tr.scale.key_frames(),
+                PropKind::Opacity => tr.opacity.key_frames(),
+            };
+            for &i in idxs {
+                if let Some(&f) = frames.get(i) {
+                    min_frame = min_frame.min(f);
+                    max_frame = max_frame.max(f);
+                }
+            }
+        }
+        if min_frame <= max_frame {
+            lo = lo.max(-min_frame);
+            hi = hi.min(last - max_frame);
+        }
+        if lo > hi {
+            return false;
+        }
+
+        let applied = delta.clamp(lo, hi);
+        if applied == 0 {
+            return false;
+        }
+        for (kind, idxs) in &per_prop {
+            match kind {
+                PropKind::Position => tr.position.move_keys(idxs, applied),
+                PropKind::Rotation => tr.rotation_deg.move_keys(idxs, applied),
+                PropKind::Scale => tr.scale.move_keys(idxs, applied),
+                PropKind::Opacity => tr.opacity.move_keys(idxs, applied),
+            };
+        }
         true
     }
 
@@ -1537,7 +1650,7 @@ impl App {
         parent.children.push(node);
 
         self.selected = Some(NodeId(id));
-        self.selected_key = None;
+        self.selected_keys.clear();
         true
     }
 
@@ -1588,7 +1701,7 @@ impl App {
                 self.view = TimelineView::full(doc.duration_frames());
                 self.doc = doc;
                 self.selected = None;
-                self.selected_key = None;
+                self.selected_keys.clear();
                 self.seek_frame(0);
                 true
             }
@@ -1630,7 +1743,7 @@ impl App {
             let picked = pick(&scene, fit, px);
             if picked != self.selected {
                 self.selected = picked;
-                self.selected_key = None;
+                self.selected_keys.clear();
             }
         }
 
@@ -1643,7 +1756,14 @@ impl App {
         let rows = sel_node.map(dope_rows).unwrap_or_default();
 
         // The selected keyframe's outgoing easing segment, if it has one.
-        let ease_info = match (sel_node, self.selected_key) {
+        // Only meaningful for a single key — a segment belongs to one key, and
+        // there's no sensible "the" curve for a multi-key selection.
+        let single_key = if self.selected_keys.len() == 1 {
+            self.selected_keys.iter().next().copied()
+        } else {
+            None
+        };
+        let ease_info = match (sel_node, single_key) {
             (Some(node), Some((kind, idx))) => {
                 segment_handles_of(node, kind, idx).map(|(p1, p2)| EaseInfo {
                     p1: (p1.x as f32, p1.y as f32),
@@ -1667,7 +1787,7 @@ impl App {
         let mut edits = PropEdits::default();
         let mut dope = DopeEdits::default();
         let mut tree_edits = TreeEdits::default();
-        let selected_key = self.selected_key;
+        let selected_keys = std::mem::take(&mut self.selected_keys);
         let selected_node = self.selected;
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let mut comp = CompEdits::default();
@@ -1676,7 +1796,7 @@ impl App {
             comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp);
             tree_ui(ui, &tree, selected_node, &mut tree_edits);
             transport_ui(ui, frame, last_frame, timebase, playing, &mut transport);
-            dopesheet_ui(ui, &rows, t, last_frame, timebase, view, selected_key, &mut dope);
+            dopesheet_ui(ui, &rows, t, last_frame, timebase, view, &selected_keys, &mut dope);
             properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out);
         });
 
@@ -1703,7 +1823,7 @@ impl App {
         if let Some(id) = tree_edits.select {
             if Some(id) != self.selected {
                 self.selected = Some(id);
-                self.selected_key = None;
+                self.selected_keys.clear();
             }
         }
 
@@ -1712,11 +1832,21 @@ impl App {
             self.view = v;
         }
 
-        // Keyframe selection changes from the dopesheet.
+        // Keyframe selection changes from the dopesheet. The set was moved out
+        // of `self` before the UI ran (so the closure couldn't borrow `App`);
+        // put it back, then apply this frame's changes to it.
+        self.selected_keys = selected_keys;
         if let Some(k) = dope.select_key {
-            self.selected_key = Some(k);
+            // Plain click: this key becomes the whole selection.
+            self.selected_keys.clear();
+            self.selected_keys.insert(k);
+        } else if let Some(k) = dope.toggle_key {
+            // Ctrl/shift click: add, or remove if already in.
+            if !self.selected_keys.remove(&k) {
+                self.selected_keys.insert(k);
+            }
         } else if dope.clear_selection {
-            self.selected_key = None;
+            self.selected_keys.clear();
         }
         // Apply the UI's intent to the playback clock.
         if transport.toggle {
@@ -1733,10 +1863,17 @@ impl App {
         // Apply property edits + keyframe drags to the selected node, then
         // re-evaluate so the change is visible on this very frame.
         let mut dirty = self.apply_edits(frame, &edits);
-        if let Some((kind, idx, nt)) = dope.move_key {
-            dirty |= self.move_keyframe(kind, idx, nt);
+        if let Some(delta) = dope.move_by {
+            dirty |= self.move_selected_keys(delta);
         }
-        if let (Some((kind, idx)), Some((p1, p2))) = (self.selected_key, ease_out) {
+        // Easing edits target the single selected key (the editor only appears
+        // when exactly one is selected).
+        let single_key = if self.selected_keys.len() == 1 {
+            self.selected_keys.iter().next().copied()
+        } else {
+            None
+        };
+        if let (Some((kind, idx)), Some((p1, p2))) = (single_key, ease_out) {
             dirty |= self.set_ease(kind, idx, p1, p2);
         }
         if let Some((id, delta)) = tree_edits.reorder {
@@ -1749,7 +1886,7 @@ impl App {
             self.doc.root.remove(id);
             if self.selected == Some(id) {
                 self.selected = None;
-                self.selected_key = None;
+                self.selected_keys.clear();
             }
             dirty = true;
         }
@@ -1949,6 +2086,37 @@ mod tests {
         assert!(wide % 24 == 0, "expected a whole-second step, got {wide}");
         // And it must actually satisfy the spacing it was asked for.
         assert!(0.5 * wide as f32 >= 58.0);
+    }
+
+    #[test]
+    fn selection_groups_into_one_bucket_per_property() {
+        let mut sel = KeySelection::new();
+        // Inserted interleaved and out of order on purpose.
+        sel.insert((PropKind::Rotation, 5));
+        sel.insert((PropKind::Position, 3));
+        sel.insert((PropKind::Rotation, 1));
+        sel.insert((PropKind::Position, 0));
+        sel.insert((PropKind::Opacity, 2));
+
+        let grouped = group_selection_by_prop(&sel);
+        assert_eq!(grouped.len(), 3, "one bucket per property: {grouped:?}");
+
+        // Every property appears exactly once...
+        let mut kinds: Vec<PropKind> = grouped.iter().map(|(k, _)| *k).collect();
+        let before = kinds.len();
+        kinds.dedup();
+        assert_eq!(kinds.len(), before, "a property was split across buckets");
+
+        // ...and each bucket's indices are sorted ascending, which is what
+        // Track::move_keys and the descending-delete both assume.
+        for (kind, idxs) in &grouped {
+            assert!(idxs.windows(2).all(|w| w[0] < w[1]), "{kind:?} unsorted: {idxs:?}");
+        }
+    }
+
+    #[test]
+    fn empty_selection_groups_to_nothing() {
+        assert!(group_selection_by_prop(&KeySelection::new()).is_empty());
     }
 
     #[test]

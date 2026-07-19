@@ -173,6 +173,74 @@ impl<T: Animatable> Track<T> {
         }
     }
 
+    /// How far this set of keys can move as a rigid block, as an inclusive
+    /// `(min_delta, max_delta)` in frames. `None` if nothing valid is selected;
+    /// `min > max` means the block is boxed in and cannot move at all.
+    ///
+    /// The subtlety that makes this its own method: a *group* must clamp
+    /// against the group's outer neighbours, not each key's immediate ones.
+    /// Clamping keys individually would let the leading key jam against a
+    /// neighbour while the rest kept going, collapsing the block and destroying
+    /// the spacing the user is trying to preserve.
+    ///
+    /// Selected keys move rigidly, so their internal order and spacing are
+    /// preserved for free; only the *unselected* keys act as obstacles.
+    pub fn move_keys_limits(&self, indices: &[usize]) -> Option<(i64, i64)> {
+        let n = self.keys.len();
+        let mut sel: Vec<usize> = indices.iter().copied().filter(|i| *i < n).collect();
+        sel.sort_unstable();
+        sel.dedup();
+        if sel.is_empty() {
+            return None;
+        }
+        let selected = |i: usize| sel.binary_search(&i).is_ok();
+
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        for &i in &sel {
+            let f = self.keys[i].frame;
+            // Nearest unselected key below/above is the only real obstacle;
+            // selected keys in between are moving too.
+            if let Some(pf) = (0..i).rev().find(|j| !selected(*j)).map(|j| self.keys[j].frame) {
+                lo = lo.max(pf + 1 - f);
+            }
+            if let Some(nf) = (i + 1..n).find(|j| !selected(*j)).map(|j| self.keys[j].frame) {
+                hi = hi.min(nf - 1 - f);
+            }
+        }
+        Some((lo, hi))
+    }
+
+    /// Move `indices` as a rigid block by `delta` frames, clamped by
+    /// [`Track::move_keys_limits`]. Returns the delta actually applied, so a
+    /// caller moving several tracks in lockstep can tell what really happened.
+    ///
+    /// Indices stay valid: the block can't reorder past its neighbours, so no
+    /// re-sort is needed and a selection expressed as indices survives a drag.
+    pub fn move_keys(&mut self, indices: &[usize], delta: i64) -> i64 {
+        let Some((lo, hi)) = self.move_keys_limits(indices) else {
+            return 0;
+        };
+        if lo > hi {
+            return 0; // boxed in
+        }
+        let applied = delta.clamp(lo, hi);
+        if applied == 0 {
+            return 0;
+        }
+        let n = self.keys.len();
+        let mut sel: Vec<usize> = indices.iter().copied().filter(|i| *i < n).collect();
+        sel.sort_unstable();
+        sel.dedup();
+        for &i in &sel {
+            self.keys[i].frame += applied;
+        }
+        debug_assert!(
+            self.keys.windows(2).all(|w| w[0].frame < w[1].frame),
+            "group move broke the sorted invariant"
+        );
+        applied
+    }
+
     /// Convert legacy float-seconds keys to frames at `fps`. See
     /// [`Keyframe::legacy_seconds`]. Re-sorts, since rounding can collide or
     /// reorder keys that were microscopically apart in the old format.
@@ -322,6 +390,22 @@ impl<T: Animatable> Value<T> {
     pub fn move_key(&mut self, index: usize, new_frame: i64) {
         if let Value::Keyframed(track) = self {
             track.move_key(index, new_frame);
+        }
+    }
+
+    /// Rigid-block move limits for `indices`. `None` on a constant.
+    pub fn move_keys_limits(&self, indices: &[usize]) -> Option<(i64, i64)> {
+        match self {
+            Value::Const(_) => None,
+            Value::Keyframed(track) => track.move_keys_limits(indices),
+        }
+    }
+
+    /// Move `indices` as a rigid block; returns the delta actually applied.
+    pub fn move_keys(&mut self, indices: &[usize], delta: i64) -> i64 {
+        match self {
+            Value::Const(_) => 0,
+            Value::Keyframed(track) => track.move_keys(indices, delta),
         }
     }
 
@@ -530,6 +614,85 @@ mod tests {
         ]));
         v.move_key(1, 99);
         assert_eq!(v.key_frames(), vec![10, 11, 12], "no room, so no movement");
+    }
+
+    /// Keys at the given frames, values irrelevant.
+    fn track_at(frames: &[i64]) -> Value<f64> {
+        Value::Keyframed(Track::new(
+            frames.iter().map(|f| Keyframe::linear(*f, *f as f64)).collect(),
+        ))
+    }
+
+    #[test]
+    fn group_move_preserves_internal_spacing() {
+        let mut v = track_at(&[0, 10, 20, 100]);
+        // Move the middle block right; spacing between them must not change.
+        assert_eq!(v.move_keys(&[1, 2], 5), 5);
+        assert_eq!(v.key_frames(), vec![0, 15, 25, 100]);
+    }
+
+    #[test]
+    fn group_clamps_against_the_blocks_outer_neighbour_not_each_key() {
+        // The whole point of move_keys. Block [10,20] moving right can only go
+        // until 20 hits 99 — i.e. +79. Clamping keys individually would let 10
+        // run to 99 too and collapse the block.
+        let mut v = track_at(&[0, 10, 20, 100]);
+        let applied = v.move_keys(&[1, 2], 1000);
+        assert_eq!(applied, 79, "block should stop when its *last* key hits 99");
+        assert_eq!(v.key_frames(), vec![0, 89, 99, 100]);
+    }
+
+    #[test]
+    fn group_clamps_on_the_left_too() {
+        let mut v = track_at(&[0, 10, 20, 100]);
+        let applied = v.move_keys(&[1, 2], -1000);
+        assert_eq!(applied, -9, "block stops when its *first* key hits 1");
+        assert_eq!(v.key_frames(), vec![0, 1, 11, 100]);
+    }
+
+    #[test]
+    fn group_move_respects_unselected_keys_interleaved_in_the_block() {
+        // 10 and 30 selected, 20 is not — 20 is an obstacle for 10 and blocks
+        // the group at +9 (10 -> 19), even though 30 has room to spare.
+        let mut v = track_at(&[10, 20, 30, 100]);
+        let applied = v.move_keys(&[0, 2], 50);
+        assert_eq!(applied, 9);
+        assert_eq!(v.key_frames(), vec![19, 20, 39, 100]);
+    }
+
+    #[test]
+    fn group_move_of_every_key_is_unbounded() {
+        // With nothing left to collide with, the whole track slides freely.
+        let mut v = track_at(&[0, 10, 20]);
+        assert_eq!(v.move_keys(&[0, 1, 2], 500), 500);
+        assert_eq!(v.key_frames(), vec![500, 510, 520]);
+    }
+
+    #[test]
+    fn boxed_in_group_does_not_move() {
+        // Adjacent frames leave no room on either side.
+        let mut v = track_at(&[10, 11, 12, 13]);
+        assert_eq!(v.move_keys(&[1, 2], 5), 0, "no room, no movement");
+        assert_eq!(v.key_frames(), vec![10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn move_keys_limits_reports_the_room_available() {
+        let v = track_at(&[0, 10, 20, 100]);
+        let (lo, hi) = v.move_keys_limits(&[1, 2]).unwrap();
+        assert_eq!((lo, hi), (-9, 79));
+        // A constant has no keys to move.
+        assert!(Value::constant(1.0).move_keys_limits(&[0]).is_none());
+        // An empty selection is not a move.
+        assert!(v.move_keys_limits(&[]).is_none());
+    }
+
+    #[test]
+    fn move_keys_ignores_out_of_range_and_duplicate_indices() {
+        let mut v = track_at(&[0, 10, 20]);
+        // Index 99 doesn't exist; index 1 given twice must not double-apply.
+        assert_eq!(v.move_keys(&[1, 1, 99], 3), 3);
+        assert_eq!(v.key_frames(), vec![0, 13, 20]);
     }
 
     #[test]
