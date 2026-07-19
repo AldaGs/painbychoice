@@ -11,11 +11,13 @@
 
 pub mod demo;
 pub mod eval;
+pub mod expr;
 pub mod node;
 pub mod timebase;
 pub mod value;
 
 pub use eval::{evaluate, RenderItem, Scene};
+pub use expr::{EvalCtx, Expr, ExprValue, FromExpr, PropPath, ToExpr};
 pub use node::{Document, Node, NodeId, Shape, Stroke, Transform};
 pub use timebase::Timebase;
-pub use value::{Animatable, Color, EvalCtx, Handle, Keyframe, Track, Value};
+pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};

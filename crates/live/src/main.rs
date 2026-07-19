@@ -739,36 +739,36 @@ fn is_anim(node: &MNode, kind: PropKind) -> bool {
 }
 
 impl NodeInfo {
-    fn resolve(node: &motion_core::Node, t: f64) -> Self {
-        let ctx = EvalCtx::at(t);
+    fn resolve(node: &motion_core::Node, doc: &Document, t: f64) -> Self {
+        let mut ctx = EvalCtx::new(doc, t);
         let tr = &node.transform;
-        let pos = tr.position.resolve(&ctx);
-        let scale = tr.scale.resolve(&ctx);
+        let pos = tr.position.resolve(&mut ctx);
+        let scale = tr.scale.resolve(&mut ctx);
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
             pos: (pos.x, pos.y),
-            rot: tr.rotation_deg.resolve(&ctx),
+            rot: tr.rotation_deg.resolve(&mut ctx),
             scale: (scale.x, scale.y),
-            opacity: tr.opacity.resolve(&ctx),
+            opacity: tr.opacity.resolve(&mut ctx),
             fill: node.fill.as_ref().map(|f| {
-                let c = f.resolve(&ctx);
+                let c = f.resolve(&mut ctx);
                 [c.r as f32, c.g as f32, c.b as f32]
             }),
             size: match node.shape.as_ref() {
                 Some(MShape::Rect { size, .. }) | Some(MShape::Ellipse { size }) => {
-                    let s = size.resolve(&ctx);
+                    let s = size.resolve(&mut ctx);
                     Some((s.x, s.y))
                 }
                 _ => None,
             },
             radius: match node.shape.as_ref() {
-                Some(MShape::Rect { radius, .. }) => Some(radius.resolve(&ctx)),
+                Some(MShape::Rect { radius, .. }) => Some(radius.resolve(&mut ctx)),
                 _ => None,
             },
             stroke: node.stroke.as_ref().map(|s| {
-                let c = s.color.resolve(&ctx);
-                ([c.r as f32, c.g as f32, c.b as f32], s.width.resolve(&ctx))
+                let c = s.color.resolve(&mut ctx);
+                ([c.r as f32, c.g as f32, c.b as f32], s.width.resolve(&mut ctx))
             }),
             pos_anim: tr.position.is_animated(),
             rot_anim: tr.rotation_deg.is_animated(),
@@ -2312,7 +2312,7 @@ impl App {
     /// property sets a keyframe on `frame` (via `Value::set_at`).
     fn apply_edits(&mut self, frame: i64, e: &PropEdits) -> bool {
         let t = frame as f64;
-        let ctx = EvalCtx::at(t);
+        let mut ctx = EvalCtx::at(t);
         let Some(id) = self.selected else {
             return false;
         };
@@ -2323,7 +2323,7 @@ impl App {
         let mut changed = false;
 
         if e.pos_x.is_some() || e.pos_y.is_some() {
-            let cur = tr.position.resolve(&ctx);
+            let cur = tr.position.resolve(&mut ctx);
             let v = Vec2::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y));
             tr.position.set_at(frame, v);
             changed = true;
@@ -2333,7 +2333,7 @@ impl App {
             changed = true;
         }
         if e.scale_x.is_some() || e.scale_y.is_some() {
-            let cur = tr.scale.resolve(&ctx);
+            let cur = tr.scale.resolve(&mut ctx);
             let v = Vec2::new(e.scale_x.unwrap_or(cur.x), e.scale_y.unwrap_or(cur.y));
             tr.scale.set_at(frame, v);
             changed = true;
@@ -2388,7 +2388,7 @@ impl App {
             if let Some(MShape::Rect { size, .. }) | Some(MShape::Ellipse { size }) =
                 node.shape.as_mut()
             {
-                let cur = size.resolve(&ctx);
+                let cur = size.resolve(&mut ctx);
                 let v = Vec2::new(e.size_x.unwrap_or(cur.x), e.size_y.unwrap_or(cur.y));
                 size.set_at(frame, v);
                 changed = true;
@@ -2764,7 +2764,9 @@ impl App {
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
         let sel_node = self.selected.and_then(|id| self.doc.root.find(id));
-        let sel_info = sel_node.map(|node| NodeInfo::resolve(node, t));
+        // Pass the doc so an expression-driven property resolves against the
+        // scene (a doc-less context would show its fallback instead).
+        let sel_info = sel_node.map(|node| NodeInfo::resolve(node, &self.doc, t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
 
         // The selected keyframe's outgoing easing segment, if it has one.

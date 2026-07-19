@@ -4,8 +4,9 @@
 
 use kurbo::{Affine, BezPath};
 
+use crate::expr::EvalCtx;
 use crate::node::{Document, Node, NodeId};
-use crate::value::{Color, EvalCtx};
+use crate::value::Color;
 
 /// One flat, ready-to-draw item. `source` traces it back to the node that
 /// produced it — provenance for selection and debugging.
@@ -35,15 +36,17 @@ pub struct Scene {
 /// [`crate::timebase::Timebase`].
 pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     let mut scene = Scene::default();
-    // The resolve context is built once here and shared by the whole walk, so
-    // every property in the frame resolves against the same context — the seam
-    // the expression engine and its cache slot into.
-    let ctx = EvalCtx::at(frame);
-    walk(&doc.root, Affine::IDENTITY, 1.0, &ctx, &mut scene);
+    // The resolve context is built once here and shared (by `&mut`) down the
+    // whole walk, so every property resolves against the same document, cache,
+    // and warnings sink. Expression warnings gathered during the walk are folded
+    // into the scene's provenance-tagged list afterward.
+    let mut ctx = EvalCtx::new(doc, frame);
+    walk(&doc.root, Affine::IDENTITY, 1.0, &mut ctx, &mut scene);
+    scene.warnings.append(&mut ctx.take_warnings());
     scene
 }
 
-fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &EvalCtx, scene: &mut Scene) {
+fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, scene: &mut Scene) {
     let (local_xf, local_opacity) = node.transform.resolve(ctx);
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
@@ -132,6 +135,52 @@ mod tests {
 
         let scene = evaluate(&doc, 0.0);
         assert!((scene.items[0].opacity - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_expression_drives_an_evaluated_property() {
+        use crate::expr::{Expr, PropPath};
+        // A driver node holds opacity 0.4; a visible square mirrors it via an
+        // expression. The evaluated square's opacity should be the driver's.
+        let driver = Node::group(1, "driver")
+            .with_transform(Transform { opacity: Value::constant(0.4), ..Transform::default() });
+        let square = Node::shape(
+            2,
+            "square",
+            Shape::Rect { size: Value::constant(Vec2::new(10.0, 10.0)), radius: Value::constant(0.0) },
+        )
+        .with_fill(Color::rgb(1.0, 1.0, 1.0))
+        .with_transform(Transform {
+            opacity: Value::expr(Expr::reference(NodeId(1), PropPath::Opacity)),
+            ..Transform::default()
+        });
+        let doc =
+            Document::new(100.0, 100.0, Node::group(0, "root").with_child(driver).with_child(square));
+
+        let scene = evaluate(&doc, 0.0);
+        let item = scene.items.iter().find(|i| i.source == NodeId(2)).unwrap();
+        assert!((item.opacity - 0.4).abs() < 1e-9, "opacity = {}", item.opacity);
+        assert!(scene.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_expression_cycle_surfaces_as_a_scene_warning() {
+        use crate::expr::{Expr, PropPath};
+        // A visible square whose opacity references itself: evaluate must return
+        // (not hang) and report the cycle in the scene's warnings.
+        let square = Node::shape(
+            2,
+            "square",
+            Shape::Rect { size: Value::constant(Vec2::new(10.0, 10.0)), radius: Value::constant(0.0) },
+        )
+        .with_transform(Transform {
+            opacity: Value::expr(Expr::reference(NodeId(2), PropPath::Opacity)),
+            ..Transform::default()
+        });
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square));
+
+        let scene = evaluate(&doc, 0.0);
+        assert!(!scene.warnings.is_empty(), "the cycle should reach the scene");
     }
 
     #[test]

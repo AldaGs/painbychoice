@@ -5,7 +5,8 @@
 use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::value::{Color, EvalCtx, Value};
+use crate::expr::EvalCtx;
+use crate::value::{Color, Value};
 
 /// Stable identity for a node, used for selection and for tracing an evaluated
 /// render item back to its source (EBN's line→nodeId map idea, applied to a
@@ -39,7 +40,7 @@ impl Default for Transform {
 impl Transform {
     /// Resolve to (matrix, opacity) against `ctx`. The matrix maps local space
     /// to parent space: translate(position) · rotate · scale · translate(-anchor).
-    pub fn resolve(&self, ctx: &EvalCtx) -> (kurbo::Affine, f64) {
+    pub fn resolve(&self, ctx: &mut EvalCtx) -> (kurbo::Affine, f64) {
         let anchor = self.anchor.resolve(ctx);
         let position = self.position.resolve(ctx);
         let rot = self.rotation_deg.resolve(ctx).to_radians();
@@ -76,7 +77,7 @@ pub enum Shape {
 }
 
 impl Shape {
-    pub fn to_path(&self, ctx: &EvalCtx) -> BezPath {
+    pub fn to_path(&self, ctx: &mut EvalCtx) -> BezPath {
         match self {
             Shape::Path(p) => p.clone(),
             Shape::Rect { size, radius } => {
