@@ -222,6 +222,14 @@ pub enum Expr {
     Add(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
     Neg(Box<Expr>),
+    /// A user-defined parameter, by name. `node: None` means "this node's" —
+    /// the common case, and what keeps a parameterised node self-contained
+    /// (copy the node and its expressions still point at its own knobs).
+    Param {
+        #[serde(default)]
+        node: Option<NodeId>,
+        name: String,
+    },
     /// A Rhai script, evaluated each frame with `frame`/`time` in scope. Returns
     /// a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`). A leaf: it
     /// pulls its inputs from `frame`, not from wired-in child nodes.
@@ -251,6 +259,7 @@ impl Expr {
             Expr::Add(..) => ExprKind::Add,
             Expr::Mul(..) => ExprKind::Mul,
             Expr::Neg(..) => ExprKind::Neg,
+            Expr::Param { .. } => ExprKind::Param,
             Expr::Script(_) => ExprKind::Script,
         }
     }
@@ -270,6 +279,7 @@ impl Expr {
             ExprKind::Add => Expr::Add(Box::new(Expr::num(0.0)), Box::new(Expr::num(0.0))),
             ExprKind::Mul => Expr::Mul(Box::new(Expr::num(1.0)), Box::new(Expr::num(1.0))),
             ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
+            ExprKind::Param => Expr::Param { node: None, name: String::new() },
             ExprKind::Script => Expr::Script(String::new()),
         }
     }
@@ -280,7 +290,7 @@ impl Expr {
         match self {
             Expr::Add(..) | Expr::Mul(..) => 2,
             Expr::Neg(..) => 1,
-            Expr::Lit(_) | Expr::Ref { .. } | Expr::Script(_) => 0,
+            Expr::Lit(_) | Expr::Ref { .. } | Expr::Param { .. } | Expr::Script(_) => 0,
         }
     }
 
@@ -321,17 +331,19 @@ pub enum ExprKind {
     Add,
     Mul,
     Neg,
+    Param,
     Script,
 }
 
 impl ExprKind {
     /// Every kind, in picker order.
-    pub const ALL: [ExprKind; 6] = [
+    pub const ALL: [ExprKind; 7] = [
         ExprKind::Lit,
         ExprKind::Ref,
         ExprKind::Add,
         ExprKind::Mul,
         ExprKind::Neg,
+        ExprKind::Param,
         ExprKind::Script,
     ];
 
@@ -342,6 +354,7 @@ impl ExprKind {
             ExprKind::Add => "add",
             ExprKind::Mul => "mul",
             ExprKind::Neg => "neg",
+            ExprKind::Param => "param",
             ExprKind::Script => "script",
         }
     }
@@ -373,6 +386,8 @@ impl fmt::Display for Expr {
             Expr::Add(a, b) => write!(f, "({a} + {b})"),
             Expr::Mul(a, b) => write!(f, "({a} * {b})"),
             Expr::Neg(a) => write!(f, "-{a}"),
+            Expr::Param { node: None, name } => write!(f, "param({name})"),
+            Expr::Param { node: Some(n), name } => write!(f, "param(#{}, {name})", n.0),
             Expr::Script(src) => write!(f, "{{ {src} }}"),
         }
     }
@@ -458,6 +473,8 @@ fn build_engine() -> rhai::Engine {
     engine.register_fn("value_at", |name: &str, prop: &str, frame: f64| {
         script_value(name, prop, Some(frame))
     });
+    engine.register_fn("param", |name: &str| script_param(None, name));
+    engine.register_fn("param_of", |node: &str, name: &str| script_param(Some(node), name));
     engine.register_fn("wiggle", |freq: f64, amp: f64| script_wiggle(freq, amp, 0.0));
     engine.register_fn("wiggle", |freq: f64, amp: f64, seed: f64| script_wiggle(freq, amp, seed));
     engine
@@ -486,6 +503,30 @@ fn script_value(
     })
     .ok_or_else(|| script_err("value() is only available while evaluating a document"))?
     .ok_or_else(|| script_err(format!("no node named '{name}'")))?;
+    Ok(expr_value_to_dynamic(out))
+}
+
+/// `param("speed")` — this node's parameter; `param_of("A", "speed")` — another
+/// node's. Resolved through the same memoized, cycle-guarded path as a
+/// property, so a parameter driven by an expression that reads it back warns
+/// instead of hanging.
+fn script_param(
+    node: Option<&str>,
+    name: &str,
+) -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+    let out = bridge::with_ctx(|ctx| {
+        let owner = match node {
+            Some(n) => ctx.find_named(n).ok_or_else(|| format!("no node named '{n}'"))?,
+            None => ctx.current.ok_or_else(|| {
+                "param() has no owning node here; use param_of(\"node\", \"name\")".to_string()
+            })?,
+        };
+        let frame = ctx.frame;
+        ctx.resolve_param(owner, name, frame)
+            .ok_or_else(|| format!("no parameter named '{name}' on node {}", owner.0))
+    })
+    .ok_or_else(|| script_err("param() is only available while evaluating a document"))?
+    .map_err(script_err)?;
     Ok(expr_value_to_dynamic(out))
 }
 
@@ -596,9 +637,17 @@ fn dynamic_to_num(d: &rhai::Dynamic) -> Result<f64, String> {
     }
 }
 
-/// A cache key: a property reference at an exact frame. The frame is in the key
+/// What a reference points at on a node: a built-in property, or a user-defined
+/// parameter (by name).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Target {
+    Prop(PropPath),
+    Param(String),
+}
+
+/// A cache key: a reference at an exact frame. The frame is in the key
 /// (`to_bits`) so an off-time sample can't poison the primary value's memo slot.
-type PropKey = (NodeId, PropPath, u64);
+type PropKey = (NodeId, Target, u64);
 
 /// Per-evaluation memoization + cycle detection for expression resolution.
 ///
@@ -687,6 +736,20 @@ impl<'a> EvalCtx<'a> {
         }
     }
 
+    /// Resolve something in the context of `node`: warnings are attributed to
+    /// it, and a `param("x")` with no explicit owner reads *its* parameters.
+    ///
+    /// Anything resolving a node's properties outside [`crate::evaluate`] — a
+    /// panel showing one node's values, say — must go through this, or a
+    /// node-relative `param()` has no owner to look in (it warns and falls
+    /// back rather than guessing).
+    pub fn in_node<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.enter_node(node);
+        let out = f(self);
+        self.exit_node(prev);
+        out
+    }
+
     /// Mark `node` as the one being resolved, returning the previous mark to
     /// hand back to [`EvalCtx::exit_node`]. The walk brackets each node with
     /// this so warnings land on the right layer.
@@ -713,30 +776,61 @@ impl<'a> EvalCtx<'a> {
     /// Resolve `prop` on `node` at `frame`, dynamically. This is the one place
     /// an expression reaches back into the document. Memoized and cycle-guarded.
     fn resolve_prop(&mut self, node: NodeId, prop: PropPath, frame: f64) -> ExprValue {
-        let key = (node, prop, frame.to_bits());
+        self.resolve_target(node, Target::Prop(prop), frame)
+    }
+
+    /// Resolve a parameter by name on `node`. Same memo + cycle guard as a
+    /// property: a parameter can be expression-driven, so it can loop.
+    fn resolve_param(&mut self, node: NodeId, name: &str, frame: f64) -> Option<ExprValue> {
+        // Check it exists first — a missing parameter is a script error worth
+        // reporting, not a silent zero.
+        let target = self.doc?.root.find(node)?;
+        target.param(name)?;
+        Some(self.resolve_target(node, Target::Param(name.to_string()), frame))
+    }
+
+    fn resolve_target(&mut self, node: NodeId, target: Target, frame: f64) -> ExprValue {
+        let zero = match &target {
+            Target::Prop(p) => p.zero(),
+            // A parameter's neutral value isn't knowable without finding it,
+            // and the only callers that reach the failure paths below have
+            // already established it exists.
+            Target::Param(_) => ExprValue::Num(0.0),
+        };
+        let key = (node, target.clone(), frame.to_bits());
         if let Some(v) = self.cache.memo.get(&key) {
             return *v;
         }
         if self.cache.visiting.contains(&key) {
-            self.warn(node, format!("expression cycle through {prop:?} on node {}", node.0));
-            return prop.zero();
+            let what = match &target {
+                Target::Prop(p) => format!("{p:?}"),
+                Target::Param(n) => format!("param '{n}'"),
+            };
+            self.warn(node, format!("expression cycle through {what} on node {}", node.0));
+            return zero;
         }
         // Copy the document reference out (it's `&'a`, independent of `self`) so
         // the recursive resolve below can borrow `self` mutably for the cache.
         let Some(doc) = self.doc else {
-            return prop.zero();
+            return zero;
         };
-        let Some(target) = doc.root.find(node) else {
+        let Some(found) = doc.root.find(node) else {
             self.warn(node, format!("expression references missing node {}", node.0));
-            return prop.zero();
+            return zero;
         };
 
-        self.cache.visiting.insert(key);
+        self.cache.visiting.insert(key.clone());
         let saved = self.frame;
         self.frame = frame;
         // Warnings raised while resolving the *target* belong to the target.
         let prev = self.enter_node(node);
-        let value = self.resolve_on(target, prop);
+        let value = match &target {
+            Target::Prop(prop) => self.resolve_on(found, *prop),
+            Target::Param(name) => match found.param(name) {
+                Some(p) => p.value.resolve(self),
+                None => zero,
+            },
+        };
         self.exit_node(prev);
         self.frame = saved;
         self.cache.visiting.remove(&key);
@@ -812,6 +906,23 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
             a.zip(b, |x, y| x * y)
         }
         Expr::Neg(a) => eval_expr(a, ctx).map(|x| -x),
+        // A parameter reads off its owning node — `None` meaning "the node
+        // being resolved", which `walk` and `resolve_target` keep current.
+        Expr::Param { node, name } => {
+            let owner = node.or(ctx.current);
+            let Some(owner) = owner else {
+                ctx.warn_here(format!("param '{name}' has no owning node"));
+                return ExprValue::Num(0.0);
+            };
+            let frame = ctx.frame;
+            match ctx.resolve_param(owner, name, frame) {
+                Some(v) => v,
+                None => {
+                    ctx.warn_here(format!("no parameter named '{name}' on node {}", owner.0));
+                    ExprValue::Num(0.0)
+                }
+            }
+        }
         // A bad script (compile/run/type error) falls back to a neutral value
         // rather than breaking the frame. The error also becomes a scene
         // warning, so a broken script is visible without opening the graph
@@ -849,7 +960,9 @@ mod tests {
     fn opacity_of(doc: &Document, id: u64, frame: f64) -> f64 {
         let node = doc.root.find(NodeId(id)).unwrap();
         let mut ctx = EvalCtx::new(doc, frame);
-        node.transform.opacity.resolve(&mut ctx)
+        // `in_node` is what `evaluate`'s walk does; a node-relative `param()`
+        // needs it to know whose knobs to read.
+        ctx.in_node(node.id, |ctx| node.transform.opacity.resolve(ctx))
     }
 
     #[test]
@@ -951,7 +1064,7 @@ mod tests {
             let expected = match k {
                 ExprKind::Add | ExprKind::Mul => 2,
                 ExprKind::Neg => 1,
-                ExprKind::Lit | ExprKind::Ref | ExprKind::Script => 0,
+                ExprKind::Lit | ExprKind::Ref | ExprKind::Param | ExprKind::Script => 0,
             };
             assert_eq!(e.arity(), expected, "{k:?}");
         }
@@ -1182,6 +1295,128 @@ mod tests {
         }
         assert_eq!(PropPath::parse("  POSITION "), Some(PropPath::Position), "trims + folds case");
         assert_eq!(PropPath::parse("nope"), None);
+    }
+
+    // ---- exposed parameters ----
+
+    #[test]
+    fn a_param_node_reads_its_own_nodes_knob() {
+        use crate::node::ParamValue;
+        // b.opacity = param("gain"), and b's `gain` is 0.75.
+        let mut doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Param { node: None, name: "gain".into() }),
+        );
+        doc.root
+            .find_mut(NodeId(2))
+            .unwrap()
+            .set_param("gain", ParamValue::Num(Value::constant(0.75)));
+        assert_eq!(opacity_of(&doc, 2, 0.0), 0.75);
+    }
+
+    #[test]
+    fn one_param_drives_several_properties() {
+        use crate::node::ParamValue;
+        // The point of parameters: one knob, many properties. `size` drives
+        // both scale (a vec) and opacity (a scalar) — the param is a scalar,
+        // and the vec property takes it broadcast through a Mul.
+        use crate::node::{Shape, Transform as T};
+        let mut n = Node::shape(
+            1,
+            "n",
+            Shape::Rect {
+                size: Value::constant(Vec2::new(10.0, 10.0)),
+                radius: Value::constant(0.0),
+            },
+        )
+        .with_transform(T {
+            opacity: Value::expr(Expr::Param { node: None, name: "size".into() }),
+            scale: Value::expr(Expr::Mul(
+                Box::new(Expr::Lit(ExprValue::Vec2(Vec2::new(1.0, 1.0)))),
+                Box::new(Expr::Param { node: None, name: "size".into() }),
+            )),
+            ..T::default()
+        });
+        n.set_param("size", ParamValue::Num(Value::constant(0.4)));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(n));
+        let node = doc.root.find(NodeId(1)).unwrap();
+        let mut ctx = EvalCtx::new(&doc, 0.0);
+        ctx.in_node(node.id, |ctx| {
+            assert_eq!(node.transform.opacity.resolve(ctx), 0.4);
+            assert_eq!(node.transform.scale.resolve(ctx), Vec2::new(0.4, 0.4));
+        });
+    }
+
+    #[test]
+    fn a_param_can_be_keyframed_like_any_value() {
+        use crate::node::ParamValue;
+        let track = Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 1.0)]);
+        let mut doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Param { node: None, name: "gain".into() }),
+        );
+        doc.root.find_mut(NodeId(2)).unwrap().set_param("gain", ParamValue::Num(Value::Keyframed(track)));
+        assert_eq!(opacity_of(&doc, 2, 5.0), 0.5, "the knob animates");
+    }
+
+    #[test]
+    fn a_script_reads_params_on_its_own_and_other_nodes() {
+        use crate::node::ParamValue;
+        let mut doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Script("param(\"mine\") + param_of(\"a\", \"theirs\")".into())),
+        );
+        doc.root
+            .find_mut(NodeId(1))
+            .unwrap()
+            .set_param("theirs", ParamValue::Num(Value::constant(3.0)));
+        doc.root
+            .find_mut(NodeId(2))
+            .unwrap()
+            .set_param("mine", ParamValue::Num(Value::constant(4.0)));
+        assert_eq!(opacity_of(&doc, 2, 0.0), 7.0);
+    }
+
+    #[test]
+    fn a_missing_param_warns_instead_of_resolving_to_zero_silently() {
+        let doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Param { node: None, name: "nope".into() }),
+        );
+        let node = doc.root.find(NodeId(2)).unwrap();
+        let mut ctx = EvalCtx::new(&doc, 0.0);
+        let v = ctx.in_node(node.id, |ctx| node.transform.opacity.resolve(ctx));
+        assert_eq!(v, 0.0, "falls back");
+        let warnings = ctx.take_warnings();
+        assert!(warnings.iter().any(|(_, m)| m.contains("nope")), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_param_that_reads_itself_is_caught_as_a_cycle() {
+        use crate::node::ParamValue;
+        // `gain` is driven by param("gain") — the guard has to catch this the
+        // same way it catches a property cycle, or the stack goes.
+        let mut doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Param { node: None, name: "gain".into() }),
+        );
+        let b = doc.root.find_mut(NodeId(2)).unwrap();
+        b.set_param(
+            "gain",
+            ParamValue::Num(Value::expr(Expr::Param { node: None, name: "gain".into() })),
+        );
+        assert_eq!(opacity_of(&doc, 2, 0.0), 0.0, "falls back rather than hanging");
+    }
+
+    #[test]
+    fn setting_a_param_twice_replaces_rather_than_duplicates() {
+        use crate::node::ParamValue;
+        let mut n = Node::group(1, "n");
+        n.set_param("x", ParamValue::Num(Value::constant(1.0)));
+        n.set_param("x", ParamValue::Num(Value::constant(2.0)));
+        assert_eq!(n.params.len(), 1, "a duplicate name would make param(\"x\") ambiguous");
+        assert!(n.remove_param("x"));
+        assert!(!n.remove_param("x"), "already gone");
     }
 
     #[test]

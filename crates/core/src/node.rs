@@ -112,6 +112,53 @@ pub struct Stroke {
     pub width: Value<f64>,
 }
 
+/// A user-exposed control on a node: a named, animatable knob that expressions
+/// and scripts read by name (`param("speed")`).
+///
+/// This is the piece that makes a node a *reusable* thing rather than a bag of
+/// hardcoded values — one parameter can drive many properties, and (once a
+/// composition can be nested) it's what a pre-comp exposes to its parent.
+/// A parameter is a `Value` like any property, so it keyframes and can itself
+/// be expression-driven.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Param {
+    /// How a script names it. Unique per node — [`Node::set_param`] enforces
+    /// that, since a duplicate would make `param("x")` ambiguous.
+    pub name: String,
+    pub value: ParamValue,
+}
+
+/// A parameter's type. Mirrors the three `ExprValue` kinds, so a parameter can
+/// drive any property an expression can.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ParamValue {
+    Num(Value<f64>),
+    Vec(Value<Vec2>),
+    Color(Value<Color>),
+}
+
+impl ParamValue {
+    /// Resolve to the dynamic expression space. Takes `&mut EvalCtx` because a
+    /// parameter's own value may be an expression.
+    pub fn resolve(&self, ctx: &mut EvalCtx) -> crate::expr::ExprValue {
+        use crate::expr::ToExpr;
+        match self {
+            ParamValue::Num(v) => v.resolve(ctx).to_expr(),
+            ParamValue::Vec(v) => v.resolve(ctx).to_expr(),
+            ParamValue::Color(v) => v.resolve(ctx).to_expr(),
+        }
+    }
+
+    /// The label a picker shows, and the word a serialized param reads as.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ParamValue::Num(_) => "number",
+            ParamValue::Vec(_) => "vector",
+            ParamValue::Color(_) => "color",
+        }
+    }
+}
+
 /// One node in the scene graph. A group (no shape) just composes its children;
 /// a leaf carries a shape + paint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +169,10 @@ pub struct Node {
     pub shape: Option<Shape>,
     pub fill: Option<Value<Color>>,
     pub stroke: Option<Stroke>,
+    /// User-exposed controls, in display order. `#[serde(default)]` so a `.pbc`
+    /// written before parameters existed still loads.
+    #[serde(default)]
+    pub params: Vec<Param>,
     pub children: Vec<Node>,
 }
 
@@ -134,6 +185,7 @@ impl Node {
             shape: None,
             fill: None,
             stroke: None,
+            params: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -146,12 +198,44 @@ impl Node {
             shape: Some(shape),
             fill: None,
             stroke: None,
+            params: Vec::new(),
             children: Vec::new(),
         }
     }
 
     pub fn with_fill(mut self, color: Color) -> Self {
         self.fill = Some(Value::constant(color));
+        self
+    }
+
+    /// Look a parameter up by name.
+    pub fn param(&self, name: &str) -> Option<&Param> {
+        self.params.iter().find(|p| p.name == name)
+    }
+
+    /// Add a parameter, or replace the one already using that name. Names are
+    /// the only way a script addresses a parameter, so duplicates can't exist:
+    /// `param("x")` has to mean one thing.
+    pub fn set_param(&mut self, name: impl Into<String>, value: ParamValue) {
+        let name = name.into();
+        match self.params.iter_mut().find(|p| p.name == name) {
+            Some(existing) => existing.value = value,
+            None => self.params.push(Param { name, value }),
+        }
+    }
+
+    /// Remove a parameter by name, returning whether it was there. Expressions
+    /// referencing it aren't rewritten — they warn and fall back, the same as
+    /// any other dangling reference.
+    pub fn remove_param(&mut self, name: &str) -> bool {
+        let before = self.params.len();
+        self.params.retain(|p| p.name != name);
+        before != self.params.len()
+    }
+
+    /// Builder form of [`Node::set_param`].
+    pub fn with_param(mut self, name: impl Into<String>, value: ParamValue) -> Self {
+        self.set_param(name, value);
         self
     }
 

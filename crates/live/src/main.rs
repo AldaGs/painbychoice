@@ -20,9 +20,9 @@ use std::time::Instant;
 
 use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate, Color as MColor, Document, EvalCtx, Expr, ExprKind, ExprValue,
-    Handle, Keyframe, Node as MNode, NodeId, PropPath, Scene as MScene, Shape as MShape, Transform,
-    Value,
+    demo::demo_document, evaluate, node::ParamValue, Color as MColor, Document, EvalCtx, Expr,
+    ExprKind, ExprValue, Handle, Keyframe, Node as MNode, NodeId, PropPath, Scene as MScene,
+    Shape as MShape, Transform, Value,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
@@ -765,34 +765,41 @@ fn is_anim(node: &MNode, kind: PropKind) -> bool {
 impl NodeInfo {
     fn resolve(node: &motion_core::Node, doc: &Document, t: f64) -> Self {
         let mut ctx = EvalCtx::new(doc, t);
+        // Mark the node, as `evaluate`'s walk does: a `param("x")` with no
+        // explicit owner reads this node's knobs, so the panel would otherwise
+        // show a fallback where the canvas shows the real value.
+        ctx.in_node(node.id, |ctx| Self::resolve_in(node, ctx))
+    }
+
+    fn resolve_in(node: &motion_core::Node, ctx: &mut EvalCtx) -> Self {
         let tr = &node.transform;
-        let pos = tr.position.resolve(&mut ctx);
-        let scale = tr.scale.resolve(&mut ctx);
+        let pos = tr.position.resolve(ctx);
+        let scale = tr.scale.resolve(ctx);
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
             pos: (pos.x, pos.y),
-            rot: tr.rotation_deg.resolve(&mut ctx),
+            rot: tr.rotation_deg.resolve(ctx),
             scale: (scale.x, scale.y),
-            opacity: tr.opacity.resolve(&mut ctx),
+            opacity: tr.opacity.resolve(ctx),
             fill: node.fill.as_ref().map(|f| {
-                let c = f.resolve(&mut ctx);
+                let c = f.resolve(ctx);
                 [c.r as f32, c.g as f32, c.b as f32]
             }),
             size: match node.shape.as_ref() {
                 Some(MShape::Rect { size, .. }) | Some(MShape::Ellipse { size }) => {
-                    let s = size.resolve(&mut ctx);
+                    let s = size.resolve(ctx);
                     Some((s.x, s.y))
                 }
                 _ => None,
             },
             radius: match node.shape.as_ref() {
-                Some(MShape::Rect { radius, .. }) => Some(radius.resolve(&mut ctx)),
+                Some(MShape::Rect { radius, .. }) => Some(radius.resolve(ctx)),
                 _ => None,
             },
             stroke: node.stroke.as_ref().map(|s| {
-                let c = s.color.resolve(&mut ctx);
-                ([c.r as f32, c.g as f32, c.b as f32], s.width.resolve(&mut ctx))
+                let c = s.color.resolve(ctx);
+                ([c.r as f32, c.g as f32, c.b as f32], s.width.resolve(ctx))
             }),
             pos_anim: tr.position.is_animated(),
             rot_anim: tr.rotation_deg.is_animated(),
@@ -2066,6 +2073,28 @@ fn prop_path_label(p: PropPath) -> &'static str {
     }
 }
 
+/// Which kind of parameter an "add" button creates. The UI's counterpart to
+/// core's `ParamValue`, without carrying a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParamKind {
+    Num,
+    Vec,
+    Color,
+}
+
+impl ParamKind {
+    /// A fresh parameter of this kind, at a neutral value.
+    fn seed(self) -> ParamValue {
+        match self {
+            ParamKind::Num => ParamValue::Num(Value::constant(0.0)),
+            ParamKind::Vec => ParamValue::Vec(Value::constant(Vec2::ZERO)),
+            ParamKind::Color => {
+                ParamValue::Color(Value::constant(MColor::rgba(1.0, 1.0, 1.0, 1.0)))
+            }
+        }
+    }
+}
+
 /// Every script node's current result, keyed by its `(property, tree-path)`
 /// address. `Ok` is the formatted value, `Err` the first line of the error.
 type ScriptResults = HashMap<(PropKind, Vec<usize>), Result<String, String>>;
@@ -2089,6 +2118,8 @@ struct GraphInfo {
     props: Vec<GraphProp>,
     /// (id, name) of every node in the document.
     nodes: Vec<(u64, String)>,
+    /// The selected node's parameter names and kinds, in display order.
+    params: Vec<(String, &'static str)>,
     /// Each script node's result at the current frame, addressed the same way
     /// an edit is: `(property, tree-path)`. Evaluated **here**, against the
     /// document, because `value()`/`wiggle()` need a real `EvalCtx` — a
@@ -2121,10 +2152,23 @@ impl GraphInfo {
         for prop in &props {
             if let Some(expr) = &prop.expr {
                 let mut ctx = EvalCtx::new(doc, frame);
-                collect_scripts(expr, prop.kind, &mut Vec::new(), &mut ctx, &mut script_results);
+                // In this node's context, so a script's `param("x")` previews
+                // the same value it resolves to at render time.
+                ctx.in_node(id, |ctx| {
+                    collect_scripts(expr, prop.kind, &mut Vec::new(), ctx, &mut script_results)
+                });
             }
         }
-        Some(GraphInfo { node_id: id, node_name: node.name.clone(), props, nodes, script_results })
+        let params =
+            node.params.iter().map(|p| (p.name.clone(), p.value.kind_name())).collect();
+        Some(GraphInfo {
+            node_id: id,
+            node_name: node.name.clone(),
+            props,
+            nodes,
+            params,
+            script_results,
+        })
     }
 }
 
@@ -2176,6 +2220,12 @@ enum GraphOp {
     SetRef { kind: PropKind, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
     /// Set the script source at `path`.
     SetScript { kind: PropKind, path: Vec<usize>, src: String },
+    /// Point a `param` node at a parameter of the node that owns the property.
+    SetParam { kind: PropKind, path: Vec<usize>, name: String },
+    /// Add a parameter to the selected node, seeded with a neutral value.
+    AddParam { name: String, kind: ParamKind },
+    /// Remove a parameter. Expressions reading it aren't rewritten — they warn.
+    RemoveParam { name: String },
 }
 
 #[derive(Default)]
@@ -2197,6 +2247,7 @@ fn box_height(expr: &Expr) -> f32 {
     match expr {
         Expr::Ref { .. } => 100.0,
         Expr::Script(_) => 66.0,
+        Expr::Param { .. } => 66.0,
         Expr::Lit(_) => 50.0,
         Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
     }
@@ -2271,6 +2322,8 @@ fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, out: &mut G
     };
     ui.weak(format!("Node: {}  ·  drag a node to arrange", info.node_name));
     ui.separator();
+    let param_names = params_ui(ui, info, out);
+    ui.separator();
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -2300,6 +2353,7 @@ fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, out: &mut G
                         prop.kind,
                         frame,
                         &info.nodes,
+                        &param_names,
                         &info.script_results,
                         out,
                     );
@@ -2328,6 +2382,7 @@ fn expr_canvas(
     kind: PropKind,
     frame: f64,
     nodes: &[(u64, String)],
+    params: &[String],
     results: &ScriptResults,
     out: &mut GraphEdits,
 ) {
@@ -2393,7 +2448,7 @@ fn expr_canvas(
             egui::StrokeKind::Inside,
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
-        expr_box(&mut child, node, kind, frame, &b.path, nodes, results, out);
+        expr_box(&mut child, node, kind, frame, &b.path, nodes, params, results, out);
     }
 
     ui.data_mut(|d| d.insert_temp(mem_id, positions));
@@ -2410,6 +2465,7 @@ fn expr_box(
     frame: f64,
     path: &[usize],
     nodes: &[(u64, String)],
+    params: &[String],
     results: &ScriptResults,
     out: &mut GraphEdits,
 ) {
@@ -2429,11 +2485,102 @@ fn expr_box(
         Expr::Ref { node, prop, time_offset } => {
             ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
         }
+        Expr::Param { name, .. } => param_editor(ui, name, params, kind, path, out),
         Expr::Script(src) => {
             let result = results.get(&(kind, path.to_vec()));
             script_editor(ui, src, frame, result, kind, path, out)
         }
         _ => {}
+    }
+}
+
+/// The selected node's parameters: what exists, plus add/remove. Returns the
+/// names, which the `param` nodes below use to populate their picker.
+///
+/// Parameters live here rather than in the properties panel because they only
+/// mean anything to expressions — a knob nothing reads is noise in a list of
+/// real properties.
+fn params_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdits) -> Vec<String> {
+    let names: Vec<String> = info.params.iter().map(|(n, _)| n.clone()).collect();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Parameters");
+        // The new parameter's name is typed into egui memory, so the panel
+        // stays a pure function of the document (the same rule as the canvas'
+        // box positions).
+        let buf_id = egui::Id::new(("param_new", info.node_id.0));
+        let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id).unwrap_or_default());
+        ui.add(
+            egui::TextEdit::singleline(&mut buf).hint_text("new name").desired_width(90.0),
+        );
+        for (label, kind) in
+            [("+num", ParamKind::Num), ("+vec", ParamKind::Vec), ("+col", ParamKind::Color)]
+        {
+            let taken = names.contains(&buf);
+            let ok = !buf.trim().is_empty() && !taken;
+            if ui
+                .add_enabled(ok, egui::Button::new(label).small())
+                .on_disabled_hover_text(if taken {
+                    "that name is taken"
+                } else {
+                    "type a name first"
+                })
+                .clicked()
+            {
+                out.op = Some(GraphOp::AddParam { name: buf.trim().to_string(), kind });
+                buf.clear();
+            }
+        }
+        ui.data_mut(|d| d.insert_temp(buf_id, buf));
+    });
+    if info.params.is_empty() {
+        ui.weak("None. A parameter is a named knob expressions can read.");
+    }
+    for (name, kind) in &info.params {
+        ui.horizontal(|ui| {
+            if ui.small_button("x").on_hover_text("Remove").clicked() {
+                out.op = Some(GraphOp::RemoveParam { name: name.clone() });
+            }
+            ui.label(name);
+            ui.weak(*kind);
+        });
+    }
+    names
+}
+
+/// Pick which of the owning node's parameters this node reads. A combo rather
+/// than a free-text field: the parameters that exist are knowable, and a typo
+/// would only surface as a warning at render time.
+fn param_editor(
+    ui: &mut egui::Ui,
+    name: &str,
+    params: &[String],
+    kind: PropKind,
+    path: &[usize],
+    out: &mut GraphEdits,
+) {
+    if params.is_empty() {
+        ui.weak("no parameters");
+        ui.small("add one above");
+        return;
+    }
+    egui::ComboBox::from_id_salt(("pn", kind.label(), path))
+        .width(120.0)
+        .selected_text(if name.is_empty() { "(pick)" } else { name })
+        .show_ui(ui, |ui| {
+            for p in params {
+                if ui.selectable_label(p == name, p).clicked() && p != name {
+                    out.op = Some(GraphOp::SetParam {
+                        kind,
+                        path: path.to_vec(),
+                        name: p.clone(),
+                    });
+                }
+            }
+        });
+    // A name that no longer matches any parameter (renamed or removed) would
+    // otherwise look like a valid pick.
+    if !name.is_empty() && !params.iter().any(|p| p == name) {
+        ui.colored_label(egui::Color32::from_rgb(220, 90, 90), format!("'{name}' is gone"));
     }
 }
 
@@ -2621,6 +2768,19 @@ fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, frame: i64)
             edit_expr(doc, selected, kind, &path, |e| {
                 *e = Expr::Ref { node, prop, time_offset: offset }
             });
+        }
+        GraphOp::AddParam { name, kind } => {
+            if let Some(node) = doc.root.find_mut(selected) {
+                node.set_param(name, kind.seed());
+            }
+        }
+        GraphOp::RemoveParam { name } => {
+            if let Some(node) = doc.root.find_mut(selected) {
+                node.remove_param(&name);
+            }
+        }
+        GraphOp::SetParam { kind, path, name } => {
+            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Param { node: None, name });
         }
         GraphOp::SetScript { kind, path, src } => {
             edit_expr(doc, selected, kind, &path, |e| *e = Expr::Script(src));
@@ -4251,7 +4411,7 @@ mod tests {
     fn resolved_opacity(doc: &Document, id: NodeId) -> f64 {
         let node = doc.root.find(id).unwrap();
         let mut ctx = EvalCtx::new(doc, 0.0);
-        node.transform.opacity.resolve(&mut ctx)
+        ctx.in_node(node.id, |ctx| node.transform.opacity.resolve(ctx))
     }
 
     #[test]
@@ -4335,6 +4495,55 @@ mod tests {
         let err = info.script_results[&(PropKind::Opacity, vec![])].clone().unwrap_err();
         assert!(err.contains("nope"), "{err}");
         assert!(!err.contains('\n'), "one line, so it fits under the field");
+    }
+
+    #[test]
+    fn add_param_then_remove_it_through_the_graph_ops() {
+        let (mut doc, id) = graph_doc(Value::constant(0.5));
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::AddParam { name: "gain".into(), kind: ParamKind::Num },
+            0,
+        );
+        assert!(doc.root.find(id).unwrap().param("gain").is_some());
+        // The panel lists it, so a `param` node can pick it.
+        let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+        assert_eq!(info.params, vec![("gain".to_string(), "number")]);
+
+        apply_graph_op(&mut doc, id, GraphOp::RemoveParam { name: "gain".into() }, 0);
+        assert!(doc.root.find(id).unwrap().param("gain").is_none());
+    }
+
+    #[test]
+    fn a_param_node_drives_a_property_end_to_end() {
+        // The whole flow through the panel's ops: add a knob, point the
+        // property's expression at it, and see the property take its value.
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::AddParam { name: "gain".into(), kind: ParamKind::Num },
+            0,
+        );
+        doc.root
+            .find_mut(id)
+            .unwrap()
+            .set_param("gain", ParamValue::Num(Value::constant(0.8)));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Param },
+            0,
+        );
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetParam { kind: PropKind::Opacity, path: vec![], name: "gain".into() },
+            0,
+        );
+        assert_eq!(resolved_opacity(&doc, id), 0.8);
     }
 
     #[test]
