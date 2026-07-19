@@ -2066,6 +2066,7 @@ struct GraphProp {
 /// every node (for a reference target picker). Cloned before the UI pass so the
 /// panel never borrows `App`.
 struct GraphInfo {
+    node_id: NodeId,
     node_name: String,
     props: Vec<GraphProp>,
     /// (id, name) of every node in the document.
@@ -2074,7 +2075,8 @@ struct GraphInfo {
 
 impl GraphInfo {
     fn gather(doc: &Document, selected: Option<NodeId>) -> Option<GraphInfo> {
-        let node = doc.root.find(selected?)?;
+        let id = selected?;
+        let node = doc.root.find(id)?;
         let props = PropKind::ALL
             .iter()
             .filter_map(|&kind| {
@@ -2090,7 +2092,7 @@ impl GraphInfo {
             .collect();
         let mut nodes = Vec::new();
         collect_nodes(&doc.root, &mut nodes);
-        Some(GraphInfo { node_name: node.name.clone(), props, nodes })
+        Some(GraphInfo { node_id: id, node_name: node.name.clone(), props, nodes })
     }
 }
 
@@ -2115,6 +2117,8 @@ enum GraphOp {
     SetLit { kind: PropKind, path: Vec<usize>, value: ExprValue },
     /// Set the reference at `path`.
     SetRef { kind: PropKind, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
+    /// Set the script source at `path`.
+    SetScript { kind: PropKind, path: Vec<usize>, src: String },
 }
 
 #[derive(Default)]
@@ -2122,54 +2126,77 @@ struct GraphEdits {
     op: Option<GraphOp>,
 }
 
-// Canvas geometry (logical points). A node box sits at
-// (depth·COL_W, row·ROW_H) inside the scrolled content.
-const GRAPH_COL_W: f32 = 150.0;
-const GRAPH_ROW_H: f32 = 58.0;
-const GRAPH_BOX_W: f32 = 132.0;
-const GRAPH_BOX_H: f32 = 46.0;
+// Canvas geometry (logical points). A node box sits at (depth·COL_W, y) inside
+// the scrolled content; its *height* varies by kind (see `box_height`).
+const GRAPH_COL_W: f32 = 172.0;
+const GRAPH_BOX_W: f32 = 152.0;
+const GRAPH_V_GAP: f32 = 12.0;
 const GRAPH_MARGIN: f32 = 10.0;
 
-/// A node's slot in the auto-laid-out expression tree: its `path`, tree `depth`
-/// (its column), and a vertical `row` (leaves take successive rows; a parent
-/// centres over its children). Positionless — pixels are `depth`/`row` × the
-/// canvas spacing — so the layout is a pure function of the tree, and tested.
+/// How tall a node's box needs to be, by kind — enough for its controls. A
+/// `ref` node stacks three pickers plus an offset, a `script` a field and its
+/// result line, a `value` its editor, and an operator just its kind picker.
+fn box_height(expr: &Expr) -> f32 {
+    match expr {
+        Expr::Ref { .. } => 100.0,
+        Expr::Script(_) => 66.0,
+        Expr::Lit(_) => 50.0,
+        Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
+    }
+}
+
+/// A node's place in the auto-laid-out expression tree: its `path`, tree `depth`
+/// (its column), and its box's `y` top and `height` (in content-local points).
+/// The layout is a pure function of the tree, so it's unit-tested.
 struct ExprBox {
     path: Vec<usize>,
     depth: usize,
-    row: f32,
+    y: f32,
+    height: f32,
+}
+
+#[cfg(test)]
+impl ExprBox {
+    /// The vertical centre of the box (wires attach here). Used by the layout
+    /// tests; the canvas derives the same point from each box's rect.
+    fn center_y(&self) -> f32 {
+        self.y + self.height / 2.0
+    }
 }
 
 /// Lay an expression tree out as a tidy tree: root on the left, children to the
-/// right, leaves stacked top-to-bottom and parents centred over their span.
+/// right, leaves stacked top-to-bottom (each reserving its own height + a gap)
+/// and every parent centred on the span of its children.
 fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
+    // Returns the laid-out node's centre-y, so a parent can centre on its kids.
     fn rec(
         expr: &Expr,
         path: &mut Vec<usize>,
         depth: usize,
-        next_row: &mut f32,
+        cursor_y: &mut f32,
         out: &mut Vec<ExprBox>,
     ) -> f32 {
-        let arity = expr.arity();
-        let row = if arity == 0 {
-            let r = *next_row;
-            *next_row += 1.0;
-            r
+        let height = box_height(expr);
+        if expr.arity() == 0 {
+            let y = *cursor_y;
+            *cursor_y += height + GRAPH_V_GAP;
+            out.push(ExprBox { path: path.clone(), depth, y, height });
+            y + height / 2.0
         } else {
             let (mut first, mut last) = (0.0, 0.0);
-            for slot in 0..arity {
+            for slot in 0..expr.arity() {
                 path.push(slot);
-                let cr = rec(child_ref(expr, slot).unwrap(), path, depth + 1, next_row, out);
+                let c = rec(child_ref(expr, slot).unwrap(), path, depth + 1, cursor_y, out);
                 path.pop();
                 if slot == 0 {
-                    first = cr;
+                    first = c;
                 }
-                last = cr;
+                last = c;
             }
-            (first + last) / 2.0
-        };
-        out.push(ExprBox { path: path.clone(), depth, row });
-        row
+            let center = (first + last) / 2.0;
+            out.push(ExprBox { path: path.clone(), depth, y: center - height / 2.0, height });
+            center
+        }
     }
     let mut out = Vec::new();
     rec(expr, &mut Vec::new(), 0, &mut 0.0, &mut out);
@@ -2178,84 +2205,118 @@ fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
 
 /// The expression/node-graph panel: for the selected node, promote a property to
 /// an expression, edit its tree on a node canvas, or bake it back to a constant.
-fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
+fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, out: &mut GraphEdits) {
     ui.add_space(8.0);
     ui.heading("Graph");
     let Some(info) = info else {
         ui.weak("Select a node to drive its properties with expressions.");
         return;
     };
-    ui.weak(format!("Node: {}", info.node_name));
+    ui.weak(format!("Node: {}  ·  drag a node to arrange", info.node_name));
     ui.separator();
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        for prop in &info.props {
-            ui.horizontal(|ui| {
-                ui.strong(prop.label);
-                if prop.is_expr {
-                    if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
-                        out.op = Some(GraphOp::Bake(prop.kind));
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for prop in &info.props {
+                ui.horizontal(|ui| {
+                    ui.strong(prop.label);
+                    if prop.is_expr {
+                        if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
+                            out.op = Some(GraphOp::Bake(prop.kind));
+                        }
+                        if let Some(printed) = &prop.printed {
+                            ui.weak(format!("= {printed}"));
+                        }
+                    } else if ui
+                        .small_button("= fx")
+                        .on_hover_text("Drive with an expression")
+                        .clicked()
+                    {
+                        out.op = Some(GraphOp::Promote(prop.kind));
                     }
-                    if let Some(printed) = &prop.printed {
-                        ui.weak(format!("= {printed}"));
-                    }
-                } else if ui
-                    .small_button("= fx")
-                    .on_hover_text("Drive with an expression")
-                    .clicked()
-                {
-                    out.op = Some(GraphOp::Promote(prop.kind));
+                });
+                if let Some(expr) = &prop.expr {
+                    expr_canvas(ui, expr, info.node_id, prop.kind, frame, &info.nodes, out);
+                    ui.separator();
                 }
-            });
-            if let Some(expr) = &prop.expr {
-                expr_canvas(ui, expr, prop.kind, &info.nodes, out);
-                ui.separator();
             }
-        }
-    });
+        });
 }
 
-/// Draw one property's expression as a node canvas: boxes at their laid-out
-/// positions, wires from each node's output (right) to its parent's input
-/// (left), and a compact editor inside each box. Every control reports a
-/// [`GraphOp`] against the node's tree-path; nothing mutates here.
+/// Manually-placed node positions for one property's canvas, in content-local
+/// points. Absent entries fall back to the auto-layout; this is ephemeral view
+/// state (egui memory), not saved with the document.
+type GraphPositions = std::collections::HashMap<Vec<usize>, egui::Vec2>;
+
+/// Draw one property's expression as a node canvas: boxes at their positions
+/// (auto-laid-out, or wherever the user has dragged them), wires from each
+/// node's output (right) to its parent's input (left), and a compact editor
+/// inside each box. Every editor control reports a [`GraphOp`] against the
+/// node's tree-path; dragging updates only the (ephemeral) position memory —
+/// neither mutates the document here.
+#[allow(clippy::too_many_arguments)]
 fn expr_canvas(
     ui: &mut egui::Ui,
     expr: &Expr,
+    node_id: NodeId,
     kind: PropKind,
+    frame: f64,
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
 ) {
     let boxes = layout_expr(expr);
-    let cols = boxes.iter().map(|b| b.depth).max().unwrap_or(0) + 1;
-    let rows = boxes.iter().map(|b| b.row).fold(0.0, f32::max) + 1.0;
-    let content = egui::vec2(
-        cols as f32 * GRAPH_COL_W + GRAPH_MARGIN,
-        rows * GRAPH_ROW_H + GRAPH_MARGIN,
-    );
-    let (area, _) = ui.allocate_exact_size(content, egui::Sense::hover());
-    let origin = area.min + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN);
-    let box_at = |b: &ExprBox| {
-        egui::Rect::from_min_size(
-            egui::pos2(origin.x + b.depth as f32 * GRAPH_COL_W, origin.y + b.row * GRAPH_ROW_H),
-            egui::vec2(GRAPH_BOX_W, GRAPH_BOX_H),
-        )
+
+    // Positions are remembered per (node, property) in egui memory; a box with
+    // no stored position falls back to its auto-layout slot (column × its y).
+    let mem_id = ui.id().with(("graphpos", node_id.0, kind.label()));
+    let mut positions: GraphPositions =
+        ui.data(|d| d.get_temp::<GraphPositions>(mem_id)).unwrap_or_default();
+    let pos_of = |b: &ExprBox, positions: &GraphPositions| {
+        positions
+            .get(&b.path)
+            .copied()
+            .unwrap_or_else(|| egui::vec2(b.depth as f32 * GRAPH_COL_W, b.y))
     };
+    // A box's rect at content-local top-left `p`, using its own (kind-based) height.
+    let rect_of = |b: &ExprBox, p: egui::Vec2, origin: egui::Pos2| {
+        egui::Rect::from_min_size(origin + p, egui::vec2(GRAPH_BOX_W, b.height))
+    };
+
+    // Content bounds cover every box (including dragged-out ones) so the scroll
+    // area can reach them.
+    let mut extent = egui::vec2(0.0, 0.0);
+    for b in &boxes {
+        let p = pos_of(b, &positions);
+        extent.x = extent.x.max(p.x + GRAPH_BOX_W);
+        extent.y = extent.y.max(p.y + b.height);
+    }
+    let (area, _) = ui.allocate_exact_size(extent + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN), egui::Sense::hover());
+    let origin = area.min + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN);
 
     // Wires under the boxes: each node's left-centre to its parent's right-centre.
     let wire = ui.visuals().weak_text_color();
     for b in &boxes {
         if let Some((_, parent_path)) = b.path.split_last() {
             if let Some(pb) = boxes.iter().find(|x| x.path == parent_path) {
-                let child_in = box_at(b).left_center();
-                let parent_out = box_at(pb).right_center();
+                let child_in = rect_of(b, pos_of(b, &positions), origin).left_center();
+                let parent_out = rect_of(pb, pos_of(pb, &positions), origin).right_center();
                 ui.painter().line_segment([parent_out, child_in], egui::Stroke::new(1.5, wire));
             }
         }
     }
 
-    // Boxes on top, each an inline editor placed at its rect.
+    // Boxes on top: a drag response for the box body, then the editor widgets
+    // (which take pointer priority where they sit, so dragging an empty part of
+    // the box moves it while the controls stay usable).
     for b in &boxes {
-        let rect = box_at(b);
+        let mut p = pos_of(b, &positions);
+        let drag_id = ui.id().with(("graphbox", node_id.0, kind.label(), b.path.as_slice()));
+        let resp = ui.interact(rect_of(b, p, origin), drag_id, egui::Sense::drag());
+        if resp.dragged() {
+            p = (p + resp.drag_delta()).max(egui::vec2(0.0, 0.0));
+            positions.insert(b.path.clone(), p);
+        }
+        let rect = rect_of(b, p, origin);
         let node = expr.at(&b.path).unwrap_or(expr);
         ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
         ui.painter().rect_stroke(
@@ -2265,17 +2326,21 @@ fn expr_canvas(
             egui::StrokeKind::Inside,
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
-        expr_box(&mut child, node, kind, &b.path, nodes, out);
+        expr_box(&mut child, node, kind, frame, &b.path, nodes, out);
     }
+
+    ui.data_mut(|d| d.insert_temp(mem_id, positions));
 }
 
 /// The controls inside one canvas box: a kind picker, and a compact editor for a
 /// `Lit`/`Ref`. Operators (`Add`/`Mul`/`Neg`) show only their kind — their
 /// inputs are separate boxes wired in.
+#[allow(clippy::too_many_arguments)]
 fn expr_box(
     ui: &mut egui::Ui,
     expr: &Expr,
     kind: PropKind,
+    frame: f64,
     path: &[usize],
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
@@ -2296,7 +2361,39 @@ fn expr_box(
         Expr::Ref { node, prop, time_offset } => {
             ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
         }
+        Expr::Script(src) => script_editor(ui, src, frame, kind, path, out),
         _ => {}
+    }
+}
+
+/// A one-line Rhai editor with live feedback: below the field, the value the
+/// script currently evaluates to, or the error (in red) if it doesn't compile.
+fn script_editor(
+    ui: &mut egui::Ui,
+    src: &str,
+    frame: f64,
+    kind: PropKind,
+    path: &[usize],
+    out: &mut GraphEdits,
+) {
+    let mut text = src.to_string();
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .hint_text("frame * 2.0")
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace),
+    );
+    if resp.changed() {
+        out.op = Some(GraphOp::SetScript { kind, path: path.to_vec(), src: text.clone() });
+    }
+    match motion_core::eval_script(&text, frame) {
+        Ok(v) => {
+            ui.weak(format!("= {v}"));
+        }
+        Err(e) => {
+            let msg = e.lines().next().unwrap_or("error").to_string();
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), msg);
+        }
     }
 }
 
@@ -2420,6 +2517,9 @@ fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, frame: i64)
             edit_expr(doc, selected, kind, &path, |e| {
                 *e = Expr::Ref { node, prop, time_offset: offset }
             });
+        }
+        GraphOp::SetScript { kind, path, src } => {
+            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Script(src));
         }
     }
 }
@@ -3297,7 +3397,7 @@ impl App {
                     Editor::Properties => {
                         properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
                     }
-                    Editor::Graph => graph_ui(ui, &graph_info, &mut graph_edits),
+                    Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
                     // vello paints here; egui only measures the hole.
                     Editor::Canvas => canvas_pts = Some(ui.max_rect()),
                 },
@@ -4099,38 +4199,80 @@ mod tests {
     }
 
     #[test]
-    fn layout_places_leaves_in_rows_and_centres_parents() {
-        // A single leaf: one box at the origin.
+    fn layout_stacks_leaves_and_centres_parents() {
+        // A single leaf: one box at the top-left column.
         let single = layout_expr(&Expr::num(1.0));
         assert_eq!(single.len(), 1);
-        assert_eq!((single[0].depth, single[0].row), (0, 0.0));
+        assert_eq!((single[0].depth, single[0].y), (0, 0.0));
 
-        // Add(Lit, Lit): two leaves stacked, the operator centred between them.
+        // Add(Lit, Lit): two leaves stacked (the second below the first by at
+        // least the first's height), the operator centred between them.
         let add = layout_expr(&Expr::Add(Box::new(Expr::num(1.0)), Box::new(Expr::num(2.0))));
         assert_eq!(add.len(), 3);
-        assert_eq!(box_at_path(&add, &[]).depth, 0);
-        assert_eq!(box_at_path(&add, &[0]).row, 0.0);
-        assert_eq!(box_at_path(&add, &[1]).row, 1.0);
-        assert_eq!(box_at_path(&add, &[]).row, 0.5, "operator centred over its inputs");
-        assert_eq!(box_at_path(&add, &[0]).depth, 1, "inputs one column right");
+        let (root, a, b) = (
+            box_at_path(&add, &[]),
+            box_at_path(&add, &[0]),
+            box_at_path(&add, &[1]),
+        );
+        assert_eq!((root.depth, a.depth), (0, 1), "inputs one column right");
+        assert_eq!(a.y, 0.0);
+        assert!(b.y >= a.y + a.height, "second leaf clears the first");
+        assert!(
+            (root.center_y() - (a.center_y() + b.center_y()) / 2.0).abs() < 1e-4,
+            "operator centred over its inputs"
+        );
     }
 
     #[test]
     fn layout_handles_a_nested_tree() {
-        // Add(Lit, Mul(Lit, Lit)): three leaves in rows 0,1,2; Mul centred on
-        // 1.5; root centred on (0 + 1.5)/2 = 0.75.
+        // Add(Lit, Mul(Lit, Lit)): three leaves stacked top-to-bottom; each
+        // parent centred on its children's span.
         let e = Expr::Add(
             Box::new(Expr::num(1.0)),
             Box::new(Expr::Mul(Box::new(Expr::num(2.0)), Box::new(Expr::num(3.0)))),
         );
         let boxes = layout_expr(&e);
         assert_eq!(boxes.len(), 5);
-        assert_eq!(box_at_path(&boxes, &[0]).row, 0.0);
-        assert_eq!(box_at_path(&boxes, &[1, 0]).row, 1.0);
-        assert_eq!(box_at_path(&boxes, &[1, 1]).row, 2.0);
-        assert_eq!(box_at_path(&boxes, &[1]).row, 1.5, "Mul centred over its two inputs");
-        assert_eq!(box_at_path(&boxes, &[]).row, 0.75, "root centred over its span");
+        let cy = |p: &[usize]| box_at_path(&boxes, p).center_y();
+        assert!(cy(&[0]) < cy(&[1, 0]) && cy(&[1, 0]) < cy(&[1, 1]), "leaves stacked in order");
+        assert!((cy(&[1]) - (cy(&[1, 0]) + cy(&[1, 1])) / 2.0).abs() < 1e-4, "Mul centred");
+        assert!((cy(&[]) - (cy(&[0]) + cy(&[1])) / 2.0).abs() < 1e-4, "root centred on its span");
         assert_eq!(box_at_path(&boxes, &[1, 1]).depth, 2, "deepest column");
+    }
+
+    #[test]
+    fn taller_nodes_reserve_more_vertical_room() {
+        // A ref node is taller than a value node, and the leaf stacked below it
+        // clears its full height (so their boxes don't overlap).
+        let e = Expr::Add(
+            Box::new(Expr::reference(NodeId(1), PropPath::Position)),
+            Box::new(Expr::num(0.0)),
+        );
+        let boxes = layout_expr(&e);
+        let refb = box_at_path(&boxes, &[0]);
+        let litb = box_at_path(&boxes, &[1]);
+        assert!(refb.height > litb.height, "a ref box is taller than a value box");
+        assert!(litb.y >= refb.y + refb.height, "the box below clears the taller one");
+    }
+
+    #[test]
+    fn set_script_drives_a_property_from_the_frame() {
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Script },
+            0,
+        );
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetScript { kind: PropKind::Opacity, path: vec![], src: "frame + 0.25".into() },
+            0,
+        );
+        // resolved_opacity samples at frame 0, so the script yields 0.25.
+        assert!((resolved_opacity(&doc, id) - 0.25).abs() < 1e-9);
     }
 
     #[test]

@@ -171,6 +171,10 @@ pub enum Expr {
     Add(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
     Neg(Box<Expr>),
+    /// A Rhai script, evaluated each frame with `frame`/`time` in scope. Returns
+    /// a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`). A leaf: it
+    /// pulls its inputs from `frame`, not from wired-in child nodes.
+    Script(String),
 }
 
 impl Expr {
@@ -196,6 +200,7 @@ impl Expr {
             Expr::Add(..) => ExprKind::Add,
             Expr::Mul(..) => ExprKind::Mul,
             Expr::Neg(..) => ExprKind::Neg,
+            Expr::Script(_) => ExprKind::Script,
         }
     }
 
@@ -214,6 +219,7 @@ impl Expr {
             ExprKind::Add => Expr::Add(Box::new(Expr::num(0.0)), Box::new(Expr::num(0.0))),
             ExprKind::Mul => Expr::Mul(Box::new(Expr::num(1.0)), Box::new(Expr::num(1.0))),
             ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
+            ExprKind::Script => Expr::Script(String::new()),
         }
     }
 
@@ -223,7 +229,7 @@ impl Expr {
         match self {
             Expr::Add(..) | Expr::Mul(..) => 2,
             Expr::Neg(..) => 1,
-            Expr::Lit(_) | Expr::Ref { .. } => 0,
+            Expr::Lit(_) | Expr::Ref { .. } | Expr::Script(_) => 0,
         }
     }
 
@@ -264,12 +270,19 @@ pub enum ExprKind {
     Add,
     Mul,
     Neg,
+    Script,
 }
 
 impl ExprKind {
     /// Every kind, in picker order.
-    pub const ALL: [ExprKind; 5] =
-        [ExprKind::Lit, ExprKind::Ref, ExprKind::Add, ExprKind::Mul, ExprKind::Neg];
+    pub const ALL: [ExprKind; 6] = [
+        ExprKind::Lit,
+        ExprKind::Ref,
+        ExprKind::Add,
+        ExprKind::Mul,
+        ExprKind::Neg,
+        ExprKind::Script,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -278,6 +291,7 @@ impl ExprKind {
             ExprKind::Add => "add",
             ExprKind::Mul => "mul",
             ExprKind::Neg => "neg",
+            ExprKind::Script => "script",
         }
     }
 }
@@ -308,7 +322,60 @@ impl fmt::Display for Expr {
             Expr::Add(a, b) => write!(f, "({a} + {b})"),
             Expr::Mul(a, b) => write!(f, "({a} * {b})"),
             Expr::Neg(a) => write!(f, "-{a}"),
+            Expr::Script(src) => write!(f, "{{ {src} }}"),
         }
+    }
+}
+
+thread_local! {
+    /// One Rhai engine per thread, reused across evaluations. Building an engine
+    /// isn't free, and resolving runs on the (single) render thread.
+    static SCRIPT_ENGINE: rhai::Engine = rhai::Engine::new();
+}
+
+/// Evaluate a Rhai `src` at `frame`, with `frame` and `time` in scope as
+/// constants. The script's result becomes an [`ExprValue`]: a number → `Num`, a
+/// 2/3/4-element array → `Vec2`/`Color`. Returns a message on a compile-time,
+/// run-time, or return-type error — the UI surfaces it; [`eval_expr`] falls back
+/// to a neutral value so a bad script never breaks the frame.
+pub fn eval_script(src: &str, frame: f64) -> Result<ExprValue, String> {
+    SCRIPT_ENGINE.with(|engine| {
+        let mut scope = rhai::Scope::new();
+        scope.push_constant("frame", frame);
+        scope.push_constant("time", frame);
+        let out: rhai::Dynamic =
+            engine.eval_with_scope(&mut scope, src).map_err(|e| e.to_string())?;
+        dynamic_to_expr_value(&out)
+    })
+}
+
+fn dynamic_to_expr_value(d: &rhai::Dynamic) -> Result<ExprValue, String> {
+    if let Ok(f) = d.as_float() {
+        return Ok(ExprValue::Num(f));
+    }
+    if let Ok(i) = d.as_int() {
+        return Ok(ExprValue::Num(i as f64));
+    }
+    if d.is_array() {
+        let arr = d.clone().into_array().map_err(|_| "expected an array".to_string())?;
+        let nums = arr.iter().map(dynamic_to_num).collect::<Result<Vec<f64>, String>>()?;
+        return match nums.as_slice() {
+            [x, y] => Ok(ExprValue::Vec2(kurbo::Vec2::new(*x, *y))),
+            [r, g, b] => Ok(ExprValue::Color(Color::rgb(*r, *g, *b))),
+            [r, g, b, a] => Ok(ExprValue::Color(Color::rgba(*r, *g, *b, *a))),
+            _ => Err("array must have 2 (vec), 3 or 4 (color) numbers".into()),
+        };
+    }
+    Err("script must return a number or an array".into())
+}
+
+fn dynamic_to_num(d: &rhai::Dynamic) -> Result<f64, String> {
+    if let Ok(f) = d.as_float() {
+        Ok(f)
+    } else if let Ok(i) = d.as_int() {
+        Ok(i as f64)
+    } else {
+        Err("array element is not a number".into())
     }
 }
 
@@ -437,6 +504,9 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
             a.zip(b, |x, y| x * y)
         }
         Expr::Neg(a) => eval_expr(a, ctx).map(|x| -x),
+        // A bad script (compile/run/type error) falls back to a neutral value
+        // rather than breaking the frame; the editor shows the error.
+        Expr::Script(src) => eval_script(src, ctx.frame).unwrap_or(ExprValue::Num(0.0)),
     }
 }
 
@@ -563,7 +633,7 @@ mod tests {
             let expected = match k {
                 ExprKind::Add | ExprKind::Mul => 2,
                 ExprKind::Neg => 1,
-                ExprKind::Lit | ExprKind::Ref => 0,
+                ExprKind::Lit | ExprKind::Ref | ExprKind::Script => 0,
             };
             assert_eq!(e.arity(), expected, "{k:?}");
         }
@@ -594,6 +664,40 @@ mod tests {
             Expr::reference_at(NodeId(2), PropPath::Rotation, 5.0).to_string(),
             "@2.Rotation[+5]"
         );
+    }
+
+    #[test]
+    fn a_script_evaluates_against_the_frame() {
+        // Number result → Num, read from `frame`.
+        let v: Value<f64> = Value::expr(Expr::Script("frame * 2.0".into()));
+        let mut ctx = EvalCtx::at(5.0);
+        assert_eq!(v.resolve(&mut ctx), 10.0);
+        // `time` is an alias for `frame`.
+        assert_eq!(eval_script("time + 1", 4.0).unwrap(), ExprValue::Num(5.0));
+    }
+
+    #[test]
+    fn a_script_array_becomes_a_vec_or_color() {
+        assert_eq!(
+            eval_script("[frame, frame * 2.0]", 3.0).unwrap(),
+            ExprValue::Vec2(kurbo::Vec2::new(3.0, 6.0))
+        );
+        assert_eq!(
+            eval_script("[1.0, 0.5, 0.0]", 0.0).unwrap(),
+            ExprValue::Color(Color::rgb(1.0, 0.5, 0.0))
+        );
+    }
+
+    #[test]
+    fn a_bad_script_errors_but_does_not_break_the_frame() {
+        // A syntax error is reported by eval_script...
+        assert!(eval_script("frame *", 0.0).is_err());
+        // ...and resolves to the neutral fallback rather than panicking.
+        let v: Value<f64> = Value::expr(Expr::Script("this is not rhai".into()));
+        let mut ctx = EvalCtx::at(0.0);
+        assert_eq!(v.resolve(&mut ctx), 0.0);
+        // A wrong return type (string) is also an error.
+        assert!(eval_script("\"hello\"", 0.0).is_err());
     }
 
     #[test]

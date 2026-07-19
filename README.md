@@ -5,7 +5,9 @@ A blend of After Effects, Figma, Animate, and Cavalry. Rust engine.
 
 > **Status:** working single-window editor. You can build a composition from
 > scratch, animate it with frame-accurate keyframes + editable easing,
-> scrub/play, and save/load.
+> scrub/play, and save/load — with a **splittable dockable-panel** workspace and
+> an **expression / node-graph** editor (including Rhai script nodes) driving any
+> property.
 > Repo: https://github.com/AldaGs/painbychoice
 
 ---
@@ -157,6 +159,21 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   cubic-bezier editor for its outgoing segment: draggable control points +
   Linear/Smooth/Ease In/Ease Out presets. Deliberately hidden for a multi-key
   selection: a segment belongs to one key, so there is no "the" curve for a set.
+- **Dockable panels** — every area carries a header: an editor picker to change
+  what it shows, plus split (`|`/`-`) and close (`x`). Drag the splitters to
+  resize. A **Layout** menu (comp bar) switches between built-in presets
+  (`Default`/`Animation`/`Design`) and saves the current arrangement as a
+  session preset; the active layout and user presets are written into the
+  `.pbc`. The canvas and the comp/transport toolbars are fixed chrome (no
+  header), which keeps the single-canvas invariants safe.
+- **Graph / expressions** — a summonable **Graph** panel (pick it in any area's
+  header) drives the selected node's properties with expressions. `= fx`
+  promotes a property (seeded from its current value); `bake` freezes it back to
+  a constant. The expression is a **node canvas** — boxes wired parent↔child,
+  each a `value` / `ref` (another node's property, at an optional frame offset) /
+  `add` / `mul` / `neg` / **`script`** (a Rhai one-liner over `frame`/`time`,
+  with its live result or error shown). Drag boxes to arrange them. A cycle or a
+  bad script falls back to a neutral value instead of breaking the frame.
 
 ## Key code locations
 
@@ -177,7 +194,8 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   (+provenance).
 - `core/src/expr.rs` — expressions: `EvalCtx` (the resolve context: frame, doc,
   cache, warnings), `ExprValue` + `From`/`ToExpr`, the `Expr` IR, `PropPath`,
-  and `eval_expr` with the memo + cycle-detecting `ResolveCache`.
+  `eval_expr` with the memo + cycle-detecting `ResolveCache`, and `eval_script`
+  (Rhai, on a thread-local engine) for `Expr::Script` nodes.
 - `core/src/demo.rs` — the demo document loaded on launch.
 - `live/src/main.rs` — everything UI. `App::render` is the per-frame heart:
   evaluate → hit-test → gather snapshots → run egui → apply `*Edits` → GPU. Panel
@@ -196,6 +214,11 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   **`prop_of` / `prop_of_mut`** are the single place `PropKind` is matched:
   they hand back a `PropRef`/`PropRefMut` (Vec2 | Num | Color) and every
   keyframe op goes through that. See below.
+  Graph canvas: `layout_expr` (tidy-tree placement, `box_height` per kind) +
+  `expr_canvas`/`expr_box` draw it; every edit is one deferred `GraphOp` keyed by
+  `(property, tree-path)` applied by `apply_graph_op` (a free fn over
+  `&mut Document`, so it's unit-tested). Node positions are ephemeral egui-memory
+  view state, not saved with the doc.
 
 ### The panel layout tree
 
@@ -320,7 +343,7 @@ Two rules keep this safe:
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
 UX ✅ → shape/stroke params ✅ → dockable panels ✅ → node graph + expression
-IR (next) → …**. Next up:
+IR 🚧 → …**. Next up:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -398,16 +421,27 @@ IR (next) → …**. Next up:
      drive the selected node's properties with expressions: **`= fx`** promotes a
      property (seeded from its current value), **bake** freezes it back to a
      constant, and the expression is edited on a **node canvas** — boxes wired
-     parent↔child, each with a kind picker (`value`/`ref`/`add`/`mul`/`neg`) and a
-     compact editor; changing one node's kind grows the tree (operators seed
-     neutral inputs). Layout is a tidy-tree auto-placement (`layout_expr`, a
-     tested pure function); edits are deferred `GraphOp`s addressed by
-     `(property, tree-path)` and applied after the UI pass by `apply_graph_op`
-     (a free function, so the whole flow is unit-tested) — the same discipline as
-     the dock. Boxes are auto-placed for now; free dragging + a canvas pan are the
-     next refinement over the same model.
-   - **Rhai scripting** (text expressions) — lowers to the IR that's now in place.
-     Its real cost is the `EvalCtx`-callback bridge, not the syntax.
+     parent↔child, each with a kind picker (`value`/`ref`/`add`/`mul`/`neg`/
+     `script`) and a compact editor; changing one node's kind grows the tree
+     (operators seed neutral inputs). Layout is a tidy-tree auto-placement
+     (`layout_expr`, a tested pure function) where each box's **height varies by
+     kind** (`box_height`) so a `ref`'s three pickers or a `script`'s field +
+     result line get the room they need and the stack stays clear; edits are
+     deferred `GraphOp`s addressed by `(property, tree-path)` and applied after
+     the UI pass by `apply_graph_op` (a free function, so the whole flow is
+     unit-tested) — the same discipline as the dock. Boxes start on the tidy-tree
+     layout and can be **dragged** to rearrange; positions are remembered per
+     (node, property) in egui memory (ephemeral view state, not saved with the
+     document).
+   - ~~**Rhai scripting** (first cut).~~ ✅ Done. A `script` node kind holds Rhai
+     source (`Expr::Script`), evaluated each frame with `frame`/`time` in scope;
+     the result is a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`).
+     `eval_script` runs on a thread-local engine; a bad script resolves to a
+     neutral fallback (never breaks the frame) and the editor shows the error
+     live. **Deliberately time-only for now**: the general `value("A", "prop")`
+     cross-reference needs an `unsafe` thread-local bridge to reach `&mut EvalCtx`
+     from a `'static` Rhai fn (this crate has no `unsafe`), so it — and `wiggle`
+     — are the next scripting step. Use `ref` nodes for cross-property links today.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
