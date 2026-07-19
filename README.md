@@ -404,8 +404,9 @@ IR (next) → …**. Next up:
      tested pure function); edits are deferred `GraphOp`s addressed by
      `(property, tree-path)` and applied after the UI pass by `apply_graph_op`
      (a free function, so the whole flow is unit-tested) — the same discipline as
-     the dock. Boxes are auto-placed for now; free dragging + a canvas pan are the
-     next refinement over the same model.
+     the dock. Boxes start on the tidy-tree layout and can be **dragged** to
+     rearrange; positions are remembered per (node, property) in egui memory
+     (ephemeral view state, not saved with the document).
    - **Rhai scripting** (text expressions) — lowers to the IR that's now in place.
      Its real cost is the `EvalCtx`-callback bridge, not the syntax.
 

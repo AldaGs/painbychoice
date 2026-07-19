@@ -2066,6 +2066,7 @@ struct GraphProp {
 /// every node (for a reference target picker). Cloned before the UI pass so the
 /// panel never borrows `App`.
 struct GraphInfo {
+    node_id: NodeId,
     node_name: String,
     props: Vec<GraphProp>,
     /// (id, name) of every node in the document.
@@ -2074,7 +2075,8 @@ struct GraphInfo {
 
 impl GraphInfo {
     fn gather(doc: &Document, selected: Option<NodeId>) -> Option<GraphInfo> {
-        let node = doc.root.find(selected?)?;
+        let id = selected?;
+        let node = doc.root.find(id)?;
         let props = PropKind::ALL
             .iter()
             .filter_map(|&kind| {
@@ -2090,7 +2092,7 @@ impl GraphInfo {
             .collect();
         let mut nodes = Vec::new();
         collect_nodes(&doc.root, &mut nodes);
-        Some(GraphInfo { node_name: node.name.clone(), props, nodes })
+        Some(GraphInfo { node_id: id, node_name: node.name.clone(), props, nodes })
     }
 }
 
@@ -2185,77 +2187,104 @@ fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
         ui.weak("Select a node to drive its properties with expressions.");
         return;
     };
-    ui.weak(format!("Node: {}", info.node_name));
+    ui.weak(format!("Node: {}  ·  drag a node to arrange", info.node_name));
     ui.separator();
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        for prop in &info.props {
-            ui.horizontal(|ui| {
-                ui.strong(prop.label);
-                if prop.is_expr {
-                    if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
-                        out.op = Some(GraphOp::Bake(prop.kind));
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for prop in &info.props {
+                ui.horizontal(|ui| {
+                    ui.strong(prop.label);
+                    if prop.is_expr {
+                        if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
+                            out.op = Some(GraphOp::Bake(prop.kind));
+                        }
+                        if let Some(printed) = &prop.printed {
+                            ui.weak(format!("= {printed}"));
+                        }
+                    } else if ui
+                        .small_button("= fx")
+                        .on_hover_text("Drive with an expression")
+                        .clicked()
+                    {
+                        out.op = Some(GraphOp::Promote(prop.kind));
                     }
-                    if let Some(printed) = &prop.printed {
-                        ui.weak(format!("= {printed}"));
-                    }
-                } else if ui
-                    .small_button("= fx")
-                    .on_hover_text("Drive with an expression")
-                    .clicked()
-                {
-                    out.op = Some(GraphOp::Promote(prop.kind));
+                });
+                if let Some(expr) = &prop.expr {
+                    expr_canvas(ui, expr, info.node_id, prop.kind, &info.nodes, out);
+                    ui.separator();
                 }
-            });
-            if let Some(expr) = &prop.expr {
-                expr_canvas(ui, expr, prop.kind, &info.nodes, out);
-                ui.separator();
             }
-        }
-    });
+        });
 }
 
-/// Draw one property's expression as a node canvas: boxes at their laid-out
-/// positions, wires from each node's output (right) to its parent's input
-/// (left), and a compact editor inside each box. Every control reports a
-/// [`GraphOp`] against the node's tree-path; nothing mutates here.
+/// Manually-placed node positions for one property's canvas, in content-local
+/// points. Absent entries fall back to the auto-layout; this is ephemeral view
+/// state (egui memory), not saved with the document.
+type GraphPositions = std::collections::HashMap<Vec<usize>, egui::Vec2>;
+
+/// Draw one property's expression as a node canvas: boxes at their positions
+/// (auto-laid-out, or wherever the user has dragged them), wires from each
+/// node's output (right) to its parent's input (left), and a compact editor
+/// inside each box. Every editor control reports a [`GraphOp`] against the
+/// node's tree-path; dragging updates only the (ephemeral) position memory —
+/// neither mutates the document here.
 fn expr_canvas(
     ui: &mut egui::Ui,
     expr: &Expr,
+    node_id: NodeId,
     kind: PropKind,
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
 ) {
     let boxes = layout_expr(expr);
-    let cols = boxes.iter().map(|b| b.depth).max().unwrap_or(0) + 1;
-    let rows = boxes.iter().map(|b| b.row).fold(0.0, f32::max) + 1.0;
-    let content = egui::vec2(
-        cols as f32 * GRAPH_COL_W + GRAPH_MARGIN,
-        rows * GRAPH_ROW_H + GRAPH_MARGIN,
-    );
-    let (area, _) = ui.allocate_exact_size(content, egui::Sense::hover());
-    let origin = area.min + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN);
-    let box_at = |b: &ExprBox| {
-        egui::Rect::from_min_size(
-            egui::pos2(origin.x + b.depth as f32 * GRAPH_COL_W, origin.y + b.row * GRAPH_ROW_H),
-            egui::vec2(GRAPH_BOX_W, GRAPH_BOX_H),
-        )
+
+    // Positions are remembered per (node, property) in egui memory; a box with
+    // no stored position falls back to its auto-layout slot.
+    let mem_id = ui.id().with(("graphpos", node_id.0, kind.label()));
+    let mut positions: GraphPositions =
+        ui.data(|d| d.get_temp::<GraphPositions>(mem_id)).unwrap_or_default();
+    let auto = |b: &ExprBox| egui::vec2(b.depth as f32 * GRAPH_COL_W, b.row * GRAPH_ROW_H);
+    let pos_of = |b: &ExprBox, positions: &GraphPositions| {
+        positions.get(&b.path).copied().unwrap_or_else(|| auto(b))
     };
+
+    // Content bounds cover every box (including dragged-out ones) so the scroll
+    // area can reach them.
+    let mut extent = egui::vec2(0.0, 0.0);
+    for b in &boxes {
+        let p = pos_of(b, &positions);
+        extent.x = extent.x.max(p.x + GRAPH_BOX_W);
+        extent.y = extent.y.max(p.y + GRAPH_BOX_H);
+    }
+    let (area, _) = ui.allocate_exact_size(extent + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN), egui::Sense::hover());
+    let origin = area.min + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN);
+    let rect_of = |p: egui::Vec2| egui::Rect::from_min_size(origin + p, egui::vec2(GRAPH_BOX_W, GRAPH_BOX_H));
 
     // Wires under the boxes: each node's left-centre to its parent's right-centre.
     let wire = ui.visuals().weak_text_color();
     for b in &boxes {
         if let Some((_, parent_path)) = b.path.split_last() {
             if let Some(pb) = boxes.iter().find(|x| x.path == parent_path) {
-                let child_in = box_at(b).left_center();
-                let parent_out = box_at(pb).right_center();
+                let child_in = rect_of(pos_of(b, &positions)).left_center();
+                let parent_out = rect_of(pos_of(pb, &positions)).right_center();
                 ui.painter().line_segment([parent_out, child_in], egui::Stroke::new(1.5, wire));
             }
         }
     }
 
-    // Boxes on top, each an inline editor placed at its rect.
+    // Boxes on top: a drag response for the box body, then the editor widgets
+    // (which take pointer priority where they sit, so dragging an empty part of
+    // the box moves it while the controls stay usable).
     for b in &boxes {
-        let rect = box_at(b);
+        let mut p = pos_of(b, &positions);
+        let drag_id = ui.id().with(("graphbox", node_id.0, kind.label(), b.path.as_slice()));
+        let resp = ui.interact(rect_of(p), drag_id, egui::Sense::drag());
+        if resp.dragged() {
+            p = (p + resp.drag_delta()).max(egui::vec2(0.0, 0.0));
+            positions.insert(b.path.clone(), p);
+        }
+        let rect = rect_of(p);
         let node = expr.at(&b.path).unwrap_or(expr);
         ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
         ui.painter().rect_stroke(
@@ -2267,6 +2296,8 @@ fn expr_canvas(
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
         expr_box(&mut child, node, kind, &b.path, nodes, out);
     }
+
+    ui.data_mut(|d| d.insert_temp(mem_id, positions));
 }
 
 /// The controls inside one canvas box: a kind picker, and a compact editor for a
