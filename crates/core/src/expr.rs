@@ -140,6 +140,35 @@ pub enum PropPath {
 }
 
 impl PropPath {
+    /// The name a script writes: `value("A", "position")`. Also what
+    /// [`std::fmt::Debug`] would give lowercased, but spelled out so renaming a
+    /// variant can't silently change the script-facing vocabulary.
+    pub fn name(self) -> &'static str {
+        match self {
+            PropPath::Position => "position",
+            PropPath::Rotation => "rotation",
+            PropPath::Scale => "scale",
+            PropPath::Opacity => "opacity",
+            PropPath::Anchor => "anchor",
+            PropPath::Fill => "fill",
+        }
+    }
+
+    /// Parse a script-facing property name, case-insensitively.
+    pub fn parse(s: &str) -> Option<PropPath> {
+        let s = s.trim().to_ascii_lowercase();
+        [
+            PropPath::Position,
+            PropPath::Rotation,
+            PropPath::Scale,
+            PropPath::Opacity,
+            PropPath::Anchor,
+            PropPath::Fill,
+        ]
+        .into_iter()
+        .find(|p| p.name() == s)
+    }
+
     /// The neutral value of this property's kind, for the error cases (missing
     /// node, no document, or a cycle) where there's no real value to return.
     fn zero(self) -> ExprValue {
@@ -330,15 +359,181 @@ impl fmt::Display for Expr {
 thread_local! {
     /// One Rhai engine per thread, reused across evaluations. Building an engine
     /// isn't free, and resolving runs on the (single) render thread.
-    static SCRIPT_ENGINE: rhai::Engine = rhai::Engine::new();
+    static SCRIPT_ENGINE: rhai::Engine = build_engine();
+}
+
+/// The bridge that lets a `'static` Rhai function reach the `&mut EvalCtx` of
+/// the evaluation that called it.
+///
+/// Rhai's registered functions must be `'static`, so the borrow can't be
+/// captured; it's parked in a thread-local raw pointer for exactly the span of
+/// one `eval_with_scope` call. Three rules keep that sound, and the module is
+/// small so they can be checked by reading it:
+///
+/// 1. **Lifetime.** [`enter`] stores a pointer derived from a live `&mut
+///    EvalCtx` and the returned guard clears it on drop, so the pointer is only
+///    observable while that borrow is alive. Rhai calls back synchronously,
+///    inside `eval_with_scope`, which is inside the guard's scope.
+/// 2. **Aliasing.** [`with_ctx`] *takes* the pointer (leaving null) for the
+///    duration of the callback, so a second `&mut` can never exist alongside
+///    the first. A nested script (`value()` → a referenced property that is
+///    itself a script) re-parks a pointer through `enter` from the inner
+///    borrow, which is the correct nesting order; its guard restores the outer
+///    pointer on the way out.
+/// 3. **Threads.** The pointer is thread-local, so it cannot escape to another
+///    thread, and `EvalCtx` need not be `Send`.
+///
+/// Outside a script call the pointer is null and the `value()` family returns a
+/// script error rather than pretending to have a document.
+mod bridge {
+    use super::EvalCtx;
+    use std::cell::Cell;
+    use std::ptr;
+
+    thread_local! {
+        /// Type-erased `*mut EvalCtx<'_>`; the lifetime can't be named here and
+        /// is re-attached only inside [`with_ctx`], for the callback's span.
+        static CTX: Cell<*mut ()> = const { Cell::new(ptr::null_mut()) };
+    }
+
+    /// Restores the previously parked pointer, so nesting is transparent.
+    pub(super) struct Guard(*mut ());
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CTX.with(|c| c.set(self.0));
+        }
+    }
+
+    /// Park `ctx` for the lifetime of the returned guard.
+    pub(super) fn enter(ctx: &mut EvalCtx<'_>) -> Guard {
+        let raw = ctx as *mut EvalCtx<'_> as *mut ();
+        Guard(CTX.with(|c| c.replace(raw)))
+    }
+
+    /// Run `f` against the parked context, or return `None` if there is none.
+    pub(super) fn with_ctx<R>(f: impl FnOnce(&mut EvalCtx<'_>) -> R) -> Option<R> {
+        // Take it out for the call: while `f` holds the `&mut`, no other
+        // `with_ctx` on this thread can hand out a second one (rule 2).
+        let raw = CTX.with(|c| c.replace(ptr::null_mut()));
+        if raw.is_null() {
+            return None;
+        }
+        let _restore = Guard(raw);
+        // SAFETY: `raw` was derived from a `&mut EvalCtx` in `enter`, whose
+        // guard is still alive (it is only cleared on drop), and it was taken
+        // out of the cell above so no other borrow can be handed out while this
+        // one lives. The erased lifetime is re-attached only for this call,
+        // which cannot outlive the original borrow.
+        Some(f(unsafe { &mut *(raw as *mut EvalCtx<'_>) }))
+    }
+}
+
+/// Build the per-thread engine with the scene-access functions registered.
+fn build_engine() -> rhai::Engine {
+    let mut engine = rhai::Engine::new();
+    engine.register_fn("value", |name: &str, prop: &str| script_value(name, prop, None));
+    engine.register_fn("value_at", |name: &str, prop: &str, frame: f64| {
+        script_value(name, prop, Some(frame))
+    });
+    engine.register_fn("wiggle", |freq: f64, amp: f64| script_wiggle(freq, amp, 0.0));
+    engine.register_fn("wiggle", |freq: f64, amp: f64, seed: f64| script_wiggle(freq, amp, seed));
+    engine
+}
+
+/// A script error, phrased for the field under the editor.
+fn script_err(msg: impl Into<String>) -> Box<rhai::EvalAltResult> {
+    Box::new(rhai::EvalAltResult::ErrorRuntime(msg.into().into(), rhai::Position::NONE))
+}
+
+/// `value(name, prop)` / `value_at(name, prop, frame)`: another node's property,
+/// by node name, at the current frame or an explicit one. Goes through the same
+/// memoized, cycle-guarded [`EvalCtx::resolve_prop`] as an `Expr::Ref`, so a
+/// script that references itself warns and falls back instead of recursing.
+fn script_value(
+    name: &str,
+    prop: &str,
+    frame: Option<f64>,
+) -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+    let prop = PropPath::parse(prop)
+        .ok_or_else(|| script_err(format!("unknown property '{prop}'")))?;
+    let out = bridge::with_ctx(|ctx| {
+        let node = ctx.find_named(name)?;
+        let frame = frame.unwrap_or(ctx.frame);
+        Some(ctx.resolve_prop(node, prop, frame))
+    })
+    .ok_or_else(|| script_err("value() is only available while evaluating a document"))?
+    .ok_or_else(|| script_err(format!("no node named '{name}'")))?;
+    Ok(expr_value_to_dynamic(out))
+}
+
+/// `wiggle(freq, amp)` — smooth pseudo-random deviation around zero, sampled at
+/// the current frame. Deterministic: the same frame always gives the same value
+/// (scrubbing back and forth is stable, and a render matches the preview).
+/// `freq` is in wiggles per frame; `seed` picks an independent stream, so `x`
+/// and `y` can wiggle separately.
+fn script_wiggle(freq: f64, amp: f64, seed: f64) -> Result<f64, Box<rhai::EvalAltResult>> {
+    let frame = bridge::with_ctx(|ctx| ctx.frame)
+        .ok_or_else(|| script_err("wiggle() is only available while evaluating a document"))?;
+    Ok(value_noise(frame * freq, seed) * amp)
+}
+
+/// Value noise in [-1, 1]: hashed lattice points, smoothstep-interpolated.
+fn value_noise(t: f64, seed: f64) -> f64 {
+    let i = t.floor();
+    let f = t - i;
+    let f = f * f * (3.0 - 2.0 * f); // smoothstep — C1, so no kinks at the lattice
+    let a = hash_to_unit(i, seed);
+    let b = hash_to_unit(i + 1.0, seed);
+    a + (b - a) * f
+}
+
+/// A stable hash of a lattice point to [-1, 1].
+fn hash_to_unit(i: f64, seed: f64) -> f64 {
+    let mut h = (i as i64 as u64) ^ ((seed as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^= h >> 33;
+    // Top 53 bits → [0, 1), then recentre.
+    ((h >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+}
+
+/// The inverse of [`dynamic_to_expr_value`], for handing a resolved property
+/// back to a script: a number stays a number, a vec/colour becomes an array.
+fn expr_value_to_dynamic(v: ExprValue) -> rhai::Dynamic {
+    match v {
+        ExprValue::Num(n) => rhai::Dynamic::from_float(n),
+        ExprValue::Vec2(v) => rhai::Dynamic::from_array(vec![
+            rhai::Dynamic::from_float(v.x),
+            rhai::Dynamic::from_float(v.y),
+        ]),
+        ExprValue::Color(c) => rhai::Dynamic::from_array(vec![
+            rhai::Dynamic::from_float(c.r),
+            rhai::Dynamic::from_float(c.g),
+            rhai::Dynamic::from_float(c.b),
+            rhai::Dynamic::from_float(c.a),
+        ]),
+    }
 }
 
 /// Evaluate a Rhai `src` at `frame`, with `frame` and `time` in scope as
-/// constants. The script's result becomes an [`ExprValue`]: a number → `Num`, a
-/// 2/3/4-element array → `Vec2`/`Color`. Returns a message on a compile-time,
-/// run-time, or return-type error — the UI surfaces it; [`eval_expr`] falls back
-/// to a neutral value so a bad script never breaks the frame.
+/// constants, with no document behind it — `value()`/`wiggle()` then error out.
+/// Prefer [`eval_script_ctx`] anywhere a context exists.
 pub fn eval_script(src: &str, frame: f64) -> Result<ExprValue, String> {
+    eval_script_ctx(src, &mut EvalCtx::at(frame))
+}
+
+/// Evaluate a Rhai `src` against `ctx` (at `ctx.frame`), with `frame`/`time` in
+/// scope and the `value()`/`wiggle()` functions wired to the document. The
+/// script's result becomes an [`ExprValue`]: a number → `Num`, a 2/3/4-element
+/// array → `Vec2`/`Color`. Returns a message on a compile-time, run-time, or
+/// return-type error — the UI surfaces it; [`eval_expr`] falls back to a neutral
+/// value so a bad script never breaks the frame.
+pub fn eval_script_ctx(src: &str, ctx: &mut EvalCtx<'_>) -> Result<ExprValue, String> {
+    let frame = ctx.frame;
+    let _parked = bridge::enter(ctx);
     SCRIPT_ENGINE.with(|engine| {
         let mut scope = rhai::Scope::new();
         scope.push_constant("frame", frame);
@@ -432,6 +627,13 @@ impl<'a> EvalCtx<'a> {
         std::mem::take(&mut self.warnings)
     }
 
+    /// Find a node by name, for the script-facing `value("A", …)`. Names aren't
+    /// unique in the model, so this takes the first match in tree order — the
+    /// same rule the layers panel shows top-down.
+    fn find_named(&self, name: &str) -> Option<NodeId> {
+        self.doc?.root.find_named(name).map(|n| n.id)
+    }
+
     fn warn(&mut self, node: NodeId, msg: impl Into<String>) {
         self.warnings.push((node, msg.into()));
     }
@@ -506,7 +708,7 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
         Expr::Neg(a) => eval_expr(a, ctx).map(|x| -x),
         // A bad script (compile/run/type error) falls back to a neutral value
         // rather than breaking the frame; the editor shows the error.
-        Expr::Script(src) => eval_script(src, ctx.frame).unwrap_or(ExprValue::Num(0.0)),
+        Expr::Script(src) => eval_script_ctx(src, ctx).unwrap_or(ExprValue::Num(0.0)),
     }
 }
 
@@ -712,5 +914,128 @@ mod tests {
         v.bake_to_const(&mut ctx);
         assert!(matches!(v, Value::Const(_)));
         assert_eq!(v.resolve(&mut ctx), 0.9);
+    }
+
+    // ---- the scripting bridge: value() / value_at() / wiggle() ----
+
+    #[test]
+    fn a_script_reads_another_node_by_name() {
+        let doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Script("value(\"a\", \"opacity\") * 2.0".into())),
+        );
+        assert_eq!(opacity_of(&doc, 2, 0.0), 1.0);
+    }
+
+    #[test]
+    fn a_script_reads_a_vec_property_as_an_array() {
+        let a = Node::group(1, "a").with_transform(Transform {
+            position: Value::constant(Vec2::new(30.0, 4.0)),
+            ..Transform::default()
+        });
+        // Take the x of a's position: an array subscript, straight from Rhai.
+        let b = Node::group(2, "b").with_transform(Transform {
+            opacity: Value::expr(Expr::Script("value(\"a\", \"position\")[0]".into())),
+            ..Transform::default()
+        });
+        let doc =
+            Document::new(100.0, 100.0, Node::group(0, "root").with_child(a).with_child(b));
+        assert_eq!(opacity_of(&doc, 2, 0.0), 30.0);
+    }
+
+    #[test]
+    fn value_at_samples_an_animated_property_off_time() {
+        // a.opacity ramps 0 → 1 over frames 0..10; b reads it 10 frames late.
+        let track = Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 1.0)]);
+        let doc = doc_with(
+            Value::Keyframed(track),
+            Value::expr(Expr::Script("value_at(\"a\", \"opacity\", frame - 10.0)".into())),
+        );
+        assert_eq!(opacity_of(&doc, 2, 15.0), 0.5, "frame 15 reads a at frame 5");
+    }
+
+    #[test]
+    fn a_script_referencing_itself_is_caught_as_a_cycle() {
+        // b.opacity = value("b", "opacity") — the cycle guard must stop this
+        // rather than recursing until the stack goes.
+        let doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Script("value(\"b\", \"opacity\")".into())),
+        );
+        assert_eq!(opacity_of(&doc, 2, 0.0), 0.0, "falls back to neutral");
+    }
+
+    #[test]
+    fn a_script_can_reference_a_node_that_is_itself_a_script() {
+        // Nested bridge entry: b's script resolves a, whose value is a script.
+        let a = Node::group(1, "a").with_transform(Transform {
+            opacity: Value::expr(Expr::Script("frame * 0.1".into())),
+            ..Transform::default()
+        });
+        let b = Node::group(2, "b").with_transform(Transform {
+            opacity: Value::expr(Expr::Script("value(\"a\", \"opacity\") + 1.0".into())),
+            ..Transform::default()
+        });
+        let doc =
+            Document::new(100.0, 100.0, Node::group(0, "root").with_child(a).with_child(b));
+        assert_eq!(opacity_of(&doc, 2, 20.0), 3.0);
+    }
+
+    #[test]
+    fn a_bad_name_or_property_is_a_script_error() {
+        let doc = doc_with(Value::constant(0.5), Value::constant(0.0));
+        let mut ctx = EvalCtx::new(&doc, 0.0);
+        let err = eval_script_ctx("value(\"nope\", \"opacity\")", &mut ctx).unwrap_err();
+        assert!(err.contains("nope"), "names the missing node: {err}");
+        let err = eval_script_ctx("value(\"a\", \"wobble\")", &mut ctx).unwrap_err();
+        assert!(err.contains("wobble"), "names the bad property: {err}");
+    }
+
+    #[test]
+    fn value_without_a_document_errors_rather_than_lying() {
+        // A document-less context has no nodes at all, so the lookup fails and
+        // the script errors — it never silently resolves to a neutral value.
+        let err = eval_script("value(\"a\", \"opacity\")", 0.0).unwrap_err();
+        assert!(err.contains("no node named"), "{err}");
+    }
+
+    #[test]
+    fn wiggle_is_deterministic_bounded_and_seed_separable() {
+        let at = |frame: f64, src: &str| {
+            let mut ctx = EvalCtx::at(frame);
+            match eval_script_ctx(src, &mut ctx).unwrap() {
+                ExprValue::Num(n) => n,
+                other => panic!("expected a number, got {other:?}"),
+            }
+        };
+        // Same frame, same value — scrubbing back and forth is stable.
+        assert_eq!(at(12.0, "wiggle(0.5, 10.0)"), at(12.0, "wiggle(0.5, 10.0)"));
+        // Bounded by the amplitude, over a decent sweep.
+        for f in 0..200 {
+            let v = at(f as f64 * 0.37, "wiggle(0.5, 10.0)");
+            assert!(v.abs() <= 10.0, "frame {f}: {v} out of amplitude");
+        }
+        // It actually moves.
+        assert_ne!(at(0.0, "wiggle(0.5, 10.0)"), at(7.0, "wiggle(0.5, 10.0)"));
+        // Different seeds are independent streams — x and y can differ.
+        assert_ne!(at(7.0, "wiggle(0.5, 10.0)"), at(7.0, "wiggle(0.5, 10.0, 2.0)"));
+    }
+
+    #[test]
+    fn wiggle_is_continuous_across_a_lattice_point() {
+        // freq 1.0 puts lattice points on integer frames; the smoothstep must
+        // not leave a visible jump at frame 3.
+        let at = |frame: f64| match eval_script_ctx(
+            "wiggle(1.0, 1.0)",
+            &mut EvalCtx::at(frame),
+        )
+        .unwrap()
+        {
+            ExprValue::Num(n) => n,
+            other => panic!("expected a number, got {other:?}"),
+        };
+        let (before, on, after) = (at(2.999), at(3.0), at(3.001));
+        assert!((before - on).abs() < 1e-2, "{before} → {on}");
+        assert!((after - on).abs() < 1e-2, "{on} → {after}");
     }
 }

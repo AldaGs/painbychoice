@@ -173,6 +173,16 @@ impl Node {
         self.children.iter().find_map(|c| c.find(id))
     }
 
+    /// Depth-first search for a node by name, self included. Names aren't
+    /// unique, so this is "the first one in tree order" — what a script's
+    /// `value("A", …)` resolves to.
+    pub fn find_named(&self, name: &str) -> Option<&Node> {
+        if self.name == name {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.find_named(name))
+    }
+
     /// Mutable depth-first search for a node by id, self included.
     pub fn find_mut(&mut self, id: NodeId) -> Option<&mut Node> {
         if self.id == id {
