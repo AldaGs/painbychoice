@@ -84,6 +84,13 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   to edit. A painted **stopwatch** per property (filled = animated, hollow =
   constant) inserts a keyframe at the playhead — first click on a constant
   promotes it to a track (this is how a property *starts* animating).
+  Transform (Position/Rotation/Scale/Opacity), **Fill**, **Stroke** (color +
+  width, with add/remove — a node without one shows `+ add`), and **parametric
+  geometry**: Size for a Rect or Ellipse, Radius for a Rect. Rows appear only
+  where the property exists — a group has no fill, an ellipse no radius, an
+  imported `Path` no size. **All of them are animatable**, on equal footing:
+  every one gets a stopwatch, a dopesheet row, and the full selection /
+  retime / copy-paste / easing treatment.
 - **Timeline / dopesheet** (bottom) — a **frame ruler** with adaptive ticks
   (1/2/5/10-frame steps plus whole-second multiples, so labels land on round
   timecodes when zoomed out; per-frame minor ticks once frames are ≥6px apart),
@@ -144,6 +151,25 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   `BTreeSet<KeyRef>` (ordered so `group_selection_by_prop` can bucket it in one
   pass), `KeyClipboard`/`ClipTrack` for copy/paste — `ClipTrack` is the
   type-erasure boundary that keeps `Vec2` keys off a scalar property.
+  **`prop_of` / `prop_of_mut`** are the single place `PropKind` is matched:
+  they hand back a `PropRef`/`PropRefMut` (Vec2 | Num | Color) and every
+  keyframe op goes through that. See below.
+
+### Adding an animatable property
+
+`PropKind` names every animatable property; `prop_of`/`prop_of_mut` borrow one
+off a `Node` as a type-erased `PropRef`/`PropRefMut`. Everything else — dopesheet
+rows, retiming, delete, copy/paste, easing, the stopwatch — is written against
+that pair, so **adding a property is a `PropKind` variant, an entry in
+`PropKind::ALL`, a `label()` arm, and one arm in each of the two `prop_of`
+functions.** No other match statement should have to grow.
+
+`PropRef` returns `Option` because not every node has every property (a group
+has no fill; an `Ellipse` no radius; a `Path` no parametric size) — callers skip
+`None` rather than branching on shape kind, which is what keeps the "does this
+node have it" question in exactly one place. The two functions must agree on
+which properties exist, or reads and writes silently target different things;
+there's a test pinning that.
 
 ### Loading a `.pbc`: always call `migrate()`
 
@@ -182,7 +208,7 @@ round onto the same frame collapse to one.
 ## Roadmap (agreed order)
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
-UX ✅ → shape/stroke params → …**. Next up:
+UX ✅ → shape/stroke params ✅ → dockable panels → …**. Next up:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -206,8 +232,16 @@ UX ✅ → shape/stroke params → …**. Next up:
    - Paste replaces any key already sitting on a landing frame (the one-key-per-
      frame invariant `sample` needs) and drops keys that would land before frame
      0 rather than piling them up there.
-3. **More shape params + stroke editing (next)** in the properties panel.
-4. **Blender-style splittable/dockable panels** (see EBN's `layoutTree` idea).
+3. ~~**More shape params + stroke editing.**~~ ✅ Done. Rect/Ellipse Size, Rect
+   Radius, and Stroke colour + width are editable and fully animatable, plus
+   add/remove stroke.
+   - This pass also closed a gap: **fill was editable and had a stopwatch but no
+     `PropKind` variant**, so fill keyframes existed with no dopesheet row —
+     uncreatable-to-manage, invisible to select/retime/delete. Rather than add a
+     fifth special case, `PropKind` became the single enumeration of animatable
+     properties behind `prop_of`/`prop_of_mut`.
+4. **Blender-style splittable/dockable panels (next)** (see EBN's `layoutTree`
+   idea).
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
 

@@ -204,11 +204,31 @@ struct NodeInfo {
     scale: (f64, f64),
     opacity: f64,
     fill: Option<[f32; 3]>,
+    /// Parametric geometry, `None` for a group or a hand-drawn `Path`.
+    size: Option<(f64, f64)>,
+    /// Corner radius — `Some` only for a Rect.
+    radius: Option<f64>,
+    /// Stroke color + width, `None` when the node has no stroke.
+    stroke: Option<([f32; 3], f64)>,
     pos_anim: bool,
     rot_anim: bool,
     scale_anim: bool,
     opacity_anim: bool,
     fill_anim: bool,
+    size_anim: bool,
+    radius_anim: bool,
+    stroke_color_anim: bool,
+    stroke_width_anim: bool,
+}
+
+/// egui's color buttons speak `[f32; 3]`; the document speaks `Color`.
+fn rgb_color(rgb: [f32; 3]) -> MColor {
+    MColor::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64)
+}
+
+/// Whether `kind` exists on this node *and* is keyframed.
+fn is_anim(node: &MNode, kind: PropKind) -> bool {
+    prop_of(node, kind).is_some_and(|p| p.is_animated())
 }
 
 impl NodeInfo {
@@ -227,11 +247,33 @@ impl NodeInfo {
                 let c = f.resolve(t);
                 [c.r as f32, c.g as f32, c.b as f32]
             }),
+            size: match node.shape.as_ref() {
+                Some(MShape::Rect { size, .. }) | Some(MShape::Ellipse { size }) => {
+                    let s = size.resolve(t);
+                    Some((s.x, s.y))
+                }
+                _ => None,
+            },
+            radius: match node.shape.as_ref() {
+                Some(MShape::Rect { radius, .. }) => Some(radius.resolve(t)),
+                _ => None,
+            },
+            stroke: node.stroke.as_ref().map(|s| {
+                let c = s.color.resolve(t);
+                ([c.r as f32, c.g as f32, c.b as f32], s.width.resolve(t))
+            }),
             pos_anim: tr.position.is_animated(),
             rot_anim: tr.rotation_deg.is_animated(),
             scale_anim: tr.scale.is_animated(),
             opacity_anim: tr.opacity.is_animated(),
-            fill_anim: node.fill.as_ref().is_some_and(|f| f.is_animated()),
+            // Whether each optional property is animated. `prop_of` already
+            // encodes "does this node even have it", so ask it rather than
+            // re-deriving the shape/stroke cases here and risking disagreement.
+            fill_anim: is_anim(node, PropKind::Fill),
+            size_anim: is_anim(node, PropKind::ShapeSize),
+            radius_anim: is_anim(node, PropKind::ShapeRadius),
+            stroke_color_anim: is_anim(node, PropKind::StrokeColor),
+            stroke_width_anim: is_anim(node, PropKind::StrokeWidth),
         }
     }
 }
@@ -247,13 +289,22 @@ struct PropEdits {
     scale_y: Option<f64>,
     opacity: Option<f64>,
     fill: Option<[f32; 3]>,
-    // Insert-keyframe-at-playhead requests (the "stopwatch").
-    key_pos: bool,
-    key_rot: bool,
-    key_scale: bool,
-    key_opacity: bool,
-    key_fill: bool,
+    size_x: Option<f64>,
+    size_y: Option<f64>,
+    radius: Option<f64>,
+    stroke_color: Option<[f32; 3]>,
+    stroke_width: Option<f64>,
+    /// Add a default stroke to a node that has none / drop the one it has.
+    add_stroke: bool,
+    remove_stroke: bool,
+    // Insert-keyframe-at-playhead requests (the "stopwatch"). Keyed by
+    // `PropKind` rather than one bool per property, so adding an animatable
+    // property doesn't grow this struct.
+    key: KeySelectionKinds,
 }
+
+/// The set of properties whose stopwatch was clicked this frame.
+type KeySelectionKinds = std::collections::BTreeSet<PropKind>;
 
 /// A "stopwatch" toggle: a filled dot when the property is animated, a hollow
 /// ring when constant. Clicking it inserts a keyframe at the playhead
@@ -398,7 +449,9 @@ fn properties_ui(
                         edits.pos_y = Some(y);
                     }
                 });
-                edits.key_pos |= key_button(ui, n.pos_anim);
+                if key_button(ui, n.pos_anim) {
+                    edits.key.insert(PropKind::Position);
+                }
                 ui.end_row();
 
                 ui.label("Rotation");
@@ -409,7 +462,9 @@ fn properties_ui(
                 {
                     edits.rot = Some(rot);
                 }
-                edits.key_rot |= key_button(ui, n.rot_anim);
+                if key_button(ui, n.rot_anim) {
+                    edits.key.insert(PropKind::Rotation);
+                }
                 ui.end_row();
 
                 ui.label("Scale");
@@ -423,7 +478,9 @@ fn properties_ui(
                         edits.scale_y = Some(sy);
                     }
                 });
-                edits.key_scale |= key_button(ui, n.scale_anim);
+                if key_button(ui, n.scale_anim) {
+                    edits.key.insert(PropKind::Scale);
+                }
                 ui.end_row();
 
                 ui.label("Opacity");
@@ -434,7 +491,9 @@ fn properties_ui(
                 {
                     edits.opacity = Some(op);
                 }
-                edits.key_opacity |= key_button(ui, n.opacity_anim);
+                if key_button(ui, n.opacity_anim) {
+                    edits.key.insert(PropKind::Opacity);
+                }
                 ui.end_row();
 
                 ui.label("Fill");
@@ -442,12 +501,93 @@ fn properties_ui(
                     if ui.color_edit_button_rgb(&mut rgb).changed() {
                         edits.fill = Some(rgb);
                     }
-                    edits.key_fill |= key_button(ui, n.fill_anim);
+                    if key_button(ui, n.fill_anim) {
+                        edits.key.insert(PropKind::Fill);
+                    }
                 } else {
                     ui.weak("none");
                     ui.label("");
                 }
                 ui.end_row();
+
+                // --- Stroke. Optional, so the row doubles as its add/remove
+                // control: a node without one gets a "+ add" button rather
+                // than disabled widgets. ---
+                ui.label("Stroke");
+                if let Some((mut rgb, _)) = n.stroke {
+                    ui.horizontal(|ui| {
+                        if ui.color_edit_button_rgb(&mut rgb).changed() {
+                            edits.stroke_color = Some(rgb);
+                        }
+                        if ui.small_button("✕").on_hover_text("Remove stroke").clicked() {
+                            edits.remove_stroke = true;
+                        }
+                    });
+                    if key_button(ui, n.stroke_color_anim) {
+                        edits.key.insert(PropKind::StrokeColor);
+                    }
+                } else {
+                    if ui.small_button("+ add").clicked() {
+                        edits.add_stroke = true;
+                    }
+                    ui.label("");
+                }
+                ui.end_row();
+
+                if let Some((_, w)) = n.stroke {
+                    ui.label("Stroke W");
+                    let mut w = w;
+                    if ui
+                        .add(egui::DragValue::new(&mut w).speed(0.1).range(0.0..=f64::MAX))
+                        .changed()
+                    {
+                        edits.stroke_width = Some(w);
+                    }
+                    if key_button(ui, n.stroke_width_anim) {
+                        edits.key.insert(PropKind::StrokeWidth);
+                    }
+                    ui.end_row();
+                }
+
+                // --- Parametric geometry. Absent for groups and for imported
+                // `Path` shapes, whose geometry isn't expressed as parameters. ---
+                if let Some((w, h)) = n.size {
+                    ui.label("Size");
+                    ui.horizontal(|ui| {
+                        let (mut w, mut h) = (w, h);
+                        if ui
+                            .add(egui::DragValue::new(&mut w).speed(0.5).range(0.0..=f64::MAX))
+                            .changed()
+                        {
+                            edits.size_x = Some(w);
+                        }
+                        if ui
+                            .add(egui::DragValue::new(&mut h).speed(0.5).range(0.0..=f64::MAX))
+                            .changed()
+                        {
+                            edits.size_y = Some(h);
+                        }
+                    });
+                    if key_button(ui, n.size_anim) {
+                        edits.key.insert(PropKind::ShapeSize);
+                    }
+                    ui.end_row();
+                }
+
+                if let Some(r) = n.radius {
+                    ui.label("Radius");
+                    let mut r = r;
+                    if ui
+                        .add(egui::DragValue::new(&mut r).speed(0.5).range(0.0..=f64::MAX))
+                        .changed()
+                    {
+                        edits.radius = Some(r);
+                    }
+                    if key_button(ui, n.radius_anim) {
+                        edits.key.insert(PropKind::ShapeRadius);
+                    }
+                    ui.end_row();
+                }
             });
 
             ui.add_space(6.0);
@@ -529,12 +669,190 @@ fn transport_ui(
 
 /// Which animated property a dopesheet row refers to. Lets the UI report a
 /// keyframe drag back to `App` without knowing the property's value type.
+///
+/// Declaration order is meaningful twice over: it's the dopesheet's row order,
+/// and — because `KeySelection` is a `BTreeSet` keyed on this — it's what makes
+/// a selection's entries for one property contiguous (see
+/// `group_selection_by_prop`). Transform first, then paint, then geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PropKind {
     Position,
     Rotation,
     Scale,
     Opacity,
+    Fill,
+    StrokeColor,
+    StrokeWidth,
+    ShapeSize,
+    ShapeRadius,
+}
+
+impl PropKind {
+    /// Every property that can be animated, in row order.
+    const ALL: [PropKind; 9] = [
+        PropKind::Position,
+        PropKind::Rotation,
+        PropKind::Scale,
+        PropKind::Opacity,
+        PropKind::Fill,
+        PropKind::StrokeColor,
+        PropKind::StrokeWidth,
+        PropKind::ShapeSize,
+        PropKind::ShapeRadius,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PropKind::Position => "Position",
+            PropKind::Rotation => "Rotation",
+            PropKind::Scale => "Scale",
+            PropKind::Opacity => "Opacity",
+            PropKind::Fill => "Fill",
+            PropKind::StrokeColor => "Stroke",
+            PropKind::StrokeWidth => "Stroke W",
+            PropKind::ShapeSize => "Size",
+            PropKind::ShapeRadius => "Radius",
+        }
+    }
+}
+
+/// A borrowed animatable property, with its value type erased down to the three
+/// the document actually uses.
+///
+/// This exists so the keyframe machinery — dopesheet rows, retiming, delete,
+/// copy/paste, easing — matches on `PropKind` in exactly *one* place
+/// ([`prop_of`] / [`prop_of_mut`]) instead of once per operation. Adding a new
+/// animatable property is then a `PropKind` variant plus two match arms, rather
+/// than an edit to eight call sites that all have to agree.
+enum PropRef<'a> {
+    Vec2(&'a Value<Vec2>),
+    Num(&'a Value<f64>),
+    Color(&'a Value<MColor>),
+}
+
+enum PropRefMut<'a> {
+    Vec2(&'a mut Value<Vec2>),
+    Num(&'a mut Value<f64>),
+    Color(&'a mut Value<MColor>),
+}
+
+/// Call the same method on whichever `Value<T>` a `PropRef`/`PropRefMut` holds.
+/// The body is written once and monomorphized per arm, which is the whole point
+/// — every op below is identical apart from `T`.
+macro_rules! on_prop {
+    ($p:expr, $v:ident => $body:expr) => {
+        match $p {
+            PropRef::Vec2($v) => $body,
+            PropRef::Num($v) => $body,
+            PropRef::Color($v) => $body,
+        }
+    };
+}
+
+macro_rules! on_prop_mut {
+    ($p:expr, $v:ident => $body:expr) => {
+        match $p {
+            PropRefMut::Vec2($v) => $body,
+            PropRefMut::Num($v) => $body,
+            PropRefMut::Color($v) => $body,
+        }
+    };
+}
+
+impl PropRef<'_> {
+    fn is_animated(&self) -> bool {
+        on_prop!(self, v => v.is_animated())
+    }
+    fn key_frames(&self) -> Vec<i64> {
+        on_prop!(self, v => v.key_frames())
+    }
+    fn move_keys_limits(&self, idxs: &[usize]) -> Option<(i64, i64)> {
+        on_prop!(self, v => v.move_keys_limits(idxs))
+    }
+    fn segment_handles(&self, index: usize) -> Option<(Handle, Handle)> {
+        on_prop!(self, v => v.segment_handles(index))
+    }
+    /// Copy the keys at `idxs` onto the clipboard, tagged with their type.
+    fn keys_at(&self, idxs: &[usize]) -> ClipTrack {
+        match self {
+            PropRef::Vec2(v) => ClipTrack::Vec2(v.keys_at(idxs)),
+            PropRef::Num(v) => ClipTrack::Num(v.keys_at(idxs)),
+            PropRef::Color(v) => ClipTrack::Color(v.keys_at(idxs)),
+        }
+    }
+}
+
+impl PropRefMut<'_> {
+    fn move_keys(&mut self, idxs: &[usize], delta: i64) {
+        on_prop_mut!(self, v => { v.move_keys(idxs, delta); })
+    }
+    fn remove_key(&mut self, index: usize) {
+        on_prop_mut!(self, v => v.remove_key(index))
+    }
+    fn insert_key(&mut self, frame: i64) {
+        on_prop_mut!(self, v => v.insert_key(frame))
+    }
+    fn set_segment_handles(&mut self, index: usize, out: Handle, next_in: Handle) {
+        on_prop_mut!(self, v => v.set_segment_handles(index, out, next_in))
+    }
+    /// Paste a clipboard track, but only onto a property of the same type — a
+    /// `Vec2` clip must never land on a scalar. Mismatches can't happen through
+    /// the UI (a clip is tagged at copy time) so they're simply ignored.
+    fn insert_keys(&mut self, clip: &ClipTrack, offset: i64) -> Vec<usize> {
+        match (self, clip) {
+            (PropRefMut::Vec2(v), ClipTrack::Vec2(k)) => v.insert_keys(k, offset),
+            (PropRefMut::Num(v), ClipTrack::Num(k)) => v.insert_keys(k, offset),
+            (PropRefMut::Color(v), ClipTrack::Color(k)) => v.insert_keys(k, offset),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Borrow one of a node's animatable properties. `None` when the node doesn't
+/// have it at all — a group has no fill, an ellipse has no corner radius, and a
+/// hand-drawn `Path` has no parametric size.
+fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
+    let tr = &node.transform;
+    Some(match kind {
+        PropKind::Position => PropRef::Vec2(&tr.position),
+        PropKind::Rotation => PropRef::Num(&tr.rotation_deg),
+        PropKind::Scale => PropRef::Vec2(&tr.scale),
+        PropKind::Opacity => PropRef::Num(&tr.opacity),
+        PropKind::Fill => PropRef::Color(node.fill.as_ref()?),
+        PropKind::StrokeColor => PropRef::Color(&node.stroke.as_ref()?.color),
+        PropKind::StrokeWidth => PropRef::Num(&node.stroke.as_ref()?.width),
+        PropKind::ShapeSize => match node.shape.as_ref()? {
+            MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRef::Vec2(size),
+            MShape::Path(_) => return None,
+        },
+        PropKind::ShapeRadius => match node.shape.as_ref()? {
+            MShape::Rect { radius, .. } => PropRef::Num(radius),
+            _ => return None,
+        },
+    })
+}
+
+/// Mutable twin of [`prop_of`]. Kept adjacent on purpose: the two must agree on
+/// which properties exist, and they're only correct read together.
+fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut<'_>> {
+    let tr = &mut node.transform;
+    Some(match kind {
+        PropKind::Position => PropRefMut::Vec2(&mut tr.position),
+        PropKind::Rotation => PropRefMut::Num(&mut tr.rotation_deg),
+        PropKind::Scale => PropRefMut::Vec2(&mut tr.scale),
+        PropKind::Opacity => PropRefMut::Num(&mut tr.opacity),
+        PropKind::Fill => PropRefMut::Color(node.fill.as_mut()?),
+        PropKind::StrokeColor => PropRefMut::Color(&mut node.stroke.as_mut()?.color),
+        PropKind::StrokeWidth => PropRefMut::Num(&mut node.stroke.as_mut()?.width),
+        PropKind::ShapeSize => match node.shape.as_mut()? {
+            MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRefMut::Vec2(size),
+            MShape::Path(_) => return None,
+        },
+        PropKind::ShapeRadius => match node.shape.as_mut()? {
+            MShape::Rect { radius, .. } => PropRefMut::Num(radius),
+            _ => return None,
+        },
+    })
 }
 
 /// One dopesheet row: an animated property and the frames of its keyframes.
@@ -546,23 +864,17 @@ struct DopeRow {
 
 /// Gather the animated properties of a node into dopesheet rows.
 fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
-    let tr = &node.transform;
-    let mut rows = Vec::new();
-    // Each property is a distinct value type, so this is spelled out rather
-    // than looped.
-    if tr.position.is_animated() {
-        rows.push(DopeRow { label: "Position", kind: PropKind::Position, frames: tr.position.key_frames() });
-    }
-    if tr.rotation_deg.is_animated() {
-        rows.push(DopeRow { label: "Rotation", kind: PropKind::Rotation, frames: tr.rotation_deg.key_frames() });
-    }
-    if tr.scale.is_animated() {
-        rows.push(DopeRow { label: "Scale", kind: PropKind::Scale, frames: tr.scale.key_frames() });
-    }
-    if tr.opacity.is_animated() {
-        rows.push(DopeRow { label: "Opacity", kind: PropKind::Opacity, frames: tr.opacity.key_frames() });
-    }
-    rows
+    PropKind::ALL
+        .iter()
+        .filter_map(|&kind| {
+            let p = prop_of(node, kind)?;
+            p.is_animated().then(|| DopeRow {
+                label: kind.label(),
+                kind,
+                frames: p.key_frames(),
+            })
+        })
+        .collect()
 }
 
 /// A keyframe's identity within a node: which property, which index.
@@ -599,6 +911,18 @@ fn group_selection_by_prop(sel: &KeySelection) -> Vec<(PropKind, Vec<usize>)> {
 enum ClipTrack {
     Vec2(Vec<Keyframe<Vec2>>),
     Num(Vec<Keyframe<f64>>),
+    Color(Vec<Keyframe<MColor>>),
+}
+
+impl ClipTrack {
+    /// Frame of the earliest copied key, or `None` if nothing was copied.
+    fn first_frame(&self) -> Option<i64> {
+        match self {
+            ClipTrack::Vec2(k) => k.first().map(|k| k.frame),
+            ClipTrack::Num(k) => k.first().map(|k| k.frame),
+            ClipTrack::Color(k) => k.first().map(|k| k.frame),
+        }
+    }
 }
 
 /// Keyframes on the clipboard, with the frame they were copied from.
@@ -614,13 +938,7 @@ struct KeyClipboard {
 
 /// Read the outgoing-segment handles for a given property + keyframe index.
 fn segment_handles_of(node: &MNode, kind: PropKind, index: usize) -> Option<(Handle, Handle)> {
-    let tr = &node.transform;
-    match kind {
-        PropKind::Position => tr.position.segment_handles(index),
-        PropKind::Rotation => tr.rotation_deg.segment_handles(index),
-        PropKind::Scale => tr.scale.segment_handles(index),
-        PropKind::Opacity => tr.opacity.segment_handles(index),
-    }
+    prop_of(node, kind)?.segment_handles(index)
 }
 
 /// What the dopesheet reports after a frame: seek, keyframe move, and/or a
@@ -1519,32 +1837,69 @@ impl App {
         }
         if let Some(rgb) = e.fill {
             if let Some(fill) = node.fill.as_mut() {
-                fill.set_at(frame, MColor::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64));
+                fill.set_at(frame, rgb_color(rgb));
+                changed = true;
+            }
+        }
+
+        // Stroke add/remove first, so a stroke added this frame is immediately
+        // editable by the value edits below rather than a frame later.
+        if e.add_stroke && node.stroke.is_none() {
+            node.stroke = Some(motion_core::Stroke {
+                color: Value::constant(MColor::rgb(0.0, 0.0, 0.0)),
+                width: Value::constant(2.0),
+            });
+            changed = true;
+        }
+        if e.remove_stroke {
+            node.stroke = None;
+            // Its keyframes go with it, so drop any selection pointing at them
+            // — stale `(kind, index)` refs would otherwise address a track that
+            // no longer exists.
+            self.selected_keys
+                .retain(|(k, _)| !matches!(k, PropKind::StrokeColor | PropKind::StrokeWidth));
+            changed = true;
+        }
+        let node = self.doc.root.find_mut(id).expect("checked above");
+        if let Some(rgb) = e.stroke_color {
+            if let Some(s) = node.stroke.as_mut() {
+                s.color.set_at(frame, rgb_color(rgb));
+                changed = true;
+            }
+        }
+        if let Some(w) = e.stroke_width {
+            if let Some(s) = node.stroke.as_mut() {
+                s.width.set_at(frame, w);
+                changed = true;
+            }
+        }
+
+        // Shape geometry. Size is a `Vec2` edited as two independent fields, so
+        // the untouched axis has to be read back from the current value — same
+        // pattern as position/scale above.
+        if e.size_x.is_some() || e.size_y.is_some() {
+            if let Some(MShape::Rect { size, .. }) | Some(MShape::Ellipse { size }) =
+                node.shape.as_mut()
+            {
+                let cur = size.resolve(t);
+                let v = Vec2::new(e.size_x.unwrap_or(cur.x), e.size_y.unwrap_or(cur.y));
+                size.set_at(frame, v);
+                changed = true;
+            }
+        }
+        if let Some(r) = e.radius {
+            if let Some(MShape::Rect { radius, .. }) = node.shape.as_mut() {
+                radius.set_at(frame, r);
                 changed = true;
             }
         }
 
         // Stopwatch clicks: insert a keyframe at the playhead (promoting a
-        // constant to a track the first time).
-        if e.key_pos {
-            tr.position.insert_key(frame);
-            changed = true;
-        }
-        if e.key_rot {
-            tr.rotation_deg.insert_key(frame);
-            changed = true;
-        }
-        if e.key_scale {
-            tr.scale.insert_key(frame);
-            changed = true;
-        }
-        if e.key_opacity {
-            tr.opacity.insert_key(frame);
-            changed = true;
-        }
-        if e.key_fill {
-            if let Some(fill) = node.fill.as_mut() {
-                fill.insert_key(frame);
+        // constant to a track the first time). Driven off `PropKind` so a new
+        // animatable property needs no new branch here.
+        for &kind in &e.key {
+            if let Some(mut p) = prop_of_mut(node, kind) {
+                p.insert_key(frame);
                 changed = true;
             }
         }
@@ -1561,13 +1916,10 @@ impl App {
         };
         let out = Handle::new(p1.0 as f64, p1.1 as f64);
         let next_in = Handle::new(p2.0 as f64, p2.1 as f64);
-        let tr = &mut node.transform;
-        match kind {
-            PropKind::Position => tr.position.set_segment_handles(index, out, next_in),
-            PropKind::Rotation => tr.rotation_deg.set_segment_handles(index, out, next_in),
-            PropKind::Scale => tr.scale.set_segment_handles(index, out, next_in),
-            PropKind::Opacity => tr.opacity.set_segment_handles(index, out, next_in),
-        }
+        let Some(mut p) = prop_of_mut(node, kind) else {
+            return false;
+        };
+        p.set_segment_handles(index, out, next_in);
         true
     }
 
@@ -1583,15 +1935,11 @@ impl App {
         let Some(node) = self.doc.root.find_mut(id) else {
             return false;
         };
-        let tr = &mut node.transform;
         // Descending index order: removing a key shifts every later index
         // down, so deleting from the back keeps the remaining ones valid.
         for &(kind, index) in self.selected_keys.iter().rev() {
-            match kind {
-                PropKind::Position => tr.position.remove_key(index),
-                PropKind::Rotation => tr.rotation_deg.remove_key(index),
-                PropKind::Scale => tr.scale.remove_key(index),
-                PropKind::Opacity => tr.opacity.remove_key(index),
+            if let Some(mut p) = prop_of_mut(node, kind) {
+                p.remove_key(index);
             }
         }
         self.selected_keys.clear();
@@ -1607,21 +1955,12 @@ impl App {
         if self.selected_keys.is_empty() {
             return false;
         }
-        let tr = &node.transform;
         let mut tracks = Vec::new();
         let mut origin = i64::MAX;
         for (kind, idxs) in group_selection_by_prop(&self.selected_keys) {
-            let clip = match kind {
-                PropKind::Position => ClipTrack::Vec2(tr.position.keys_at(&idxs)),
-                PropKind::Scale => ClipTrack::Vec2(tr.scale.keys_at(&idxs)),
-                PropKind::Rotation => ClipTrack::Num(tr.rotation_deg.keys_at(&idxs)),
-                PropKind::Opacity => ClipTrack::Num(tr.opacity.keys_at(&idxs)),
-            };
-            let first = match &clip {
-                ClipTrack::Vec2(k) => k.first().map(|k| k.frame),
-                ClipTrack::Num(k) => k.first().map(|k| k.frame),
-            };
-            let Some(first) = first else { continue };
+            let Some(p) = prop_of(node, kind) else { continue };
+            let clip = p.keys_at(&idxs);
+            let Some(first) = clip.first_frame() else { continue };
             origin = origin.min(first);
             tracks.push((kind, clip));
         }
@@ -1646,20 +1985,12 @@ impl App {
         let Some(node) = self.doc.root.find_mut(id) else {
             return false;
         };
-        let tr = &mut node.transform;
         let mut landed = KeySelection::new();
         for (kind, track) in &clip.tracks {
-            let idxs = match (kind, track) {
-                (PropKind::Position, ClipTrack::Vec2(k)) => tr.position.insert_keys(k, offset),
-                (PropKind::Scale, ClipTrack::Vec2(k)) => tr.scale.insert_keys(k, offset),
-                (PropKind::Rotation, ClipTrack::Num(k)) => tr.rotation_deg.insert_keys(k, offset),
-                (PropKind::Opacity, ClipTrack::Num(k)) => tr.opacity.insert_keys(k, offset),
-                // A Vec2 clip can't land on a scalar property (or vice versa).
-                // Unreachable via the UI — copy tags each clip with the kind it
-                // came from — but skipping is the right answer if it ever is.
-                _ => Vec::new(),
-            };
-            for i in idxs {
+            // Skipped when the paste target lacks the property entirely —
+            // copying an ellipse's Size and pasting onto a group, say.
+            let Some(mut p) = prop_of_mut(node, *kind) else { continue };
+            for i in p.insert_keys(track, offset) {
                 landed.insert((*kind, i));
             }
         }
@@ -1688,18 +2019,12 @@ impl App {
         };
 
         let per_prop = group_selection_by_prop(&self.selected_keys);
-        let tr = &node.transform;
 
         // Intersect the allowed delta across every affected track.
         let (mut lo, mut hi) = (i64::MIN, i64::MAX);
         for (kind, idxs) in &per_prop {
-            let limits = match kind {
-                PropKind::Position => tr.position.move_keys_limits(idxs),
-                PropKind::Rotation => tr.rotation_deg.move_keys_limits(idxs),
-                PropKind::Scale => tr.scale.move_keys_limits(idxs),
-                PropKind::Opacity => tr.opacity.move_keys_limits(idxs),
-            };
-            if let Some((l, h)) = limits {
+            let Some(p) = prop_of(node, *kind) else { continue };
+            if let Some((l, h)) = p.move_keys_limits(idxs) {
                 lo = lo.max(l);
                 hi = hi.min(h);
             }
@@ -1710,16 +2035,11 @@ impl App {
         // Also keep the whole selection inside the composition.
         let last = self.doc.duration_frames().max(1);
         let node = self.doc.root.find_mut(id).expect("checked above");
-        let tr = &mut node.transform;
         let mut min_frame = i64::MAX;
         let mut max_frame = i64::MIN;
         for (kind, idxs) in &per_prop {
-            let frames = match kind {
-                PropKind::Position => tr.position.key_frames(),
-                PropKind::Rotation => tr.rotation_deg.key_frames(),
-                PropKind::Scale => tr.scale.key_frames(),
-                PropKind::Opacity => tr.opacity.key_frames(),
-            };
+            let Some(p) = prop_of(node, *kind) else { continue };
+            let frames = p.key_frames();
             for &i in idxs {
                 if let Some(&f) = frames.get(i) {
                     min_frame = min_frame.min(f);
@@ -1740,12 +2060,9 @@ impl App {
             return false;
         }
         for (kind, idxs) in &per_prop {
-            match kind {
-                PropKind::Position => tr.position.move_keys(idxs, applied),
-                PropKind::Rotation => tr.rotation_deg.move_keys(idxs, applied),
-                PropKind::Scale => tr.scale.move_keys(idxs, applied),
-                PropKind::Opacity => tr.opacity.move_keys(idxs, applied),
-            };
+            if let Some(mut p) = prop_of_mut(node, *kind) {
+                p.move_keys(idxs, applied);
+            }
         }
         true
     }
@@ -2357,6 +2674,103 @@ mod tests {
         let fit = Affine::IDENTITY;
         // Dot center: square pos (300,540) + child offset (0,-120) = (300,420).
         assert_eq!(pick(&scene, fit, (300.0, 420.0)), Some(NodeId(2)));
+    }
+
+    /// A rect with every optional property present.
+    fn full_node() -> MNode {
+        let mut n = MNode::shape(
+            1,
+            "rect",
+            MShape::Rect {
+                size: Value::constant(Vec2::new(100.0, 50.0)),
+                radius: Value::constant(4.0),
+            },
+        )
+        .with_fill(MColor::rgb(1.0, 0.0, 0.0));
+        n.stroke = Some(motion_core::Stroke {
+            color: Value::constant(MColor::rgb(0.0, 0.0, 1.0)),
+            width: Value::constant(2.0),
+        });
+        n
+    }
+
+    #[test]
+    fn prop_of_and_prop_of_mut_agree_on_what_exists() {
+        // The two are separate matches over the same 9 variants, and every
+        // keyframe operation trusts them to describe the same node. If they
+        // ever disagree, reads and writes silently target different properties.
+        for node in [full_node(), MNode::group(1, "g")] {
+            for kind in PropKind::ALL {
+                let mut m = node.clone();
+                assert_eq!(
+                    prop_of(&node, kind).is_some(),
+                    prop_of_mut(&mut m, kind).is_some(),
+                    "{kind:?} disagrees on {}",
+                    node.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_properties_are_absent_when_the_node_lacks_them() {
+        // A group has no paint and no geometry...
+        let g = MNode::group(1, "g");
+        for kind in [
+            PropKind::Fill,
+            PropKind::StrokeColor,
+            PropKind::StrokeWidth,
+            PropKind::ShapeSize,
+            PropKind::ShapeRadius,
+        ] {
+            assert!(prop_of(&g, kind).is_none(), "group should not have {kind:?}");
+        }
+        // ...but it still transforms.
+        assert!(prop_of(&g, PropKind::Position).is_some());
+
+        // An ellipse has a size but no corner radius.
+        let e = MNode::shape(2, "e", MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
+        assert!(prop_of(&e, PropKind::ShapeSize).is_some());
+        assert!(prop_of(&e, PropKind::ShapeRadius).is_none(), "ellipse has no radius");
+
+        // A hand-drawn path has neither: its geometry isn't parametric.
+        let p = MNode::shape(3, "p", MShape::Path(kurbo::BezPath::new()));
+        assert!(prop_of(&p, PropKind::ShapeSize).is_none());
+        assert!(prop_of(&p, PropKind::ShapeRadius).is_none());
+    }
+
+    #[test]
+    fn dope_rows_lists_animated_shape_and_stroke_properties() {
+        let mut n = full_node();
+        // Nothing animated yet → no rows, even though every property exists.
+        assert!(dope_rows(&n).is_empty());
+
+        prop_of_mut(&mut n, PropKind::ShapeRadius).unwrap().insert_key(5);
+        prop_of_mut(&mut n, PropKind::StrokeWidth).unwrap().insert_key(7);
+        prop_of_mut(&mut n, PropKind::Fill).unwrap().insert_key(9);
+
+        let rows = dope_rows(&n);
+        let kinds: Vec<_> = rows.iter().map(|r| r.kind).collect();
+        // Row order follows PropKind's declaration order, not insertion order.
+        assert_eq!(
+            kinds,
+            vec![PropKind::Fill, PropKind::StrokeWidth, PropKind::ShapeRadius]
+        );
+        assert_eq!(rows[2].frames, vec![5], "radius keyed at frame 5");
+    }
+
+    #[test]
+    fn a_color_clip_will_not_paste_onto_a_scalar_property() {
+        // The type tag on ClipTrack is the only thing standing between a fill
+        // copy and a width track full of nonsense.
+        let mut n = full_node();
+        prop_of_mut(&mut n, PropKind::Fill).unwrap().insert_key(0);
+        let clip = prop_of(&n, PropKind::Fill).unwrap().keys_at(&[0]);
+        assert!(matches!(clip, ClipTrack::Color(_)));
+
+        let landed = prop_of_mut(&mut n, PropKind::StrokeWidth).unwrap().insert_keys(&clip, 0);
+        assert!(landed.is_empty(), "color keys must not land on a width track");
+        assert!(!is_anim(&n, PropKind::StrokeWidth), "width stays constant");
     }
 }
 
