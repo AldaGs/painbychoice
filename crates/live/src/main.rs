@@ -213,8 +213,10 @@ enum DockCmd {
 /// recursion into a plain `Ui`.
 ///
 /// This shape is deliberately serialization-ready: `size` lives here rather than
-/// only in egui's panel memory, so a future "save this layout" (named presets,
-/// and per-project layouts) is a `serde` derive away and needs no new plumbing.
+/// only in egui's panel memory, so a future "save this layout" (per-project
+/// layouts, roadmap #4) is a `serde` derive away and needs no new plumbing.
+/// `Clone` is what lets a saved preset be re-applied without rebuilding it.
+#[derive(Clone)]
 enum Dock {
     Leaf(Editor),
     Split {
@@ -271,6 +273,64 @@ impl Dock {
                         Editor::Dopesheet,
                         Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
                     ),
+                ),
+            ),
+        )
+    }
+
+    /// Timeline-forward layout for keyframe-heavy work: the dopesheet spans the
+    /// full width at the bottom and is given far more height than the stock
+    /// arrangement, with layers and properties flanking a smaller canvas above.
+    fn animation_layout() -> Dock {
+        use DockSide::*;
+        Dock::split(
+            Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                Bottom,
+                TRANSPORT_H,
+                false,
+                Editor::Transport,
+                Dock::split(
+                    Bottom,
+                    320.0,
+                    true,
+                    Editor::Dopesheet,
+                    Dock::split(
+                        Left,
+                        TREE_W,
+                        true,
+                        Editor::Layers,
+                        Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    /// Design layout: no dopesheet, so the canvas gets the whole middle for
+    /// vector/layout work. The transport stays (you still scrub), and the
+    /// dopesheet is one picker-click away on any content area if it's wanted.
+    fn design_layout() -> Dock {
+        use DockSide::*;
+        Dock::split(
+            Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                Bottom,
+                TRANSPORT_H,
+                false,
+                Editor::Transport,
+                Dock::split(
+                    Left,
+                    TREE_W,
+                    true,
+                    Editor::Layers,
+                    Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
                 ),
             ),
         )
@@ -342,6 +402,31 @@ impl Dock {
             }
         }
     }
+}
+
+/// A named layout the user can switch to. Built-ins ship with the app and can't
+/// be renamed or removed; user presets are made by "Save current" and (for now)
+/// live only for the session — persisting them into the `.pbc` is roadmap #4's
+/// next step, and the `Clone`-able tree is already all that needs.
+struct Preset {
+    name: String,
+    dock: Dock,
+    builtin: bool,
+}
+
+/// The layouts offered out of the box. `Default` reproduces the fixed pre-dock
+/// arrangement; `Animation` and `Design` re-weight the same panels for two
+/// common modes of work. Adding another is one more entry here plus a `Dock`
+/// constructor — which is exactly the extensibility the tree was built for.
+fn builtin_presets() -> Vec<Preset> {
+    [
+        ("Default", Dock::default_layout as fn() -> Dock),
+        ("Animation", Dock::animation_layout),
+        ("Design", Dock::design_layout),
+    ]
+    .into_iter()
+    .map(|(name, make)| Preset { name: name.to_string(), dock: make(), builtin: true })
+    .collect()
 }
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
@@ -460,10 +545,31 @@ struct CompEdits {
     duration: Option<f64>,
 }
 
-/// Top composition bar: editable resolution, fps, and duration. These drive the
-/// canvas fit, the playback clock, the frame step, and the timeline mapping —
-/// so editing them here reshapes the whole comp. Reports edits into `out`.
-fn comp_ui(ui: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, out: &mut CompEdits) {
+/// Layout-preset intent from the top bar's Layout menu. At most one per frame.
+#[derive(Default)]
+struct LayoutEdits {
+    /// Index into the preset list to switch the whole layout to.
+    apply: Option<usize>,
+    /// Save the current layout as a user preset under this (trimmed) name.
+    save_as: Option<String>,
+}
+
+/// Top composition bar: editable resolution, fps, and duration, plus the Layout
+/// menu (switch preset / save current). These drive the canvas fit, the
+/// playback clock, the frame step, and the timeline mapping — so editing them
+/// here reshapes the whole comp. Reports edits into `out` / `layout`.
+#[allow(clippy::too_many_arguments)]
+fn comp_ui(
+    ui: &mut egui::Ui,
+    width: f64,
+    height: f64,
+    fps: f64,
+    duration: f64,
+    out: &mut CompEdits,
+    presets: &[String],
+    name_buf: &mut String,
+    layout: &mut LayoutEdits,
+) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
@@ -497,6 +603,32 @@ fn comp_ui(ui: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, 
         {
             out.duration = Some(dur);
         }
+        ui.separator();
+
+        // Layout presets. A menu keeps the bar tidy: pick a preset to apply it,
+        // or name and save the current arrangement as a session preset.
+        ui.menu_button("Layout", |ui| {
+            for (i, name) in presets.iter().enumerate() {
+                if ui.button(name).clicked() {
+                    layout.apply = Some(i);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(name_buf)
+                        .hint_text("preset name")
+                        .desired_width(120.0),
+                );
+                let named = !name_buf.trim().is_empty();
+                if ui.add_enabled(named, egui::Button::new("Save current")).clicked() {
+                    layout.save_as = Some(name_buf.trim().to_string());
+                    name_buf.clear();
+                    ui.close();
+                }
+            });
+        });
     });
 }
 
@@ -1850,6 +1982,11 @@ struct App {
     view: TimelineView,
     /// The panel layout.
     dock: Dock,
+    /// Named layouts (built-ins + session-made user presets) offered in the
+    /// Layout menu. Applying one replaces `dock` with a clone of its tree.
+    presets: Vec<Preset>,
+    /// The Layout menu's "save current as" name field, kept across frames.
+    preset_name_buf: String,
     /// Canvas area in physical pixels, measured from the layout tree's canvas
     /// leaf during the last UI pass. `None` until the first pass has run.
     canvas_rect: Option<kurbo::Rect>,
@@ -1885,6 +2022,8 @@ impl App {
             key_clipboard: None,
             view,
             dock: Dock::default_layout(),
+            presets: builtin_presets(),
+            preset_name_buf: String::new(),
             canvas_rect: None,
             next_id,
         }
@@ -2569,6 +2708,11 @@ impl App {
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let mut comp = CompEdits::default();
         let (doc_w, doc_h, doc_fps) = (self.doc.width, self.doc.height, self.doc.fps);
+        // Layout-preset menu: the names to list, the save-field buffer (taken so
+        // the UI never borrows `self`, restored after), and the reported intent.
+        let preset_names: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
+        let mut preset_name_buf = std::mem::take(&mut self.preset_name_buf);
+        let mut layout = LayoutEdits::default();
         // Panels are drawn by walking the layout tree; each leaf dispatches to
         // the matching editor. Nothing here knows *where* a panel is — that's
         // the tree's business, which is the whole point of the refactor.
@@ -2586,7 +2730,17 @@ impl App {
                 &mut next_id,
                 &mut path,
                 &mut |editor, ui| match editor {
-                    Editor::Comp => comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp),
+                    Editor::Comp => comp_ui(
+                        ui,
+                        doc_w,
+                        doc_h,
+                        doc_fps,
+                        duration,
+                        &mut comp,
+                        &preset_names,
+                        &mut preset_name_buf,
+                        &mut layout,
+                    ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Transport => {
                         transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
@@ -2616,6 +2770,24 @@ impl App {
         if let Some(cmd) = dock_cmd {
             self.dock.apply(cmd);
             window.request_redraw();
+        }
+        // Restore the save-field buffer taken for the UI pass.
+        self.preset_name_buf = preset_name_buf;
+        // Layout presets: switch to one, or save the current arrangement as a
+        // session preset. Both re-lay out the panels, so a redraw is due.
+        if let Some(i) = layout.apply {
+            if let Some(preset) = self.presets.get(i) {
+                self.dock = preset.dock.clone();
+                window.request_redraw();
+            }
+        }
+        if let Some(name) = layout.save_as {
+            let current = self.dock.clone();
+            // Overwrite a user preset of the same name; never clobber a built-in.
+            match self.presets.iter_mut().find(|p| !p.builtin && p.name == name) {
+                Some(existing) => existing.dock = current,
+                None => self.presets.push(Preset { name, dock: current, builtin: false }),
+            }
         }
         // Points → physical pixels for the next frame's fit.
         self.canvas_rect = canvas_pts.map(|r| {
@@ -3197,6 +3369,34 @@ mod tests {
         assert_eq!(count_editor(&d, Editor::Properties), 0, "area closed");
         assert_eq!(count_editor(&d, Editor::Canvas), 1, "canvas survives");
         assert!(innermost_is_canvas(&d));
+    }
+
+    #[test]
+    fn every_builtin_preset_is_a_valid_layout() {
+        // A preset a user can switch to must keep the structural guarantees the
+        // rest of the app leans on: exactly one canvas as the innermost leaf, and
+        // the two headerless toolbars present (there's no way to bring back a
+        // Comp or Transport that a preset dropped — they carry no picker).
+        for preset in builtin_presets() {
+            let d = &preset.dock;
+            assert_eq!(count_editor(d, Editor::Canvas), 1, "{}: one canvas", preset.name);
+            assert!(innermost_is_canvas(d), "{}: canvas innermost", preset.name);
+            assert_eq!(count_editor(d, Editor::Comp), 1, "{}: comp bar", preset.name);
+            assert_eq!(count_editor(d, Editor::Transport), 1, "{}: transport", preset.name);
+        }
+    }
+
+    #[test]
+    fn presets_offer_more_than_one_arrangement() {
+        // The whole point of presets: the Design layout drops the dopesheet the
+        // default keeps, so switching visibly changes the panels.
+        let presets = builtin_presets();
+        assert!(presets.len() >= 3);
+        assert!(presets.iter().all(|p| p.builtin));
+        let default = &presets.iter().find(|p| p.name == "Default").unwrap().dock;
+        let design = &presets.iter().find(|p| p.name == "Design").unwrap().dock;
+        assert_eq!(count_editor(default, Editor::Dopesheet), 1);
+        assert_eq!(count_editor(design, Editor::Dopesheet), 0);
     }
 
     #[test]

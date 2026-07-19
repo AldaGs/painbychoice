@@ -303,11 +303,18 @@ UX ✅ → shape/stroke params ✅ → dockable panels 🚧 → …**. Next up:
      header controls, for the same capability. The canvas and the two toolbars
      stay header-less on purpose, which is what protects the single-canvas and
      innermost-canvas invariants.
-   - **Layout presets**: several named defaults plus user-made ones. The tree is
-     already serialization-ready (`size` lives in the tree, and
-     `default_layout()` is just one constructor among future many).
+   - ~~**Layout presets**: several named defaults plus user-made ones.~~ ✅ Done.
+     A **Layout** menu in the comp bar switches between built-ins (`Default`,
+     `Animation` — a tall dopesheet; `Design` — no dopesheet, wide canvas) and
+     lets you name + save the current arrangement as a preset. Each built-in is
+     just a `Dock` constructor listed in `builtin_presets()`; a user preset is a
+     cloned tree (`Dock` is now `Clone`). A test pins that *every* preset keeps
+     the structural guarantees (one innermost canvas; comp + transport present,
+     since those headerless toolbars can't be re-added if a preset drops them).
    - **Save the layout into the project** once it's been changed, so a `.pbc`
-     reopens the way it was left.
+     reopens the way it was left. User presets currently live only for the
+     session; this is where they (and the active layout) get persisted — the
+     `Dock`/`Preset` trees are already `Clone` and shaped for a `serde` derive.
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
 
