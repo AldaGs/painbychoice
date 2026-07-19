@@ -5,7 +5,7 @@
 use kurbo::{Affine, BezPath};
 
 use crate::node::{Document, Node, NodeId};
-use crate::value::Color;
+use crate::value::{Color, EvalCtx};
 
 /// One flat, ready-to-draw item. `source` traces it back to the node that
 /// produced it — provenance for selection and debugging.
@@ -35,22 +35,26 @@ pub struct Scene {
 /// [`crate::timebase::Timebase`].
 pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     let mut scene = Scene::default();
-    walk(&doc.root, Affine::IDENTITY, 1.0, frame, &mut scene);
+    // The resolve context is built once here and shared by the whole walk, so
+    // every property in the frame resolves against the same context — the seam
+    // the expression engine and its cache slot into.
+    let ctx = EvalCtx::at(frame);
+    walk(&doc.root, Affine::IDENTITY, 1.0, &ctx, &mut scene);
     scene
 }
 
-fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, frame: f64, scene: &mut Scene) {
-    let (local_xf, local_opacity) = node.transform.resolve(frame);
+fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &EvalCtx, scene: &mut Scene) {
+    let (local_xf, local_opacity) = node.transform.resolve(ctx);
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
 
     if let Some(shape) = &node.shape {
-        let path = shape.to_path(frame);
-        let fill = node.fill.as_ref().map(|f| f.resolve(frame));
+        let path = shape.to_path(ctx);
+        let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
         let stroke = node
             .stroke
             .as_ref()
-            .map(|s| (s.color.resolve(frame), s.width.resolve(frame)));
+            .map(|s| (s.color.resolve(ctx), s.width.resolve(ctx)));
 
         // Provenance-tagged sanity check: surface non-finite geometry instead
         // of silently emitting a broken frame.
@@ -71,7 +75,7 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, frame: f64, scene: 
     }
 
     for child in &node.children {
-        walk(child, xf, opacity, frame, scene);
+        walk(child, xf, opacity, ctx, scene);
     }
 }
 

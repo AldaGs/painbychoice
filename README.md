@@ -32,6 +32,13 @@ a constant or a keyframe track today; an expression / parametric-node IR later.
 time `t` into a flat `Scene` of draw items. Non-destructive editing and
 non-linear scrubbing both fall out of that single design choice.
 
+A resolve now takes an **`EvalCtx`** rather than a bare frame:
+`Value::resolve(&self, ctx: &EvalCtx)`. Today `EvalCtx` carries only the
+(fractional) frame, so nothing about behaviour changed — but it's the seam the
+node/expression IR (roadmap #5) grows into: the document, a script engine, and a
+memo + cycle cache all land on this one struct without re-threading every
+`resolve` in the tree. `evaluate` builds one context and shares it down the walk.
+
 Every evaluated item carries a `source: NodeId` (provenance) so a frame traces
 back to the node that produced it — used for click-to-select and debugging.
 
@@ -344,6 +351,19 @@ IR (next) → …**. Next up:
    With that, **item #4 is complete.** Next is the node/expression IR (#5).
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
+   🚧 in progress, being built in stages:
+   - ~~**The `EvalCtx` seam.**~~ ✅ Done. `resolve` now takes an `EvalCtx`
+     instead of a bare frame (see *The core idea* above). Purely mechanical and
+     behaviour-preserving — it exists so the next steps are additive, not another
+     ripple through every call site.
+   - **`Value::Expr` + the IR** — the dynamic↔typed `ExprValue { Num, Vec2,
+     Color }` boundary, a small expression IR (literal, cross-property reference
+     with time offset, arithmetic), and a `ResolveCache` on `EvalCtx` for
+     memoization + cycle detection (a cycle → a `scene.warnings` entry via the
+     provenance channel + a fallback, never a hang). See the design note below.
+   - **Rhai scripting**, then the **node-graph GUI panel** (a new `Editor` in the
+     dock — the split/join work makes slotting one in trivial), both lowering to
+     the same IR.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
@@ -463,9 +483,12 @@ frame cache. Store *references* in `.pbc`, never pixels.
 `Value::Expr` is another `Value<T>` recipe; `evaluate` runs it instead of
 sampling keyframes. Expressions and the node graph are two front-ends that lower
 to the **same IR** (the EBN IR + dumb-printer discipline).
-- **Signature ripple:** `resolve(&self, t)` → `resolve(&self, ctx: &mut
-  EvalCtx)` carrying `{ t, doc, engine, cache }`. A single-`t` "bake first"
-  pre-pass can't work because `valueAtTime(t')` samples at *other* times.
+- **Signature ripple:** `resolve(&self, t)` → `resolve(&self, ctx: &EvalCtx)` —
+  ✅ **done** (`EvalCtx` carries just `{ frame }` today). Still to add to the
+  context: `{ doc, engine, cache }`, and the switch to `&mut` once the cache
+  lands (it's the only part that mutates). A single-`t` "bake first" pre-pass
+  can't work because `valueAtTime(t')` samples at *other* times, which is the
+  whole reason the context — not a bare frame — is threaded.
 - **Dynamic↔typed boundary:** `ExprValue { Num, Vec2, Color }` + `FromExpr` /
   `ToExpr`, implemented only for scriptable `T` (not `BezPath` — enforced by the
   trait bound).

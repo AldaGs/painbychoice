@@ -379,6 +379,27 @@ impl<T: Animatable> Track<T> {
     }
 }
 
+/// The context a [`Value`] resolves against.
+///
+/// Today it carries only the (fractional) frame, so a resolve is still a pure
+/// function of time. It exists now — rather than passing a bare `f64` — because
+/// the expression/node-graph step threads *more* through here (the document, a
+/// script engine, and a memo + cycle-detection cache) without changing the
+/// arity of every `resolve` in the tree. One struct grows; the call sites don't.
+#[derive(Clone, Copy, Debug)]
+pub struct EvalCtx {
+    /// The frame to resolve at. Fractional on purpose — keys sit on the grid,
+    /// the playhead need not (sub-frame sampling is what motion blur will want).
+    pub frame: f64,
+}
+
+impl EvalCtx {
+    /// A context that resolves at `frame`.
+    pub fn at(frame: f64) -> Self {
+        Self { frame }
+    }
+}
+
 /// A property's value source. Adding `Expr` / `Parametric` variants later is
 /// how expressions and node-graph-driven values plug in — the same lowered-IR
 /// discipline EBN uses for control flow, applied to dataflow values.
@@ -393,11 +414,11 @@ impl<T: Animatable> Value<T> {
         Value::Const(v)
     }
 
-    /// Resolve at `frame` (fractional allowed — see [`Track::sample`]).
-    pub fn resolve(&self, frame: f64) -> T {
+    /// Resolve against `ctx` (fractional frame allowed — see [`Track::sample`]).
+    pub fn resolve(&self, ctx: &EvalCtx) -> T {
         match self {
             Value::Const(v) => v.clone(),
-            Value::Keyframed(track) => track.sample(frame),
+            Value::Keyframed(track) => track.sample(ctx.frame),
         }
     }
 
@@ -558,11 +579,17 @@ fn solve_ease(u: f64, p1: Handle, p2: Handle) -> f64 {
 mod tests {
     use super::*;
 
+    /// A resolve context at `frame`. These tests only sample constants and
+    /// tracks, so the frame is all the context they need.
+    fn at(frame: f64) -> EvalCtx {
+        EvalCtx::at(frame)
+    }
+
     #[test]
     fn const_resolves_anywhere() {
         let v = Value::constant(5.0);
-        assert_eq!(v.resolve(0.0), 5.0);
-        assert_eq!(v.resolve(99.0), 5.0);
+        assert_eq!(v.resolve(&at(0.0)), 5.0);
+        assert_eq!(v.resolve(&at(99.0)), 5.0);
     }
 
     #[test]
@@ -571,7 +598,7 @@ mod tests {
             Keyframe::linear(0, 0.0),
             Keyframe::linear(24, 100.0),
         ]));
-        assert!((v.resolve(12.0) - 50.0).abs() < 1e-3, "got {}", v.resolve(12.0));
+        assert!((v.resolve(&at(12.0)) - 50.0).abs() < 1e-3, "got {}", v.resolve(&at(12.0)));
     }
 
     #[test]
@@ -580,8 +607,8 @@ mod tests {
             Keyframe::linear(24, 10.0),
             Keyframe::linear(48, 20.0),
         ]));
-        assert_eq!(v.resolve(0.0), 10.0);
-        assert_eq!(v.resolve(120.0), 20.0);
+        assert_eq!(v.resolve(&at(0.0)), 10.0);
+        assert_eq!(v.resolve(&at(120.0)), 20.0);
     }
 
     #[test]
@@ -591,7 +618,7 @@ mod tests {
             Keyframe::linear(0, 0.0),
             Keyframe::linear(10, 100.0),
         ]));
-        assert!((v.resolve(2.5) - 25.0).abs() < 1e-9, "got {}", v.resolve(2.5));
+        assert!((v.resolve(&at(2.5)) - 25.0).abs() < 1e-9, "got {}", v.resolve(&at(2.5)));
     }
 
     #[test]
@@ -601,16 +628,16 @@ mod tests {
             Keyframe::smooth(0, 0.0),
             Keyframe::smooth(24, 100.0),
         ]));
-        assert!((v.resolve(12.0) - 50.0).abs() < 1.0, "got {}", v.resolve(12.0));
+        assert!((v.resolve(&at(12.0)) - 50.0).abs() < 1.0, "got {}", v.resolve(&at(12.0)));
         // ...but eased slower at the start than linear would be.
-        assert!(v.resolve(6.0) < 25.0, "ease-in should lag: {}", v.resolve(6.0));
+        assert!(v.resolve(&at(6.0)) < 25.0, "ease-in should lag: {}", v.resolve(&at(6.0)));
     }
 
     #[test]
     fn set_at_overwrites_a_constant() {
         let mut v = Value::constant(3.0);
         v.set_at(24, 9.0);
-        assert_eq!(v.resolve(0.0), 9.0);
+        assert_eq!(v.resolve(&at(0.0)), 9.0);
         assert!(!v.is_animated());
     }
 
@@ -622,10 +649,10 @@ mod tests {
         ]));
         // Edit exactly on the first key: replaces its value, no new key.
         v.set_at(0, 50.0);
-        assert_eq!(v.resolve(0.0), 50.0);
+        assert_eq!(v.resolve(&at(0.0)), 50.0);
         // Edit between keys: inserts a new key on that frame.
         v.set_at(12, 75.0);
-        assert!((v.resolve(12.0) - 75.0).abs() < 1e-6);
+        assert!((v.resolve(&at(12.0)) - 75.0).abs() < 1e-6);
         if let Value::Keyframed(track) = &v {
             assert_eq!(track.keys().len(), 3, "a key should have been inserted");
         } else {
@@ -640,7 +667,7 @@ mod tests {
         v.insert_key(24);
         assert!(v.is_animated(), "constant should become a track");
         assert_eq!(v.key_frames(), vec![24]);
-        assert_eq!(v.resolve(24.0), 7.0, "the held value carries over");
+        assert_eq!(v.resolve(&at(24.0)), 7.0, "the held value carries over");
         // A second insert on a new frame adds a key holding the resolved value.
         v.insert_key(72);
         assert_eq!(v.key_frames().len(), 2);
@@ -674,7 +701,7 @@ mod tests {
         assert!(f[1] < f[2], "middle key must stay before the last");
         assert!(f[1] > f[0], "and after the first");
         // Order preserved, so sampling still works.
-        assert!(v.resolve(12.0).is_finite());
+        assert!(v.resolve(&at(12.0)).is_finite());
     }
 
     #[test]
@@ -811,7 +838,7 @@ mod tests {
         v.insert_keys(&clip, 30);
         assert!(v.is_animated());
         assert_eq!(v.key_frames(), vec![0, 30, 40], "seed key at 0 keeps it samplable");
-        assert_eq!(v.resolve(0.0), 7.0, "the old constant is the value before the paste");
+        assert_eq!(v.resolve(&at(0.0)), 7.0, "the old constant is the value before the paste");
     }
 
     #[test]
@@ -821,7 +848,7 @@ mod tests {
             Keyframe::linear(0, Vec2::new(0.0, 0.0)),
             Keyframe::linear(24, Vec2::new(10.0, 20.0)),
         ]));
-        let p = v.resolve(12.0);
+        let p = v.resolve(&at(12.0));
         assert!((p.x - 5.0).abs() < 1e-3 && (p.y - 10.0).abs() < 1e-3);
     }
 
