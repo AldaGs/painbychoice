@@ -19,8 +19,9 @@ use std::time::Instant;
 
 use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate, Color as MColor, Document, EvalCtx, Handle, Keyframe,
-    Node as MNode, NodeId, Scene as MScene, Shape as MShape, Transform, Value,
+    demo::demo_document, evaluate, Color as MColor, Document, EvalCtx, Expr, ExprKind, ExprValue,
+    Handle, Keyframe, Node as MNode, NodeId, PropPath, Scene as MScene, Shape as MShape, Transform,
+    Value,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
@@ -142,6 +143,10 @@ enum Editor {
     Properties,
     Transport,
     Dopesheet,
+    /// The expression/node-graph editor: builds a `Value::Expr` on the selected
+    /// node's properties. Not in the default layout — summon it into any content
+    /// area with the area-header picker.
+    Graph,
 }
 
 /// The editors a user may freely place, split, and close in a dockable area.
@@ -152,7 +157,8 @@ enum Editor {
 /// and **Transport** are fixed chrome. So those three carry no area header:
 /// they can't be swapped away, split, or closed, which is exactly what keeps
 /// the canvas invariants intact while the content panels rearrange around them.
-const SWAPPABLE: [Editor; 3] = [Editor::Layers, Editor::Properties, Editor::Dopesheet];
+const SWAPPABLE: [Editor; 4] =
+    [Editor::Layers, Editor::Properties, Editor::Dopesheet, Editor::Graph];
 
 impl Editor {
     /// Human name shown in the area-header picker.
@@ -164,6 +170,7 @@ impl Editor {
             Editor::Properties => "Properties",
             Editor::Transport => "Transport",
             Editor::Dopesheet => "Dopesheet",
+            Editor::Graph => "Graph",
         }
     }
 
@@ -1263,6 +1270,13 @@ impl PropRef<'_> {
     fn is_animated(&self) -> bool {
         on_prop!(self, v => v.is_animated())
     }
+    fn is_expr(&self) -> bool {
+        on_prop!(self, v => v.is_expr())
+    }
+    /// The expression tree, if this property is expression-driven.
+    fn expr(&self) -> Option<&Expr> {
+        on_prop!(self, v => v.expr_ref())
+    }
     fn key_frames(&self) -> Vec<i64> {
         on_prop!(self, v => v.key_frames())
     }
@@ -1285,6 +1299,18 @@ impl PropRef<'_> {
 impl PropRefMut<'_> {
     fn move_keys(&mut self, idxs: &[usize], delta: i64) {
         on_prop_mut!(self, v => { v.move_keys(idxs, delta); })
+    }
+    /// Seed an expression from the current value (see [`Value::promote_to_expr`]).
+    fn promote_to_expr(&mut self, ctx: &mut EvalCtx) {
+        on_prop_mut!(self, v => v.promote_to_expr(ctx))
+    }
+    /// Freeze an expression back to a constant (see [`Value::bake_to_const`]).
+    fn bake_to_const(&mut self, ctx: &mut EvalCtx) {
+        on_prop_mut!(self, v => v.bake_to_const(ctx))
+    }
+    /// The expression tree mutably, for structured editing by path.
+    fn expr_mut(&mut self) -> Option<&mut Expr> {
+        on_prop_mut!(self, v => v.expr_mut())
     }
     fn remove_key(&mut self, index: usize) {
         on_prop_mut!(self, v => v.remove_key(index))
@@ -2001,6 +2027,319 @@ fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
                 }
             }
         });
+    }
+}
+
+/// The `PropPath`s an expression can reference, with labels. A subset of core's
+/// `PropPath` (the transform channels + fill), covering all three value kinds.
+const PROP_PATHS: [PropPath; 6] = [
+    PropPath::Position,
+    PropPath::Rotation,
+    PropPath::Scale,
+    PropPath::Opacity,
+    PropPath::Anchor,
+    PropPath::Fill,
+];
+
+fn prop_path_label(p: PropPath) -> &'static str {
+    match p {
+        PropPath::Position => "Position",
+        PropPath::Rotation => "Rotation",
+        PropPath::Scale => "Scale",
+        PropPath::Opacity => "Opacity",
+        PropPath::Anchor => "Anchor",
+        PropPath::Fill => "Fill",
+    }
+}
+
+/// One property in the graph panel: its kind, and — if it's expression-driven —
+/// a clone of the tree to render and its printed form.
+struct GraphProp {
+    kind: PropKind,
+    label: &'static str,
+    is_expr: bool,
+    expr: Option<Expr>,
+    printed: Option<String>,
+}
+
+/// What the graph panel renders: the selected node, its editable properties, and
+/// every node (for a reference target picker). Cloned before the UI pass so the
+/// panel never borrows `App`.
+struct GraphInfo {
+    node_name: String,
+    props: Vec<GraphProp>,
+    /// (id, name) of every node in the document.
+    nodes: Vec<(u64, String)>,
+}
+
+impl GraphInfo {
+    fn gather(doc: &Document, selected: Option<NodeId>) -> Option<GraphInfo> {
+        let node = doc.root.find(selected?)?;
+        let props = PropKind::ALL
+            .iter()
+            .filter_map(|&kind| {
+                let p = prop_of(node, kind)?;
+                Some(GraphProp {
+                    kind,
+                    label: kind.label(),
+                    is_expr: p.is_expr(),
+                    expr: p.expr().cloned(),
+                    printed: p.expr().map(|e| e.to_string()),
+                })
+            })
+            .collect();
+        let mut nodes = Vec::new();
+        collect_nodes(&doc.root, &mut nodes);
+        Some(GraphInfo { node_name: node.name.clone(), props, nodes })
+    }
+}
+
+fn collect_nodes(node: &MNode, out: &mut Vec<(u64, String)>) {
+    out.push((node.id.0, node.name.clone()));
+    for c in &node.children {
+        collect_nodes(c, out);
+    }
+}
+
+/// One deferred graph edit. Like the dock, the panel records at most one per
+/// frame against a `(property, tree-path)` address and `App` applies it after
+/// the UI pass, so the tree isn't restructured mid-render.
+enum GraphOp {
+    /// Make a property expression-driven (seeded from its current value).
+    Promote(PropKind),
+    /// Freeze an expression back to a constant.
+    Bake(PropKind),
+    /// Replace the node at `path` with a fresh node of `new` kind.
+    SetKind { kind: PropKind, path: Vec<usize>, new: ExprKind },
+    /// Set the literal at `path`.
+    SetLit { kind: PropKind, path: Vec<usize>, value: ExprValue },
+    /// Set the reference at `path`.
+    SetRef { kind: PropKind, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
+}
+
+#[derive(Default)]
+struct GraphEdits {
+    op: Option<GraphOp>,
+}
+
+/// The expression/node-graph panel: for the selected node, promote a property to
+/// an expression and edit its tree, or bake it back to a constant.
+fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, out: &mut GraphEdits) {
+    ui.add_space(8.0);
+    ui.heading("Graph");
+    let Some(info) = info else {
+        ui.weak("Select a node to drive its properties with expressions.");
+        return;
+    };
+    ui.weak(format!("Node: {}", info.node_name));
+    ui.separator();
+    for prop in &info.props {
+        ui.horizontal(|ui| {
+            ui.strong(prop.label);
+            if prop.is_expr {
+                if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
+                    out.op = Some(GraphOp::Bake(prop.kind));
+                }
+            } else if ui
+                .small_button("= fx")
+                .on_hover_text("Drive with an expression")
+                .clicked()
+            {
+                out.op = Some(GraphOp::Promote(prop.kind));
+            }
+        });
+        if let Some(expr) = &prop.expr {
+            if let Some(printed) = &prop.printed {
+                ui.weak(format!("= {printed}"));
+            }
+            let mut path = Vec::new();
+            expr_editor(ui, expr, prop.kind, &mut path, &info.nodes, out);
+            ui.separator();
+        }
+    }
+}
+
+/// Render one expression node (a kind picker plus kind-specific editors) and
+/// recurse into its children, indenting by depth. Every control reports a
+/// [`GraphOp`] against this node's `path` rather than mutating in place.
+fn expr_editor(
+    ui: &mut egui::Ui,
+    expr: &Expr,
+    kind: PropKind,
+    path: &mut Vec<usize>,
+    nodes: &[(u64, String)],
+    out: &mut GraphEdits,
+) {
+    let cur = expr.kind();
+    ui.horizontal(|ui| {
+        ui.add_space(8.0 + path.len() as f32 * 14.0);
+        egui::ComboBox::from_id_salt(("ek", kind.label(), path.as_slice()))
+            .width(52.0)
+            .selected_text(cur.label())
+            .show_ui(ui, |ui| {
+                for k in ExprKind::ALL {
+                    if ui.selectable_label(k == cur, k.label()).clicked() && k != cur {
+                        out.op = Some(GraphOp::SetKind { kind, path: path.clone(), new: k });
+                    }
+                }
+            });
+        match expr {
+            Expr::Lit(v) => lit_editor(ui, *v, kind, path, out),
+            Expr::Ref { node, prop, time_offset } => {
+                ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
+            }
+            _ => {}
+        }
+    });
+    // Children occupy slots 0.. in order; recurse with the slot pushed on `path`.
+    for slot in 0..expr.arity() {
+        if let Some(child) = child_ref(expr, slot) {
+            path.push(slot);
+            expr_editor(ui, child, kind, path, nodes, out);
+            path.pop();
+        }
+    }
+}
+
+/// The child expression at `slot` (0/1 for `Add`/`Mul`, 0 for `Neg`).
+fn child_ref(expr: &Expr, slot: usize) -> Option<&Expr> {
+    match (expr, slot) {
+        (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => Some(a),
+        (Expr::Add(_, b) | Expr::Mul(_, b), 1) => Some(b),
+        _ => None,
+    }
+}
+
+fn lit_editor(ui: &mut egui::Ui, v: ExprValue, kind: PropKind, path: &[usize], out: &mut GraphEdits) {
+    let set = |value| Some(GraphOp::SetLit { kind, path: path.to_vec(), value });
+    match v {
+        ExprValue::Num(n) => {
+            let mut n = n;
+            if ui.add(egui::DragValue::new(&mut n).speed(0.1)).changed() {
+                out.op = set(ExprValue::Num(n));
+            }
+        }
+        ExprValue::Vec2(vec) => {
+            let (mut x, mut y) = (vec.x, vec.y);
+            let cx = ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed();
+            let cy = ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed();
+            if cx || cy {
+                out.op = set(ExprValue::Vec2(Vec2::new(x, y)));
+            }
+        }
+        ExprValue::Color(c) => {
+            let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                out.op = set(ExprValue::Color(rgb_color(rgb)));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ref_editor(
+    ui: &mut egui::Ui,
+    node: NodeId,
+    prop: PropPath,
+    offset: f64,
+    kind: PropKind,
+    path: &[usize],
+    nodes: &[(u64, String)],
+    out: &mut GraphEdits,
+) {
+    let mut chosen_node = node;
+    let cur_name = nodes
+        .iter()
+        .find(|(id, _)| *id == node.0)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| format!("#{}", node.0));
+    egui::ComboBox::from_id_salt(("rn", kind.label(), path))
+        .selected_text(cur_name)
+        .show_ui(ui, |ui| {
+            for (id, name) in nodes {
+                if ui.selectable_label(*id == node.0, format!("{name} (#{id})")).clicked() {
+                    chosen_node = NodeId(*id);
+                }
+            }
+        });
+    let mut chosen_prop = prop;
+    egui::ComboBox::from_id_salt(("rp", kind.label(), path))
+        .width(80.0)
+        .selected_text(prop_path_label(prop))
+        .show_ui(ui, |ui| {
+            for p in PROP_PATHS {
+                if ui.selectable_label(p == prop, prop_path_label(p)).clicked() {
+                    chosen_prop = p;
+                }
+            }
+        });
+    let mut off = offset;
+    let off_changed = ui
+        .add(egui::DragValue::new(&mut off).speed(0.5).prefix("t"))
+        .on_hover_text("Frame offset")
+        .changed();
+    if chosen_node != node || chosen_prop != prop || off_changed {
+        out.op = Some(GraphOp::SetRef { kind, path: path.to_vec(), node: chosen_node, prop: chosen_prop, offset: off });
+    }
+}
+
+/// Apply a deferred graph-panel edit to `selected`'s property in `doc`. A free
+/// function (not an `App` method) so the whole promote/edit/bake flow is unit-
+/// testable against a plain `Document`, no window required.
+fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, frame: i64) {
+    let t = frame as f64;
+    match op {
+        GraphOp::Promote(kind) => {
+            // Promoting a constant/keyframed value only reads its own current
+            // value, so a document-less context is enough.
+            let mut ctx = EvalCtx::at(t);
+            if let Some(node) = doc.root.find_mut(selected) {
+                if let Some(mut p) = prop_of_mut(node, kind) {
+                    p.promote_to_expr(&mut ctx);
+                }
+            }
+        }
+        GraphOp::Bake(kind) => {
+            // Baking resolves the *expression*, which may reference other nodes —
+            // so it needs the document. Resolve against a clone so the read
+            // context doesn't alias the node being mutated.
+            let snapshot = doc.clone();
+            let mut ctx = EvalCtx::new(&snapshot, t);
+            if let Some(node) = doc.root.find_mut(selected) {
+                if let Some(mut p) = prop_of_mut(node, kind) {
+                    p.bake_to_const(&mut ctx);
+                }
+            }
+        }
+        GraphOp::SetKind { kind, path, new } => {
+            edit_expr(doc, selected, kind, &path, |e| *e = Expr::seed(new));
+        }
+        GraphOp::SetLit { kind, path, value } => {
+            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Lit(value));
+        }
+        GraphOp::SetRef { kind, path, node, prop, offset } => {
+            edit_expr(doc, selected, kind, &path, |e| {
+                *e = Expr::Ref { node, prop, time_offset: offset }
+            });
+        }
+    }
+}
+
+/// Mutate the expression subtree at `path` on `selected`'s `kind` property.
+/// No-op if the property isn't an expression or the path is stale.
+fn edit_expr(
+    doc: &mut Document,
+    selected: NodeId,
+    kind: PropKind,
+    path: &[usize],
+    f: impl FnOnce(&mut Expr),
+) {
+    if let Some(node) = doc.root.find_mut(selected) {
+        if let Some(mut p) = prop_of_mut(node, kind) {
+            if let Some(target) = p.expr_mut().and_then(|e| e.at_mut(path)) {
+                f(target);
+            }
+        }
     }
 }
 
@@ -2768,6 +3107,8 @@ impl App {
         // scene (a doc-less context would show its fallback instead).
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, &self.doc, t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
+        // Snapshot for the graph panel (clones the selected node's expressions).
+        let graph_info = GraphInfo::gather(&self.doc, self.selected);
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -2819,6 +3160,7 @@ impl App {
         // At most one layout edit (split/join/retype) from an area header this
         // frame; applied to the tree after the UI pass, never during it.
         let mut dock_cmd: Option<DockCmd> = None;
+        let mut graph_edits = GraphEdits::default();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
             let mut path = Vec::new();
@@ -2856,12 +3198,20 @@ impl App {
                     Editor::Properties => {
                         properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
                     }
+                    Editor::Graph => graph_ui(ui, &graph_info, &mut graph_edits),
                     // vello paints here; egui only measures the hole.
                     Editor::Canvas => canvas_pts = Some(ui.max_rect()),
                 },
                 &mut dock_cmd,
             );
         });
+        // Apply a graph edit (promote/bake/tree change) after the UI pass.
+        if let Some(op) = graph_edits.op.take() {
+            if let Some(id) = self.selected {
+                apply_graph_op(&mut self.doc, id, op, frame);
+                window.request_redraw();
+            }
+        }
         // Now that egui has finished, restructure the layout tree if an area
         // header asked to. Doing it here (not mid-pass) keeps the panels and
         // their egui ids stable for the frame that was just drawn.
@@ -3566,9 +3916,107 @@ mod tests {
         assert!(Editor::Layers.is_swappable());
         assert!(Editor::Properties.is_swappable());
         assert!(Editor::Dopesheet.is_swappable());
+        assert!(Editor::Graph.is_swappable());
         assert!(!Editor::Canvas.is_swappable());
         assert!(!Editor::Comp.is_swappable());
         assert!(!Editor::Transport.is_swappable());
+    }
+
+    /// A one-node doc (id 1) with the given opacity, under a root.
+    fn graph_doc(opacity: Value<f64>) -> (Document, NodeId) {
+        let n = MNode::group(1, "n")
+            .with_transform(Transform { opacity, ..Transform::default() });
+        let doc = Document::new(100.0, 100.0, MNode::group(0, "root").with_child(n));
+        (doc, NodeId(1))
+    }
+
+    fn resolved_opacity(doc: &Document, id: NodeId) -> f64 {
+        let node = doc.root.find(id).unwrap();
+        let mut ctx = EvalCtx::new(doc, 0.0);
+        node.transform.opacity.resolve(&mut ctx)
+    }
+
+    #[test]
+    fn gather_lists_the_selected_nodes_properties() {
+        let (doc, id) = graph_doc(Value::constant(0.5));
+        let info = GraphInfo::gather(&doc, Some(id)).unwrap();
+        let opacity = info.props.iter().find(|p| p.kind == PropKind::Opacity).unwrap();
+        assert!(!opacity.is_expr, "starts as a plain value");
+        assert!(opacity.expr.is_none());
+        // The reference-target list includes every node.
+        assert!(info.nodes.iter().any(|(nid, _)| *nid == 1));
+        assert!(info.nodes.iter().any(|(nid, _)| *nid == 0), "root too");
+    }
+
+    #[test]
+    fn promote_edit_then_bake_round_trips_a_property() {
+        let (mut doc, id) = graph_doc(Value::constant(0.5));
+        // Promote seeds a literal of the current value — unchanged.
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        assert!(doc.root.find(id).unwrap().transform.opacity.is_expr());
+        assert_eq!(resolved_opacity(&doc, id), 0.5);
+        // Edit the literal.
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetLit { kind: PropKind::Opacity, path: vec![], value: ExprValue::Num(0.9) },
+            0,
+        );
+        assert_eq!(resolved_opacity(&doc, id), 0.9);
+        // Bake back to a constant, freezing the value.
+        apply_graph_op(&mut doc, id, GraphOp::Bake(PropKind::Opacity), 0);
+        assert!(!doc.root.find(id).unwrap().transform.opacity.is_expr());
+        assert_eq!(resolved_opacity(&doc, id), 0.9);
+    }
+
+    #[test]
+    fn set_kind_grows_a_tree_that_evaluates() {
+        // Promote, turn the root into Add, then set its two children: 0.2 + 0.3.
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Add },
+            0,
+        );
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetLit { kind: PropKind::Opacity, path: vec![0], value: ExprValue::Num(0.2) },
+            0,
+        );
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetLit { kind: PropKind::Opacity, path: vec![1], value: ExprValue::Num(0.3) },
+            0,
+        );
+        assert!((resolved_opacity(&doc, id) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_ref_links_one_property_to_another() {
+        // Two nodes: a (id 1) opacity 0.4, b (id 2) empty; b.opacity references a.
+        let a = MNode::group(1, "a")
+            .with_transform(Transform { opacity: Value::constant(0.4), ..Transform::default() });
+        let b = MNode::group(2, "b");
+        let mut doc =
+            Document::new(100.0, 100.0, MNode::group(0, "root").with_child(a).with_child(b));
+        apply_graph_op(&mut doc, NodeId(2), GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            NodeId(2),
+            GraphOp::SetRef {
+                kind: PropKind::Opacity,
+                path: vec![],
+                node: NodeId(1),
+                prop: PropPath::Opacity,
+                offset: 0.0,
+            },
+            0,
+        );
+        assert_eq!(resolved_opacity(&doc, NodeId(2)), 0.4, "b now mirrors a");
     }
 
     /// A rect with every optional property present.

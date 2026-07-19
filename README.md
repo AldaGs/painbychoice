@@ -182,7 +182,8 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
 - `live/src/main.rs` — everything UI. `App::render` is the per-frame heart:
   evaluate → hit-test → gather snapshots → run egui → apply `*Edits` → GPU. Panel
   fns: `comp_ui`, `tree_ui`, `transport_ui`, `dopesheet_ui`, `properties_ui`,
-  `ease_editor`, `key_button`. Each panel fn renders into a `&mut Ui` it is
+  `graph_ui` (the expression editor; `apply_graph_op` applies its deferred
+  edits), `ease_editor`, `key_button`. Each panel fn renders into a `&mut Ui` it is
   handed — it does **not** create its own `egui::Panel`; placement is the
   layout tree's job (see below).
   Timeline mapping: `TimelineView` (the visible frame window) + `Axis`
@@ -391,11 +392,21 @@ IR (next) → …**. Next up:
      the dynamic `ExprValue { Num, Vec2, Color }` and its `From`/`ToExpr` edge, a
      tiny IR (`Lit`, `Ref { node, prop, time_offset }`, `Add`/`Mul`/`Neg`), and a
      `ResolveCache` on `EvalCtx` doing per-frame memoization + cycle detection (a
-     cycle → a `scene.warnings` entry + a neutral fallback, never a hang). No UI
-     yet — expressions are built in code / a hand-edited `.pbc`; the panel is next.
-   - **Rhai scripting**, then the **node-graph GUI panel** (a new `Editor` in the
-     dock — the split/join work makes slotting one in trivial), both lowering to
-     the same IR. This is where expressions get a way to be *authored*.
+     cycle → a `scene.warnings` entry + a neutral fallback, never a hang).
+   - ~~**Node-graph panel (first cut).**~~ ✅ Done. A new `Editor::Graph`
+     (summonable into any content area via the split/join picker — no default-
+     layout change) lets you drive the selected node's properties with
+     expressions: **`= fx`** promotes a property (seeded from its current value),
+     **bake** freezes it back to a constant, and the expression is edited as a
+     structured tree — a kind picker per node (`value`/`ref`/`add`/`mul`/`neg`)
+     with kind-specific editors, changing one node's kind grows the tree. Edits
+     are deferred `GraphOp`s addressed by `(property, tree-path)` and applied
+     after the UI pass, the same discipline as the dock. It's an indented outline,
+     not yet a free node canvas — that's the next refinement over the same model
+     (`Expr::at_mut`/`seed`/`kind`, all unit-tested).
+   - **A free node canvas** (draggable boxes + wires) over the same `Expr` model,
+     and **Rhai scripting** (text expressions) — both lower to the IR that's now
+     in place. Rhai's real cost is the `EvalCtx`-callback bridge, not syntax.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the

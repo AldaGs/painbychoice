@@ -8,6 +8,7 @@
 //! is a pure function of the frame and the values it references.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +185,116 @@ impl Expr {
     /// A reference shifted by `frames` (negative = earlier — a trailing echo).
     pub fn reference_at(node: NodeId, prop: PropPath, frames: f64) -> Expr {
         Expr::Ref { node, prop, time_offset: frames }
+    }
+
+    /// Which variant this node is — for an editor's kind picker, without
+    /// exposing the payloads.
+    pub fn kind(&self) -> ExprKind {
+        match self {
+            Expr::Lit(_) => ExprKind::Lit,
+            Expr::Ref { .. } => ExprKind::Ref,
+            Expr::Add(..) => ExprKind::Add,
+            Expr::Mul(..) => ExprKind::Mul,
+            Expr::Neg(..) => ExprKind::Neg,
+        }
+    }
+
+    /// A fresh node of `kind`, with children seeded to neutral literals so an
+    /// editor can grow a tree by changing one node's kind at a time (a `Lit`
+    /// becomes an `Add` of two zeros you then edit or change further). `Add`
+    /// seeds 0+0, `Mul` 1×1 — the identities, so a half-built node is harmless.
+    pub fn seed(kind: ExprKind) -> Expr {
+        match kind {
+            ExprKind::Lit => Expr::num(0.0),
+            ExprKind::Ref => Expr::Ref {
+                node: NodeId(0),
+                prop: PropPath::Position,
+                time_offset: 0.0,
+            },
+            ExprKind::Add => Expr::Add(Box::new(Expr::num(0.0)), Box::new(Expr::num(0.0))),
+            ExprKind::Mul => Expr::Mul(Box::new(Expr::num(1.0)), Box::new(Expr::num(1.0))),
+            ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
+        }
+    }
+
+    /// How many child slots this node has: `Add`/`Mul` two, `Neg` one, others
+    /// none. Lets an editor iterate a node's inputs without matching the kind.
+    pub fn arity(&self) -> usize {
+        match self {
+            Expr::Add(..) | Expr::Mul(..) => 2,
+            Expr::Neg(..) => 1,
+            Expr::Lit(_) | Expr::Ref { .. } => 0,
+        }
+    }
+
+    /// Borrow the subtree at `path` (a sequence of child slots from this node).
+    /// An out-of-range slot yields `None`, so a stale editor path no-ops.
+    pub fn at_mut(&mut self, path: &[usize]) -> Option<&mut Expr> {
+        let Some((&slot, rest)) = path.split_first() else {
+            return Some(self);
+        };
+        let child = match (self, slot) {
+            (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_mut(),
+            (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_mut(),
+            _ => return None,
+        };
+        child.at_mut(rest)
+    }
+}
+
+/// The variant of an [`Expr`] node, for an editor's kind picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExprKind {
+    Lit,
+    Ref,
+    Add,
+    Mul,
+    Neg,
+}
+
+impl ExprKind {
+    /// Every kind, in picker order.
+    pub const ALL: [ExprKind; 5] =
+        [ExprKind::Lit, ExprKind::Ref, ExprKind::Add, ExprKind::Mul, ExprKind::Neg];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ExprKind::Lit => "value",
+            ExprKind::Ref => "ref",
+            ExprKind::Add => "add",
+            ExprKind::Mul => "mul",
+            ExprKind::Neg => "neg",
+        }
+    }
+}
+
+impl fmt::Display for ExprValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExprValue::Num(n) => write!(f, "{n}"),
+            ExprValue::Vec2(v) => write!(f, "[{}, {}]", v.x, v.y),
+            ExprValue::Color(c) => write!(f, "rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a),
+        }
+    }
+}
+
+/// The "dumb printer": an [`Expr`] rendered back to a compact, readable form.
+/// A reference reads `@node.Prop` (with `[+n]`/`[-n]` for a time offset).
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Lit(v) => write!(f, "{v}"),
+            Expr::Ref { node, prop, time_offset } => {
+                if *time_offset == 0.0 {
+                    write!(f, "@{}.{prop:?}", node.0)
+                } else {
+                    write!(f, "@{}.{prop:?}[{time_offset:+}]", node.0)
+                }
+            }
+            Expr::Add(a, b) => write!(f, "({a} + {b})"),
+            Expr::Mul(a, b) => write!(f, "({a} * {b})"),
+            Expr::Neg(a) => write!(f, "-{a}"),
+        }
     }
 }
 
@@ -428,5 +539,60 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         let back: Value<f64> = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Value::Expr(Expr::Ref { .. })));
+    }
+
+    #[test]
+    fn seed_matches_its_kind_and_arity() {
+        for k in ExprKind::ALL {
+            let e = Expr::seed(k);
+            assert_eq!(e.kind(), k);
+            let expected = match k {
+                ExprKind::Add | ExprKind::Mul => 2,
+                ExprKind::Neg => 1,
+                ExprKind::Lit | ExprKind::Ref => 0,
+            };
+            assert_eq!(e.arity(), expected, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn at_mut_addresses_a_subtree_by_slot_path() {
+        // (2 + (3 * 4)) — edit the 4 (path [1, 1]) into a 9.
+        let mut e = Expr::Add(
+            Box::new(Expr::num(2.0)),
+            Box::new(Expr::Mul(Box::new(Expr::num(3.0)), Box::new(Expr::num(4.0)))),
+        );
+        *e.at_mut(&[1, 1]).unwrap() = Expr::num(9.0);
+        assert_eq!(e.to_string(), "(2 + (3 * 9))");
+        // A slot past the node's arity is None (Neg has only slot 0).
+        assert!(Expr::seed(ExprKind::Neg).at_mut(&[1]).is_none());
+    }
+
+    #[test]
+    fn display_prints_the_tree_readably() {
+        let e = Expr::Add(
+            Box::new(Expr::num(2.0)),
+            Box::new(Expr::Mul(Box::new(Expr::num(3.0)), Box::new(Expr::num(4.0)))),
+        );
+        assert_eq!(e.to_string(), "(2 + (3 * 4))");
+        assert_eq!(Expr::reference(NodeId(1), PropPath::Position).to_string(), "@1.Position");
+        assert_eq!(
+            Expr::reference_at(NodeId(2), PropPath::Rotation, 5.0).to_string(),
+            "@2.Rotation[+5]"
+        );
+    }
+
+    #[test]
+    fn promote_seeds_with_the_current_value_then_bake_freezes_it() {
+        let mut v: Value<f64> = Value::constant(0.5);
+        let mut ctx = EvalCtx::at(0.0);
+        v.promote_to_expr(&mut ctx);
+        assert!(v.is_expr(), "now an expression");
+        assert_eq!(v.resolve(&mut ctx), 0.5, "seeded with the old value, unchanged");
+        // Edit the literal, then bake: the constant freezes the resolved value.
+        *v.expr_mut().unwrap() = Expr::num(0.9);
+        v.bake_to_const(&mut ctx);
+        assert!(matches!(v, Value::Const(_)));
+        assert_eq!(v.resolve(&mut ctx), 0.9);
     }
 }

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::expr::{eval_expr, EvalCtx, Expr, FromExpr};
+use crate::expr::{eval_expr, EvalCtx, Expr, FromExpr, ToExpr};
 
 /// Anything that can be interpolated between two states.
 pub trait Animatable: Clone {
@@ -392,7 +392,7 @@ pub enum Value<T> {
     Expr(Expr),
 }
 
-impl<T: Animatable + FromExpr> Value<T> {
+impl<T: Animatable + FromExpr + ToExpr> Value<T> {
     pub fn constant(v: T) -> Self {
         Value::Const(v)
     }
@@ -400,6 +400,47 @@ impl<T: Animatable + FromExpr> Value<T> {
     /// An expression-driven value.
     pub fn expr(e: Expr) -> Self {
         Value::Expr(e)
+    }
+
+    /// Whether this value is expression-driven.
+    pub fn is_expr(&self) -> bool {
+        matches!(self, Value::Expr(_))
+    }
+
+    /// The expression, if this is an `Expr` value — for an editor to render or
+    /// walk the tree.
+    pub fn expr_ref(&self) -> Option<&Expr> {
+        match self {
+            Value::Expr(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The expression mutably, for structured editing of the tree in place.
+    pub fn expr_mut(&mut self) -> Option<&mut Expr> {
+        match self {
+            Value::Expr(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Turn a constant/keyframed value into an expression, seeded with a literal
+    /// of the value it currently resolves to — so promoting a property doesn't
+    /// visibly change it until you edit the expression. No-op if already an expr.
+    pub fn promote_to_expr(&mut self, ctx: &mut EvalCtx) {
+        if !self.is_expr() {
+            let current = self.resolve(ctx);
+            *self = Value::Expr(Expr::Lit(current.to_expr()));
+        }
+    }
+
+    /// Bake an expression down to a constant of the value it currently resolves
+    /// to (freezing this frame's result). No-op if not an expression.
+    pub fn bake_to_const(&mut self, ctx: &mut EvalCtx) {
+        if self.is_expr() {
+            let current = self.resolve(ctx);
+            *self = Value::Const(current);
+        }
     }
 
     /// Resolve against `ctx` (fractional frame allowed — see [`Track::sample`]).
