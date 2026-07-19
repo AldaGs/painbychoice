@@ -79,7 +79,7 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   *quantizes* to the frame grid, so changing FPS visibly changes the playback
   cadence.
 - **Layers** (left) — scene tree; select, reorder (▲/▼), add Rect/Ellipse/Group,
-  delete (✕), Save…/Load… (`.pbc` JSON via serde).
+  delete (✕), Save…/Load… (`.pbc` JSON via serde — document *and* panel layout).
 - **Properties** (right) — resolved values for the selection; drag or click-type
   to edit. A painted **stopwatch** per property (filled = animated, hollow =
   constant) inserts a keyframe at the playhead — first click on a constant
@@ -182,6 +182,24 @@ frame) rather than living only in egui's panel memory — that's what keeps the
 tree the source of truth, so saving layouts is a `serde` derive rather than a
 scrape of egui internals.
 
+**Split / join / retype.** Every *content* area wears a thin header
+(`area_header`): an editor picker plus `|`/`-`/`x` buttons. Splitting a leaf
+rewrites it to a `Split` of two clones; closing an area collapses its parent
+`Split` to the surviving sibling; the picker swaps a leaf's `Editor`. These are
+pure tree edits (`Dock::apply`), and — like every other panel — they don't
+mutate mid-render: an area header only *records* a `DockCmd` against the leaf's
+`path` (a `Vec<Branch>` naming it from the root), which `render` applies once
+the egui pass is done. Restructuring the tree while its panels are still laid
+out would desync egui's per-panel ids.
+
+- **Only the three content editors are `SWAPPABLE`** (Layers, Properties,
+  Dopesheet). The canvas and the comp/transport toolbars are *structural* leaves
+  with **no header** — so a user can't duplicate, retype, or close them. That's
+  not a UI nicety, it's what keeps the two canvas invariants safe: there is
+  always exactly one canvas leaf to measure (`canvas_rect`), and it stays the
+  tree's innermost leaf. A closed area is always content, so the canvas — its
+  sibling, or in an untouched ancestor branch — always survives.
+
 **Known wrinkle:** the canvas rect is measured during the UI pass, but the fit is
 needed *before* it (to pick, and to build the vello scene), so the fit uses the
 previous frame's rect. Stale only while a splitter or the window is actively
@@ -213,6 +231,27 @@ it's a no-op on an already-migrated doc. The legacy field is never
 re-serialized, so a file is permanently migrated on its first save. Keys that
 round onto the same frame collapse to one.
 
+### Saving the layout: the `Project` wrapper
+
+The `.pbc` is a `Project { document, layout }` (both in `live/`), **not** a bare
+`Document` — the UI layout can't live in `core::Document` without breaking the
+headless-engine split, so the app wraps the two on the way to disk. `layout`
+holds the active `Dock` and the user presets (built-ins are code, so they're
+never stored; `Preset::builtin` is `#[serde(skip)]` and reconstructs as `false`).
+
+Two rules keep this safe:
+
+- **Reading is backward-compatible.** `load` tries `Project` first; a pre-layout
+  file is a bare `Document` with no `document` field, so that parse fails and the
+  loader falls back to deserializing a plain `Document` (with the default
+  layout). Distinguishing the two is exactly the absent/present `document` key —
+  don't give `Project::document` a serde default or the fallback stops firing.
+- **A loaded layout is validated.** `Dock::is_valid` requires the invariants the
+  render path assumes (one canvas, innermost; comp + transport present). A file
+  that fails is dropped for `default_layout()` rather than wedging the editor
+  with, say, a layout that has no way back to the comp bar. User presets are
+  filtered the same way.
+
 ## Known issues / gotchas
 
 - **egui default font lacks many glyphs** (◆ ◇ ● ○ ❚ ⟲ ▸) — they render as tofu
@@ -240,7 +279,8 @@ round onto the same frame collapse to one.
 ## Roadmap (agreed order)
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
-UX ✅ → shape/stroke params ✅ → dockable panels 🚧 → …**. Next up:
+UX ✅ → shape/stroke params ✅ → dockable panels ✅ → node graph + expression
+IR (next) → …**. Next up:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -276,13 +316,32 @@ UX ✅ → shape/stroke params ✅ → dockable panels 🚧 → …**. Next up:
    tree + draggable splitters are done (see *The panel layout tree* above), and
    the canvas fit now derives from the tree instead of hardcoded panel sizes.
    Still to come, in order:
-   - **Split / join areas** (Blender's drag-a-border-corner) and a per-area
-     dropdown to change which `Editor` an area shows.
-   - **Layout presets**: several named defaults plus user-made ones. The tree is
-     already serialization-ready (`size` lives in the tree, and
-     `default_layout()` is just one constructor among future many).
-   - **Save the layout into the project** once it's been changed, so a `.pbc`
-     reopens the way it was left.
+   - ~~**Split / join areas** and a per-area dropdown to change which `Editor`
+     an area shows.~~ ✅ Done. Each content area carries a header with an editor
+     picker and split (`|` left/right, `-` top/bottom) + close (`x`) buttons;
+     the ops are pure `Dock` tree rewrites applied after the UI pass (see *Split
+     / join / retype* above). Deliberately **not** the literal drag-a-corner
+     gesture: layered on egui's own panel splitters that's far more fragile than
+     header controls, for the same capability. The canvas and the two toolbars
+     stay header-less on purpose, which is what protects the single-canvas and
+     innermost-canvas invariants.
+   - ~~**Layout presets**: several named defaults plus user-made ones.~~ ✅ Done.
+     A **Layout** menu in the comp bar switches between built-ins (`Default`,
+     `Animation` — a tall dopesheet; `Design` — no dopesheet, wide canvas) and
+     lets you name + save the current arrangement as a preset. Each built-in is
+     just a `Dock` constructor listed in `builtin_presets()`; a user preset is a
+     cloned tree (`Dock` is now `Clone`). A test pins that *every* preset keeps
+     the structural guarantees (one innermost canvas; comp + transport present,
+     since those headerless toolbars can't be re-added if a preset drops them).
+   - ~~**Save the layout into the project** so a `.pbc` reopens the way it was
+     left.~~ ✅ Done. The `.pbc` is now a `Project { document, layout }` wrapper
+     (see *Saving the layout* below); the active dock and user presets ride
+     alongside the document. Built-ins stay code, not data. A loaded layout is
+     validated (`Dock::is_valid`) and discarded for the default if it's broken,
+     so a hand-edited file can't wedge the editor. Old bare-`Document` `.pbc`
+     files still open — the loader falls back to a plain document parse.
+
+   With that, **item #4 is complete.** Next is the node/expression IR (#5).
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
 

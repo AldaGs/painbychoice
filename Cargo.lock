@@ -1116,6 +1116,7 @@ dependencies = [
  "motion-core",
  "pollster",
  "rfd",
+ "serde",
  "serde_json",
  "vello",
  "winit",

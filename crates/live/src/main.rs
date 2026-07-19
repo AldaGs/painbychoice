@@ -22,6 +22,7 @@ use motion_core::{
     demo::demo_document, evaluate, Color as MColor, Document, Handle, Keyframe, Node as MNode,
     NodeId, Scene as MScene, Shape as MShape, Transform, Value,
 };
+use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -133,7 +134,7 @@ const COMP_H: f32 = 34.0;
 /// The canvas is one of these even though vello draws it, not egui: it has to
 /// occupy a leaf so the layout tree knows where the leftover space is. Its leaf
 /// draws nothing and merely reports its rect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Editor {
     Canvas,
     Comp,
@@ -143,13 +144,65 @@ enum Editor {
     Dopesheet,
 }
 
+/// The editors a user may freely place, split, and close in a dockable area.
+///
+/// Deliberately excludes the three structural leaves. **Canvas** is a single
+/// vello target measured from its one leaf ([`App::canvas_rect`]) and must stay
+/// the tree's innermost leaf — duplicating or losing it breaks both. **Comp**
+/// and **Transport** are fixed chrome. So those three carry no area header:
+/// they can't be swapped away, split, or closed, which is exactly what keeps
+/// the canvas invariants intact while the content panels rearrange around them.
+const SWAPPABLE: [Editor; 3] = [Editor::Layers, Editor::Properties, Editor::Dopesheet];
+
+impl Editor {
+    /// Human name shown in the area-header picker.
+    fn label(self) -> &'static str {
+        match self {
+            Editor::Canvas => "Canvas",
+            Editor::Comp => "Composition",
+            Editor::Layers => "Layers",
+            Editor::Properties => "Properties",
+            Editor::Transport => "Transport",
+            Editor::Dopesheet => "Dopesheet",
+        }
+    }
+
+    /// Whether this area gets a header (picker + split/close) — see [`SWAPPABLE`].
+    fn is_swappable(self) -> bool {
+        SWAPPABLE.contains(&self)
+    }
+}
+
 /// Which edge of an area a split pins its first child to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum DockSide {
     Left,
     Right,
     Top,
     Bottom,
+}
+
+/// A step down the layout tree: into a split's `first` or `second` child. A
+/// sequence of these names a leaf. Area-header clicks record a target leaf as a
+/// path so the edit can be applied *after* the egui pass — restructuring the
+/// tree mid-render would desync egui's live panels and their ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Branch {
+    First,
+    Second,
+}
+
+/// A pending change to the layout tree, produced by an area header during the
+/// UI pass and applied once egui is done — the same defer-then-apply discipline
+/// the rest of the panels use for their `*Edits`.
+enum DockCmd {
+    /// Show a different editor in the area at `path`.
+    Retype { path: Vec<Branch>, editor: Editor },
+    /// Split the area at `path` in two along `side`; the new area clones the
+    /// editor. `size` is the first child's start size (half the area) in points.
+    Split { path: Vec<Branch>, side: DockSide, size: f32 },
+    /// Close the area at `path`; its sibling absorbs the freed space.
+    Close { path: Vec<Branch> },
 }
 
 /// The panel layout: a binary tree of splits with editors at the leaves.
@@ -161,8 +214,11 @@ enum DockSide {
 /// recursion into a plain `Ui`.
 ///
 /// This shape is deliberately serialization-ready: `size` lives here rather than
-/// only in egui's panel memory, so a future "save this layout" (named presets,
-/// and per-project layouts) is a `serde` derive away and needs no new plumbing.
+/// only in egui's panel memory, so a future "save this layout" (per-project
+/// layouts, roadmap #4) is a `serde` derive away and needs no new plumbing.
+/// `Clone` is what lets a saved preset be re-applied without rebuilding it;
+/// `serde` is what lets the active layout and user presets ride in the `.pbc`.
+#[derive(Clone, Serialize, Deserialize)]
 enum Dock {
     Leaf(Editor),
     Split {
@@ -223,6 +279,213 @@ impl Dock {
             ),
         )
     }
+
+    /// Timeline-forward layout for keyframe-heavy work: the dopesheet spans the
+    /// full width at the bottom and is given far more height than the stock
+    /// arrangement, with layers and properties flanking a smaller canvas above.
+    fn animation_layout() -> Dock {
+        use DockSide::*;
+        Dock::split(
+            Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                Bottom,
+                TRANSPORT_H,
+                false,
+                Editor::Transport,
+                Dock::split(
+                    Bottom,
+                    320.0,
+                    true,
+                    Editor::Dopesheet,
+                    Dock::split(
+                        Left,
+                        TREE_W,
+                        true,
+                        Editor::Layers,
+                        Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    /// Design layout: no dopesheet, so the canvas gets the whole middle for
+    /// vector/layout work. The transport stays (you still scrub), and the
+    /// dopesheet is one picker-click away on any content area if it's wanted.
+    fn design_layout() -> Dock {
+        use DockSide::*;
+        Dock::split(
+            Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                Bottom,
+                TRANSPORT_H,
+                false,
+                Editor::Transport,
+                Dock::split(
+                    Left,
+                    TREE_W,
+                    true,
+                    Editor::Layers,
+                    Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
+                ),
+            ),
+        )
+    }
+
+    /// Borrow the subtree named by `path`. If the path outruns the tree (a stale
+    /// edit against a since-changed layout) it stops at the deepest node reached,
+    /// which the callers then no-op on.
+    fn node_at_mut(&mut self, path: &[Branch]) -> &mut Dock {
+        let mut cur = self;
+        for &b in path {
+            cur = match cur {
+                Dock::Split { first, second, .. } => match b {
+                    Branch::First => first.as_mut(),
+                    Branch::Second => second.as_mut(),
+                },
+                Dock::Leaf(_) => return cur,
+            };
+        }
+        cur
+    }
+
+    /// Apply a deferred layout edit. Each op is a local tree rewrite; every path
+    /// is re-resolved here (never held across the UI pass), so a command that no
+    /// longer matches the tree simply finds a leaf where it expected a split, or
+    /// vice versa, and does nothing.
+    fn apply(&mut self, cmd: DockCmd) {
+        match cmd {
+            DockCmd::Retype { path, editor } => {
+                let leaf = self.node_at_mut(&path);
+                if matches!(leaf, Dock::Leaf(_)) {
+                    *leaf = Dock::Leaf(editor);
+                }
+            }
+            DockCmd::Split { path, side, size } => {
+                let leaf = self.node_at_mut(&path);
+                if let Dock::Leaf(e) = leaf {
+                    let e = *e;
+                    // Both halves start on the cloned editor; the picker then
+                    // lets the user retype either. New splits are always
+                    // resizable — only the stock toolbars are fixed.
+                    *leaf = Dock::Split {
+                        side,
+                        size: size.max(48.0),
+                        resizable: true,
+                        first: Box::new(Dock::Leaf(e)),
+                        second: Box::new(Dock::Leaf(e)),
+                    };
+                }
+            }
+            DockCmd::Close { path } => {
+                // Replace the parent split with the *kept* sibling. The closed
+                // leaf is always a content leaf (the canvas has no close button),
+                // so the canvas — living in the sibling or an untouched ancestor
+                // branch — always survives.
+                let Some((&last, parent_path)) = path.split_last() else {
+                    return; // the root has no sibling to fall back to.
+                };
+                let parent = self.node_at_mut(parent_path);
+                if let Dock::Split { .. } = parent {
+                    let old = std::mem::replace(parent, Dock::Leaf(Editor::Canvas));
+                    if let Dock::Split { first, second, .. } = old {
+                        *parent = match last {
+                            Branch::First => *second,
+                            Branch::Second => *first,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether this tree is safe to drive the UI. A layout loaded from a `.pbc`
+    /// (which may have been hand-edited or written by a newer/older build) has
+    /// to hold the same guarantees the code paths lean on, or it's discarded for
+    /// the default: exactly one canvas — the single vello target and the tree's
+    /// innermost leaf — plus the two headerless toolbars, which no picker can
+    /// re-add if a bad layout dropped them.
+    fn is_valid(&self) -> bool {
+        fn tally(d: &Dock, canvas: &mut u32, comp: &mut u32, transport: &mut u32) {
+            match d {
+                Dock::Leaf(Editor::Canvas) => *canvas += 1,
+                Dock::Leaf(Editor::Comp) => *comp += 1,
+                Dock::Leaf(Editor::Transport) => *transport += 1,
+                Dock::Leaf(_) => {}
+                Dock::Split { first, second, .. } => {
+                    tally(first, canvas, comp, transport);
+                    tally(second, canvas, comp, transport);
+                }
+            }
+        }
+        let (mut canvas, mut comp, mut transport) = (0, 0, 0);
+        tally(self, &mut canvas, &mut comp, &mut transport);
+        let mut cur = self;
+        let innermost_is_canvas = loop {
+            match cur {
+                Dock::Split { second, .. } => cur = second,
+                Dock::Leaf(e) => break *e == Editor::Canvas,
+            }
+        };
+        canvas == 1 && comp == 1 && transport == 1 && innermost_is_canvas
+    }
+}
+
+/// A named layout the user can switch to. Built-ins ship with the app and can't
+/// be renamed or removed; user presets are made by "Save current" and are saved
+/// into the `.pbc`. Only user presets are serialized — `builtin` is skipped and
+/// so defaults to `false` on load, which is what every loaded preset is.
+#[derive(Clone, Serialize, Deserialize)]
+struct Preset {
+    name: String,
+    dock: Dock,
+    #[serde(skip)]
+    builtin: bool,
+}
+
+/// The layouts offered out of the box. `Default` reproduces the fixed pre-dock
+/// arrangement; `Animation` and `Design` re-weight the same panels for two
+/// common modes of work. Adding another is one more entry here plus a `Dock`
+/// constructor — which is exactly the extensibility the tree was built for.
+fn builtin_presets() -> Vec<Preset> {
+    [
+        ("Default", Dock::default_layout as fn() -> Dock),
+        ("Animation", Dock::animation_layout),
+        ("Design", Dock::design_layout),
+    ]
+    .into_iter()
+    .map(|(name, make)| Preset { name: name.to_string(), dock: make(), builtin: true })
+    .collect()
+}
+
+/// The on-disk `.pbc` bundle: the headless document plus this shell's UI layout.
+/// The layout lives here in `live/`, never in `core::Document` — the engine
+/// stays UI-agnostic (the whole point of the crate split). Files written before
+/// layouts were saved are a *bare* `Document`; [`App::load`] falls back to that
+/// and defaults the layout, so old projects keep opening.
+#[derive(Serialize, Deserialize)]
+struct Project {
+    document: Document,
+    #[serde(default)]
+    layout: LayoutState,
+}
+
+/// The persisted UI layout: the active arrangement and any user-made presets.
+/// Built-in presets are code, not data, so they're never stored.
+#[derive(Default, Serialize, Deserialize)]
+struct LayoutState {
+    /// The active layout. Absent → fall back to [`Dock::default_layout`].
+    #[serde(default)]
+    dock: Option<Dock>,
+    /// Presets saved via the Layout menu (built-ins omitted).
+    #[serde(default)]
+    user_presets: Vec<Preset>,
 }
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
@@ -231,14 +494,28 @@ impl Dock {
 /// panel state (including the size a user dragged a splitter to) off that, so
 /// the ids must stay stable frame to frame — which they are, since the walk
 /// order is the tree's own structure.
+///
+/// `path` tracks the current leaf's address as the walk descends, and `cmd`
+/// collects at most one area-header interaction (split/join/retype) to be
+/// applied after the pass — the tree must not be restructured while its panels
+/// are still being laid out this frame.
 fn show_dock(
     node: &mut Dock,
     ui: &mut egui::Ui,
     next_id: &mut u32,
+    path: &mut Vec<Branch>,
     draw: &mut dyn FnMut(Editor, &mut egui::Ui),
+    cmd: &mut Option<DockCmd>,
 ) {
     match node {
-        Dock::Leaf(editor) => draw(*editor, ui),
+        Dock::Leaf(editor) => {
+            // Content areas get a header (picker + split/close); the three
+            // structural leaves (canvas, comp, transport) don't — see `SWAPPABLE`.
+            if editor.is_swappable() {
+                area_header(ui, *editor, path, cmd);
+            }
+            draw(*editor, ui);
+        }
         Dock::Split { side, size, resizable, first, second } => {
             let id = egui::Id::new(("dock", *next_id));
             *next_id += 1;
@@ -253,7 +530,11 @@ fn show_dock(
             } else {
                 panel.exact_size(*size)
             };
-            let resp = panel.show(ui, |ui| show_dock(first, ui, next_id, draw));
+            let resp = panel.show(ui, |ui| {
+                path.push(Branch::First);
+                show_dock(first, ui, next_id, path, draw, cmd);
+                path.pop();
+            });
             // Read the size back so the tree — not egui's private panel memory —
             // stays the source of truth for what the layout currently is.
             let r = resp.response.rect;
@@ -264,9 +545,54 @@ fn show_dock(
             // The remaining space is the second child's area. Recursing here
             // (rather than into a sibling panel) is what makes the nesting
             // depth-first and the geometry exact.
-            show_dock(second, ui, next_id, draw);
+            path.push(Branch::Second);
+            show_dock(second, ui, next_id, path, draw, cmd);
+            path.pop();
         }
     }
+}
+
+/// The control strip atop a dockable area: an editor picker plus split and
+/// close buttons. It never mutates the tree (egui is mid-layout); a click just
+/// records a [`DockCmd`] against this leaf's `path`, applied once the frame's
+/// UI is done. At most one command survives a frame, which is all a click can
+/// produce anyway.
+fn area_header(ui: &mut egui::Ui, editor: Editor, path: &[Branch], cmd: &mut Option<DockCmd>) {
+    // Measured before any content is drawn, so a split starts at half the area.
+    let area = ui.max_rect();
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(("area", path))
+            .selected_text(editor.label())
+            .show_ui(ui, |ui| {
+                for e in SWAPPABLE {
+                    if ui.selectable_label(e == editor, e.label()).clicked() && e != editor {
+                        *cmd = Some(DockCmd::Retype { path: path.to_vec(), editor: e });
+                    }
+                }
+            });
+        // Split/close sit at the right edge. Plain ASCII glyphs on purpose — the
+        // egui default font tofus most box-drawing characters (see README).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("x").on_hover_text("Close this area").clicked() {
+                *cmd = Some(DockCmd::Close { path: path.to_vec() });
+            }
+            if ui.small_button("-").on_hover_text("Split top / bottom").clicked() {
+                *cmd = Some(DockCmd::Split {
+                    path: path.to_vec(),
+                    side: DockSide::Top,
+                    size: area.height() * 0.5,
+                });
+            }
+            if ui.small_button("|").on_hover_text("Split left / right").clicked() {
+                *cmd = Some(DockCmd::Split {
+                    path: path.to_vec(),
+                    side: DockSide::Left,
+                    size: area.width() * 0.5,
+                });
+            }
+        });
+    });
+    ui.separator();
 }
 
 /// Composition-settings edits from the top bar. Any `Some` is a new value.
@@ -278,10 +604,31 @@ struct CompEdits {
     duration: Option<f64>,
 }
 
-/// Top composition bar: editable resolution, fps, and duration. These drive the
-/// canvas fit, the playback clock, the frame step, and the timeline mapping —
-/// so editing them here reshapes the whole comp. Reports edits into `out`.
-fn comp_ui(ui: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, out: &mut CompEdits) {
+/// Layout-preset intent from the top bar's Layout menu. At most one per frame.
+#[derive(Default)]
+struct LayoutEdits {
+    /// Index into the preset list to switch the whole layout to.
+    apply: Option<usize>,
+    /// Save the current layout as a user preset under this (trimmed) name.
+    save_as: Option<String>,
+}
+
+/// Top composition bar: editable resolution, fps, and duration, plus the Layout
+/// menu (switch preset / save current). These drive the canvas fit, the
+/// playback clock, the frame step, and the timeline mapping — so editing them
+/// here reshapes the whole comp. Reports edits into `out` / `layout`.
+#[allow(clippy::too_many_arguments)]
+fn comp_ui(
+    ui: &mut egui::Ui,
+    width: f64,
+    height: f64,
+    fps: f64,
+    duration: f64,
+    out: &mut CompEdits,
+    presets: &[String],
+    name_buf: &mut String,
+    layout: &mut LayoutEdits,
+) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
@@ -315,6 +662,32 @@ fn comp_ui(ui: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64, 
         {
             out.duration = Some(dur);
         }
+        ui.separator();
+
+        // Layout presets. A menu keeps the bar tidy: pick a preset to apply it,
+        // or name and save the current arrangement as a session preset.
+        ui.menu_button("Layout", |ui| {
+            for (i, name) in presets.iter().enumerate() {
+                if ui.button(name).clicked() {
+                    layout.apply = Some(i);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(name_buf)
+                        .hint_text("preset name")
+                        .desired_width(120.0),
+                );
+                let named = !name_buf.trim().is_empty();
+                if ui.add_enabled(named, egui::Button::new("Save current")).clicked() {
+                    layout.save_as = Some(name_buf.trim().to_string());
+                    name_buf.clear();
+                    ui.close();
+                }
+            });
+        });
     });
 }
 
@@ -1668,6 +2041,11 @@ struct App {
     view: TimelineView,
     /// The panel layout.
     dock: Dock,
+    /// Named layouts (built-ins + session-made user presets) offered in the
+    /// Layout menu. Applying one replaces `dock` with a clone of its tree.
+    presets: Vec<Preset>,
+    /// The Layout menu's "save current as" name field, kept across frames.
+    preset_name_buf: String,
     /// Canvas area in physical pixels, measured from the layout tree's canvas
     /// leaf during the last UI pass. `None` until the first pass has run.
     canvas_rect: Option<kurbo::Rect>,
@@ -1703,6 +2081,8 @@ impl App {
             key_clipboard: None,
             view,
             dock: Dock::default_layout(),
+            presets: builtin_presets(),
+            preset_name_buf: String::new(),
             canvas_rect: None,
             next_id,
         }
@@ -2247,9 +2627,10 @@ impl App {
         true
     }
 
-    /// Serialize the document to a `.pbc` (JSON) file chosen via a native
-    /// save dialog. The document already derives serde, so this is the whole
-    /// file format.
+    /// Serialize the document *and the current UI layout* to a `.pbc` (JSON)
+    /// file chosen via a native save dialog. The layout (active dock + user
+    /// presets) rides in a [`Project`] wrapper alongside the document; built-in
+    /// presets are code, so only user ones are written.
     fn save(&self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Pain By Choice", &["pbc", "json"])
@@ -2258,7 +2639,14 @@ impl App {
         else {
             return;
         };
-        match serde_json::to_string_pretty(&self.doc) {
+        let project = Project {
+            document: self.doc.clone(),
+            layout: LayoutState {
+                dock: Some(self.dock.clone()),
+                user_presets: self.presets.iter().filter(|p| !p.builtin).cloned().collect(),
+            },
+        };
+        match serde_json::to_string_pretty(&project) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
                     eprintln!("save failed: {e}");
@@ -2268,9 +2656,14 @@ impl App {
         }
     }
 
-    /// Load a `.pbc` document via a native open dialog, replacing the current
-    /// one. Returns whether the document changed. Selection and the id counter
-    /// are reset to match the loaded tree.
+    /// Load a `.pbc` via a native open dialog, replacing the current document
+    /// *and* layout. Returns whether the document changed. Selection and the id
+    /// counter are reset to match the loaded tree.
+    ///
+    /// Reads both the current [`Project`] format and the older bare-`Document`
+    /// files (which carry no layout): the wrapper is tried first, and a bare doc
+    /// fails it — it has no `document` field — so it falls through to the plain
+    /// parse and keeps the default layout.
     fn load(&mut self) -> bool {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Pain By Choice", &["pbc", "json"])
@@ -2285,24 +2678,46 @@ impl App {
                 return false;
             }
         };
-        match serde_json::from_str::<Document>(&text) {
-            Ok(mut doc) => {
-                // Pre-frame-grid docs stored keyframes as float seconds; this
-                // converts them using the doc's own fps. No-op on new files.
-                doc.migrate();
-                self.next_id = max_id(&doc.root) + 1;
-                self.view = TimelineView::full(doc.duration_frames());
-                self.doc = doc;
-                self.selected = None;
-                self.selected_keys.clear();
-                self.seek_frame(0);
-                true
+        let (mut doc, layout) = match serde_json::from_str::<Project>(&text) {
+            Ok(p) => (p.document, Some(p.layout)),
+            Err(_) => match serde_json::from_str::<Document>(&text) {
+                Ok(d) => (d, None),
+                Err(e) => {
+                    eprintln!("parse failed: {e}");
+                    return false;
+                }
+            },
+        };
+        // Pre-frame-grid docs stored keyframes as float seconds; this converts
+        // them using the doc's own fps. No-op on new files.
+        doc.migrate();
+        self.next_id = max_id(&doc.root) + 1;
+        self.view = TimelineView::full(doc.duration_frames());
+        self.doc = doc;
+        self.selected = None;
+        self.selected_keys.clear();
+
+        // Restore the layout. Built-ins are always rebuilt from code; loaded user
+        // presets (and the active dock) are validated, so a corrupt or edited
+        // file can never wedge the editor with an unusable arrangement.
+        self.presets = builtin_presets();
+        let restored = match layout {
+            Some(l) => {
+                self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
+                l.dock
             }
-            Err(e) => {
-                eprintln!("parse failed: {e}");
-                false
+            None => None,
+        };
+        self.dock = match restored {
+            Some(d) if d.is_valid() => d,
+            Some(_) => {
+                eprintln!("ignoring invalid saved layout; using default");
+                Dock::default_layout()
             }
-        }
+            None => Dock::default_layout(),
+        };
+        self.seek_frame(0);
+        true
     }
 
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
@@ -2387,36 +2802,87 @@ impl App {
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let mut comp = CompEdits::default();
         let (doc_w, doc_h, doc_fps) = (self.doc.width, self.doc.height, self.doc.fps);
+        // Layout-preset menu: the names to list, the save-field buffer (taken so
+        // the UI never borrows `self`, restored after), and the reported intent.
+        let preset_names: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
+        let mut preset_name_buf = std::mem::take(&mut self.preset_name_buf);
+        let mut layout = LayoutEdits::default();
         // Panels are drawn by walking the layout tree; each leaf dispatches to
         // the matching editor. Nothing here knows *where* a panel is — that's
         // the tree's business, which is the whole point of the refactor.
         let dock = &mut self.dock;
         let mut canvas_pts: Option<egui::Rect> = None;
+        // At most one layout edit (split/join/retype) from an area header this
+        // frame; applied to the tree after the UI pass, never during it.
+        let mut dock_cmd: Option<DockCmd> = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
-            show_dock(dock, ui, &mut next_id, &mut |editor, ui| match editor {
-                Editor::Comp => comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp),
-                Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
-                Editor::Transport => {
-                    transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
-                }
-                Editor::Dopesheet => dopesheet_ui(
-                    ui,
-                    &rows,
-                    t,
-                    last_frame,
-                    timebase,
-                    view,
-                    &selected_keys,
-                    &mut dope,
-                ),
-                Editor::Properties => {
-                    properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
-                }
-                // vello paints here; egui only measures the hole.
-                Editor::Canvas => canvas_pts = Some(ui.max_rect()),
-            });
+            let mut path = Vec::new();
+            show_dock(
+                dock,
+                ui,
+                &mut next_id,
+                &mut path,
+                &mut |editor, ui| match editor {
+                    Editor::Comp => comp_ui(
+                        ui,
+                        doc_w,
+                        doc_h,
+                        doc_fps,
+                        duration,
+                        &mut comp,
+                        &preset_names,
+                        &mut preset_name_buf,
+                        &mut layout,
+                    ),
+                    Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
+                    Editor::Transport => {
+                        transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
+                    }
+                    Editor::Dopesheet => dopesheet_ui(
+                        ui,
+                        &rows,
+                        t,
+                        last_frame,
+                        timebase,
+                        view,
+                        &selected_keys,
+                        &mut dope,
+                    ),
+                    Editor::Properties => {
+                        properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
+                    }
+                    // vello paints here; egui only measures the hole.
+                    Editor::Canvas => canvas_pts = Some(ui.max_rect()),
+                },
+                &mut dock_cmd,
+            );
         });
+        // Now that egui has finished, restructure the layout tree if an area
+        // header asked to. Doing it here (not mid-pass) keeps the panels and
+        // their egui ids stable for the frame that was just drawn.
+        if let Some(cmd) = dock_cmd {
+            self.dock.apply(cmd);
+            window.request_redraw();
+        }
+        // Restore the save-field buffer taken for the UI pass.
+        self.preset_name_buf = preset_name_buf;
+        // Layout presets: switch to one, or save the current arrangement as a
+        // session preset. Both re-lay out the panels, so a redraw is due.
+        if let Some(i) = layout.apply {
+            if let Some(preset) = self.presets.get(i) {
+                self.dock = preset.dock.clone();
+                window.request_redraw();
+            }
+        }
+        if let Some(name) = layout.save_as {
+            let current = self.dock.clone();
+            // Overwrite a user preset of the same name; never clobber a built-in.
+            match self.presets.iter_mut().find(|p| !p.builtin && p.name == name) {
+                Some(existing) => existing.dock = current,
+                None => self.presets.push(Preset { name, dock: current, builtin: false }),
+            }
+        }
         // Points → physical pixels for the next frame's fit.
         self.canvas_rect = canvas_pts.map(|r| {
             kurbo::Rect::new(
@@ -2903,6 +3369,202 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Flatten a layout tree to the editors it shows, in walk order.
+    fn dock_editors(d: &Dock) -> Vec<Editor> {
+        fn go(d: &Dock, out: &mut Vec<Editor>) {
+            match d {
+                Dock::Leaf(e) => out.push(*e),
+                Dock::Split { first, second, .. } => {
+                    go(first, out);
+                    go(second, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(d, &mut out);
+        out
+    }
+
+    /// The address of the first leaf showing `target`, or `None`.
+    fn path_to(d: &Dock, target: Editor) -> Option<Vec<Branch>> {
+        match d {
+            Dock::Leaf(e) => (*e == target).then(Vec::new),
+            Dock::Split { first, second, .. } => path_to(first, target)
+                .map(|mut p| {
+                    p.insert(0, Branch::First);
+                    p
+                })
+                .or_else(|| {
+                    path_to(second, target).map(|mut p| {
+                        p.insert(0, Branch::Second);
+                        p
+                    })
+                }),
+        }
+    }
+
+    fn count_editor(d: &Dock, e: Editor) -> usize {
+        dock_editors(d).into_iter().filter(|x| *x == e).count()
+    }
+
+    /// Following `.second` from the root always lands on the canvas — the
+    /// invariant the canvas-rect measurement depends on.
+    fn innermost_is_canvas(d: &Dock) -> bool {
+        let mut cur = d;
+        loop {
+            match cur {
+                Dock::Split { second, .. } => cur = second,
+                Dock::Leaf(e) => return *e == Editor::Canvas,
+            }
+        }
+    }
+
+    #[test]
+    fn retype_swaps_the_editor_in_place() {
+        let mut d = Dock::default_layout();
+        let path = path_to(&d, Editor::Layers).unwrap();
+        d.apply(DockCmd::Retype { path, editor: Editor::Properties });
+        assert_eq!(count_editor(&d, Editor::Layers), 0, "old editor gone");
+        assert_eq!(count_editor(&d, Editor::Properties), 2, "now shown twice");
+        // Structure is otherwise untouched.
+        assert_eq!(dock_editors(&d).len(), 6);
+        assert!(innermost_is_canvas(&d));
+    }
+
+    #[test]
+    fn split_then_close_the_new_half_round_trips() {
+        let mut d = Dock::default_layout();
+        let before = dock_editors(&d);
+        let path = path_to(&d, Editor::Properties).unwrap();
+        d.apply(DockCmd::Split {
+            path: path.clone(),
+            side: DockSide::Left,
+            size: 120.0,
+        });
+        // The leaf became a split of two Properties.
+        assert_eq!(count_editor(&d, Editor::Properties), 2);
+        assert!(innermost_is_canvas(&d), "a split must not dislodge the canvas");
+        // Close the newly-made second half; its sibling (the original) absorbs it.
+        let mut new_half = path.clone();
+        new_half.push(Branch::Second);
+        d.apply(DockCmd::Close { path: new_half });
+        assert_eq!(dock_editors(&d), before, "join undoes the split exactly");
+    }
+
+    #[test]
+    fn closing_an_area_keeps_the_canvas() {
+        // Properties sits beside the canvas; closing it must leave the canvas as
+        // the surviving sibling, never remove it.
+        let mut d = Dock::default_layout();
+        let path = path_to(&d, Editor::Properties).unwrap();
+        d.apply(DockCmd::Close { path });
+        assert_eq!(count_editor(&d, Editor::Properties), 0, "area closed");
+        assert_eq!(count_editor(&d, Editor::Canvas), 1, "canvas survives");
+        assert!(innermost_is_canvas(&d));
+    }
+
+    #[test]
+    fn every_builtin_preset_is_a_valid_layout() {
+        // A preset a user can switch to must keep the structural guarantees the
+        // rest of the app leans on: exactly one canvas as the innermost leaf, and
+        // the two headerless toolbars present (there's no way to bring back a
+        // Comp or Transport that a preset dropped — they carry no picker).
+        for preset in builtin_presets() {
+            let d = &preset.dock;
+            assert_eq!(count_editor(d, Editor::Canvas), 1, "{}: one canvas", preset.name);
+            assert!(innermost_is_canvas(d), "{}: canvas innermost", preset.name);
+            assert_eq!(count_editor(d, Editor::Comp), 1, "{}: comp bar", preset.name);
+            assert_eq!(count_editor(d, Editor::Transport), 1, "{}: transport", preset.name);
+        }
+    }
+
+    #[test]
+    fn presets_offer_more_than_one_arrangement() {
+        // The whole point of presets: the Design layout drops the dopesheet the
+        // default keeps, so switching visibly changes the panels.
+        let presets = builtin_presets();
+        assert!(presets.len() >= 3);
+        assert!(presets.iter().all(|p| p.builtin));
+        let default = &presets.iter().find(|p| p.name == "Default").unwrap().dock;
+        let design = &presets.iter().find(|p| p.name == "Design").unwrap().dock;
+        assert_eq!(count_editor(default, Editor::Dopesheet), 1);
+        assert_eq!(count_editor(design, Editor::Dopesheet), 0);
+    }
+
+    #[test]
+    fn is_valid_accepts_layouts_and_rejects_broken_ones() {
+        for p in builtin_presets() {
+            assert!(p.dock.is_valid(), "{} should be valid", p.name);
+        }
+        // No toolbars, no comp: a lone canvas leaves the user no way back.
+        assert!(!Dock::Leaf(Editor::Canvas).is_valid());
+        // Two canvases — the vello target measurement expects exactly one.
+        let two = Dock::split(DockSide::Top, 10.0, false, Editor::Canvas, Dock::default_layout());
+        assert!(!two.is_valid());
+        // Canvas present but not the innermost leaf (it's a split's `first`).
+        let off = Dock::split(
+            DockSide::Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                DockSide::Bottom,
+                TRANSPORT_H,
+                false,
+                Editor::Transport,
+                Dock::split(DockSide::Left, 10.0, true, Editor::Canvas, Dock::Leaf(Editor::Properties)),
+            ),
+        );
+        assert!(!off.is_valid());
+    }
+
+    #[test]
+    fn project_round_trips_document_and_layout() {
+        // A non-default arrangement plus a user preset must survive save/load.
+        let mut dock = Dock::default_layout();
+        let path = path_to(&dock, Editor::Properties).unwrap();
+        dock.apply(DockCmd::Split { path, side: DockSide::Top, size: 60.0 });
+        let project = Project {
+            document: demo_document(),
+            layout: LayoutState {
+                dock: Some(dock.clone()),
+                user_presets: vec![Preset {
+                    name: "Mine".into(),
+                    dock: Dock::design_layout(),
+                    builtin: true, // deliberately set — serialization must drop it
+                }],
+            },
+        };
+        let json = serde_json::to_string(&project).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(dock_editors(&back.layout.dock.unwrap()), dock_editors(&dock));
+        assert_eq!(back.layout.user_presets.len(), 1);
+        assert_eq!(back.layout.user_presets[0].name, "Mine");
+        assert!(!back.layout.user_presets[0].builtin, "builtin is skipped → false on load");
+    }
+
+    #[test]
+    fn a_bare_document_file_still_loads() {
+        // Old `.pbc` files are a bare Document with no layout wrapper; the loader
+        // tries Project first (which lacks a `document` field here and fails),
+        // then falls back to the plain document parse.
+        let json = serde_json::to_string(&demo_document()).unwrap();
+        assert!(serde_json::from_str::<Project>(&json).is_err(), "no `document` field");
+        assert!(serde_json::from_str::<Document>(&json).is_ok(), "parses as a bare doc");
+    }
+
+    #[test]
+    fn only_content_areas_carry_a_header() {
+        // The three structural leaves must never offer split/close/retype, or the
+        // canvas-rect and innermost-canvas invariants could be broken from the UI.
+        assert!(Editor::Layers.is_swappable());
+        assert!(Editor::Properties.is_swappable());
+        assert!(Editor::Dopesheet.is_swappable());
+        assert!(!Editor::Canvas.is_swappable());
+        assert!(!Editor::Comp.is_swappable());
+        assert!(!Editor::Transport.is_swappable());
     }
 
     /// A rect with every optional property present.
