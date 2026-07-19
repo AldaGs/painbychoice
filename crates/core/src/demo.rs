@@ -9,7 +9,13 @@ use crate::value::{Color, Keyframe, Track, Value};
 /// A red rounded square that slides across and eases, carrying a spinning
 /// white dot. Exercises keyframes, temporal easing, parametric geometry
 /// (the corner radius animates), transform composition, and nesting.
+///
+/// Keyframes are in frames: the animation spans `0..=END`, which at the
+/// document's default 60fps is the first two seconds.
 pub fn demo_document() -> Document {
+    /// Last frame of the demo animation — 2s at the default 60fps.
+    const END: i64 = 120;
+
     let dot = Node::shape(
         2,
         "dot",
@@ -19,8 +25,8 @@ pub fn demo_document() -> Document {
     .with_transform(Transform {
         position: Value::constant(Vec2::new(0.0, -120.0)),
         rotation_deg: Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0.0, 0.0),
-            Keyframe::linear(2.0, 360.0),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(END, 360.0),
         ])),
         ..Transform::default()
     });
@@ -31,20 +37,20 @@ pub fn demo_document() -> Document {
         Shape::Rect {
             size: Value::constant(Vec2::new(200.0, 200.0)),
             radius: Value::Keyframed(Track::new(vec![
-                Keyframe::smooth(0.0, 0.0),
-                Keyframe::smooth(2.0, 100.0),
+                Keyframe::smooth(0, 0.0),
+                Keyframe::smooth(END, 100.0),
             ])),
         },
     )
     .with_fill(Color::rgb(0.90, 0.25, 0.25))
     .with_transform(Transform {
         position: Value::Keyframed(Track::new(vec![
-            Keyframe::smooth(0.0, Vec2::new(300.0, 540.0)),
-            Keyframe::smooth(2.0, Vec2::new(1620.0, 540.0)),
+            Keyframe::smooth(0, Vec2::new(300.0, 540.0)),
+            Keyframe::smooth(END, Vec2::new(1620.0, 540.0)),
         ])),
         rotation_deg: Value::Keyframed(Track::new(vec![
-            Keyframe::smooth(0.0, 0.0),
-            Keyframe::smooth(2.0, 90.0),
+            Keyframe::smooth(0, 0.0),
+            Keyframe::smooth(END, 90.0),
         ])),
         ..Transform::default()
     })

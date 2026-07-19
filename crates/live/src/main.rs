@@ -189,7 +189,8 @@ fn comp_ui(root: &mut egui::Ui, width: f64, height: f64, fps: f64, duration: f64
 struct Transport {
     toggle: bool,
     restart: bool,
-    scrub_to: Option<f64>,
+    /// Frame to scrub to. Snapped by the slider's integer step.
+    scrub_to: Option<i64>,
 }
 
 /// A snapshot of the selected node's resolved properties at the current time,
@@ -480,7 +481,14 @@ fn properties_ui(
 /// Build the bottom transport bar. Reads the current time / playing state and
 /// writes user intent into `out`; it never touches `App` directly, so it can't
 /// collide with the borrows in `render`.
-fn transport_ui(root: &mut egui::Ui, t: f64, duration: f64, playing: bool, out: &mut Transport) {
+fn transport_ui(
+    root: &mut egui::Ui,
+    frame: i64,
+    last_frame: i64,
+    tb: motion_core::Timebase,
+    playing: bool,
+    out: &mut Transport,
+) {
     egui::Panel::bottom("transport")
         .exact_size(TRANSPORT_H as f32)
         .show(root, |ui| {
@@ -493,13 +501,22 @@ fn transport_ui(root: &mut egui::Ui, t: f64, duration: f64, playing: bool, out: 
                 if ui.button("Restart").clicked() {
                     out.restart = true;
                 }
-                ui.label(format!("{t:6.2}s / {duration:.2}s"));
+                // Frame-domain readout: hh:mm:ss.ff plus the raw frame number,
+                // monospaced so the digits don't jitter during playback.
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  [{frame}/{last_frame}]",
+                        tb.timecode(frame as f64)
+                    ))
+                    .monospace(),
+                );
 
-                // Full-width playhead scrubber.
-                let mut val = t.clamp(0.0, duration);
+                // Full-width playhead scrubber. An integer slider, so dragging
+                // it can only produce whole frames — snapping for free.
+                let mut val = frame.clamp(0, last_frame);
                 ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
                 let resp = ui.add(
-                    egui::Slider::new(&mut val, 0.0..=duration)
+                    egui::Slider::new(&mut val, 0..=last_frame.max(1))
                         .show_value(false)
                         .trailing_fill(true),
                 );
@@ -520,11 +537,11 @@ enum PropKind {
     Opacity,
 }
 
-/// One dopesheet row: an animated property and the times of its keyframes.
+/// One dopesheet row: an animated property and the frames of its keyframes.
 struct DopeRow {
     label: &'static str,
     kind: PropKind,
-    times: Vec<f64>,
+    frames: Vec<i64>,
 }
 
 /// Gather the animated properties of a node into dopesheet rows.
@@ -534,16 +551,16 @@ fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
     // Each property is a distinct value type, so this is spelled out rather
     // than looped.
     if tr.position.is_animated() {
-        rows.push(DopeRow { label: "Position", kind: PropKind::Position, times: tr.position.key_times() });
+        rows.push(DopeRow { label: "Position", kind: PropKind::Position, frames: tr.position.key_frames() });
     }
     if tr.rotation_deg.is_animated() {
-        rows.push(DopeRow { label: "Rotation", kind: PropKind::Rotation, times: tr.rotation_deg.key_times() });
+        rows.push(DopeRow { label: "Rotation", kind: PropKind::Rotation, frames: tr.rotation_deg.key_frames() });
     }
     if tr.scale.is_animated() {
-        rows.push(DopeRow { label: "Scale", kind: PropKind::Scale, times: tr.scale.key_times() });
+        rows.push(DopeRow { label: "Scale", kind: PropKind::Scale, frames: tr.scale.key_frames() });
     }
     if tr.opacity.is_animated() {
-        rows.push(DopeRow { label: "Opacity", kind: PropKind::Opacity, times: tr.opacity.key_times() });
+        rows.push(DopeRow { label: "Opacity", kind: PropKind::Opacity, frames: tr.opacity.key_frames() });
     }
     rows
 }
@@ -566,16 +583,123 @@ fn segment_handles_of(node: &MNode, kind: PropKind, index: usize) -> Option<(Han
 /// change to which keyframe is selected.
 #[derive(Default)]
 struct DopeEdits {
-    seek_to: Option<f64>,
-    /// (property, keyframe index, new time)
-    move_key: Option<(PropKind, usize, f64)>,
+    /// Frame to seek to. Already snapped to the grid.
+    seek_to: Option<i64>,
+    /// (property, keyframe index, new frame)
+    move_key: Option<(PropKind, usize, i64)>,
     /// A diamond was clicked → select it.
     select_key: Option<KeyRef>,
     /// Empty track was clicked → clear the keyframe selection.
     clear_selection: bool,
+    /// Zoom / pan produced a new visible window.
+    set_view: Option<TimelineView>,
 }
 
-const DOPESHEET_H: f64 = 150.0;
+/// The visible frame window of the timeline. Zoom and pan only ever change
+/// this; every frame↔pixel mapping reads it, so the ruler, the keyframes, and
+/// the playhead cannot drift out of agreement.
+#[derive(Clone, Copy, Debug)]
+struct TimelineView {
+    /// Leftmost visible frame (fractional — panning is continuous).
+    start: f64,
+    /// How many frames fit across the track.
+    visible: f64,
+}
+
+impl TimelineView {
+    fn full(last_frame: i64) -> Self {
+        Self { start: 0.0, visible: last_frame.max(1) as f64 }
+    }
+
+    /// Keep the window inside `0..=last_frame` and never narrower than a few
+    /// frames (past that the diamonds are wider than their spacing anyway).
+    fn clamped(self, last_frame: i64) -> Self {
+        let total = last_frame.max(1) as f64;
+        let visible = self.visible.clamp(4.0, total);
+        let start = self.start.clamp(0.0, (total - visible).max(0.0));
+        Self { start, visible }
+    }
+}
+
+/// Maps frames to pixels across one track's inset width. Built once from the
+/// ruler's rect and shared by every row below it.
+#[derive(Clone, Copy)]
+struct Axis {
+    x0: f32,
+    span: f32,
+    view: TimelineView,
+}
+
+impl Axis {
+    fn new(track: egui::Rect, view: TimelineView) -> Self {
+        // Inset so keys on the first/last visible frame sit fully inside the
+        // track rather than clipped at the edge.
+        const PAD: f32 = 8.0;
+        let x0 = track.left() + PAD;
+        let span = ((track.right() - PAD) - x0).max(1.0);
+        Self { x0, span, view }
+    }
+
+    fn px_per_frame(&self) -> f32 {
+        self.span / self.view.visible as f32
+    }
+
+    fn frame_to_x(&self, f: f64) -> f32 {
+        self.x0 + ((f - self.view.start) as f32) * self.px_per_frame()
+    }
+
+    fn x_to_frame_exact(&self, x: f32) -> f64 {
+        self.view.start + ((x - self.x0) / self.px_per_frame()) as f64
+    }
+
+    /// Snapped to the grid — this is where clicking and dragging become
+    /// frame-exact, regardless of zoom.
+    fn x_to_frame(&self, x: f32) -> i64 {
+        self.x_to_frame_exact(x).round() as i64
+    }
+}
+
+/// Choose a ruler tick interval (in frames) that leaves at least `min_px`
+/// between labels. Candidates are the 1-2-5-10 frame steps plus whole-second
+/// multiples, so labels land on round timecodes once you zoom out.
+fn tick_step(px_per_frame: f32, fps: f64, min_px: f32) -> i64 {
+    let f = fps.round().max(1.0) as i64;
+    let mut cands: Vec<i64> = vec![1, 2, 5, 10];
+    for secs in [1i64, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600] {
+        cands.push(secs * f);
+    }
+    cands.sort_unstable();
+    cands.dedup();
+    *cands
+        .iter()
+        .find(|c| px_per_frame * (**c as f32) >= min_px)
+        .unwrap_or_else(|| cands.last().unwrap())
+}
+
+/// How hard the timeline should auto-pan for a pointer at `x`, given the
+/// track's `left`/`right` edges and the width of the sensitive zone.
+///
+/// Returns -1..0 in the left zone, 0..1 in the right zone, 0 in the middle;
+/// magnitude ramps linearly with depth so a nudge scrolls slowly and pinning
+/// the pointer to the edge scrolls fast. Past the edge it saturates at ±1
+/// rather than accelerating without bound.
+fn edge_pan_intensity(x: f32, left: f32, right: f32, edge: f32) -> f32 {
+    if edge <= 0.0 || right <= left {
+        return 0.0;
+    }
+    if x < left + edge {
+        -(((left + edge - x) / edge).min(1.0))
+    } else if x > right - edge {
+        ((x - (right - edge)) / edge).min(1.0)
+    } else {
+        0.0
+    }
+}
+
+const DOPESHEET_H: f64 = 178.0;
+const RULER_H: f32 = 20.0;
+/// Width of the auto-pan zone at each end of the track, in points.
+const EDGE_PAN_W: f32 = 36.0;
 
 /// Bottom dopesheet: one row per animated property, keyframes drawn as diamonds
 /// along a shared time axis with a playhead line. Click a row's track to seek;
@@ -583,8 +707,10 @@ const DOPESHEET_H: f64 = 150.0;
 fn dopesheet_ui(
     root: &mut egui::Ui,
     rows: &[DopeRow],
-    t: f64,
-    duration: f64,
+    frame: f64,
+    last_frame: i64,
+    tb: motion_core::Timebase,
+    view: TimelineView,
     selected_key: Option<KeyRef>,
     out: &mut DopeEdits,
 ) {
@@ -595,21 +721,139 @@ fn dopesheet_ui(
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.strong("Timeline");
-                ui.weak("— click to seek, click a key to select (Del removes), drag to move");
+                ui.weak("— scroll to zoom, shift+scroll to pan, drag to an edge to auto-pan");
             });
             ui.separator();
 
+            const LABEL_W: f32 = 80.0;
+            const ROW_H: f32 = 22.0;
+            let accent = egui::Color32::from_rgb(255, 216, 51);
+            let playhead_col = egui::Color32::from_rgb(240, 90, 90);
+            // Set by any drag on the timeline (ruler scrub or keyframe drag).
+            // Gates the edge auto-pan below.
+            let mut dragging = false;
+
+            // --- Ruler. Allocated with the same layout as a property row, so
+            // its axis geometry is exactly the rows' axis geometry. ---
+            let mut axis = None;
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(LABEL_W, RULER_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.weak("Frame");
+                    },
+                );
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width() - 8.0, RULER_H),
+                    egui::Sense::click_and_drag(),
+                );
+                let a = Axis::new(rect, view);
+                axis = Some(a);
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+
+                // Ticks. Minor ticks appear only once frames are far enough
+                // apart to be legible as individual frames.
+                let step = tick_step(a.px_per_frame(), tb.fps(), 58.0);
+                let minor = if a.px_per_frame() >= 6.0 { 1 } else { 0 };
+                let first = view.start.floor() as i64;
+                let last = (view.start + view.visible).ceil() as i64;
+
+                if minor > 0 {
+                    let mut f = first;
+                    while f <= last {
+                        if f % step != 0 {
+                            let x = a.frame_to_x(f as f64);
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, rect.bottom() - 4.0),
+                                    egui::pos2(x, rect.bottom()),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
+                            );
+                        }
+                        f += 1;
+                    }
+                }
+
+                let mut f = (first.div_euclid(step)) * step;
+                while f <= last {
+                    if f >= 0 {
+                        let x = a.frame_to_x(f as f64);
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top() + 3.0), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                        );
+                        painter.text(
+                            egui::pos2(x + 3.0, rect.top() + 1.0),
+                            egui::Align2::LEFT_TOP,
+                            tb.timecode(f as f64),
+                            egui::FontId::monospace(9.0),
+                            egui::Color32::from_gray(165),
+                        );
+                    }
+                    f += step;
+                }
+
+                // Playhead marker on the ruler.
+                let px = a.frame_to_x(frame);
+                painter.line_segment(
+                    [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+                    egui::Stroke::new(1.5, playhead_col),
+                );
+
+                // Dragging or clicking the ruler scrubs.
+                if resp.clicked() || resp.dragged() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        out.seek_to = Some(a.x_to_frame(p.x).clamp(0, last_frame));
+                    }
+                }
+                dragging |= resp.dragged();
+            });
+
+            let axis = axis.expect("ruler always allocates the axis");
+
+            // --- Zoom / pan. Scroll anywhere over the panel; zoom keeps the
+            // frame under the cursor pinned, which is what makes it feel like
+            // zooming rather than jumping. ---
+            let panel_rect = ui.max_rect();
+            let (scroll, hover) =
+                ui.input(|i| (i.smooth_scroll_delta, i.pointer.hover_pos()));
+            if let Some(p) = hover.filter(|p| panel_rect.contains(*p)) {
+                // egui rewrites a shift+wheel gesture into a *horizontal*
+                // scroll, so the shift modifier is already gone by the time we
+                // see it — a nonzero x delta is the pan signal, not `shift`.
+                // (Trackpad sideways swipes land here too, which is right.)
+                let next = if scroll.x != 0.0 {
+                    // Pan: one notch moves a tenth of the window.
+                    Some(TimelineView {
+                        start: view.start - (scroll.x as f64 / 120.0) * view.visible * 0.1,
+                        visible: view.visible,
+                    })
+                } else if scroll.y != 0.0 {
+                    let factor = (0.9f64).powf(scroll.y as f64 / 120.0);
+                    let anchor = axis.x_to_frame_exact(p.x);
+                    let visible = view.visible * factor;
+                    // Keep `anchor` under the cursor at the new scale.
+                    let ratio = (anchor - view.start) / view.visible.max(1e-9);
+                    Some(TimelineView { start: anchor - ratio * visible, visible })
+                } else {
+                    None
+                };
+                if let Some(next) = next {
+                    out.set_view = Some(next.clamped(last_frame));
+                }
+            }
+
+            // No early return: the rows loop is a no-op on an empty slice, and
+            // returning here would skip the edge auto-pan below (which should
+            // still work while scrubbing the ruler with nothing selected).
             if rows.is_empty() {
                 ui.add_space(8.0);
                 ui.weak("Select a node with animated properties to see its keyframes.");
-                return;
             }
-
-            const LABEL_W: f32 = 80.0;
-            const ROW_H: f32 = 22.0;
-            let dur = duration.max(f64::MIN_POSITIVE) as f32;
-            let accent = egui::Color32::from_rgb(255, 216, 51);
-            let playhead_col = egui::Color32::from_rgb(240, 90, 90);
 
             for (row_idx, row) in rows.iter().enumerate() {
                 ui.horizontal(|ui| {
@@ -630,18 +874,11 @@ fn dopesheet_ui(
                     let painter = ui.painter_at(track);
                     painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
 
-                    // Inset the time axis so keys at t=0 and t=max sit inside
-                    // the track (fully visible and clickable, not clipped at
-                    // the edge).
-                    const PAD: f32 = 8.0;
-                    let x0 = track.left() + PAD;
-                    let x1 = track.right() - PAD;
-                    let span = (x1 - x0).max(1.0);
-                    let time_to_x = |time: f64| x0 + (time as f32 / dur) * span;
-                    let x_to_time = |x: f32| ((x - x0) / span * dur) as f64;
+                    let frame_to_x = |f: f64| axis.frame_to_x(f);
+                    let x_to_frame = |x: f32| axis.x_to_frame(x);
 
                     // Playhead line.
-                    let px = time_to_x(t);
+                    let px = frame_to_x(frame);
                     painter.line_segment(
                         [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
                         egui::Stroke::new(1.5, playhead_col),
@@ -650,15 +887,20 @@ fn dopesheet_ui(
                     // Click on empty track → seek and clear the key selection.
                     if track_resp.clicked() {
                         if let Some(p) = track_resp.interact_pointer_pos() {
-                            out.seek_to = Some(x_to_time(p.x).clamp(0.0, duration));
+                            out.seek_to = Some(x_to_frame(p.x).clamp(0, last_frame));
                             out.clear_selection = true;
                         }
                     }
 
                     // Keyframe diamonds (interactive, drawn on top).
                     let cy = track.center().y;
-                    for (key_idx, &kt) in row.times.iter().enumerate() {
-                        let kx = time_to_x(kt);
+                    for (key_idx, &kf) in row.frames.iter().enumerate() {
+                        let kx = frame_to_x(kf as f64);
+                        // Skip keys scrolled out of the window — otherwise
+                        // their hit rects stay live outside the visible track.
+                        if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
+                            continue;
+                        }
                         let is_sel = selected_key == Some((row.kind, key_idx));
                         let r = if is_sel { 6.5 } else { 5.0 };
                         let hit = egui::Rect::from_center_size(
@@ -691,14 +933,45 @@ fn dopesheet_ui(
                             out.select_key = Some((row.kind, key_idx));
                         }
                         if resp.dragged() {
+                            dragging = true;
                             if let Some(p) = resp.interact_pointer_pos() {
-                                let nt = x_to_time(p.x).clamp(0.0, duration);
-                                out.move_key = Some((row.kind, key_idx, nt));
+                                let nf = x_to_frame(p.x).clamp(0, last_frame);
+                                out.move_key = Some((row.kind, key_idx, nf));
                                 out.select_key = Some((row.kind, key_idx));
                             }
                         }
                     }
                 });
+            }
+
+            // --- Edge auto-pan. While dragging (scrubbing the ruler or moving
+            // a keyframe), holding the pointer near either end of the track
+            // scrolls the window that way — so you can drag a key past the
+            // visible range without letting go. Deliberately drag-only: doing
+            // this on plain hover would scroll the timeline out from under the
+            // pointer whenever it drifted near an edge. ---
+            if dragging {
+                if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                    let intensity = edge_pan_intensity(
+                        p.x,
+                        axis.x0,
+                        axis.x0 + axis.span,
+                        EDGE_PAN_W,
+                    );
+                    if intensity != 0.0 {
+                        // Time-based so the speed doesn't depend on frame rate;
+                        // clamped in case a slow frame produces a huge dt.
+                        let dt = (ui.input(|i| i.stable_dt) as f64).min(0.05);
+                        let delta = intensity as f64 * view.visible * 0.8 * dt;
+                        out.set_view = Some(
+                            TimelineView { start: view.start + delta, visible: view.visible }
+                                .clamped(last_frame),
+                        );
+                        // Redraw is event-driven, so without this the pan stops
+                        // the moment the pointer stops moving.
+                        ui.ctx().request_repaint();
+                    }
+                }
             }
         });
 }
@@ -833,6 +1106,8 @@ struct App {
     selected: Option<NodeId>,
     /// The keyframe selected in the dopesheet, if any.
     selected_key: Option<KeyRef>,
+    /// The timeline's visible frame window (zoom / pan).
+    view: TimelineView,
     /// Next unused node id, for shapes created in-app.
     next_id: u64,
 }
@@ -845,6 +1120,7 @@ fn max_id(node: &MNode) -> u64 {
 impl App {
     fn new(doc: Document) -> Self {
         let next_id = max_id(&doc.root) + 1;
+        let view = TimelineView::full(doc.duration_frames());
         Self {
             context: RenderContext::new(),
             renderers: Vec::new(),
@@ -861,12 +1137,15 @@ impl App {
             pending_pick: None,
             selected: None,
             selected_key: None,
+            view,
             next_id,
         }
     }
 
-    /// Current looped document time in seconds.
-    fn current_time(&self) -> f64 {
+    /// Current looped position on the wall clock, in seconds. Continuous — this
+    /// is the clock, not the frame grid. Use `current_frame` / `current_time`
+    /// for anything that evaluates or displays.
+    fn raw_time(&self) -> f64 {
         let raw = if self.playing {
             self.anchor.elapsed().as_secs_f64()
         } else {
@@ -877,6 +1156,31 @@ impl App {
         } else {
             raw
         }
+    }
+
+    /// The frame the playhead currently sits on.
+    ///
+    /// Floors rather than rounds: a frame must be *held* for its full duration,
+    /// the way a projector does. Rounding would show frame N starting half a
+    /// frame early and is the classic off-by-half in playback code.
+    fn current_frame(&self) -> i64 {
+        let tb = self.doc.timebase();
+        tb.seconds_to_frames_exact(self.raw_time()).floor() as i64
+    }
+
+    /// Current document time in seconds, **snapped to the frame grid**. This is
+    /// what the canvas evaluates at, so playback actually steps at `doc.fps`
+    /// instead of running at the monitor's refresh rate.
+    fn current_time(&self) -> f64 {
+        self.doc.timebase().frames_to_seconds(self.current_frame() as f64)
+    }
+
+    /// Seek to a frame, wrapping around the composition length. All seeking
+    /// goes through here, so the playhead can only ever land on the grid.
+    fn seek_frame(&mut self, frame: i64) {
+        let total = self.doc.duration_frames().max(1);
+        let frame = frame.rem_euclid(total);
+        self.seek(self.doc.timebase().frames_to_seconds(frame as f64));
     }
 
     fn seek(&mut self, t: f64) {
@@ -1001,21 +1305,18 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. }
                 if !consumed && event.state == ElementState::Pressed =>
             {
-                let step = 1.0 / self.doc.fps.max(1.0);
                 match event.logical_key {
                     Key::Named(NamedKey::Space) => self.toggle_play(),
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Named(NamedKey::ArrowRight) => {
                         self.playing = false;
-                        let t = self.current_time() + step;
-                        self.seek(t);
+                        self.seek_frame(self.current_frame() + 1);
                     }
                     Key::Named(NamedKey::ArrowLeft) => {
                         self.playing = false;
-                        let t = self.current_time() - step;
-                        self.seek(t);
+                        self.seek_frame(self.current_frame() - 1);
                     }
-                    Key::Character(ref s) if s == "r" || s == "R" => self.seek(0.0),
+                    Key::Character(ref s) if s == "r" || s == "R" => self.seek_frame(0),
                     Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
                         self.delete_selected_key();
                     }
@@ -1061,8 +1362,9 @@ impl ApplicationHandler for App {
 impl App {
     /// Write the panel's edits into the selected node. Returns whether anything
     /// changed. An edit to a constant overwrites it; an edit to an animated
-    /// property sets a keyframe at time `t` (via `Value::set_at`).
-    fn apply_edits(&mut self, t: f64, e: &PropEdits) -> bool {
+    /// property sets a keyframe on `frame` (via `Value::set_at`).
+    fn apply_edits(&mut self, frame: i64, e: &PropEdits) -> bool {
+        let t = frame as f64;
         let Some(id) = self.selected else {
             return false;
         };
@@ -1075,26 +1377,26 @@ impl App {
         if e.pos_x.is_some() || e.pos_y.is_some() {
             let cur = tr.position.resolve(t);
             let v = Vec2::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y));
-            tr.position.set_at(t, v);
+            tr.position.set_at(frame, v);
             changed = true;
         }
         if let Some(r) = e.rot {
-            tr.rotation_deg.set_at(t, r);
+            tr.rotation_deg.set_at(frame, r);
             changed = true;
         }
         if e.scale_x.is_some() || e.scale_y.is_some() {
             let cur = tr.scale.resolve(t);
             let v = Vec2::new(e.scale_x.unwrap_or(cur.x), e.scale_y.unwrap_or(cur.y));
-            tr.scale.set_at(t, v);
+            tr.scale.set_at(frame, v);
             changed = true;
         }
         if let Some(o) = e.opacity {
-            tr.opacity.set_at(t, o);
+            tr.opacity.set_at(frame, o);
             changed = true;
         }
         if let Some(rgb) = e.fill {
             if let Some(fill) = node.fill.as_mut() {
-                fill.set_at(t, MColor::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64));
+                fill.set_at(frame, MColor::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64));
                 changed = true;
             }
         }
@@ -1102,24 +1404,24 @@ impl App {
         // Stopwatch clicks: insert a keyframe at the playhead (promoting a
         // constant to a track the first time).
         if e.key_pos {
-            tr.position.insert_key(t);
+            tr.position.insert_key(frame);
             changed = true;
         }
         if e.key_rot {
-            tr.rotation_deg.insert_key(t);
+            tr.rotation_deg.insert_key(frame);
             changed = true;
         }
         if e.key_scale {
-            tr.scale.insert_key(t);
+            tr.scale.insert_key(frame);
             changed = true;
         }
         if e.key_opacity {
-            tr.opacity.insert_key(t);
+            tr.opacity.insert_key(frame);
             changed = true;
         }
         if e.key_fill {
             if let Some(fill) = node.fill.as_mut() {
-                fill.insert_key(t);
+                fill.insert_key(frame);
                 changed = true;
             }
         }
@@ -1147,7 +1449,7 @@ impl App {
     }
 
     /// Move a keyframe of the selected node's property (dopesheet drag).
-    fn move_keyframe(&mut self, kind: PropKind, index: usize, new_time: f64) -> bool {
+    fn move_keyframe(&mut self, kind: PropKind, index: usize, new_frame: i64) -> bool {
         let Some(id) = self.selected else {
             return false;
         };
@@ -1156,10 +1458,10 @@ impl App {
         };
         let tr = &mut node.transform;
         match kind {
-            PropKind::Position => tr.position.move_key(index, new_time),
-            PropKind::Rotation => tr.rotation_deg.move_key(index, new_time),
-            PropKind::Scale => tr.scale.move_key(index, new_time),
-            PropKind::Opacity => tr.opacity.move_key(index, new_time),
+            PropKind::Position => tr.position.move_key(index, new_frame),
+            PropKind::Rotation => tr.rotation_deg.move_key(index, new_frame),
+            PropKind::Scale => tr.scale.move_key(index, new_frame),
+            PropKind::Opacity => tr.opacity.move_key(index, new_frame),
         }
         true
     }
@@ -1278,12 +1580,16 @@ impl App {
             }
         };
         match serde_json::from_str::<Document>(&text) {
-            Ok(doc) => {
+            Ok(mut doc) => {
+                // Pre-frame-grid docs stored keyframes as float seconds; this
+                // converts them using the doc's own fps. No-op on new files.
+                doc.migrate();
                 self.next_id = max_id(&doc.root) + 1;
+                self.view = TimelineView::full(doc.duration_frames());
                 self.doc = doc;
                 self.selected = None;
                 self.selected_key = None;
-                self.seek(0.0);
+                self.seek_frame(0);
                 true
             }
             Err(e) => {
@@ -1295,7 +1601,11 @@ impl App {
 
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     fn render(&mut self, window: &Window) {
-        let t = self.current_time();
+        // The whole render path is in the frame domain; seconds only ever
+        // appear in the timecode string.
+        let frame = self.current_frame();
+        let t = frame as f64;
+        let last_frame = self.doc.duration_frames().max(1);
         let scene = evaluate(&self.doc, t);
         for (id, msg) in &scene.warnings {
             eprintln!("warning [node {}]: {msg}", id.0);
@@ -1350,6 +1660,8 @@ impl App {
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
         let duration = self.doc.duration;
+        let timebase = self.doc.timebase();
+        let view = self.view;
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
@@ -1363,8 +1675,8 @@ impl App {
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp);
             tree_ui(ui, &tree, selected_node, &mut tree_edits);
-            transport_ui(ui, t, duration, playing, &mut transport);
-            dopesheet_ui(ui, &rows, t, duration, selected_key, &mut dope);
+            transport_ui(ui, frame, last_frame, timebase, playing, &mut transport);
+            dopesheet_ui(ui, &rows, t, last_frame, timebase, view, selected_key, &mut dope);
             properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out);
         });
 
@@ -1381,6 +1693,11 @@ impl App {
         if let Some(d) = comp.duration {
             self.doc.duration = d.max(0.1);
         }
+        // fps/duration changes resize the frame axis under the view, so the
+        // window may now hang past the end of the comp.
+        if comp.fps.is_some() || comp.duration.is_some() {
+            self.view = self.view.clamped(self.doc.duration_frames());
+        }
 
         // Layers panel: selection + reorder.
         if let Some(id) = tree_edits.select {
@@ -1388,6 +1705,11 @@ impl App {
                 self.selected = Some(id);
                 self.selected_key = None;
             }
+        }
+
+        // Zoom / pan from the timeline.
+        if let Some(v) = dope.set_view {
+            self.view = v;
         }
 
         // Keyframe selection changes from the dopesheet.
@@ -1401,16 +1723,16 @@ impl App {
             self.toggle_play();
         }
         if transport.restart {
-            self.seek(0.0);
+            self.seek_frame(0);
         }
-        if let Some(nt) = transport.scrub_to.or(dope.seek_to) {
+        if let Some(nf) = transport.scrub_to.or(dope.seek_to) {
             self.playing = false;
-            self.seek(nt);
+            self.seek_frame(nf);
         }
 
         // Apply property edits + keyframe drags to the selected node, then
         // re-evaluate so the change is visible on this very frame.
-        let mut dirty = self.apply_edits(t, &edits);
+        let mut dirty = self.apply_edits(frame, &edits);
         if let Some((kind, idx, nt)) = dope.move_key {
             dirty |= self.move_keyframe(kind, idx, nt);
         }
@@ -1547,6 +1869,126 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_axis(view: TimelineView) -> Axis {
+        // 8px pad each side → a 400px usable span.
+        Axis::new(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(416.0, 20.0)),
+            view,
+        )
+    }
+
+    #[test]
+    fn axis_round_trips_frames_through_pixels() {
+        let a = test_axis(TimelineView { start: 0.0, visible: 100.0 });
+        for f in [0i64, 1, 37, 99, 100] {
+            assert_eq!(a.x_to_frame(a.frame_to_x(f as f64)), f, "frame {f}");
+        }
+    }
+
+    #[test]
+    fn axis_round_trips_when_panned_and_zoomed() {
+        let a = test_axis(TimelineView { start: 240.0, visible: 12.0 });
+        for f in [240i64, 243, 251, 252] {
+            assert_eq!(a.x_to_frame(a.frame_to_x(f as f64)), f, "frame {f}");
+        }
+    }
+
+    #[test]
+    fn x_to_frame_snaps_to_the_nearest_frame() {
+        let a = test_axis(TimelineView { start: 0.0, visible: 10.0 });
+        // 40px per frame here, so a third of the way past frame 2 still snaps
+        // back to 2, and two-thirds snaps up to 3.
+        let x2 = a.frame_to_x(2.0);
+        assert_eq!(a.x_to_frame(x2 + 13.0), 2);
+        assert_eq!(a.x_to_frame(x2 + 27.0), 3);
+    }
+
+    #[test]
+    fn zoom_keeps_the_anchored_frame_under_the_cursor() {
+        // This is the property that makes zooming feel like zooming: whatever
+        // frame is under the pointer must not move while the scale changes.
+        let view = TimelineView { start: 0.0, visible: 120.0 };
+        let a = test_axis(view);
+        let cursor_x = a.frame_to_x(90.0);
+        let anchor = a.x_to_frame_exact(cursor_x);
+
+        for factor in [0.5f64, 0.8, 1.25, 2.0] {
+            let visible = view.visible * factor;
+            let ratio = (anchor - view.start) / view.visible;
+            let next = TimelineView { start: anchor - ratio * visible, visible };
+            let moved = test_axis(next).frame_to_x(anchor);
+            assert!(
+                (moved - cursor_x).abs() < 0.5,
+                "factor {factor}: anchor drifted {cursor_x} -> {moved}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_clamp_keeps_the_window_inside_the_comp() {
+        let v = TimelineView { start: -50.0, visible: 5000.0 }.clamped(120);
+        assert_eq!(v.start, 0.0);
+        assert_eq!(v.visible, 120.0, "cannot show more than the comp");
+
+        // Panned past the end: slides back so the window ends at the last frame.
+        let v = TimelineView { start: 900.0, visible: 20.0 }.clamped(120);
+        assert!((v.start + v.visible - 120.0).abs() < 1e-9, "start = {}", v.start);
+
+        // Zoomed in absurdly far: floored, not zero or negative.
+        let v = TimelineView { start: 10.0, visible: 0.0001 }.clamped(120);
+        assert!(v.visible >= 4.0, "visible = {}", v.visible);
+    }
+
+    #[test]
+    fn tick_step_grows_as_you_zoom_out() {
+        // Zoomed in: every frame is far apart, so a 1-frame step fits.
+        assert_eq!(tick_step(80.0, 24.0, 58.0), 1);
+        // Zoomed out: steps must land on whole seconds at 24fps.
+        let wide = tick_step(0.5, 24.0, 58.0);
+        assert!(wide % 24 == 0, "expected a whole-second step, got {wide}");
+        // And it must actually satisfy the spacing it was asked for.
+        assert!(0.5 * wide as f32 >= 58.0);
+    }
+
+    #[test]
+    fn edge_pan_is_dead_in_the_middle_and_signed_at_the_ends() {
+        let (l, r, e) = (100.0f32, 500.0f32, 40.0f32);
+        assert_eq!(edge_pan_intensity(300.0, l, r, e), 0.0, "middle is dead");
+        assert_eq!(edge_pan_intensity(145.0, l, r, e), 0.0, "just inside the zone");
+        assert!(edge_pan_intensity(120.0, l, r, e) < 0.0, "left zone pans left");
+        assert!(edge_pan_intensity(480.0, l, r, e) > 0.0, "right zone pans right");
+    }
+
+    #[test]
+    fn edge_pan_ramps_with_depth_and_saturates() {
+        let (l, r, e) = (100.0f32, 500.0f32, 40.0f32);
+        // Deeper into the zone → stronger.
+        let shallow = edge_pan_intensity(130.0, l, r, e).abs();
+        let deep = edge_pan_intensity(105.0, l, r, e).abs();
+        assert!(deep > shallow, "{deep} should exceed {shallow}");
+        // At and beyond the edge it saturates rather than running away.
+        assert!((edge_pan_intensity(l, l, r, e) + 1.0).abs() < 1e-6);
+        assert!((edge_pan_intensity(-9999.0, l, r, e) + 1.0).abs() < 1e-6);
+        assert!((edge_pan_intensity(9999.0, l, r, e) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edge_pan_handles_degenerate_tracks() {
+        // A collapsed or inverted track must not produce a pan (or a NaN).
+        assert_eq!(edge_pan_intensity(50.0, 100.0, 100.0, 36.0), 0.0);
+        assert_eq!(edge_pan_intensity(50.0, 500.0, 100.0, 36.0), 0.0);
+        assert_eq!(edge_pan_intensity(50.0, 100.0, 500.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn tick_step_never_returns_zero() {
+        // A degenerate/huge zoom-out must still yield a usable positive step,
+        // since it's used as a modulus when drawing the ruler.
+        for pxf in [1e-6f32, 0.0, 1000.0] {
+            assert!(tick_step(pxf, 24.0, 58.0) > 0, "px/frame {pxf}");
+        }
+    }
 
     /// A click on the demo square (centered at t=0) should select it, and a
     /// click far outside should deselect. Fit is identity here so physical

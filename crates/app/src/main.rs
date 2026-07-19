@@ -18,10 +18,15 @@ fn main() {
     fs::create_dir_all(out_dir).expect("create out/");
 
     let bg = Color::rgb(0.08, 0.09, 0.11);
-    let frames = 9;
-    for i in 0..frames {
-        let t = i as f64 / (frames - 1) as f64 * 2.0; // 0..2s
-        let scene = evaluate(&doc, t);
+    let tb = doc.timebase();
+    // Sample 9 evenly-spaced instants across the first 2 seconds. `evaluate`
+    // works in frames, so convert once here — this binary is an "edge" and
+    // seconds are a presentation unit.
+    let samples = 9;
+    let last_frame = tb.seconds_to_frames(2.0);
+    for i in 0..samples {
+        let frame = (i as f64 / (samples - 1) as f64 * last_frame as f64).round();
+        let scene = evaluate(&doc, frame);
         for (id, msg) in &scene.warnings {
             eprintln!("warning [node {}]: {msg}", id.0);
         }
@@ -29,7 +34,8 @@ fn main() {
         let path = out_dir.join(format!("frame_{i:02}.svg"));
         fs::write(&path, svg).expect("write svg");
         println!(
-            "t={t:.2}s  ->  {}  ({} items)",
+            "{}  (frame {frame})  ->  {}  ({} items)",
+            tb.timecode(frame),
             path.display(),
             scene.items.len()
         );

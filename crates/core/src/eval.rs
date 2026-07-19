@@ -28,25 +28,29 @@ pub struct Scene {
     pub warnings: Vec<(NodeId, String)>,
 }
 
-/// Evaluate a document at time `t` (in seconds) into a flat `Scene`.
-pub fn evaluate(doc: &Document, t: f64) -> Scene {
+/// Evaluate a document at `frame` into a flat `Scene`.
+///
+/// The frame may be fractional — keys sit on the grid, the playhead need not.
+/// Seconds never reach this layer; convert at the edges with
+/// [`crate::timebase::Timebase`].
+pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     let mut scene = Scene::default();
-    walk(&doc.root, Affine::IDENTITY, 1.0, t, &mut scene);
+    walk(&doc.root, Affine::IDENTITY, 1.0, frame, &mut scene);
     scene
 }
 
-fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, t: f64, scene: &mut Scene) {
-    let (local_xf, local_opacity) = node.transform.resolve(t);
+fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, frame: f64, scene: &mut Scene) {
+    let (local_xf, local_opacity) = node.transform.resolve(frame);
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
 
     if let Some(shape) = &node.shape {
-        let path = shape.to_path(t);
-        let fill = node.fill.as_ref().map(|f| f.resolve(t));
+        let path = shape.to_path(frame);
+        let fill = node.fill.as_ref().map(|f| f.resolve(frame));
         let stroke = node
             .stroke
             .as_ref()
-            .map(|s| (s.color.resolve(t), s.width.resolve(t)));
+            .map(|s| (s.color.resolve(frame), s.width.resolve(frame)));
 
         // Provenance-tagged sanity check: surface non-finite geometry instead
         // of silently emitting a broken frame.
@@ -67,7 +71,7 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, t: f64, scene: &mut
     }
 
     for child in &node.children {
-        walk(child, xf, opacity, t, scene);
+        walk(child, xf, opacity, frame, scene);
     }
 }
 
@@ -79,8 +83,8 @@ mod tests {
     use kurbo::Vec2;
 
     /// The canonical smoke test: a keyframed square whose position animates.
-    /// At t=0.5 it should sit exactly halfway between its two keys, and the
-    /// evaluated render item's transform must reflect that.
+    /// Halfway between its two keys the evaluated render item's transform must
+    /// reflect the midpoint.
     #[test]
     fn keyframed_square_is_halfway_at_midpoint() {
         let square = Node::shape(
@@ -94,15 +98,15 @@ mod tests {
         .with_fill(Color::rgb(1.0, 0.0, 0.0))
         .with_transform(Transform {
             position: Value::Keyframed(Track::new(vec![
-                Keyframe::linear(0.0, Vec2::new(0.0, 0.0)),
-                Keyframe::linear(1.0, Vec2::new(200.0, 100.0)),
+                Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+                Keyframe::linear(24, Vec2::new(200.0, 100.0)),
             ])),
             ..Transform::default()
         });
 
         let doc = Document::new(1920.0, 1080.0, Node::group(0, "root").with_child(square));
 
-        let scene = evaluate(&doc, 0.5);
+        let scene = evaluate(&doc, 12.0);
         assert_eq!(scene.items.len(), 1, "one drawable expected");
         assert!(scene.warnings.is_empty(), "no warnings expected");
 

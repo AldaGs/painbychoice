@@ -73,9 +73,20 @@ impl Handle {
     pub const SMOOTH_IN: Handle = Handle::new(0.58, 1.0);
 }
 
+/// A key at an exact frame. Frames are integers on purpose: a keyframe that
+/// sits between frames can never be reached by playback, and float times
+/// forced every comparison through an epsilon fudge. The frame *grid* lives in
+/// [`crate::timebase::Timebase`]; a key knows only its index on that grid.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Keyframe<T> {
-    pub time: f64,
+    #[serde(default)]
+    pub frame: i64,
+    /// Legacy `.pbc` docs stored keyframe times as float seconds. Deserializing
+    /// one parks the value here; [`Document::migrate`] converts it to a frame
+    /// once `fps` is known (a `Keyframe` alone can't — it has no timebase).
+    /// Never re-serialized, so a doc is migrated permanently on first save.
+    #[serde(default, rename = "time", skip_serializing)]
+    pub(crate) legacy_seconds: Option<f64>,
     pub value: T,
     /// Timing handle leaving this key toward the next.
     pub out_handle: Handle,
@@ -85,18 +96,20 @@ pub struct Keyframe<T> {
 
 impl<T> Keyframe<T> {
     /// A linearly-timed key.
-    pub fn linear(time: f64, value: T) -> Self {
+    pub fn linear(frame: i64, value: T) -> Self {
         Self {
-            time,
+            frame,
+            legacy_seconds: None,
             value,
             out_handle: Handle::LINEAR_OUT,
             in_handle: Handle::LINEAR_IN,
         }
     }
     /// A smoothly-eased key.
-    pub fn smooth(time: f64, value: T) -> Self {
+    pub fn smooth(frame: i64, value: T) -> Self {
         Self {
-            time,
+            frame,
+            legacy_seconds: None,
             value,
             out_handle: Handle::SMOOTH_OUT,
             in_handle: Handle::SMOOTH_IN,
@@ -113,7 +126,7 @@ pub struct Track<T> {
 
 impl<T: Animatable> Track<T> {
     pub fn new(mut keys: Vec<Keyframe<T>>) -> Self {
-        keys.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+        keys.sort_by_key(|k| k.frame);
         Self { keys }
     }
 
@@ -129,31 +142,53 @@ impl<T: Animatable> Track<T> {
         self.keys.is_empty()
     }
 
-    /// Times of every keyframe, in order.
-    pub fn times(&self) -> Vec<f64> {
-        self.keys.iter().map(|k| k.time).collect()
+    /// Frames of every keyframe, in order.
+    pub fn frames(&self) -> Vec<i64> {
+        self.keys.iter().map(|k| k.frame).collect()
     }
 
-    /// Move keyframe `index` to `new_time`, clamped so it can't cross its
-    /// neighbours. Clamping preserves the sorted invariant `sample` relies on
-    /// and keeps the key's index stable across a drag.
-    pub fn move_key(&mut self, index: usize, new_time: f64) {
+    /// Move keyframe `index` to `new_frame`, clamped so it can't cross or land
+    /// on its neighbours. Clamping preserves the sorted invariant `sample`
+    /// relies on and keeps the key's index stable across a drag.
+    ///
+    /// On the frame grid the gap is exactly one frame — no epsilon. If there is
+    /// no room between the neighbours the key simply doesn't move.
+    pub fn move_key(&mut self, index: usize, new_frame: i64) {
         let n = self.keys.len();
         if index >= n {
             return;
         }
-        const EPS: f64 = 1e-3;
         let lo = if index > 0 {
-            self.keys[index - 1].time + EPS
+            self.keys[index - 1].frame + 1
         } else {
-            f64::NEG_INFINITY
+            i64::MIN
         };
         let hi = if index + 1 < n {
-            self.keys[index + 1].time - EPS
+            self.keys[index + 1].frame - 1
         } else {
-            f64::INFINITY
+            i64::MAX
         };
-        self.keys[index].time = new_time.clamp(lo, hi);
+        if lo <= hi {
+            self.keys[index].frame = new_frame.clamp(lo, hi);
+        }
+    }
+
+    /// Convert legacy float-seconds keys to frames at `fps`. See
+    /// [`Keyframe::legacy_seconds`]. Re-sorts, since rounding can collide or
+    /// reorder keys that were microscopically apart in the old format.
+    pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        let mut touched = false;
+        for k in &mut self.keys {
+            if let Some(seconds) = k.legacy_seconds.take() {
+                k.frame = (seconds * fps).round() as i64;
+                touched = true;
+            }
+        }
+        if touched {
+            self.keys.sort_by_key(|k| k.frame);
+            // Rounding can land two old keys on one frame; keep the first.
+            self.keys.dedup_by_key(|k| k.frame);
+        }
     }
 
     /// Remove keyframe `index`. A track is never emptied below one key.
@@ -181,41 +216,47 @@ impl<T: Animatable> Track<T> {
         }
     }
 
-    /// Insert or update a keyframe at `time`. If a key already sits at (about)
-    /// that time its value is replaced (handles preserved); otherwise a new
+    /// Insert or update a keyframe at `frame`. If a key already sits on that
+    /// frame its value is replaced (handles preserved); otherwise a new
     /// smoothly-eased key is inserted in sorted order. This is the "auto-key"
     /// behavior an editor uses when the user changes an animated value.
-    pub fn set_key(&mut self, time: f64, value: T) {
-        const EPS: f64 = 1e-4;
-        if let Some(k) = self.keys.iter_mut().find(|k| (k.time - time).abs() < EPS) {
+    ///
+    /// Exact integer equality — the old float-epsilon match is gone, which is
+    /// half the point of moving to a frame grid.
+    pub fn set_key(&mut self, frame: i64, value: T) {
+        if let Some(k) = self.keys.iter_mut().find(|k| k.frame == frame) {
             k.value = value;
         } else {
-            self.keys.push(Keyframe::smooth(time, value));
-            self.keys
-                .sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+            self.keys.push(Keyframe::smooth(frame, value));
+            self.keys.sort_by_key(|k| k.frame);
         }
     }
 
-    pub fn sample(&self, t: f64) -> T {
+    /// Sample at `frame`, which is deliberately fractional: playback runs off a
+    /// wall clock and the compositor will want sub-frame samples for motion
+    /// blur. The *keys* are on the grid; the playhead need not be.
+    pub fn sample(&self, frame: f64) -> T {
         match self.keys.as_slice() {
             [] => panic!("Track::sample on an empty track"),
             [only] => only.value.clone(),
             keys => {
                 // Before first / after last: hold the endpoint.
-                if t <= keys[0].time {
+                if frame <= keys[0].frame as f64 {
                     return keys[0].value.clone();
                 }
-                if t >= keys[keys.len() - 1].time {
+                if frame >= keys[keys.len() - 1].frame as f64 {
                     return keys[keys.len() - 1].value.clone();
                 }
                 // Find the surrounding segment [a, b].
-                let seg = keys.windows(2).find(|w| t >= w[0].time && t <= w[1].time);
+                let seg = keys
+                    .windows(2)
+                    .find(|w| frame >= w[0].frame as f64 && frame <= w[1].frame as f64);
                 let [a, b] = match seg {
                     Some(w) => [&w[0], &w[1]],
                     None => return keys[keys.len() - 1].value.clone(),
                 };
-                let span = b.time - a.time;
-                let u = if span > 0.0 { (t - a.time) / span } else { 0.0 };
+                let span = (b.frame - a.frame) as f64;
+                let u = if span > 0.0 { (frame - a.frame as f64) / span } else { 0.0 };
                 // Temporal easing: solve the timing bezier for eased fraction.
                 let eased = solve_ease(u, a.out_handle, b.in_handle);
                 T::lerp(&a.value, &b.value, eased)
@@ -238,20 +279,28 @@ impl<T: Animatable> Value<T> {
         Value::Const(v)
     }
 
-    pub fn resolve(&self, t: f64) -> T {
+    /// Resolve at `frame` (fractional allowed — see [`Track::sample`]).
+    pub fn resolve(&self, frame: f64) -> T {
         match self {
             Value::Const(v) => v.clone(),
-            Value::Keyframed(track) => track.sample(t),
+            Value::Keyframed(track) => track.sample(frame),
         }
     }
 
-    /// Write `value` at time `t`. A constant is overwritten wholesale; an
-    /// animated value gets a keyframe set at `t` (auto-key). This is the single
+    /// Write `value` at `frame`. A constant is overwritten wholesale; an
+    /// animated value gets a keyframe set there (auto-key). This is the single
     /// entry point an editor uses so it never has to branch on the value kind.
-    pub fn set_at(&mut self, t: f64, value: T) {
+    pub fn set_at(&mut self, frame: i64, value: T) {
         match self {
             Value::Const(v) => *v = value,
-            Value::Keyframed(track) => track.set_key(t, value),
+            Value::Keyframed(track) => track.set_key(frame, value),
+        }
+    }
+
+    /// Convert legacy float-seconds keys to frames at `fps` (no-op otherwise).
+    pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        if let Value::Keyframed(track) = self {
+            track.migrate_frames(fps);
         }
     }
 
@@ -260,19 +309,19 @@ impl<T: Animatable> Value<T> {
         matches!(self, Value::Keyframed(_))
     }
 
-    /// Keyframe times, or empty for a constant. Lets a timeline enumerate keys
+    /// Keyframe frames, or empty for a constant. Lets a timeline enumerate keys
     /// without caring about the value type `T`.
-    pub fn key_times(&self) -> Vec<f64> {
+    pub fn key_frames(&self) -> Vec<i64> {
         match self {
             Value::Const(_) => Vec::new(),
-            Value::Keyframed(track) => track.times(),
+            Value::Keyframed(track) => track.frames(),
         }
     }
 
-    /// Move keyframe `index` to `new_time` (no-op on a constant).
-    pub fn move_key(&mut self, index: usize, new_time: f64) {
+    /// Move keyframe `index` to `new_frame` (no-op on a constant).
+    pub fn move_key(&mut self, index: usize, new_frame: i64) {
         if let Value::Keyframed(track) = self {
-            track.move_key(index, new_time);
+            track.move_key(index, new_frame);
         }
     }
 
@@ -283,16 +332,16 @@ impl<T: Animatable> Value<T> {
         }
     }
 
-    /// Insert a keyframe at time `t`, holding the value the property currently
+    /// Insert a keyframe at `frame`, holding the value the property currently
     /// resolves to. A constant is promoted to a one-key track (this is how a
-    /// property *starts* being animated); an existing track gets a key at `t`.
-    pub fn insert_key(&mut self, t: f64) {
+    /// property *starts* being animated); an existing track gets a key there.
+    pub fn insert_key(&mut self, frame: i64) {
         if let Value::Const(v) = self {
             let v = v.clone();
-            *self = Value::Keyframed(Track::new(vec![Keyframe::smooth(t, v)]));
+            *self = Value::Keyframed(Track::new(vec![Keyframe::smooth(frame, v)]));
         } else if let Value::Keyframed(track) = self {
-            let cur = track.sample(t);
-            track.set_key(t, cur);
+            let cur = track.sample(frame as f64);
+            track.set_key(frame, cur);
         }
     }
 
@@ -362,38 +411,48 @@ mod tests {
     #[test]
     fn linear_track_midpoint() {
         let v: Value<f64> = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0.0, 0.0),
-            Keyframe::linear(1.0, 100.0),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(24, 100.0),
         ]));
-        assert!((v.resolve(0.5) - 50.0).abs() < 1e-3, "got {}", v.resolve(0.5));
+        assert!((v.resolve(12.0) - 50.0).abs() < 1e-3, "got {}", v.resolve(12.0));
     }
 
     #[test]
     fn track_holds_outside_range() {
         let v: Value<f64> = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(1.0, 10.0),
-            Keyframe::linear(2.0, 20.0),
+            Keyframe::linear(24, 10.0),
+            Keyframe::linear(48, 20.0),
         ]));
         assert_eq!(v.resolve(0.0), 10.0);
-        assert_eq!(v.resolve(5.0), 20.0);
+        assert_eq!(v.resolve(120.0), 20.0);
+    }
+
+    #[test]
+    fn sample_accepts_fractional_frames() {
+        // Keys are on the grid; the playhead need not be.
+        let v: Value<f64> = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(10, 100.0),
+        ]));
+        assert!((v.resolve(2.5) - 25.0).abs() < 1e-9, "got {}", v.resolve(2.5));
     }
 
     #[test]
     fn smooth_ease_is_symmetric_at_midpoint() {
         // A symmetric ease should still pass through 50% at u=0.5.
         let v: Value<f64> = Value::Keyframed(Track::new(vec![
-            Keyframe::smooth(0.0, 0.0),
-            Keyframe::smooth(1.0, 100.0),
+            Keyframe::smooth(0, 0.0),
+            Keyframe::smooth(24, 100.0),
         ]));
-        assert!((v.resolve(0.5) - 50.0).abs() < 1.0, "got {}", v.resolve(0.5));
+        assert!((v.resolve(12.0) - 50.0).abs() < 1.0, "got {}", v.resolve(12.0));
         // ...but eased slower at the start than linear would be.
-        assert!(v.resolve(0.25) < 25.0, "ease-in should lag: {}", v.resolve(0.25));
+        assert!(v.resolve(6.0) < 25.0, "ease-in should lag: {}", v.resolve(6.0));
     }
 
     #[test]
     fn set_at_overwrites_a_constant() {
         let mut v = Value::constant(3.0);
-        v.set_at(1.0, 9.0);
+        v.set_at(24, 9.0);
         assert_eq!(v.resolve(0.0), 9.0);
         assert!(!v.is_animated());
     }
@@ -401,15 +460,15 @@ mod tests {
     #[test]
     fn set_at_replaces_existing_key_and_inserts_new() {
         let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0.0, 0.0),
-            Keyframe::linear(1.0, 100.0),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(24, 100.0),
         ]));
         // Edit exactly on the first key: replaces its value, no new key.
-        v.set_at(0.0, 50.0);
+        v.set_at(0, 50.0);
         assert_eq!(v.resolve(0.0), 50.0);
-        // Edit between keys: inserts a new key at that time.
-        v.set_at(0.5, 75.0);
-        assert!((v.resolve(0.5) - 75.0).abs() < 1e-6);
+        // Edit between keys: inserts a new key on that frame.
+        v.set_at(12, 75.0);
+        assert!((v.resolve(12.0) - 75.0).abs() < 1e-6);
         if let Value::Keyframed(track) = &v {
             assert_eq!(track.keys().len(), 3, "a key should have been inserted");
         } else {
@@ -421,20 +480,20 @@ mod tests {
     fn insert_key_promotes_constant_then_adds() {
         let mut v = Value::constant(7.0);
         assert!(!v.is_animated());
-        v.insert_key(1.0);
+        v.insert_key(24);
         assert!(v.is_animated(), "constant should become a track");
-        assert_eq!(v.key_times(), vec![1.0]);
-        assert_eq!(v.resolve(1.0), 7.0, "the held value carries over");
-        // A second insert at a new time adds a key holding the resolved value.
-        v.insert_key(3.0);
-        assert_eq!(v.key_times().len(), 2);
+        assert_eq!(v.key_frames(), vec![24]);
+        assert_eq!(v.resolve(24.0), 7.0, "the held value carries over");
+        // A second insert on a new frame adds a key holding the resolved value.
+        v.insert_key(72);
+        assert_eq!(v.key_frames().len(), 2);
     }
 
     #[test]
     fn segment_handles_round_trip() {
         let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0.0, 0.0),
-            Keyframe::linear(1.0, 10.0),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(24, 10.0),
         ]));
         let (out, inn) = v.segment_handles(0).unwrap();
         assert!((out.x - Handle::LINEAR_OUT.x).abs() < 1e-9);
@@ -448,27 +507,67 @@ mod tests {
     #[test]
     fn move_key_clamps_between_neighbours() {
         let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0.0, 0.0),
-            Keyframe::linear(1.0, 100.0),
-            Keyframe::linear(2.0, 0.0),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(24, 100.0),
+            Keyframe::linear(48, 0.0),
         ]));
         // Try to drag the middle key past the last one — it must stop short.
-        v.move_key(1, 5.0);
-        let times = v.key_times();
-        assert!(times[1] < times[2], "middle key must stay before the last");
-        assert!(times[1] > times[0], "and after the first");
+        v.move_key(1, 500);
+        let f = v.key_frames();
+        assert!(f[1] < f[2], "middle key must stay before the last");
+        assert!(f[1] > f[0], "and after the first");
         // Order preserved, so sampling still works.
-        assert!(v.resolve(0.5).is_finite());
+        assert!(v.resolve(12.0).is_finite());
+    }
+
+    #[test]
+    fn move_key_into_a_full_gap_is_a_no_op() {
+        // Adjacent frames leave nowhere to go; the key must not jump the fence.
+        let mut v: Value<f64> = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(10, 0.0),
+            Keyframe::linear(11, 1.0),
+            Keyframe::linear(12, 2.0),
+        ]));
+        v.move_key(1, 99);
+        assert_eq!(v.key_frames(), vec![10, 11, 12], "no room, so no movement");
     }
 
     #[test]
     fn vec2_track() {
         use kurbo::Vec2;
         let v: Value<Vec2> = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0.0, Vec2::new(0.0, 0.0)),
-            Keyframe::linear(1.0, Vec2::new(10.0, 20.0)),
+            Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+            Keyframe::linear(24, Vec2::new(10.0, 20.0)),
         ]));
-        let p = v.resolve(0.5);
+        let p = v.resolve(12.0);
         assert!((p.x - 5.0).abs() < 1e-3 && (p.y - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn legacy_seconds_migrate_to_frames() {
+        // A pre-migration `.pbc` stored keyframe times as float seconds.
+        let json = r#"{"Keyframed":{"keys":[
+            {"time":0.0,"value":0.0,"out_handle":{"x":0.33,"y":0.33},"in_handle":{"x":0.67,"y":0.67}},
+            {"time":2.0,"value":100.0,"out_handle":{"x":0.33,"y":0.33},"in_handle":{"x":0.67,"y":0.67}}
+        ]}}"#;
+        let mut v: Value<f64> = serde_json::from_str(json).unwrap();
+        v.migrate_frames(24.0);
+        assert_eq!(v.key_frames(), vec![0, 48], "2s @ 24fps is frame 48");
+        // And it re-serializes in the new format, with no `time` field left.
+        let out = serde_json::to_string(&v).unwrap();
+        assert!(out.contains("\"frame\""), "should write frames: {out}");
+        assert!(!out.contains("\"time\""), "legacy field must not persist: {out}");
+    }
+
+    #[test]
+    fn migration_collapses_keys_that_round_onto_one_frame() {
+        // Two keys 1ms apart cannot both survive on a 24fps grid.
+        let json = r#"{"Keyframed":{"keys":[
+            {"time":1.000,"value":0.0,"out_handle":{"x":0.33,"y":0.33},"in_handle":{"x":0.67,"y":0.67}},
+            {"time":1.001,"value":100.0,"out_handle":{"x":0.33,"y":0.33},"in_handle":{"x":0.67,"y":0.67}}
+        ]}}"#;
+        let mut v: Value<f64> = serde_json::from_str(json).unwrap();
+        v.migrate_frames(24.0);
+        assert_eq!(v.key_frames(), vec![24], "collided keys collapse to one");
     }
 }
