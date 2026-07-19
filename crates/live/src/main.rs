@@ -22,6 +22,7 @@ use motion_core::{
     demo::demo_document, evaluate, Color as MColor, Document, Handle, Keyframe, Node as MNode,
     NodeId, Scene as MScene, Shape as MShape, Transform, Value,
 };
+use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -133,7 +134,7 @@ const COMP_H: f32 = 34.0;
 /// The canvas is one of these even though vello draws it, not egui: it has to
 /// occupy a leaf so the layout tree knows where the leftover space is. Its leaf
 /// draws nothing and merely reports its rect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Editor {
     Canvas,
     Comp,
@@ -173,7 +174,7 @@ impl Editor {
 }
 
 /// Which edge of an area a split pins its first child to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum DockSide {
     Left,
     Right,
@@ -215,8 +216,9 @@ enum DockCmd {
 /// This shape is deliberately serialization-ready: `size` lives here rather than
 /// only in egui's panel memory, so a future "save this layout" (per-project
 /// layouts, roadmap #4) is a `serde` derive away and needs no new plumbing.
-/// `Clone` is what lets a saved preset be re-applied without rebuilding it.
-#[derive(Clone)]
+/// `Clone` is what lets a saved preset be re-applied without rebuilding it;
+/// `serde` is what lets the active layout and user presets ride in the `.pbc`.
+#[derive(Clone, Serialize, Deserialize)]
 enum Dock {
     Leaf(Editor),
     Split {
@@ -402,15 +404,48 @@ impl Dock {
             }
         }
     }
+
+    /// Whether this tree is safe to drive the UI. A layout loaded from a `.pbc`
+    /// (which may have been hand-edited or written by a newer/older build) has
+    /// to hold the same guarantees the code paths lean on, or it's discarded for
+    /// the default: exactly one canvas — the single vello target and the tree's
+    /// innermost leaf — plus the two headerless toolbars, which no picker can
+    /// re-add if a bad layout dropped them.
+    fn is_valid(&self) -> bool {
+        fn tally(d: &Dock, canvas: &mut u32, comp: &mut u32, transport: &mut u32) {
+            match d {
+                Dock::Leaf(Editor::Canvas) => *canvas += 1,
+                Dock::Leaf(Editor::Comp) => *comp += 1,
+                Dock::Leaf(Editor::Transport) => *transport += 1,
+                Dock::Leaf(_) => {}
+                Dock::Split { first, second, .. } => {
+                    tally(first, canvas, comp, transport);
+                    tally(second, canvas, comp, transport);
+                }
+            }
+        }
+        let (mut canvas, mut comp, mut transport) = (0, 0, 0);
+        tally(self, &mut canvas, &mut comp, &mut transport);
+        let mut cur = self;
+        let innermost_is_canvas = loop {
+            match cur {
+                Dock::Split { second, .. } => cur = second,
+                Dock::Leaf(e) => break *e == Editor::Canvas,
+            }
+        };
+        canvas == 1 && comp == 1 && transport == 1 && innermost_is_canvas
+    }
 }
 
 /// A named layout the user can switch to. Built-ins ship with the app and can't
-/// be renamed or removed; user presets are made by "Save current" and (for now)
-/// live only for the session — persisting them into the `.pbc` is roadmap #4's
-/// next step, and the `Clone`-able tree is already all that needs.
+/// be renamed or removed; user presets are made by "Save current" and are saved
+/// into the `.pbc`. Only user presets are serialized — `builtin` is skipped and
+/// so defaults to `false` on load, which is what every loaded preset is.
+#[derive(Clone, Serialize, Deserialize)]
 struct Preset {
     name: String,
     dock: Dock,
+    #[serde(skip)]
     builtin: bool,
 }
 
@@ -427,6 +462,30 @@ fn builtin_presets() -> Vec<Preset> {
     .into_iter()
     .map(|(name, make)| Preset { name: name.to_string(), dock: make(), builtin: true })
     .collect()
+}
+
+/// The on-disk `.pbc` bundle: the headless document plus this shell's UI layout.
+/// The layout lives here in `live/`, never in `core::Document` — the engine
+/// stays UI-agnostic (the whole point of the crate split). Files written before
+/// layouts were saved are a *bare* `Document`; [`App::load`] falls back to that
+/// and defaults the layout, so old projects keep opening.
+#[derive(Serialize, Deserialize)]
+struct Project {
+    document: Document,
+    #[serde(default)]
+    layout: LayoutState,
+}
+
+/// The persisted UI layout: the active arrangement and any user-made presets.
+/// Built-in presets are code, not data, so they're never stored.
+#[derive(Default, Serialize, Deserialize)]
+struct LayoutState {
+    /// The active layout. Absent → fall back to [`Dock::default_layout`].
+    #[serde(default)]
+    dock: Option<Dock>,
+    /// Presets saved via the Layout menu (built-ins omitted).
+    #[serde(default)]
+    user_presets: Vec<Preset>,
 }
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
@@ -2568,9 +2627,10 @@ impl App {
         true
     }
 
-    /// Serialize the document to a `.pbc` (JSON) file chosen via a native
-    /// save dialog. The document already derives serde, so this is the whole
-    /// file format.
+    /// Serialize the document *and the current UI layout* to a `.pbc` (JSON)
+    /// file chosen via a native save dialog. The layout (active dock + user
+    /// presets) rides in a [`Project`] wrapper alongside the document; built-in
+    /// presets are code, so only user ones are written.
     fn save(&self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Pain By Choice", &["pbc", "json"])
@@ -2579,7 +2639,14 @@ impl App {
         else {
             return;
         };
-        match serde_json::to_string_pretty(&self.doc) {
+        let project = Project {
+            document: self.doc.clone(),
+            layout: LayoutState {
+                dock: Some(self.dock.clone()),
+                user_presets: self.presets.iter().filter(|p| !p.builtin).cloned().collect(),
+            },
+        };
+        match serde_json::to_string_pretty(&project) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
                     eprintln!("save failed: {e}");
@@ -2589,9 +2656,14 @@ impl App {
         }
     }
 
-    /// Load a `.pbc` document via a native open dialog, replacing the current
-    /// one. Returns whether the document changed. Selection and the id counter
-    /// are reset to match the loaded tree.
+    /// Load a `.pbc` via a native open dialog, replacing the current document
+    /// *and* layout. Returns whether the document changed. Selection and the id
+    /// counter are reset to match the loaded tree.
+    ///
+    /// Reads both the current [`Project`] format and the older bare-`Document`
+    /// files (which carry no layout): the wrapper is tried first, and a bare doc
+    /// fails it — it has no `document` field — so it falls through to the plain
+    /// parse and keeps the default layout.
     fn load(&mut self) -> bool {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Pain By Choice", &["pbc", "json"])
@@ -2606,24 +2678,46 @@ impl App {
                 return false;
             }
         };
-        match serde_json::from_str::<Document>(&text) {
-            Ok(mut doc) => {
-                // Pre-frame-grid docs stored keyframes as float seconds; this
-                // converts them using the doc's own fps. No-op on new files.
-                doc.migrate();
-                self.next_id = max_id(&doc.root) + 1;
-                self.view = TimelineView::full(doc.duration_frames());
-                self.doc = doc;
-                self.selected = None;
-                self.selected_keys.clear();
-                self.seek_frame(0);
-                true
+        let (mut doc, layout) = match serde_json::from_str::<Project>(&text) {
+            Ok(p) => (p.document, Some(p.layout)),
+            Err(_) => match serde_json::from_str::<Document>(&text) {
+                Ok(d) => (d, None),
+                Err(e) => {
+                    eprintln!("parse failed: {e}");
+                    return false;
+                }
+            },
+        };
+        // Pre-frame-grid docs stored keyframes as float seconds; this converts
+        // them using the doc's own fps. No-op on new files.
+        doc.migrate();
+        self.next_id = max_id(&doc.root) + 1;
+        self.view = TimelineView::full(doc.duration_frames());
+        self.doc = doc;
+        self.selected = None;
+        self.selected_keys.clear();
+
+        // Restore the layout. Built-ins are always rebuilt from code; loaded user
+        // presets (and the active dock) are validated, so a corrupt or edited
+        // file can never wedge the editor with an unusable arrangement.
+        self.presets = builtin_presets();
+        let restored = match layout {
+            Some(l) => {
+                self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
+                l.dock
             }
-            Err(e) => {
-                eprintln!("parse failed: {e}");
-                false
+            None => None,
+        };
+        self.dock = match restored {
+            Some(d) if d.is_valid() => d,
+            Some(_) => {
+                eprintln!("ignoring invalid saved layout; using default");
+                Dock::default_layout()
             }
-        }
+            None => Dock::default_layout(),
+        };
+        self.seek_frame(0);
+        true
     }
 
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
@@ -3397,6 +3491,68 @@ mod tests {
         let design = &presets.iter().find(|p| p.name == "Design").unwrap().dock;
         assert_eq!(count_editor(default, Editor::Dopesheet), 1);
         assert_eq!(count_editor(design, Editor::Dopesheet), 0);
+    }
+
+    #[test]
+    fn is_valid_accepts_layouts_and_rejects_broken_ones() {
+        for p in builtin_presets() {
+            assert!(p.dock.is_valid(), "{} should be valid", p.name);
+        }
+        // No toolbars, no comp: a lone canvas leaves the user no way back.
+        assert!(!Dock::Leaf(Editor::Canvas).is_valid());
+        // Two canvases — the vello target measurement expects exactly one.
+        let two = Dock::split(DockSide::Top, 10.0, false, Editor::Canvas, Dock::default_layout());
+        assert!(!two.is_valid());
+        // Canvas present but not the innermost leaf (it's a split's `first`).
+        let off = Dock::split(
+            DockSide::Top,
+            COMP_H,
+            false,
+            Editor::Comp,
+            Dock::split(
+                DockSide::Bottom,
+                TRANSPORT_H,
+                false,
+                Editor::Transport,
+                Dock::split(DockSide::Left, 10.0, true, Editor::Canvas, Dock::Leaf(Editor::Properties)),
+            ),
+        );
+        assert!(!off.is_valid());
+    }
+
+    #[test]
+    fn project_round_trips_document_and_layout() {
+        // A non-default arrangement plus a user preset must survive save/load.
+        let mut dock = Dock::default_layout();
+        let path = path_to(&dock, Editor::Properties).unwrap();
+        dock.apply(DockCmd::Split { path, side: DockSide::Top, size: 60.0 });
+        let project = Project {
+            document: demo_document(),
+            layout: LayoutState {
+                dock: Some(dock.clone()),
+                user_presets: vec![Preset {
+                    name: "Mine".into(),
+                    dock: Dock::design_layout(),
+                    builtin: true, // deliberately set — serialization must drop it
+                }],
+            },
+        };
+        let json = serde_json::to_string(&project).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(dock_editors(&back.layout.dock.unwrap()), dock_editors(&dock));
+        assert_eq!(back.layout.user_presets.len(), 1);
+        assert_eq!(back.layout.user_presets[0].name, "Mine");
+        assert!(!back.layout.user_presets[0].builtin, "builtin is skipped → false on load");
+    }
+
+    #[test]
+    fn a_bare_document_file_still_loads() {
+        // Old `.pbc` files are a bare Document with no layout wrapper; the loader
+        // tries Project first (which lacks a `document` field here and fails),
+        // then falls back to the plain document parse.
+        let json = serde_json::to_string(&demo_document()).unwrap();
+        assert!(serde_json::from_str::<Project>(&json).is_err(), "no `document` field");
+        assert!(serde_json::from_str::<Document>(&json).is_ok(), "parses as a bare doc");
     }
 
     #[test]

@@ -18,5 +18,6 @@ pollster = "0.4"
 egui = "0.35"
 egui-wgpu = "0.35"
 egui-winit = { version = "0.35", default-features = false }
+serde.workspace = true
 serde_json.workspace = true
 rfd = "0.17"
