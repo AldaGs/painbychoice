@@ -469,10 +469,22 @@ IR 🚧 → …**. Next up:
      marks that, and anything resolving a node's properties outside `evaluate`
      (the properties readout, the script preview) must go through it or it will
      show a fallback where the canvas shows the real value.
-   - **Procedural generators** (the other half) — 🚧 next. Typed knobs
-     (oscillator, noise, ramp, bounce) instead of free-text Rhai for the common
-     cases. Deliberately after parameters, since a generator's knobs are much
-     more useful once they can themselves be parameters or expressions.
+   - ~~**Procedural generators** (the other half).~~ ✅ Done. Typed-knob motion
+     primitives instead of free-text Rhai for the common cases: **`osc`**
+     (`offset + amp·wave(freq·frame + phase)`, with a sine/triangle/square/saw
+     waveform), **`noise`** (the same value noise behind `wiggle()`, as a knobbed
+     node), **`ramp`** (a linear `from→to` across a frame window, clamped flat
+     outside), and **`bounce`** (`amp·e^(−decay·frame)·cos(2π·freq·frame)`, the
+     classic overshoot-and-settle). Each is a new `Expr::Gen(Generator)` arm
+     resolving to a `Num` (feed it through `mul` to broadcast onto a vec/colour),
+     and — the reason this waited for parameters — **every knob is itself an
+     `Expr`**: it defaults to a literal you drag in the canvas but can be rewired
+     to a `param`/`ref`/expression like any other node. Frame-native and
+     deterministic (the same contract as `wiggle`: scrubbing is stable, a render
+     matches the preview). In the graph canvas a generator's knobs are wired-in
+     child boxes labelled by name (`freq`/`amp`/…); picking a generator from any
+     box's kind menu seeds it, and edits route through the same `GraphOp` /
+     `apply_graph_op` path as every other node, so the whole flow is unit-tested.
 
 **Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps
 → document-wide property graph → Blender-standard graph UI → the Nuke-style
