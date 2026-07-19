@@ -155,6 +155,14 @@ impl Node {
         self
     }
 
+    /// Give this node a stroke. The counterpart to [`Node::with_fill`], which
+    /// takes a flat colour; a stroke has two animatable channels, so it takes
+    /// the whole [`Stroke`].
+    pub fn with_stroke(mut self, stroke: Stroke) -> Self {
+        self.stroke = Some(stroke);
+        self
+    }
+
     pub fn with_transform(mut self, transform: Transform) -> Self {
         self.transform = transform;
         self

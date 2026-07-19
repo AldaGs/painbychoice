@@ -13,6 +13,7 @@
 //!
 //! The engine (`motion-core`) has no idea any of this exists.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1181,7 +1182,7 @@ fn transport_ui(
 /// and — because `KeySelection` is a `BTreeSet` keyed on this — it's what makes
 /// a selection's entries for one property contiguous (see
 /// `group_selection_by_prop`). Transform first, then paint, then geometry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum PropKind {
     Position,
     Rotation,
@@ -2030,16 +2031,9 @@ fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
     }
 }
 
-/// The `PropPath`s an expression can reference, with labels. A subset of core's
-/// `PropPath` (the transform channels + fill), covering all three value kinds.
-const PROP_PATHS: [PropPath; 6] = [
-    PropPath::Position,
-    PropPath::Rotation,
-    PropPath::Scale,
-    PropPath::Opacity,
-    PropPath::Anchor,
-    PropPath::Fill,
-];
+/// The `PropPath`s an expression can reference, with labels. Core owns the list
+/// (`PropPath::ALL`) so a new property shows up in the picker automatically.
+const PROP_PATHS: [PropPath; PropPath::ALL.len()] = PropPath::ALL;
 
 fn prop_path_label(p: PropPath) -> &'static str {
     match p {
@@ -2049,8 +2043,16 @@ fn prop_path_label(p: PropPath) -> &'static str {
         PropPath::Opacity => "Opacity",
         PropPath::Anchor => "Anchor",
         PropPath::Fill => "Fill",
+        PropPath::StrokeColor => "Stroke Color",
+        PropPath::StrokeWidth => "Stroke Width",
+        PropPath::ShapeSize => "Size",
+        PropPath::ShapeRadius => "Radius",
     }
 }
+
+/// Every script node's current result, keyed by its `(property, tree-path)`
+/// address. `Ok` is the formatted value, `Err` the first line of the error.
+type ScriptResults = HashMap<(PropKind, Vec<usize>), Result<String, String>>;
 
 /// One property in the graph panel: its kind, and — if it's expression-driven —
 /// a clone of the tree to render and its printed form.
@@ -2071,13 +2073,19 @@ struct GraphInfo {
     props: Vec<GraphProp>,
     /// (id, name) of every node in the document.
     nodes: Vec<(u64, String)>,
+    /// Each script node's result at the current frame, addressed the same way
+    /// an edit is: `(property, tree-path)`. Evaluated **here**, against the
+    /// document, because `value()`/`wiggle()` need a real `EvalCtx` — a
+    /// doc-less preview would report "no node named …" for a script that in
+    /// fact resolves fine at render time.
+    script_results: ScriptResults,
 }
 
 impl GraphInfo {
-    fn gather(doc: &Document, selected: Option<NodeId>) -> Option<GraphInfo> {
+    fn gather(doc: &Document, selected: Option<NodeId>, frame: f64) -> Option<GraphInfo> {
         let id = selected?;
         let node = doc.root.find(id)?;
-        let props = PropKind::ALL
+        let props: Vec<GraphProp> = PropKind::ALL
             .iter()
             .filter_map(|&kind| {
                 let p = prop_of(node, kind)?;
@@ -2092,7 +2100,40 @@ impl GraphInfo {
             .collect();
         let mut nodes = Vec::new();
         collect_nodes(&doc.root, &mut nodes);
-        Some(GraphInfo { node_id: id, node_name: node.name.clone(), props, nodes })
+
+        let mut script_results = ScriptResults::new();
+        for prop in &props {
+            if let Some(expr) = &prop.expr {
+                let mut ctx = EvalCtx::new(doc, frame);
+                collect_scripts(expr, prop.kind, &mut Vec::new(), &mut ctx, &mut script_results);
+            }
+        }
+        Some(GraphInfo { node_id: id, node_name: node.name.clone(), props, nodes, script_results })
+    }
+}
+
+/// Walk `expr`, evaluating every `Script` node it contains against `ctx` and
+/// recording the result under its `(property, tree-path)` address — the address
+/// the editor looks it up by.
+fn collect_scripts(
+    expr: &Expr,
+    kind: PropKind,
+    path: &mut Vec<usize>,
+    ctx: &mut EvalCtx,
+    out: &mut ScriptResults,
+) {
+    if let Expr::Script(src) = expr {
+        let result = motion_core::eval_script_ctx(src, ctx)
+            .map(|v| v.to_string())
+            .map_err(|e| e.lines().next().unwrap_or("error").to_string());
+        out.insert((kind, path.clone()), result);
+    }
+    for slot in 0..expr.arity() {
+        if let Some(child) = child_ref(expr, slot) {
+            path.push(slot);
+            collect_scripts(child, kind, path, ctx, out);
+            path.pop();
+        }
     }
 }
 
@@ -2236,7 +2277,16 @@ fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, out: &mut G
                     }
                 });
                 if let Some(expr) = &prop.expr {
-                    expr_canvas(ui, expr, info.node_id, prop.kind, frame, &info.nodes, out);
+                    expr_canvas(
+                        ui,
+                        expr,
+                        info.node_id,
+                        prop.kind,
+                        frame,
+                        &info.nodes,
+                        &info.script_results,
+                        out,
+                    );
                     ui.separator();
                 }
             }
@@ -2262,6 +2312,7 @@ fn expr_canvas(
     kind: PropKind,
     frame: f64,
     nodes: &[(u64, String)],
+    results: &ScriptResults,
     out: &mut GraphEdits,
 ) {
     let boxes = layout_expr(expr);
@@ -2326,7 +2377,7 @@ fn expr_canvas(
             egui::StrokeKind::Inside,
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
-        expr_box(&mut child, node, kind, frame, &b.path, nodes, out);
+        expr_box(&mut child, node, kind, frame, &b.path, nodes, results, out);
     }
 
     ui.data_mut(|d| d.insert_temp(mem_id, positions));
@@ -2343,6 +2394,7 @@ fn expr_box(
     frame: f64,
     path: &[usize],
     nodes: &[(u64, String)],
+    results: &ScriptResults,
     out: &mut GraphEdits,
 ) {
     let cur = expr.kind();
@@ -2361,7 +2413,10 @@ fn expr_box(
         Expr::Ref { node, prop, time_offset } => {
             ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
         }
-        Expr::Script(src) => script_editor(ui, src, frame, kind, path, out),
+        Expr::Script(src) => {
+            let result = results.get(&(kind, path.to_vec()));
+            script_editor(ui, src, frame, result, kind, path, out)
+        }
         _ => {}
     }
 }
@@ -2372,30 +2427,63 @@ fn script_editor(
     ui: &mut egui::Ui,
     src: &str,
     frame: f64,
+    result: Option<&Result<String, String>>,
     kind: PropKind,
     path: &[usize],
     out: &mut GraphEdits,
 ) {
     let mut text = src.to_string();
-    let resp = ui.add(
-        egui::TextEdit::singleline(&mut text)
-            .hint_text("frame * 2.0")
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Monospace),
-    );
+    let resp = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text("frame * 2.0")
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        )
+        .on_hover_text(SCRIPT_HELP);
     if resp.changed() {
         out.op = Some(GraphOp::SetScript { kind, path: path.to_vec(), src: text.clone() });
     }
-    match motion_core::eval_script(&text, frame) {
-        Ok(v) => {
+    // The result was computed in `GraphInfo::gather`, against the document, so
+    // `value()`/`wiggle()` resolve here exactly as they do at render time.
+    // While the field is being edited the snapshot is one frame behind the
+    // text, so fall back to a doc-less eval for that frame only — it can't
+    // resolve `value()`, and says so rather than showing a stale result.
+    match result.map(|r| r.as_ref()) {
+        Some(Ok(v)) => {
             ui.weak(format!("= {v}"));
         }
-        Err(e) => {
-            let msg = e.lines().next().unwrap_or("error").to_string();
-            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), msg);
+        Some(Err(e)) => {
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), e);
         }
+        None => match motion_core::eval_script(&text, frame) {
+            Ok(v) => {
+                ui.weak(format!("= {v}"));
+            }
+            Err(e) => {
+                let msg = e.lines().next().unwrap_or("error").to_string();
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), msg);
+            }
+        },
     }
 }
+
+/// What a script can call, shown on hover over the field. Kept short — it's a
+/// reminder of the vocabulary, not documentation.
+const SCRIPT_HELP: &str = "\
+Rhai. Return a number, or an array: [x, y] or [r, g, b(, a)].
+
+In scope:
+  frame, time          the current frame
+  value(\"node\", \"prop\")            another node's property
+  value_at(\"node\", \"prop\", frame)  …at another frame
+  wiggle(freq, amp)               smooth noise, deterministic
+  wiggle(freq, amp, seed)         an independent stream
+
+prop: position, rotation, scale, opacity, anchor, fill,
+      stroke_color, stroke_width, size, radius
+
+Nodes are named, not id'd; a vec/colour comes back as an array.";
 
 /// The child expression at `slot` (0/1 for `Add`/`Mul`, 0 for `Neg`).
 fn child_ref(expr: &Expr, slot: usize) -> Option<&Expr> {
@@ -3307,7 +3395,7 @@ impl App {
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, &self.doc, t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
         // Snapshot for the graph panel (clones the selected node's expressions).
-        let graph_info = GraphInfo::gather(&self.doc, self.selected);
+        let graph_info = GraphInfo::gather(&self.doc, self.selected, t);
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -4138,13 +4226,84 @@ mod tests {
     #[test]
     fn gather_lists_the_selected_nodes_properties() {
         let (doc, id) = graph_doc(Value::constant(0.5));
-        let info = GraphInfo::gather(&doc, Some(id)).unwrap();
+        let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
         let opacity = info.props.iter().find(|p| p.kind == PropKind::Opacity).unwrap();
         assert!(!opacity.is_expr, "starts as a plain value");
         assert!(opacity.expr.is_none());
         // The reference-target list includes every node.
         assert!(info.nodes.iter().any(|(nid, _)| *nid == 1));
         assert!(info.nodes.iter().any(|(nid, _)| *nid == 0), "root too");
+    }
+
+    #[test]
+    fn the_script_preview_resolves_against_the_document() {
+        // The panel's result line must use a doc-backed context: a doc-less
+        // preview would report "no node named 'root'" for a script that
+        // resolves fine at render time.
+        let (mut doc, id) = graph_doc(Value::expr(Expr::Script(
+            "value(\"root\", \"opacity\") + wiggle(0.0, 0.0)".into(),
+        )));
+        // Give the root a distinctive opacity to read back.
+        doc.root.transform.opacity = Value::constant(0.25);
+        let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+        let result = info.script_results.get(&(PropKind::Opacity, vec![])).unwrap();
+        assert_eq!(result.as_ref().unwrap(), "0.25");
+    }
+
+    #[test]
+    fn the_script_preview_is_addressed_by_tree_path() {
+        // A script nested under an operator is keyed by its path, so two
+        // scripts in one tree can't show each other's result.
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Add },
+            0,
+        );
+        for (slot, src) in [(0usize, "1.0"), (1, "2.0")] {
+            apply_graph_op(
+                &mut doc,
+                id,
+                GraphOp::SetKind {
+                    kind: PropKind::Opacity,
+                    path: vec![slot],
+                    new: ExprKind::Script,
+                },
+                0,
+            );
+            apply_graph_op(
+                &mut doc,
+                id,
+                GraphOp::SetScript {
+                    kind: PropKind::Opacity,
+                    path: vec![slot],
+                    src: src.into(),
+                },
+                0,
+            );
+        }
+        let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+        let at = |path: Vec<usize>| {
+            info.script_results.get(&(PropKind::Opacity, path)).unwrap().clone().unwrap()
+        };
+        assert_eq!(at(vec![0]), "1");
+        assert_eq!(at(vec![1]), "2");
+        assert!(
+            !info.script_results.contains_key(&(PropKind::Opacity, vec![])),
+            "the root is an Add, not a script"
+        );
+    }
+
+    #[test]
+    fn a_bad_script_shows_one_line_of_error_in_the_preview() {
+        let (doc, id) =
+            graph_doc(Value::expr(Expr::Script("value(\"nope\", \"opacity\")".into())));
+        let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+        let err = info.script_results[&(PropKind::Opacity, vec![])].clone().unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(!err.contains('\n'), "one line, so it fits under the field");
     }
 
     #[test]

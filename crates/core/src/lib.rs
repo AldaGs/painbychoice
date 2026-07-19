@@ -17,7 +17,7 @@ pub mod timebase;
 pub mod value;
 
 pub use eval::{evaluate, RenderItem, Scene};
-pub use expr::{eval_script, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, PropPath, ToExpr};
+pub use expr::{eval_script, eval_script_ctx, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, PropPath, ToExpr};
 pub use node::{Document, Node, NodeId, Shape, Stroke, Transform};
 pub use timebase::Timebase;
 pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};

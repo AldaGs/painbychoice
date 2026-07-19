@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::node::{Document, NodeId};
+use crate::node::{Document, NodeId, Shape};
 use crate::value::Color;
 
 /// A value flowing through an expression, before it's converted back to a
@@ -126,9 +126,10 @@ impl FromExpr for Color {
 
 /// Which animatable property of a node an expression can reference.
 ///
-/// A first, useful slice — the transform channels plus fill, covering all three
-/// [`ExprValue`] kinds. Extending it to stroke/shape params is one more variant
-/// here and one arm in [`EvalCtx::resolve_prop`]; nothing else changes.
+/// Mirrors the editor's own `PropKind` row list: the transform channels, fill,
+/// stroke, and the shape params. A node that doesn't *have* the property (no
+/// stroke, or a shape with no radius) resolves to the kind's neutral value
+/// rather than erroring — the same rule a dangling `Ref` follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PropPath {
     Position,
@@ -137,6 +138,12 @@ pub enum PropPath {
     Opacity,
     Anchor,
     Fill,
+    StrokeColor,
+    StrokeWidth,
+    /// `Rect`/`Ellipse` size. A `Path` shape has none.
+    ShapeSize,
+    /// `Rect` corner radius. Neither `Ellipse` nor `Path` has one.
+    ShapeRadius,
 }
 
 impl PropPath {
@@ -151,33 +158,48 @@ impl PropPath {
             PropPath::Opacity => "opacity",
             PropPath::Anchor => "anchor",
             PropPath::Fill => "fill",
+            PropPath::StrokeColor => "stroke_color",
+            PropPath::StrokeWidth => "stroke_width",
+            PropPath::ShapeSize => "size",
+            PropPath::ShapeRadius => "radius",
         }
     }
+
+    /// Every referenceable property — for a picker, and for the script node's
+    /// list of what `value()` accepts.
+    pub const ALL: [PropPath; 10] = [
+        PropPath::Position,
+        PropPath::Rotation,
+        PropPath::Scale,
+        PropPath::Opacity,
+        PropPath::Anchor,
+        PropPath::Fill,
+        PropPath::StrokeColor,
+        PropPath::StrokeWidth,
+        PropPath::ShapeSize,
+        PropPath::ShapeRadius,
+    ];
 
     /// Parse a script-facing property name, case-insensitively.
     pub fn parse(s: &str) -> Option<PropPath> {
         let s = s.trim().to_ascii_lowercase();
-        [
-            PropPath::Position,
-            PropPath::Rotation,
-            PropPath::Scale,
-            PropPath::Opacity,
-            PropPath::Anchor,
-            PropPath::Fill,
-        ]
-        .into_iter()
-        .find(|p| p.name() == s)
+        PropPath::ALL.into_iter().find(|p| p.name() == s)
     }
 
     /// The neutral value of this property's kind, for the error cases (missing
     /// node, no document, or a cycle) where there's no real value to return.
     fn zero(self) -> ExprValue {
         match self {
-            PropPath::Position | PropPath::Scale | PropPath::Anchor => {
+            PropPath::Position | PropPath::Scale | PropPath::Anchor | PropPath::ShapeSize => {
                 ExprValue::Vec2(kurbo::Vec2::ZERO)
             }
-            PropPath::Rotation | PropPath::Opacity => ExprValue::Num(0.0),
-            PropPath::Fill => ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0)),
+            PropPath::Rotation
+            | PropPath::Opacity
+            | PropPath::StrokeWidth
+            | PropPath::ShapeRadius => ExprValue::Num(0.0),
+            PropPath::Fill | PropPath::StrokeColor => {
+                ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
+            }
         }
     }
 }
@@ -684,6 +706,26 @@ impl<'a> EvalCtx<'a> {
                 Some(fill) => fill.resolve(self).to_expr(),
                 None => prop.zero(),
             },
+            // A node without a stroke, or a shape without this param, resolves
+            // neutral rather than erroring — same rule as a dangling `Ref`.
+            PropPath::StrokeColor => match &node.stroke {
+                Some(stroke) => stroke.color.resolve(self).to_expr(),
+                None => prop.zero(),
+            },
+            PropPath::StrokeWidth => match &node.stroke {
+                Some(stroke) => stroke.width.resolve(self).to_expr(),
+                None => prop.zero(),
+            },
+            PropPath::ShapeSize => match &node.shape {
+                Some(Shape::Rect { size, .. }) | Some(Shape::Ellipse { size }) => {
+                    size.resolve(self).to_expr()
+                }
+                _ => prop.zero(),
+            },
+            PropPath::ShapeRadius => match &node.shape {
+                Some(Shape::Rect { radius, .. }) => radius.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
         }
     }
 }
@@ -997,6 +1039,75 @@ mod tests {
         // the script errors — it never silently resolves to a neutral value.
         let err = eval_script("value(\"a\", \"opacity\")", 0.0).unwrap_err();
         assert!(err.contains("no node named"), "{err}");
+    }
+
+    #[test]
+    fn a_script_reads_stroke_and_shape_params() {
+        use crate::node::{Shape, Stroke};
+        let a = Node::shape(
+            1,
+            "a",
+            Shape::Rect {
+                size: Value::constant(Vec2::new(200.0, 80.0)),
+                radius: Value::constant(12.0),
+            },
+        )
+        .with_stroke(Stroke {
+            color: Value::constant(Color::rgb(1.0, 0.0, 0.0)),
+            width: Value::constant(4.0),
+        });
+        let b = Node::group(2, "b").with_transform(Transform {
+            opacity: Value::expr(Expr::Script(
+                "value(\"a\", \"stroke_width\") + value(\"a\", \"radius\") \
+                 + value(\"a\", \"size\")[1] + value(\"a\", \"stroke_color\")[0]"
+                    .into(),
+            )),
+            ..Transform::default()
+        });
+        let doc =
+            Document::new(100.0, 100.0, Node::group(0, "root").with_child(a).with_child(b));
+        assert_eq!(opacity_of(&doc, 2, 0.0), 4.0 + 12.0 + 80.0 + 1.0);
+    }
+
+    #[test]
+    fn a_missing_stroke_or_shape_param_resolves_neutral() {
+        // `a` is a plain group: no stroke, no shape. Reading either is not an
+        // error — it's the kind's neutral value, like a dangling `Ref`.
+        let doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Script(
+                "value(\"a\", \"stroke_width\") + value(\"a\", \"radius\") + 1.0".into(),
+            )),
+        );
+        assert_eq!(opacity_of(&doc, 2, 0.0), 1.0);
+    }
+
+    #[test]
+    fn an_ellipse_has_a_size_but_no_radius() {
+        use crate::node::Shape;
+        let a = Node::shape(1, "a", Shape::Ellipse { size: Value::constant(Vec2::new(9.0, 5.0)) });
+        let b = Node::group(2, "b").with_transform(Transform {
+            opacity: Value::expr(Expr::Script(
+                "value(\"a\", \"size\")[0] + value(\"a\", \"radius\")".into(),
+            )),
+            ..Transform::default()
+        });
+        let doc =
+            Document::new(100.0, 100.0, Node::group(0, "root").with_child(a).with_child(b));
+        assert_eq!(opacity_of(&doc, 2, 0.0), 9.0, "size reads, radius is neutral");
+    }
+
+    #[test]
+    fn every_property_name_round_trips_and_is_unique() {
+        // `name`/`parse` are the script-facing vocabulary; a duplicate or a
+        // name that won't parse back would silently shadow a property.
+        let mut seen = HashSet::new();
+        for p in PropPath::ALL {
+            assert_eq!(PropPath::parse(p.name()), Some(p), "{p:?} round-trips");
+            assert!(seen.insert(p.name()), "duplicate name {}", p.name());
+        }
+        assert_eq!(PropPath::parse("  POSITION "), Some(PropPath::Position), "trims + folds case");
+        assert_eq!(PropPath::parse("nope"), None);
     }
 
     #[test]
