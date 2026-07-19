@@ -4,7 +4,8 @@ A hybrid vector motion / animation tool — non-destructive, non-linear, paramet
 A blend of After Effects, Figma, Animate, and Cavalry. Rust engine.
 
 > **Status:** working single-window editor. You can build a composition from
-> scratch, animate it with keyframes + editable easing, scrub/play, and save/load.
+> scratch, animate it with frame-accurate keyframes + editable easing,
+> scrub/play, and save/load.
 > Repo: https://github.com/AldaGs/painbychoice
 
 ---
@@ -34,6 +35,21 @@ non-linear scrubbing both fall out of that single design choice.
 Every evaluated item carries a `source: NodeId` (provenance) so a frame traces
 back to the node that produced it — used for click-to-select and debugging.
 
+### Frames are the native time domain
+
+`core` thinks in **frames, not seconds**. `Keyframe.frame` is an `i64`, and
+`evaluate(&doc, frame)` takes a *fractional* frame: keys sit on the grid, the
+playhead need not (which leaves room for sub-frame sampling — motion blur —
+later). Seconds are a **presentation unit**, converted only at the edges by
+`core/src/timebase.rs`.
+
+The payoff is that `fps` never has to be threaded into the value engine: a
+track is a function of frames, and only the composition knows what a frame is
+worth in wall-clock time. Changing fps therefore re-times the document without
+drifting keyframes off their frames — the same thing After Effects does.
+Integer frames also killed two float-epsilon fudges (key matching, and
+neighbour clamping when dragging).
+
 **UI discipline in `live/`:** the egui closure never borrows `App`. Each panel
 reads a plain snapshot gathered before the closure and reports intent into a
 small `*Edits` struct; `App` applies those after the closure. This keeps the
@@ -58,59 +74,105 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
 - **Canvas** — vello rasterizes `evaluate(doc, t)` each frame; click a shape to
   select (front-most, via `NodeId` provenance). Selection gets a yellow outline.
 - **Transport** — Play/Pause (Space), Restart (R), ←/→ frame step, scrubbable
-  playhead. Looped playback in wall-clock time.
+  playhead (an integer slider, so it can only land on frames). Readout is
+  `hh:mm:ss.ff` plus `[frame/last]`. Playback runs off the wall clock but
+  *quantizes* to the frame grid, so changing FPS visibly changes the playback
+  cadence.
 - **Layers** (left) — scene tree; select, reorder (▲/▼), add Rect/Ellipse/Group,
   delete (✕), Save…/Load… (`.pbc` JSON via serde).
 - **Properties** (right) — resolved values for the selection; drag or click-type
   to edit. A painted **stopwatch** per property (filled = animated, hollow =
   constant) inserts a keyframe at the playhead — first click on a constant
   promotes it to a track (this is how a property *starts* animating).
-- **Timeline / dopesheet** (bottom) — one row per animated property, keyframes as
-  diamonds on a shared time axis with a red playhead. Click track to seek, click
-  a diamond to select (Del removes), drag to retime (clamped between neighbours).
+- **Timeline / dopesheet** (bottom) — a **frame ruler** with adaptive ticks
+  (1/2/5/10-frame steps plus whole-second multiples, so labels land on round
+  timecodes when zoomed out; per-frame minor ticks once frames are ≥6px apart),
+  then one row per animated property with keyframes as diamonds and a red
+  playhead. Click track to seek, click a diamond to select (Del removes), drag
+  to retime (clamped between neighbours). Everything **snaps to frames** at any
+  zoom.
+  - **Scroll** to zoom (the frame under the cursor stays pinned), **shift+scroll**
+    to pan.
+  - **Edge auto-pan**: while dragging the ruler or a keyframe, hold near either
+    end of the track and the view scrolls that way — so a key can be dragged
+    past the visible range. Drag-only on purpose; hover-panning would scroll the
+    timeline out from under the pointer.
 - **Easing editor** — selecting a keyframe reveals a CSS-style cubic-bezier
   editor for its outgoing segment: draggable control points + Linear/Smooth/
   Ease In/Ease Out presets.
 
 ## Key code locations
 
-- `core/src/value.rs` — `Value<T>`, `Track<T>`, `Keyframe`, `Handle`, easing
-  solver. Keyframe ops: `set_at`, `insert_key` (const→track), `move_key`
-  (neighbour-clamped), `remove_key`, `segment_handles` / `set_segment_handles`.
+- `core/src/timebase.rs` — `Timebase`: the **only** place that converts between
+  seconds and frames, plus `timecode()` → `hh:mm:ss.ff` (non-drop-frame).
+  Reach for `doc.timebase()`; never divide by `fps` by hand.
+- `core/src/value.rs` — `Value<T>`, `Track<T>`, `Keyframe` (`.frame: i64`),
+  `Handle`, easing solver. Keyframe ops: `set_at`, `insert_key` (const→track),
+  `move_key` (neighbour-clamped, ±1 frame), `remove_key`, `key_frames`,
+  `segment_handles` / `set_segment_handles`.
 - `core/src/node.rs` — `Node`, `Transform`, `Shape` (parametric Rect/Ellipse/
   Path), `Document`. Tree ops: `find`, `find_mut`, `reorder_child`, `remove`.
-- `core/src/eval.rs` — `evaluate(doc, t) -> Scene`, `RenderItem` (+provenance).
+  Also `Document::timebase()`, `duration_frames()`, and **`migrate()`**.
+- `core/src/eval.rs` — `evaluate(doc, frame) -> Scene`, `RenderItem`
+  (+provenance).
 - `core/src/demo.rs` — the demo document loaded on launch.
 - `live/src/main.rs` — everything UI. `App::render` is the per-frame heart:
   evaluate → hit-test → gather snapshots → run egui → apply `*Edits` → GPU. Panel
   fns: `comp_ui`, `tree_ui`, `transport_ui`, `dopesheet_ui`, `properties_ui`,
   `ease_editor`, `key_button`. Layout: `fit_transform` + the `*_H`/`*_W` consts.
+  Timeline mapping: `TimelineView` (the visible frame window) + `Axis`
+  (frame↔pixel), built once by the ruler and reused by every row so they cannot
+  drift out of alignment.
+
+### Loading a `.pbc`: always call `migrate()`
+
+Pre-frame-grid documents stored keyframe times as float **seconds**. A
+`Keyframe` can't convert itself (it has no timebase), so deserializing parks the
+old value in a serde-only `legacy_seconds` field and `Document::migrate()`
+converts it using the document's own `fps`. **Any new load path must call it**;
+it's a no-op on an already-migrated doc. The legacy field is never
+re-serialized, so a file is permanently migrated on its first save. Keys that
+round onto the same frame collapse to one.
 
 ## Known issues / gotchas
 
 - **egui default font lacks many glyphs** (◆ ◇ ● ○ ❚ ⟲ ▸) — they render as tofu
   boxes. `▶` and `•` are safe; otherwise *paint* the indicator (see `key_button`)
   or use plain words. Learned the hard way.
-- **Time is continuous float seconds** — no frame grid yet. fps exists but only
-  drives ←/→ step. This is the next big thing (see roadmap #1).
+- **egui eats the shift modifier on shift+wheel**, rewriting it into a
+  *horizontal* scroll. So the pan signal is a nonzero `smooth_scroll_delta.x`,
+  not `modifiers.shift` — checking `shift` silently does nothing.
+- **Redraw is event-driven** (`ControlFlow::Wait`). Anything that must keep
+  animating while the pointer is held still (edge auto-pan) needs an explicit
+  `ctx.request_repaint()`, or it stops the moment input stops.
 - Panel sizes are in egui *points*; the canvas fit is in *physical pixels* —
   multiply reserved sizes by `window.scale_factor()` (already done in `render`).
 - LF/CRLF warnings on commit are harmless (no `.gitattributes` yet).
+- **Don't round-trip source files through PowerShell** `Get-Content -Raw` /
+  `Set-Content`: PS 5.1 decodes as ANSI and mojibakes every non-ASCII character
+  (`—`, `×`, `▲`). Edit files directly.
 
 ## Roadmap (agreed order)
 
-Decided sequence: **composition settings ✅ → frame-based timeline → keyframe UX
-→ …**. Composition settings are done. Next up:
+Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
+UX → …**. Next up:
 
-1. **Frame-based timeline (next).** Make the whole app frame-aware (the "borrow
-   from After Effects" work). Add: a time ruler with **frame ticks**, **snap**
-   keyframes + playhead to frames (using `doc.fps`), a **frame/timecode readout**,
-   and a **zoomable** timeline. Deliberately *not* borrowing AE's heavier
-   machinery (separate graph editor, nested comps) — the inline bezier editor
-   already covers easing. Touch points: `dopesheet_ui` time↔x mapping, the
-   transport readout, `seek`/`current_time`, and per-frame stepping.
-2. **Keyframe UX polish.** Multi-select, box-select, copy/paste, drag multiple
-   keys, better selection visuals. Benefits from frame-snapping existing first.
+1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
+   with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
+   auto-pan. Deliberately *not* borrowed from AE: a separate graph editor and
+   nested comps — the inline bezier editor already covers easing.
+   - Left open: `duration` is still stored in **seconds** with
+     `duration_frames()` derived. Storing frames outright is arguably more
+     correct (the comp end would always land on a frame boundary) but it's a
+     `.pbc` format change, so it wants to ride along with the next migration.
+2. **Keyframe UX polish (next).** Multi-select, box-select, copy/paste, drag
+   multiple keys, better selection visuals. Frame-snapping now exists, which is
+   what this was waiting on: "move these 5 keys 3 frames later" is a
+   well-defined operation on an integer grid in a way it never was on floats.
+   Touch points: `KeyRef`/`selected_key` becomes a *set*, `DopeEdits` grows a
+   multi-key move, and `Track::move_key`'s neighbour clamp needs a group-aware
+   variant (moving a block must clamp against the block's outer neighbours, not
+   each key's immediate ones).
 3. **More shape params + stroke editing** in the properties panel.
 4. **Blender-style splittable/dockable panels** (see EBN's `layoutTree` idea).
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big

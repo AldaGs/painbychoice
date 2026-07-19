@@ -37,18 +37,26 @@ impl Default for Transform {
 }
 
 impl Transform {
-    /// Resolve to (matrix, opacity) at time `t`. The matrix maps local space to
+    /// Resolve to (matrix, opacity) at `frame`. The matrix maps local space to
     /// parent space: translate(position) · rotate · scale · translate(-anchor).
-    pub fn resolve(&self, t: f64) -> (kurbo::Affine, f64) {
-        let anchor = self.anchor.resolve(t);
-        let position = self.position.resolve(t);
-        let rot = self.rotation_deg.resolve(t).to_radians();
-        let scale = self.scale.resolve(t);
+    pub fn resolve(&self, frame: f64) -> (kurbo::Affine, f64) {
+        let anchor = self.anchor.resolve(frame);
+        let position = self.position.resolve(frame);
+        let rot = self.rotation_deg.resolve(frame).to_radians();
+        let scale = self.scale.resolve(frame);
         let m = kurbo::Affine::translate(position)
             * kurbo::Affine::rotate(rot)
             * kurbo::Affine::scale_non_uniform(scale.x, scale.y)
             * kurbo::Affine::translate(-anchor);
-        (m, self.opacity.resolve(t))
+        (m, self.opacity.resolve(frame))
+    }
+
+    pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        self.anchor.migrate_frames(fps);
+        self.position.migrate_frames(fps);
+        self.rotation_deg.migrate_frames(fps);
+        self.scale.migrate_frames(fps);
+        self.opacity.migrate_frames(fps);
     }
 }
 
@@ -68,19 +76,30 @@ pub enum Shape {
 }
 
 impl Shape {
-    pub fn to_path(&self, t: f64) -> BezPath {
+    pub fn to_path(&self, frame: f64) -> BezPath {
         match self {
             Shape::Path(p) => p.clone(),
             Shape::Rect { size, radius } => {
-                let s = size.resolve(t);
-                let r = radius.resolve(t);
+                let s = size.resolve(frame);
+                let r = radius.resolve(frame);
                 let rect = Rect::new(-s.x / 2.0, -s.y / 2.0, s.x / 2.0, s.y / 2.0);
                 RoundedRect::from_rect(rect, r).to_path(0.1)
             }
             Shape::Ellipse { size } => {
-                let s = size.resolve(t);
+                let s = size.resolve(frame);
                 kurbo::Ellipse::new((0.0, 0.0), (s.x / 2.0, s.y / 2.0), 0.0).to_path(0.1)
             }
+        }
+    }
+
+    pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        match self {
+            Shape::Path(_) => {}
+            Shape::Rect { size, radius } => {
+                size.migrate_frames(fps);
+                radius.migrate_frames(fps);
+            }
+            Shape::Ellipse { size } => size.migrate_frames(fps),
         }
     }
 }
@@ -185,6 +204,24 @@ impl Node {
         }
         self.children.iter_mut().find_map(|c| c.remove(id))
     }
+
+    /// Recursively convert legacy float-seconds keyframes to frames at `fps`.
+    pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        self.transform.migrate_frames(fps);
+        if let Some(shape) = &mut self.shape {
+            shape.migrate_frames(fps);
+        }
+        if let Some(fill) = &mut self.fill {
+            fill.migrate_frames(fps);
+        }
+        if let Some(stroke) = &mut self.stroke {
+            stroke.color.migrate_frames(fps);
+            stroke.width.migrate_frames(fps);
+        }
+        for child in &mut self.children {
+            child.migrate_frames(fps);
+        }
+    }
 }
 
 /// The whole animated document: a root node plus composition settings.
@@ -206,5 +243,26 @@ impl Document {
             duration: 5.0,
             root,
         }
+    }
+
+    /// The composition's frame grid. Every seconds↔frames conversion and every
+    /// timecode string goes through this — never divide by `fps` by hand.
+    pub fn timebase(&self) -> crate::timebase::Timebase {
+        crate::timebase::Timebase::new(self.fps)
+    }
+
+    /// Bring a freshly-deserialized document up to the current format.
+    ///
+    /// Today that means converting legacy float-seconds keyframes to frames
+    /// using this document's `fps`. Must be called after *every* load — it is
+    /// a no-op on an already-migrated doc, so calling it twice is safe.
+    pub fn migrate(&mut self) {
+        let fps = self.timebase().fps();
+        self.root.migrate_frames(fps);
+    }
+
+    /// Total length of the composition in whole frames: 5s @ 24fps = 120.
+    pub fn duration_frames(&self) -> i64 {
+        self.timebase().seconds_to_frames(self.duration)
     }
 }
