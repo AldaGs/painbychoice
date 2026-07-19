@@ -399,15 +399,18 @@ IR (next) → …**. Next up:
      drive the selected node's properties with expressions: **`= fx`** promotes a
      property (seeded from its current value), **bake** freezes it back to a
      constant, and the expression is edited on a **node canvas** — boxes wired
-     parent↔child, each with a kind picker (`value`/`ref`/`add`/`mul`/`neg`) and a
-     compact editor; changing one node's kind grows the tree (operators seed
-     neutral inputs). Layout is a tidy-tree auto-placement (`layout_expr`, a
-     tested pure function); edits are deferred `GraphOp`s addressed by
-     `(property, tree-path)` and applied after the UI pass by `apply_graph_op`
-     (a free function, so the whole flow is unit-tested) — the same discipline as
-     the dock. Boxes start on the tidy-tree layout and can be **dragged** to
-     rearrange; positions are remembered per (node, property) in egui memory
-     (ephemeral view state, not saved with the document).
+     parent↔child, each with a kind picker (`value`/`ref`/`add`/`mul`/`neg`/
+     `script`) and a compact editor; changing one node's kind grows the tree
+     (operators seed neutral inputs). Layout is a tidy-tree auto-placement
+     (`layout_expr`, a tested pure function) where each box's **height varies by
+     kind** (`box_height`) so a `ref`'s three pickers or a `script`'s field +
+     result line get the room they need and the stack stays clear; edits are
+     deferred `GraphOp`s addressed by `(property, tree-path)` and applied after
+     the UI pass by `apply_graph_op` (a free function, so the whole flow is
+     unit-tested) — the same discipline as the dock. Boxes start on the tidy-tree
+     layout and can be **dragged** to rearrange; positions are remembered per
+     (node, property) in egui memory (ephemeral view state, not saved with the
+     document).
    - ~~**Rhai scripting** (first cut).~~ ✅ Done. A `script` node kind holds Rhai
      source (`Expr::Script`), evaluated each frame with `frame`/`time` in scope;
      the result is a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`).

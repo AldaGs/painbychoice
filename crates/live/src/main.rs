@@ -2126,54 +2126,77 @@ struct GraphEdits {
     op: Option<GraphOp>,
 }
 
-// Canvas geometry (logical points). A node box sits at
-// (depth·COL_W, row·ROW_H) inside the scrolled content.
-const GRAPH_COL_W: f32 = 150.0;
-const GRAPH_ROW_H: f32 = 58.0;
-const GRAPH_BOX_W: f32 = 132.0;
-const GRAPH_BOX_H: f32 = 46.0;
+// Canvas geometry (logical points). A node box sits at (depth·COL_W, y) inside
+// the scrolled content; its *height* varies by kind (see `box_height`).
+const GRAPH_COL_W: f32 = 172.0;
+const GRAPH_BOX_W: f32 = 152.0;
+const GRAPH_V_GAP: f32 = 12.0;
 const GRAPH_MARGIN: f32 = 10.0;
 
-/// A node's slot in the auto-laid-out expression tree: its `path`, tree `depth`
-/// (its column), and a vertical `row` (leaves take successive rows; a parent
-/// centres over its children). Positionless — pixels are `depth`/`row` × the
-/// canvas spacing — so the layout is a pure function of the tree, and tested.
+/// How tall a node's box needs to be, by kind — enough for its controls. A
+/// `ref` node stacks three pickers plus an offset, a `script` a field and its
+/// result line, a `value` its editor, and an operator just its kind picker.
+fn box_height(expr: &Expr) -> f32 {
+    match expr {
+        Expr::Ref { .. } => 100.0,
+        Expr::Script(_) => 66.0,
+        Expr::Lit(_) => 50.0,
+        Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
+    }
+}
+
+/// A node's place in the auto-laid-out expression tree: its `path`, tree `depth`
+/// (its column), and its box's `y` top and `height` (in content-local points).
+/// The layout is a pure function of the tree, so it's unit-tested.
 struct ExprBox {
     path: Vec<usize>,
     depth: usize,
-    row: f32,
+    y: f32,
+    height: f32,
+}
+
+#[cfg(test)]
+impl ExprBox {
+    /// The vertical centre of the box (wires attach here). Used by the layout
+    /// tests; the canvas derives the same point from each box's rect.
+    fn center_y(&self) -> f32 {
+        self.y + self.height / 2.0
+    }
 }
 
 /// Lay an expression tree out as a tidy tree: root on the left, children to the
-/// right, leaves stacked top-to-bottom and parents centred over their span.
+/// right, leaves stacked top-to-bottom (each reserving its own height + a gap)
+/// and every parent centred on the span of its children.
 fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
+    // Returns the laid-out node's centre-y, so a parent can centre on its kids.
     fn rec(
         expr: &Expr,
         path: &mut Vec<usize>,
         depth: usize,
-        next_row: &mut f32,
+        cursor_y: &mut f32,
         out: &mut Vec<ExprBox>,
     ) -> f32 {
-        let arity = expr.arity();
-        let row = if arity == 0 {
-            let r = *next_row;
-            *next_row += 1.0;
-            r
+        let height = box_height(expr);
+        if expr.arity() == 0 {
+            let y = *cursor_y;
+            *cursor_y += height + GRAPH_V_GAP;
+            out.push(ExprBox { path: path.clone(), depth, y, height });
+            y + height / 2.0
         } else {
             let (mut first, mut last) = (0.0, 0.0);
-            for slot in 0..arity {
+            for slot in 0..expr.arity() {
                 path.push(slot);
-                let cr = rec(child_ref(expr, slot).unwrap(), path, depth + 1, next_row, out);
+                let c = rec(child_ref(expr, slot).unwrap(), path, depth + 1, cursor_y, out);
                 path.pop();
                 if slot == 0 {
-                    first = cr;
+                    first = c;
                 }
-                last = cr;
+                last = c;
             }
-            (first + last) / 2.0
-        };
-        out.push(ExprBox { path: path.clone(), depth, row });
-        row
+            let center = (first + last) / 2.0;
+            out.push(ExprBox { path: path.clone(), depth, y: center - height / 2.0, height });
+            center
+        }
     }
     let mut out = Vec::new();
     rec(expr, &mut Vec::new(), 0, &mut 0.0, &mut out);
@@ -2244,13 +2267,19 @@ fn expr_canvas(
     let boxes = layout_expr(expr);
 
     // Positions are remembered per (node, property) in egui memory; a box with
-    // no stored position falls back to its auto-layout slot.
+    // no stored position falls back to its auto-layout slot (column × its y).
     let mem_id = ui.id().with(("graphpos", node_id.0, kind.label()));
     let mut positions: GraphPositions =
         ui.data(|d| d.get_temp::<GraphPositions>(mem_id)).unwrap_or_default();
-    let auto = |b: &ExprBox| egui::vec2(b.depth as f32 * GRAPH_COL_W, b.row * GRAPH_ROW_H);
     let pos_of = |b: &ExprBox, positions: &GraphPositions| {
-        positions.get(&b.path).copied().unwrap_or_else(|| auto(b))
+        positions
+            .get(&b.path)
+            .copied()
+            .unwrap_or_else(|| egui::vec2(b.depth as f32 * GRAPH_COL_W, b.y))
+    };
+    // A box's rect at content-local top-left `p`, using its own (kind-based) height.
+    let rect_of = |b: &ExprBox, p: egui::Vec2, origin: egui::Pos2| {
+        egui::Rect::from_min_size(origin + p, egui::vec2(GRAPH_BOX_W, b.height))
     };
 
     // Content bounds cover every box (including dragged-out ones) so the scroll
@@ -2259,19 +2288,18 @@ fn expr_canvas(
     for b in &boxes {
         let p = pos_of(b, &positions);
         extent.x = extent.x.max(p.x + GRAPH_BOX_W);
-        extent.y = extent.y.max(p.y + GRAPH_BOX_H);
+        extent.y = extent.y.max(p.y + b.height);
     }
     let (area, _) = ui.allocate_exact_size(extent + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN), egui::Sense::hover());
     let origin = area.min + egui::vec2(GRAPH_MARGIN, GRAPH_MARGIN);
-    let rect_of = |p: egui::Vec2| egui::Rect::from_min_size(origin + p, egui::vec2(GRAPH_BOX_W, GRAPH_BOX_H));
 
     // Wires under the boxes: each node's left-centre to its parent's right-centre.
     let wire = ui.visuals().weak_text_color();
     for b in &boxes {
         if let Some((_, parent_path)) = b.path.split_last() {
             if let Some(pb) = boxes.iter().find(|x| x.path == parent_path) {
-                let child_in = rect_of(pos_of(b, &positions)).left_center();
-                let parent_out = rect_of(pos_of(pb, &positions)).right_center();
+                let child_in = rect_of(b, pos_of(b, &positions), origin).left_center();
+                let parent_out = rect_of(pb, pos_of(pb, &positions), origin).right_center();
                 ui.painter().line_segment([parent_out, child_in], egui::Stroke::new(1.5, wire));
             }
         }
@@ -2283,12 +2311,12 @@ fn expr_canvas(
     for b in &boxes {
         let mut p = pos_of(b, &positions);
         let drag_id = ui.id().with(("graphbox", node_id.0, kind.label(), b.path.as_slice()));
-        let resp = ui.interact(rect_of(p), drag_id, egui::Sense::drag());
+        let resp = ui.interact(rect_of(b, p, origin), drag_id, egui::Sense::drag());
         if resp.dragged() {
             p = (p + resp.drag_delta()).max(egui::vec2(0.0, 0.0));
             positions.insert(b.path.clone(), p);
         }
-        let rect = rect_of(p);
+        let rect = rect_of(b, p, origin);
         let node = expr.at(&b.path).unwrap_or(expr);
         ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
         ui.painter().rect_stroke(
@@ -4171,38 +4199,60 @@ mod tests {
     }
 
     #[test]
-    fn layout_places_leaves_in_rows_and_centres_parents() {
-        // A single leaf: one box at the origin.
+    fn layout_stacks_leaves_and_centres_parents() {
+        // A single leaf: one box at the top-left column.
         let single = layout_expr(&Expr::num(1.0));
         assert_eq!(single.len(), 1);
-        assert_eq!((single[0].depth, single[0].row), (0, 0.0));
+        assert_eq!((single[0].depth, single[0].y), (0, 0.0));
 
-        // Add(Lit, Lit): two leaves stacked, the operator centred between them.
+        // Add(Lit, Lit): two leaves stacked (the second below the first by at
+        // least the first's height), the operator centred between them.
         let add = layout_expr(&Expr::Add(Box::new(Expr::num(1.0)), Box::new(Expr::num(2.0))));
         assert_eq!(add.len(), 3);
-        assert_eq!(box_at_path(&add, &[]).depth, 0);
-        assert_eq!(box_at_path(&add, &[0]).row, 0.0);
-        assert_eq!(box_at_path(&add, &[1]).row, 1.0);
-        assert_eq!(box_at_path(&add, &[]).row, 0.5, "operator centred over its inputs");
-        assert_eq!(box_at_path(&add, &[0]).depth, 1, "inputs one column right");
+        let (root, a, b) = (
+            box_at_path(&add, &[]),
+            box_at_path(&add, &[0]),
+            box_at_path(&add, &[1]),
+        );
+        assert_eq!((root.depth, a.depth), (0, 1), "inputs one column right");
+        assert_eq!(a.y, 0.0);
+        assert!(b.y >= a.y + a.height, "second leaf clears the first");
+        assert!(
+            (root.center_y() - (a.center_y() + b.center_y()) / 2.0).abs() < 1e-4,
+            "operator centred over its inputs"
+        );
     }
 
     #[test]
     fn layout_handles_a_nested_tree() {
-        // Add(Lit, Mul(Lit, Lit)): three leaves in rows 0,1,2; Mul centred on
-        // 1.5; root centred on (0 + 1.5)/2 = 0.75.
+        // Add(Lit, Mul(Lit, Lit)): three leaves stacked top-to-bottom; each
+        // parent centred on its children's span.
         let e = Expr::Add(
             Box::new(Expr::num(1.0)),
             Box::new(Expr::Mul(Box::new(Expr::num(2.0)), Box::new(Expr::num(3.0)))),
         );
         let boxes = layout_expr(&e);
         assert_eq!(boxes.len(), 5);
-        assert_eq!(box_at_path(&boxes, &[0]).row, 0.0);
-        assert_eq!(box_at_path(&boxes, &[1, 0]).row, 1.0);
-        assert_eq!(box_at_path(&boxes, &[1, 1]).row, 2.0);
-        assert_eq!(box_at_path(&boxes, &[1]).row, 1.5, "Mul centred over its two inputs");
-        assert_eq!(box_at_path(&boxes, &[]).row, 0.75, "root centred over its span");
+        let cy = |p: &[usize]| box_at_path(&boxes, p).center_y();
+        assert!(cy(&[0]) < cy(&[1, 0]) && cy(&[1, 0]) < cy(&[1, 1]), "leaves stacked in order");
+        assert!((cy(&[1]) - (cy(&[1, 0]) + cy(&[1, 1])) / 2.0).abs() < 1e-4, "Mul centred");
+        assert!((cy(&[]) - (cy(&[0]) + cy(&[1])) / 2.0).abs() < 1e-4, "root centred on its span");
         assert_eq!(box_at_path(&boxes, &[1, 1]).depth, 2, "deepest column");
+    }
+
+    #[test]
+    fn taller_nodes_reserve_more_vertical_room() {
+        // A ref node is taller than a value node, and the leaf stacked below it
+        // clears its full height (so their boxes don't overlap).
+        let e = Expr::Add(
+            Box::new(Expr::reference(NodeId(1), PropPath::Position)),
+            Box::new(Expr::num(0.0)),
+        );
+        let boxes = layout_expr(&e);
+        let refb = box_at_path(&boxes, &[0]);
+        let litb = box_at_path(&boxes, &[1]);
+        assert!(refb.height > litb.height, "a ref box is taller than a value box");
+        assert!(litb.y >= refb.y + refb.height, "the box below clears the taller one");
     }
 
     #[test]
