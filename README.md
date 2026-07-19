@@ -182,6 +182,24 @@ frame) rather than living only in egui's panel memory — that's what keeps the
 tree the source of truth, so saving layouts is a `serde` derive rather than a
 scrape of egui internals.
 
+**Split / join / retype.** Every *content* area wears a thin header
+(`area_header`): an editor picker plus `|`/`-`/`x` buttons. Splitting a leaf
+rewrites it to a `Split` of two clones; closing an area collapses its parent
+`Split` to the surviving sibling; the picker swaps a leaf's `Editor`. These are
+pure tree edits (`Dock::apply`), and — like every other panel — they don't
+mutate mid-render: an area header only *records* a `DockCmd` against the leaf's
+`path` (a `Vec<Branch>` naming it from the root), which `render` applies once
+the egui pass is done. Restructuring the tree while its panels are still laid
+out would desync egui's per-panel ids.
+
+- **Only the three content editors are `SWAPPABLE`** (Layers, Properties,
+  Dopesheet). The canvas and the comp/transport toolbars are *structural* leaves
+  with **no header** — so a user can't duplicate, retype, or close them. That's
+  not a UI nicety, it's what keeps the two canvas invariants safe: there is
+  always exactly one canvas leaf to measure (`canvas_rect`), and it stays the
+  tree's innermost leaf. A closed area is always content, so the canvas — its
+  sibling, or in an untouched ancestor branch — always survives.
+
 **Known wrinkle:** the canvas rect is measured during the UI pass, but the fit is
 needed *before* it (to pick, and to build the vello scene), so the fit uses the
 previous frame's rect. Stale only while a splitter or the window is actively
@@ -276,8 +294,15 @@ UX ✅ → shape/stroke params ✅ → dockable panels 🚧 → …**. Next up:
    tree + draggable splitters are done (see *The panel layout tree* above), and
    the canvas fit now derives from the tree instead of hardcoded panel sizes.
    Still to come, in order:
-   - **Split / join areas** (Blender's drag-a-border-corner) and a per-area
-     dropdown to change which `Editor` an area shows.
+   - ~~**Split / join areas** and a per-area dropdown to change which `Editor`
+     an area shows.~~ ✅ Done. Each content area carries a header with an editor
+     picker and split (`|` left/right, `-` top/bottom) + close (`x`) buttons;
+     the ops are pure `Dock` tree rewrites applied after the UI pass (see *Split
+     / join / retype* above). Deliberately **not** the literal drag-a-corner
+     gesture: layered on egui's own panel splitters that's far more fragile than
+     header controls, for the same capability. The canvas and the two toolbars
+     stay header-less on purpose, which is what protects the single-canvas and
+     innermost-canvas invariants.
    - **Layout presets**: several named defaults plus user-made ones. The tree is
      already serialization-ready (`size` lives in the tree, and
      `default_layout()` is just one constructor among future many).

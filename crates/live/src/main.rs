@@ -143,6 +143,35 @@ enum Editor {
     Dopesheet,
 }
 
+/// The editors a user may freely place, split, and close in a dockable area.
+///
+/// Deliberately excludes the three structural leaves. **Canvas** is a single
+/// vello target measured from its one leaf ([`App::canvas_rect`]) and must stay
+/// the tree's innermost leaf — duplicating or losing it breaks both. **Comp**
+/// and **Transport** are fixed chrome. So those three carry no area header:
+/// they can't be swapped away, split, or closed, which is exactly what keeps
+/// the canvas invariants intact while the content panels rearrange around them.
+const SWAPPABLE: [Editor; 3] = [Editor::Layers, Editor::Properties, Editor::Dopesheet];
+
+impl Editor {
+    /// Human name shown in the area-header picker.
+    fn label(self) -> &'static str {
+        match self {
+            Editor::Canvas => "Canvas",
+            Editor::Comp => "Composition",
+            Editor::Layers => "Layers",
+            Editor::Properties => "Properties",
+            Editor::Transport => "Transport",
+            Editor::Dopesheet => "Dopesheet",
+        }
+    }
+
+    /// Whether this area gets a header (picker + split/close) — see [`SWAPPABLE`].
+    fn is_swappable(self) -> bool {
+        SWAPPABLE.contains(&self)
+    }
+}
+
 /// Which edge of an area a split pins its first child to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DockSide {
@@ -150,6 +179,29 @@ enum DockSide {
     Right,
     Top,
     Bottom,
+}
+
+/// A step down the layout tree: into a split's `first` or `second` child. A
+/// sequence of these names a leaf. Area-header clicks record a target leaf as a
+/// path so the edit can be applied *after* the egui pass — restructuring the
+/// tree mid-render would desync egui's live panels and their ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Branch {
+    First,
+    Second,
+}
+
+/// A pending change to the layout tree, produced by an area header during the
+/// UI pass and applied once egui is done — the same defer-then-apply discipline
+/// the rest of the panels use for their `*Edits`.
+enum DockCmd {
+    /// Show a different editor in the area at `path`.
+    Retype { path: Vec<Branch>, editor: Editor },
+    /// Split the area at `path` in two along `side`; the new area clones the
+    /// editor. `size` is the first child's start size (half the area) in points.
+    Split { path: Vec<Branch>, side: DockSide, size: f32 },
+    /// Close the area at `path`; its sibling absorbs the freed space.
+    Close { path: Vec<Branch> },
 }
 
 /// The panel layout: a binary tree of splits with editors at the leaves.
@@ -223,6 +275,73 @@ impl Dock {
             ),
         )
     }
+
+    /// Borrow the subtree named by `path`. If the path outruns the tree (a stale
+    /// edit against a since-changed layout) it stops at the deepest node reached,
+    /// which the callers then no-op on.
+    fn node_at_mut(&mut self, path: &[Branch]) -> &mut Dock {
+        let mut cur = self;
+        for &b in path {
+            cur = match cur {
+                Dock::Split { first, second, .. } => match b {
+                    Branch::First => first.as_mut(),
+                    Branch::Second => second.as_mut(),
+                },
+                Dock::Leaf(_) => return cur,
+            };
+        }
+        cur
+    }
+
+    /// Apply a deferred layout edit. Each op is a local tree rewrite; every path
+    /// is re-resolved here (never held across the UI pass), so a command that no
+    /// longer matches the tree simply finds a leaf where it expected a split, or
+    /// vice versa, and does nothing.
+    fn apply(&mut self, cmd: DockCmd) {
+        match cmd {
+            DockCmd::Retype { path, editor } => {
+                let leaf = self.node_at_mut(&path);
+                if matches!(leaf, Dock::Leaf(_)) {
+                    *leaf = Dock::Leaf(editor);
+                }
+            }
+            DockCmd::Split { path, side, size } => {
+                let leaf = self.node_at_mut(&path);
+                if let Dock::Leaf(e) = leaf {
+                    let e = *e;
+                    // Both halves start on the cloned editor; the picker then
+                    // lets the user retype either. New splits are always
+                    // resizable — only the stock toolbars are fixed.
+                    *leaf = Dock::Split {
+                        side,
+                        size: size.max(48.0),
+                        resizable: true,
+                        first: Box::new(Dock::Leaf(e)),
+                        second: Box::new(Dock::Leaf(e)),
+                    };
+                }
+            }
+            DockCmd::Close { path } => {
+                // Replace the parent split with the *kept* sibling. The closed
+                // leaf is always a content leaf (the canvas has no close button),
+                // so the canvas — living in the sibling or an untouched ancestor
+                // branch — always survives.
+                let Some((&last, parent_path)) = path.split_last() else {
+                    return; // the root has no sibling to fall back to.
+                };
+                let parent = self.node_at_mut(parent_path);
+                if let Dock::Split { .. } = parent {
+                    let old = std::mem::replace(parent, Dock::Leaf(Editor::Canvas));
+                    if let Dock::Split { first, second, .. } = old {
+                        *parent = match last {
+                            Branch::First => *second,
+                            Branch::Second => *first,
+                        };
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
@@ -231,14 +350,28 @@ impl Dock {
 /// panel state (including the size a user dragged a splitter to) off that, so
 /// the ids must stay stable frame to frame — which they are, since the walk
 /// order is the tree's own structure.
+///
+/// `path` tracks the current leaf's address as the walk descends, and `cmd`
+/// collects at most one area-header interaction (split/join/retype) to be
+/// applied after the pass — the tree must not be restructured while its panels
+/// are still being laid out this frame.
 fn show_dock(
     node: &mut Dock,
     ui: &mut egui::Ui,
     next_id: &mut u32,
+    path: &mut Vec<Branch>,
     draw: &mut dyn FnMut(Editor, &mut egui::Ui),
+    cmd: &mut Option<DockCmd>,
 ) {
     match node {
-        Dock::Leaf(editor) => draw(*editor, ui),
+        Dock::Leaf(editor) => {
+            // Content areas get a header (picker + split/close); the three
+            // structural leaves (canvas, comp, transport) don't — see `SWAPPABLE`.
+            if editor.is_swappable() {
+                area_header(ui, *editor, path, cmd);
+            }
+            draw(*editor, ui);
+        }
         Dock::Split { side, size, resizable, first, second } => {
             let id = egui::Id::new(("dock", *next_id));
             *next_id += 1;
@@ -253,7 +386,11 @@ fn show_dock(
             } else {
                 panel.exact_size(*size)
             };
-            let resp = panel.show(ui, |ui| show_dock(first, ui, next_id, draw));
+            let resp = panel.show(ui, |ui| {
+                path.push(Branch::First);
+                show_dock(first, ui, next_id, path, draw, cmd);
+                path.pop();
+            });
             // Read the size back so the tree — not egui's private panel memory —
             // stays the source of truth for what the layout currently is.
             let r = resp.response.rect;
@@ -264,9 +401,54 @@ fn show_dock(
             // The remaining space is the second child's area. Recursing here
             // (rather than into a sibling panel) is what makes the nesting
             // depth-first and the geometry exact.
-            show_dock(second, ui, next_id, draw);
+            path.push(Branch::Second);
+            show_dock(second, ui, next_id, path, draw, cmd);
+            path.pop();
         }
     }
+}
+
+/// The control strip atop a dockable area: an editor picker plus split and
+/// close buttons. It never mutates the tree (egui is mid-layout); a click just
+/// records a [`DockCmd`] against this leaf's `path`, applied once the frame's
+/// UI is done. At most one command survives a frame, which is all a click can
+/// produce anyway.
+fn area_header(ui: &mut egui::Ui, editor: Editor, path: &[Branch], cmd: &mut Option<DockCmd>) {
+    // Measured before any content is drawn, so a split starts at half the area.
+    let area = ui.max_rect();
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(("area", path))
+            .selected_text(editor.label())
+            .show_ui(ui, |ui| {
+                for e in SWAPPABLE {
+                    if ui.selectable_label(e == editor, e.label()).clicked() && e != editor {
+                        *cmd = Some(DockCmd::Retype { path: path.to_vec(), editor: e });
+                    }
+                }
+            });
+        // Split/close sit at the right edge. Plain ASCII glyphs on purpose — the
+        // egui default font tofus most box-drawing characters (see README).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("x").on_hover_text("Close this area").clicked() {
+                *cmd = Some(DockCmd::Close { path: path.to_vec() });
+            }
+            if ui.small_button("-").on_hover_text("Split top / bottom").clicked() {
+                *cmd = Some(DockCmd::Split {
+                    path: path.to_vec(),
+                    side: DockSide::Top,
+                    size: area.height() * 0.5,
+                });
+            }
+            if ui.small_button("|").on_hover_text("Split left / right").clicked() {
+                *cmd = Some(DockCmd::Split {
+                    path: path.to_vec(),
+                    side: DockSide::Left,
+                    size: area.width() * 0.5,
+                });
+            }
+        });
+    });
+    ui.separator();
 }
 
 /// Composition-settings edits from the top bar. Any `Some` is a new value.
@@ -2392,31 +2574,49 @@ impl App {
         // the tree's business, which is the whole point of the refactor.
         let dock = &mut self.dock;
         let mut canvas_pts: Option<egui::Rect> = None;
+        // At most one layout edit (split/join/retype) from an area header this
+        // frame; applied to the tree after the UI pass, never during it.
+        let mut dock_cmd: Option<DockCmd> = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
-            show_dock(dock, ui, &mut next_id, &mut |editor, ui| match editor {
-                Editor::Comp => comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp),
-                Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
-                Editor::Transport => {
-                    transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
-                }
-                Editor::Dopesheet => dopesheet_ui(
-                    ui,
-                    &rows,
-                    t,
-                    last_frame,
-                    timebase,
-                    view,
-                    &selected_keys,
-                    &mut dope,
-                ),
-                Editor::Properties => {
-                    properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
-                }
-                // vello paints here; egui only measures the hole.
-                Editor::Canvas => canvas_pts = Some(ui.max_rect()),
-            });
+            let mut path = Vec::new();
+            show_dock(
+                dock,
+                ui,
+                &mut next_id,
+                &mut path,
+                &mut |editor, ui| match editor {
+                    Editor::Comp => comp_ui(ui, doc_w, doc_h, doc_fps, duration, &mut comp),
+                    Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
+                    Editor::Transport => {
+                        transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
+                    }
+                    Editor::Dopesheet => dopesheet_ui(
+                        ui,
+                        &rows,
+                        t,
+                        last_frame,
+                        timebase,
+                        view,
+                        &selected_keys,
+                        &mut dope,
+                    ),
+                    Editor::Properties => {
+                        properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
+                    }
+                    // vello paints here; egui only measures the hole.
+                    Editor::Canvas => canvas_pts = Some(ui.max_rect()),
+                },
+                &mut dock_cmd,
+            );
         });
+        // Now that egui has finished, restructure the layout tree if an area
+        // header asked to. Doing it here (not mid-pass) keeps the panels and
+        // their egui ids stable for the frame that was just drawn.
+        if let Some(cmd) = dock_cmd {
+            self.dock.apply(cmd);
+            window.request_redraw();
+        }
         // Points → physical pixels for the next frame's fit.
         self.canvas_rect = canvas_pts.map(|r| {
             kurbo::Rect::new(
@@ -2903,6 +3103,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Flatten a layout tree to the editors it shows, in walk order.
+    fn dock_editors(d: &Dock) -> Vec<Editor> {
+        fn go(d: &Dock, out: &mut Vec<Editor>) {
+            match d {
+                Dock::Leaf(e) => out.push(*e),
+                Dock::Split { first, second, .. } => {
+                    go(first, out);
+                    go(second, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(d, &mut out);
+        out
+    }
+
+    /// The address of the first leaf showing `target`, or `None`.
+    fn path_to(d: &Dock, target: Editor) -> Option<Vec<Branch>> {
+        match d {
+            Dock::Leaf(e) => (*e == target).then(Vec::new),
+            Dock::Split { first, second, .. } => path_to(first, target)
+                .map(|mut p| {
+                    p.insert(0, Branch::First);
+                    p
+                })
+                .or_else(|| {
+                    path_to(second, target).map(|mut p| {
+                        p.insert(0, Branch::Second);
+                        p
+                    })
+                }),
+        }
+    }
+
+    fn count_editor(d: &Dock, e: Editor) -> usize {
+        dock_editors(d).into_iter().filter(|x| *x == e).count()
+    }
+
+    /// Following `.second` from the root always lands on the canvas — the
+    /// invariant the canvas-rect measurement depends on.
+    fn innermost_is_canvas(d: &Dock) -> bool {
+        let mut cur = d;
+        loop {
+            match cur {
+                Dock::Split { second, .. } => cur = second,
+                Dock::Leaf(e) => return *e == Editor::Canvas,
+            }
+        }
+    }
+
+    #[test]
+    fn retype_swaps_the_editor_in_place() {
+        let mut d = Dock::default_layout();
+        let path = path_to(&d, Editor::Layers).unwrap();
+        d.apply(DockCmd::Retype { path, editor: Editor::Properties });
+        assert_eq!(count_editor(&d, Editor::Layers), 0, "old editor gone");
+        assert_eq!(count_editor(&d, Editor::Properties), 2, "now shown twice");
+        // Structure is otherwise untouched.
+        assert_eq!(dock_editors(&d).len(), 6);
+        assert!(innermost_is_canvas(&d));
+    }
+
+    #[test]
+    fn split_then_close_the_new_half_round_trips() {
+        let mut d = Dock::default_layout();
+        let before = dock_editors(&d);
+        let path = path_to(&d, Editor::Properties).unwrap();
+        d.apply(DockCmd::Split {
+            path: path.clone(),
+            side: DockSide::Left,
+            size: 120.0,
+        });
+        // The leaf became a split of two Properties.
+        assert_eq!(count_editor(&d, Editor::Properties), 2);
+        assert!(innermost_is_canvas(&d), "a split must not dislodge the canvas");
+        // Close the newly-made second half; its sibling (the original) absorbs it.
+        let mut new_half = path.clone();
+        new_half.push(Branch::Second);
+        d.apply(DockCmd::Close { path: new_half });
+        assert_eq!(dock_editors(&d), before, "join undoes the split exactly");
+    }
+
+    #[test]
+    fn closing_an_area_keeps_the_canvas() {
+        // Properties sits beside the canvas; closing it must leave the canvas as
+        // the surviving sibling, never remove it.
+        let mut d = Dock::default_layout();
+        let path = path_to(&d, Editor::Properties).unwrap();
+        d.apply(DockCmd::Close { path });
+        assert_eq!(count_editor(&d, Editor::Properties), 0, "area closed");
+        assert_eq!(count_editor(&d, Editor::Canvas), 1, "canvas survives");
+        assert!(innermost_is_canvas(&d));
+    }
+
+    #[test]
+    fn only_content_areas_carry_a_header() {
+        // The three structural leaves must never offer split/close/retype, or the
+        // canvas-rect and innermost-canvas invariants could be broken from the UI.
+        assert!(Editor::Layers.is_swappable());
+        assert!(Editor::Properties.is_swappable());
+        assert!(Editor::Dopesheet.is_swappable());
+        assert!(!Editor::Canvas.is_swappable());
+        assert!(!Editor::Comp.is_swappable());
+        assert!(!Editor::Transport.is_swappable());
     }
 
     /// A rect with every optional property present.
