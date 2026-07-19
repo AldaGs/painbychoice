@@ -91,15 +91,29 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   playhead. Click track to seek, click a diamond to select (Del removes), drag
   to retime (clamped between neighbours). Everything **snaps to frames** at any
   zoom.
+  - **Multi-select**: ctrl/shift-click a diamond toggles it in or out of the
+    selection; dragging a box on empty track marquee-selects everything inside
+    it (replacing the selection, so shrinking the box deselects). Selected keys
+    are drawn larger with a red border.
+  - **Group retime**: dragging any selected diamond moves the *whole* selection
+    as a rigid block, so internal spacing is preserved. The block clamps against
+    its own outer neighbours rather than each key's — and across every affected
+    property at once, so a multi-property selection translates instead of
+    deforming. Dragging an unselected key selects it first.
+  - **Copy/paste** (ctrl+C / ctrl+V): copies whole keyframes — values *and*
+    easing handles — and pastes them with the block's first key on the playhead,
+    spacing intact. Pasting selects what landed, so the next drag moves it.
+    Suppressed while a text field has focus.
   - **Scroll** to zoom (the frame under the cursor stays pinned), **shift+scroll**
     to pan.
   - **Edge auto-pan**: while dragging the ruler or a keyframe, hold near either
     end of the track and the view scrolls that way — so a key can be dragged
     past the visible range. Drag-only on purpose; hover-panning would scroll the
     timeline out from under the pointer.
-- **Easing editor** — selecting a keyframe reveals a CSS-style cubic-bezier
-  editor for its outgoing segment: draggable control points + Linear/Smooth/
-  Ease In/Ease Out presets.
+- **Easing editor** — selecting **exactly one** keyframe reveals a CSS-style
+  cubic-bezier editor for its outgoing segment: draggable control points +
+  Linear/Smooth/Ease In/Ease Out presets. Deliberately hidden for a multi-key
+  selection: a segment belongs to one key, so there is no "the" curve for a set.
 
 ## Key code locations
 
@@ -110,6 +124,9 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   `Handle`, easing solver. Keyframe ops: `set_at`, `insert_key` (const→track),
   `move_key` (neighbour-clamped, ±1 frame), `remove_key`, `key_frames`,
   `segment_handles` / `set_segment_handles`.
+  Multi-key ops: `move_keys_limits` / `move_keys` (rigid block, clamped against
+  the *block's* outer neighbours — see the doc comment for why per-key clamping
+  collapses a selection), and `keys_at` / `insert_keys` for copy/paste.
 - `core/src/node.rs` — `Node`, `Transform`, `Shape` (parametric Rect/Ellipse/
   Path), `Document`. Tree ops: `find`, `find_mut`, `reorder_child`, `remove`.
   Also `Document::timebase()`, `duration_frames()`, and **`migrate()`**.
@@ -123,6 +140,10 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   Timeline mapping: `TimelineView` (the visible frame window) + `Axis`
   (frame↔pixel), built once by the ruler and reused by every row so they cannot
   drift out of alignment.
+  Keyframe selection: `KeyRef` = `(PropKind, index)`, `KeySelection` =
+  `BTreeSet<KeyRef>` (ordered so `group_selection_by_prop` can bucket it in one
+  pass), `KeyClipboard`/`ClipTrack` for copy/paste — `ClipTrack` is the
+  type-erasure boundary that keeps `Vec2` keys off a scalar property.
 
 ### Loading a `.pbc`: always call `migrate()`
 
@@ -139,6 +160,12 @@ round onto the same frame collapse to one.
 - **egui default font lacks many glyphs** (◆ ◇ ● ○ ❚ ⟲ ▸) — they render as tofu
   boxes. `▶` and `•` are safe; otherwise *paint* the indicator (see `key_button`)
   or use plain words. Learned the hard way.
+- **The box-select flag round-trips through egui memory.** Only a row's
+  `Response` can tell us a drag began on empty track (a diamond grabs the press
+  first), but the marquee rect is needed *before* the rows loop — so "a box is
+  live" is stashed with `data_mut` and read on the next frame. The one-frame lag
+  is invisible (the box has no area worth hit-testing until the pointer moves);
+  don't try to "fix" it by hoisting the hit-test out of the loop.
 - **egui eats the shift modifier on shift+wheel**, rewriting it into a
   *horizontal* scroll. So the pan signal is a nonzero `smooth_scroll_delta.x`,
   not `modifiers.shift` — checking `shift` silently does nothing.
