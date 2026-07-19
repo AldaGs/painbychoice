@@ -241,6 +241,52 @@ impl<T: Animatable> Track<T> {
         applied
     }
 
+    /// Clone the keyframes at `indices`, in frame order. Out-of-range indices
+    /// are ignored. Whole keyframes — value *and* easing handles — so a
+    /// copy/paste round-trip preserves the curve, not just the timing.
+    pub fn keys_at(&self, indices: &[usize]) -> Vec<Keyframe<T>> {
+        let mut sel: Vec<usize> = indices.iter().copied().filter(|i| *i < self.keys.len()).collect();
+        sel.sort_unstable();
+        sel.dedup();
+        sel.into_iter().map(|i| self.keys[i].clone()).collect()
+    }
+
+    /// Insert `keys` shifted by `offset` frames, and return the indices they
+    /// landed on (sorted, so the caller can select what it just pasted).
+    ///
+    /// A pasted key *replaces* whatever sits on its landing frame — the same
+    /// rule [`Track::set_key`] uses, and the only one that keeps the "one key
+    /// per frame" invariant `sample` depends on. Keys that would land before
+    /// frame 0 are dropped rather than piled up at 0, which would silently
+    /// collapse the spacing the paste is meant to preserve.
+    pub fn insert_keys(&mut self, keys: &[Keyframe<T>], offset: i64) -> Vec<usize> {
+        let mut landed = Vec::new();
+        for k in keys {
+            let frame = k.frame + offset;
+            if frame < 0 {
+                continue;
+            }
+            let mut k = k.clone();
+            k.frame = frame;
+            k.legacy_seconds = None;
+            match self.keys.iter().position(|e| e.frame == frame) {
+                Some(i) => self.keys[i] = k,
+                None => self.keys.push(k),
+            }
+            landed.push(frame);
+        }
+        if landed.is_empty() {
+            return Vec::new();
+        }
+        self.keys.sort_by_key(|k| k.frame);
+        self.keys
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| landed.contains(&k.frame))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Convert legacy float-seconds keys to frames at `fps`. See
     /// [`Keyframe::legacy_seconds`]. Re-sorts, since rounding can collide or
     /// reorder keys that were microscopically apart in the old format.
@@ -406,6 +452,33 @@ impl<T: Animatable> Value<T> {
         match self {
             Value::Const(_) => 0,
             Value::Keyframed(track) => track.move_keys(indices, delta),
+        }
+    }
+
+    /// Clone the keyframes at `indices` (empty for a constant).
+    pub fn keys_at(&self, indices: &[usize]) -> Vec<Keyframe<T>> {
+        match self {
+            Value::Const(_) => Vec::new(),
+            Value::Keyframed(track) => track.keys_at(indices),
+        }
+    }
+
+    /// Paste `keys` shifted by `offset`; returns the landed indices. A constant
+    /// is promoted to a track first — pasting onto an un-animated property is
+    /// how it starts being animated, same as [`Value::insert_key`].
+    pub fn insert_keys(&mut self, keys: &[Keyframe<T>], offset: i64) -> Vec<usize> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        if let Value::Const(v) = self {
+            // Seed the track with the constant so it is never empty (an empty
+            // `Track` would panic in `sample`); the pasted keys land on top.
+            let v = v.clone();
+            *self = Value::Keyframed(Track::new(vec![Keyframe::smooth(0, v)]));
+        }
+        match self {
+            Value::Const(_) => unreachable!("promoted just above"),
+            Value::Keyframed(track) => track.insert_keys(keys, offset),
         }
     }
 
@@ -693,6 +766,52 @@ mod tests {
         // Index 99 doesn't exist; index 1 given twice must not double-apply.
         assert_eq!(v.move_keys(&[1, 1, 99], 3), 3);
         assert_eq!(v.key_frames(), vec![0, 13, 20]);
+    }
+
+    #[test]
+    fn copy_paste_preserves_spacing_values_and_easing() {
+        let src = track_at(&[10, 15, 40]);
+        let copied = src.keys_at(&[0, 1]);
+        assert_eq!(copied.iter().map(|k| k.frame).collect::<Vec<_>>(), vec![10, 15]);
+
+        // Paste with the block's first key landing on frame 100.
+        let mut dst = track_at(&[0]);
+        let landed = dst.insert_keys(&copied, 100 - 10);
+        assert_eq!(dst.key_frames(), vec![0, 100, 105], "spacing survives the move");
+        assert_eq!(landed, vec![1, 2], "landed indices point at the pasted keys");
+        // Values and handles come along, not just the timing.
+        assert_eq!(dst.keys_at(&[1])[0].value, 10.0);
+        assert_eq!(dst.keys_at(&[1])[0].out_handle, Handle::LINEAR_OUT);
+    }
+
+    #[test]
+    fn paste_replaces_a_key_already_on_the_landing_frame() {
+        // One key per frame is the invariant `sample` relies on.
+        let mut v = track_at(&[0, 20]);
+        let clip = vec![Keyframe::linear(0, 99.0)];
+        assert_eq!(v.insert_keys(&clip, 20), vec![1]);
+        assert_eq!(v.key_frames(), vec![0, 20], "no duplicate frame 20");
+        assert_eq!(v.keys_at(&[1])[0].value, 99.0, "the pasted value wins");
+    }
+
+    #[test]
+    fn paste_drops_keys_that_would_land_before_frame_zero() {
+        // Clamping them to 0 instead would pile them up and destroy the
+        // spacing the paste exists to preserve.
+        let mut v = track_at(&[50]);
+        let clip = v.keys_at(&[0]);
+        assert!(v.insert_keys(&clip, -100).is_empty());
+        assert_eq!(v.key_frames(), vec![50], "nothing landed, nothing changed");
+    }
+
+    #[test]
+    fn pasting_onto_a_constant_starts_animating_it() {
+        let mut v = Value::constant(7.0);
+        let clip = vec![Keyframe::linear(0, 1.0), Keyframe::linear(10, 2.0)];
+        v.insert_keys(&clip, 30);
+        assert!(v.is_animated());
+        assert_eq!(v.key_frames(), vec![0, 30, 40], "seed key at 0 keeps it samplable");
+        assert_eq!(v.resolve(0.0), 7.0, "the old constant is the value before the paste");
     }
 
     #[test]

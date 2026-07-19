@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate, Color as MColor, Document, Handle, Node as MNode, NodeId,
-    Scene as MScene, Shape as MShape, Transform, Value,
+    demo::demo_document, evaluate, Color as MColor, Document, Handle, Keyframe, Node as MNode,
+    NodeId, Scene as MScene, Shape as MShape, Transform, Value,
 };
 use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
@@ -591,6 +591,27 @@ fn group_selection_by_prop(sel: &KeySelection) -> Vec<(PropKind, Vec<usize>)> {
     out
 }
 
+/// One property's worth of copied keyframes. Two variants because `Value<T>` is
+/// generic and the transform's properties are either `Vec2` or `f64` — the enum
+/// is the type-erasure boundary, so paste can only ever put `Vec2` keys back on
+/// a `Vec2` property.
+#[derive(Clone)]
+enum ClipTrack {
+    Vec2(Vec<Keyframe<Vec2>>),
+    Num(Vec<Keyframe<f64>>),
+}
+
+/// Keyframes on the clipboard, with the frame they were copied from.
+///
+/// Storing `origin` (the earliest copied frame) rather than pre-baked offsets is
+/// what makes paste land the *block* at the playhead with its internal spacing
+/// intact, regardless of where in the timeline it was copied from.
+#[derive(Clone)]
+struct KeyClipboard {
+    origin: i64,
+    tracks: Vec<(PropKind, ClipTrack)>,
+}
+
 /// Read the outgoing-segment handles for a given property + keyframe index.
 fn segment_handles_of(node: &MNode, kind: PropKind, index: usize) -> Option<(Handle, Handle)> {
     let tr = &node.transform;
@@ -616,6 +637,9 @@ struct DopeEdits {
     toggle_key: Option<KeyRef>,
     /// Empty track was clicked → clear the keyframe selection.
     clear_selection: bool,
+    /// A marquee is being dragged: every key inside it, this frame. Reported
+    /// live (not on release) so the selection previews as the box is drawn.
+    box_select: Option<KeySelection>,
     /// Zoom / pan produced a new visible window.
     set_view: Option<TimelineView>,
 }
@@ -747,7 +771,8 @@ fn dopesheet_ui(
                 ui.add_space(8.0);
                 ui.strong("Timeline");
                 ui.weak(
-                    "— ctrl+click to multi-select, drag to move them together, Del removes",
+                    "— ctrl+click or drag a box to multi-select, drag to move them \
+                     together, ctrl+C/V copies, Del removes",
                 );
             });
             ui.separator();
@@ -874,6 +899,33 @@ fn dopesheet_ui(
                 }
             }
 
+            // --- Box-select. A drag that *starts* on empty track (rather than
+            // on a diamond, which grabs the press first) draws a marquee; every
+            // key inside it becomes the selection.
+            //
+            // The rect has to be known before the rows loop, but only a row's
+            // response can tell us the drag began on a track — so the "a
+            // marquee is live" flag round-trips through egui memory and is read
+            // on the following frame. The one-frame lag is invisible: the
+            // marquee has no area worth hit-testing until the pointer has
+            // actually moved. ---
+            let marquee_id = ui.id().with("marquee");
+            let mut marquee_active: bool =
+                ui.ctx().data(|d| d.get_temp(marquee_id).unwrap_or(false));
+            let (press, latest, any_down) = ui.input(|i| {
+                (i.pointer.press_origin(), i.pointer.latest_pos(), i.pointer.any_down())
+            });
+            if marquee_active && !any_down {
+                // Released: the last live report already produced the selection.
+                marquee_active = false;
+                ui.ctx().data_mut(|d| d.insert_temp(marquee_id, false));
+            }
+            let marquee = match (marquee_active, press, latest) {
+                (true, Some(a), Some(b)) => Some(egui::Rect::from_two_pos(a, b)),
+                _ => None,
+            };
+            let mut marquee_hits = KeySelection::new();
+
             // No early return: the rows loop is a no-op on an empty slice, and
             // returning here would skip the edge auto-pan below (which should
             // still work while scrubbing the ruler with nothing selected).
@@ -896,8 +948,11 @@ fn dopesheet_ui(
                     // The track: full remaining width, fixed height.
                     let (track, track_resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width() - 8.0, ROW_H),
-                        egui::Sense::click(),
+                        egui::Sense::click_and_drag(),
                     );
+                    if track_resp.drag_started() {
+                        ui.ctx().data_mut(|d| d.insert_temp(marquee_id, true));
+                    }
                     let painter = ui.painter_at(track);
                     painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
 
@@ -927,6 +982,11 @@ fn dopesheet_ui(
                         // their hit rects stay live outside the visible track.
                         if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
                             continue;
+                        }
+                        if let Some(m) = marquee {
+                            if m.contains(egui::pos2(kx, cy)) {
+                                marquee_hits.insert((row.kind, key_idx));
+                            }
                         }
                         let is_sel = selected_keys.contains(&(row.kind, key_idx));
                         let r = if is_sel { 6.5 } else { 5.0 };
@@ -986,6 +1046,22 @@ fn dopesheet_ui(
                         }
                     }
                 });
+            }
+
+            // Report and draw the marquee. Reported even when empty, so
+            // dragging a box over nothing clears the selection like a click on
+            // empty track does.
+            if let Some(m) = marquee {
+                dragging = true;
+                out.box_select = Some(std::mem::take(&mut marquee_hits));
+                let painter = ui.painter_at(ui.max_rect());
+                painter.rect_filled(m, 2.0, egui::Color32::from_white_alpha(18));
+                painter.rect_stroke(
+                    m,
+                    2.0,
+                    egui::Stroke::new(1.0, accent),
+                    egui::StrokeKind::Inside,
+                );
             }
 
             // --- Edge auto-pan. While dragging (scrubbing the ruler or moving
@@ -1150,6 +1226,8 @@ struct App {
     selected: Option<NodeId>,
     /// The keyframes selected in the dopesheet. Empty = nothing selected.
     selected_keys: KeySelection,
+    /// Copied keyframes, pasteable onto any node's matching properties.
+    key_clipboard: Option<KeyClipboard>,
     /// The timeline's visible frame window (zoom / pan).
     view: TimelineView,
     /// Next unused node id, for shapes created in-app.
@@ -1181,6 +1259,7 @@ impl App {
             pending_pick: None,
             selected: None,
             selected_keys: KeySelection::new(),
+            key_clipboard: None,
             view,
             next_id,
         }
@@ -1519,6 +1598,78 @@ impl App {
         true
     }
 
+    /// Copy the selected keyframes (Ctrl+C). Whole keys — value and easing —
+    /// so a paste reproduces the curve, not just the timing.
+    fn copy_selected_keys(&mut self) -> bool {
+        let Some(node) = self.selected.and_then(|id| self.doc.root.find(id)) else {
+            return false;
+        };
+        if self.selected_keys.is_empty() {
+            return false;
+        }
+        let tr = &node.transform;
+        let mut tracks = Vec::new();
+        let mut origin = i64::MAX;
+        for (kind, idxs) in group_selection_by_prop(&self.selected_keys) {
+            let clip = match kind {
+                PropKind::Position => ClipTrack::Vec2(tr.position.keys_at(&idxs)),
+                PropKind::Scale => ClipTrack::Vec2(tr.scale.keys_at(&idxs)),
+                PropKind::Rotation => ClipTrack::Num(tr.rotation_deg.keys_at(&idxs)),
+                PropKind::Opacity => ClipTrack::Num(tr.opacity.keys_at(&idxs)),
+            };
+            let first = match &clip {
+                ClipTrack::Vec2(k) => k.first().map(|k| k.frame),
+                ClipTrack::Num(k) => k.first().map(|k| k.frame),
+            };
+            let Some(first) = first else { continue };
+            origin = origin.min(first);
+            tracks.push((kind, clip));
+        }
+        if tracks.is_empty() {
+            return false;
+        }
+        self.key_clipboard = Some(KeyClipboard { origin, tracks });
+        true
+    }
+
+    /// Paste the clipboard with its earliest key on the playhead (Ctrl+V), and
+    /// select what landed — so the very next drag moves the paste, which is the
+    /// motion the user almost always wants next.
+    fn paste_keys(&mut self) -> bool {
+        let Some(clip) = self.key_clipboard.clone() else {
+            return false;
+        };
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let offset = self.current_frame() - clip.origin;
+        let Some(node) = self.doc.root.find_mut(id) else {
+            return false;
+        };
+        let tr = &mut node.transform;
+        let mut landed = KeySelection::new();
+        for (kind, track) in &clip.tracks {
+            let idxs = match (kind, track) {
+                (PropKind::Position, ClipTrack::Vec2(k)) => tr.position.insert_keys(k, offset),
+                (PropKind::Scale, ClipTrack::Vec2(k)) => tr.scale.insert_keys(k, offset),
+                (PropKind::Rotation, ClipTrack::Num(k)) => tr.rotation_deg.insert_keys(k, offset),
+                (PropKind::Opacity, ClipTrack::Num(k)) => tr.opacity.insert_keys(k, offset),
+                // A Vec2 clip can't land on a scalar property (or vice versa).
+                // Unreachable via the UI — copy tags each clip with the kind it
+                // came from — but skipping is the right answer if it ever is.
+                _ => Vec::new(),
+            };
+            for i in idxs {
+                landed.insert((*kind, i));
+            }
+        }
+        if landed.is_empty() {
+            return false;
+        }
+        self.selected_keys = landed;
+        true
+    }
+
     /// Move every selected keyframe by `delta` frames as one rigid block.
     ///
     /// Each property is a separate `Track`, so the limits are intersected
@@ -1836,7 +1987,12 @@ impl App {
         // of `self` before the UI ran (so the closure couldn't borrow `App`);
         // put it back, then apply this frame's changes to it.
         self.selected_keys = selected_keys;
-        if let Some(k) = dope.select_key {
+        if let Some(hits) = dope.box_select {
+            // A live marquee owns the selection outright while it is being
+            // dragged — shrinking the box has to deselect, so this replaces
+            // rather than merges.
+            self.selected_keys = hits;
+        } else if let Some(k) = dope.select_key {
             // Plain click: this key becomes the whole selection.
             self.selected_keys.clear();
             self.selected_keys.insert(k);
@@ -1865,6 +2021,25 @@ impl App {
         let mut dirty = self.apply_edits(frame, &edits);
         if let Some(delta) = dope.move_by {
             dirty |= self.move_selected_keys(delta);
+        }
+
+        // Keyframe copy/paste. Read off egui's input rather than the winit
+        // handler because that one never sees a modifier state, and suppressed
+        // while a text field has focus so Ctrl+V in a numeric box still pastes
+        // text instead of keyframes.
+        if !self.egui_ctx.egui_wants_keyboard_input() {
+            let (copy, paste) = self.egui_ctx.input(|i| {
+                (
+                    i.modifiers.command && i.key_pressed(egui::Key::C),
+                    i.modifiers.command && i.key_pressed(egui::Key::V),
+                )
+            });
+            if copy {
+                self.copy_selected_keys();
+            }
+            if paste {
+                dirty |= self.paste_keys();
+            }
         }
         // Easing edits target the single selected key (the editor only appears
         // when exactly one is selected).

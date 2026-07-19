@@ -155,7 +155,7 @@ round onto the same frame collapse to one.
 ## Roadmap (agreed order)
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
-UX → …**. Next up:
+UX ✅ → shape/stroke params → …**. Next up:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -165,15 +165,21 @@ UX → …**. Next up:
      `duration_frames()` derived. Storing frames outright is arguably more
      correct (the comp end would always land on a frame boundary) but it's a
      `.pbc` format change, so it wants to ride along with the next migration.
-2. **Keyframe UX polish (next).** Multi-select, box-select, copy/paste, drag
-   multiple keys, better selection visuals. Frame-snapping now exists, which is
-   what this was waiting on: "move these 5 keys 3 frames later" is a
-   well-defined operation on an integer grid in a way it never was on floats.
-   Touch points: `KeyRef`/`selected_key` becomes a *set*, `DopeEdits` grows a
-   multi-key move, and `Track::move_key`'s neighbour clamp needs a group-aware
-   variant (moving a block must clamp against the block's outer neighbours, not
-   each key's immediate ones).
-3. **More shape params + stroke editing** in the properties panel.
+2. ~~**Keyframe UX polish.**~~ ✅ Done. `selected_key` became a `KeySelection`
+   set; ctrl/shift-click toggles, dragging a box on empty track marquee-selects,
+   a drag moves the whole selection as a rigid block, and ctrl+C/V copies keys
+   (values *and* easing handles) to land on the playhead with their spacing
+   intact. The group move clamps against the *block's* outer neighbours
+   (`Track::move_keys_limits`), intersected across every affected track so a
+   multi-property selection translates instead of deforming.
+   - The marquee's "a box is live" flag round-trips through egui memory, so it
+     lags the press by one frame — invisible, since the box has no area worth
+     hit-testing until the pointer moves. Only a row response can tell us the
+     drag began on empty track rather than on a diamond.
+   - Paste replaces any key already sitting on a landing frame (the one-key-per-
+     frame invariant `sample` needs) and drops keys that would land before frame
+     0 rather than piling them up there.
+3. **More shape params + stroke editing (next)** in the properties panel.
 4. **Blender-style splittable/dockable panels** (see EBN's `layoutTree` idea).
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
