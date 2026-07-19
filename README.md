@@ -32,8 +32,44 @@ a constant or a keyframe track today; an expression / parametric-node IR later.
 time `t` into a flat `Scene` of draw items. Non-destructive editing and
 non-linear scrubbing both fall out of that single design choice.
 
+A resolve takes an **`EvalCtx`** rather than a bare frame:
+`Value::resolve(&self, ctx: &mut EvalCtx)`. `EvalCtx` carries the frame, the
+document, a resolve cache, and a warnings sink — one struct threaded through the
+whole walk so nothing needs re-plumbing as the engine grows. `evaluate` builds
+one context and shares it down the walk (`&mut`, because resolving an expression
+mutates the cache).
+
 Every evaluated item carries a `source: NodeId` (provenance) so a frame traces
 back to the node that produced it — used for click-to-select and debugging.
+
+### Expressions (`core/src/expr.rs`)
+
+A third `Value` arm beside `Const`/`Keyframed`: `Value::Expr(Expr)` computes a
+property from *other* values. This is the shared substrate roadmap #5 is built
+on — expressions and (later) a node graph are two front-ends that lower to the
+same `Expr` IR (the EBN "IR + dumb-printer" split: the IR is data, evaluation is
+a pure tree-walk).
+
+- **Dynamic↔typed edge.** An expression works in `ExprValue { Num, Vec2, Color }`
+  and pins the type down only at the property, via `FromExpr`/`ToExpr` (impl'd
+  for exactly the scriptable types — never `BezPath`). A kind mismatch resolves
+  to `T::fallback()` (a neutral zero), never a failed frame.
+- **The IR** is deliberately tiny: `Lit`, `Ref { node, prop, time_offset }`, and
+  `Add`/`Mul`/`Neg` (`a - b` lowers to `Add(a, Neg(b))`). `Ref`'s `time_offset`
+  is the `valueAtTime(t')` case — sampling another property at a *shifted* frame.
+- **Dependency resolution is pull-based DFS** — a dependency resolves because you
+  recurse into it, so there's no separate topo sort. `EvalCtx`'s `ResolveCache`
+  adds a `visiting` set (a back-edge is a **cycle** → a `scene.warnings` entry +
+  a neutral fallback, so a self-referential doc warns instead of hanging) and a
+  `(node, prop, frame)` **memo** (the frame is in the key, so an off-time sample
+  can't poison the primary value's slot).
+- **Determinism** is by construction: every node is a pure function of the frame
+  and the values it reads — no IO, no clock. That's the same sandbox a script
+  engine (Rhai, next) and WASM plugins will reuse.
+
+No authoring UI yet — expressions are built in code or a hand-edited `.pbc`
+(`Value::Expr` serializes like any other value). The node-graph panel that lets
+you *build* them is the next #5 step.
 
 ### Frames are the native time domain
 
@@ -139,11 +175,15 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   Also `Document::timebase()`, `duration_frames()`, and **`migrate()`**.
 - `core/src/eval.rs` — `evaluate(doc, frame) -> Scene`, `RenderItem`
   (+provenance).
+- `core/src/expr.rs` — expressions: `EvalCtx` (the resolve context: frame, doc,
+  cache, warnings), `ExprValue` + `From`/`ToExpr`, the `Expr` IR, `PropPath`,
+  and `eval_expr` with the memo + cycle-detecting `ResolveCache`.
 - `core/src/demo.rs` — the demo document loaded on launch.
 - `live/src/main.rs` — everything UI. `App::render` is the per-frame heart:
   evaluate → hit-test → gather snapshots → run egui → apply `*Edits` → GPU. Panel
   fns: `comp_ui`, `tree_ui`, `transport_ui`, `dopesheet_ui`, `properties_ui`,
-  `ease_editor`, `key_button`. Each panel fn renders into a `&mut Ui` it is
+  `graph_ui` (the expression editor; `apply_graph_op` applies its deferred
+  edits), `ease_editor`, `key_button`. Each panel fn renders into a `&mut Ui` it is
   handed — it does **not** create its own `egui::Panel`; placement is the
   layout tree's job (see below).
   Timeline mapping: `TimelineView` (the visible frame window) + `Axis`
@@ -344,6 +384,30 @@ IR (next) → …**. Next up:
    With that, **item #4 is complete.** Next is the node/expression IR (#5).
 5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
    differentiator; the IR/printer discipline borrowed from the EBN project.
+   🚧 in progress, being built in stages:
+   - ~~**The `EvalCtx` seam.**~~ ✅ Done. `resolve` takes an `EvalCtx` instead of
+     a bare frame (see *The core idea* above).
+   - ~~**`Value::Expr` + the IR.**~~ ✅ Done — the headless engine now evaluates
+     expressions. See *Expressions* below. In short: a `crate::expr` module with
+     the dynamic `ExprValue { Num, Vec2, Color }` and its `From`/`ToExpr` edge, a
+     tiny IR (`Lit`, `Ref { node, prop, time_offset }`, `Add`/`Mul`/`Neg`), and a
+     `ResolveCache` on `EvalCtx` doing per-frame memoization + cycle detection (a
+     cycle → a `scene.warnings` entry + a neutral fallback, never a hang).
+   - ~~**Node-graph panel.**~~ ✅ Done. A new `Editor::Graph` (summonable into any
+     content area via the split/join picker — no default-layout change) lets you
+     drive the selected node's properties with expressions: **`= fx`** promotes a
+     property (seeded from its current value), **bake** freezes it back to a
+     constant, and the expression is edited on a **node canvas** — boxes wired
+     parent↔child, each with a kind picker (`value`/`ref`/`add`/`mul`/`neg`) and a
+     compact editor; changing one node's kind grows the tree (operators seed
+     neutral inputs). Layout is a tidy-tree auto-placement (`layout_expr`, a
+     tested pure function); edits are deferred `GraphOp`s addressed by
+     `(property, tree-path)` and applied after the UI pass by `apply_graph_op`
+     (a free function, so the whole flow is unit-tested) — the same discipline as
+     the dock. Boxes are auto-placed for now; free dragging + a canvas pan are the
+     next refinement over the same model.
+   - **Rhai scripting** (text expressions) — lowers to the IR that's now in place.
+     Its real cost is the `EvalCtx`-callback bridge, not the syntax.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
@@ -463,23 +527,29 @@ frame cache. Store *references* in `.pbc`, never pixels.
 `Value::Expr` is another `Value<T>` recipe; `evaluate` runs it instead of
 sampling keyframes. Expressions and the node graph are two front-ends that lower
 to the **same IR** (the EBN IR + dumb-printer discipline).
-- **Signature ripple:** `resolve(&self, t)` → `resolve(&self, ctx: &mut
-  EvalCtx)` carrying `{ t, doc, engine, cache }`. A single-`t` "bake first"
-  pre-pass can't work because `valueAtTime(t')` samples at *other* times.
-- **Dynamic↔typed boundary:** `ExprValue { Num, Vec2, Color }` + `FromExpr` /
+> **Status:** the core of this is now built — see *Expressions* above and
+> `core/src/expr.rs`. The bullets below record the reasoning; ✅ marks what's
+> implemented, and what's still ahead (Rhai, `wiggle`, stroke/shape refs).
+
+- **Signature ripple:** ✅ `resolve(&self, t)` → `resolve(&self, ctx: &mut
+  EvalCtx)` carrying `{ frame, doc, cache, warnings }`. A single-`t` "bake first"
+  pre-pass can't work because `valueAtTime(t')` samples at *other* times, which
+  is the whole reason the context — not a bare frame — is threaded.
+- **Dynamic↔typed boundary:** ✅ `ExprValue { Num, Vec2, Color }` + `FromExpr` /
   `ToExpr`, implemented only for scriptable `T` (not `BezPath` — enforced by the
-  trait bound).
+  trait bound). Mismatch → `fallback()`.
 - **Dependency graph is implicit** in pull-based DFS (a dependency resolves
   before its dependent because you recurse into it first — no separate topo
-  sort). Add to `ResolveCache`: a `visiting` set for cycle detection (a cycle →
+  sort). ✅ `ResolveCache`: a `visiting` set for cycle detection (a cycle →
   `fallback` + a `scene.warnings` entry, reusing the provenance channel) and a
-  `(node, prop, t)` memo (the `t` in the key matters — off-time samples must not
-  poison the primary value).
-- **Determinism:** expressions are pure functions of (t, inputs) — no IO, no
-  wall clock; `wiggle()` seeds from (node, prop, t). This is the *same sandbox*
-  WASM plugins need — build it once.
-- Engine: start with **Rhai** (pure-Rust, easy, safe); swap behind the IR later
-  if AE-JS compatibility (`boa`/v8) or Lua (`mlua`) is wanted.
+  `(node, prop, frame)` memo (the frame in the key matters — off-time samples
+  must not poison the primary value).
+- **Determinism:** ✅ expressions are pure functions of (frame, inputs) — no IO,
+  no wall clock. `wiggle()` (seeded from node, prop, frame) is still to come with
+  the script engine. This is the *same sandbox* WASM plugins need — build it once.
+- Engine: start with **Rhai** (pure-Rust, easy, safe) — *not yet wired*; the IR
+  and evaluator are in place for it to lower into. Swap behind the IR later if
+  AE-JS compatibility (`boa`/v8) or Lua (`mlua`) is wanted.
 
 ### The two unifying insights (why this isn't N separate projects)
 

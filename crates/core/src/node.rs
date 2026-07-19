@@ -5,6 +5,7 @@
 use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
+use crate::expr::EvalCtx;
 use crate::value::{Color, Value};
 
 /// Stable identity for a node, used for selection and for tracing an evaluated
@@ -37,18 +38,18 @@ impl Default for Transform {
 }
 
 impl Transform {
-    /// Resolve to (matrix, opacity) at `frame`. The matrix maps local space to
-    /// parent space: translate(position) · rotate · scale · translate(-anchor).
-    pub fn resolve(&self, frame: f64) -> (kurbo::Affine, f64) {
-        let anchor = self.anchor.resolve(frame);
-        let position = self.position.resolve(frame);
-        let rot = self.rotation_deg.resolve(frame).to_radians();
-        let scale = self.scale.resolve(frame);
+    /// Resolve to (matrix, opacity) against `ctx`. The matrix maps local space
+    /// to parent space: translate(position) · rotate · scale · translate(-anchor).
+    pub fn resolve(&self, ctx: &mut EvalCtx) -> (kurbo::Affine, f64) {
+        let anchor = self.anchor.resolve(ctx);
+        let position = self.position.resolve(ctx);
+        let rot = self.rotation_deg.resolve(ctx).to_radians();
+        let scale = self.scale.resolve(ctx);
         let m = kurbo::Affine::translate(position)
             * kurbo::Affine::rotate(rot)
             * kurbo::Affine::scale_non_uniform(scale.x, scale.y)
             * kurbo::Affine::translate(-anchor);
-        (m, self.opacity.resolve(frame))
+        (m, self.opacity.resolve(ctx))
     }
 
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
@@ -76,17 +77,17 @@ pub enum Shape {
 }
 
 impl Shape {
-    pub fn to_path(&self, frame: f64) -> BezPath {
+    pub fn to_path(&self, ctx: &mut EvalCtx) -> BezPath {
         match self {
             Shape::Path(p) => p.clone(),
             Shape::Rect { size, radius } => {
-                let s = size.resolve(frame);
-                let r = radius.resolve(frame);
+                let s = size.resolve(ctx);
+                let r = radius.resolve(ctx);
                 let rect = Rect::new(-s.x / 2.0, -s.y / 2.0, s.x / 2.0, s.y / 2.0);
                 RoundedRect::from_rect(rect, r).to_path(0.1)
             }
             Shape::Ellipse { size } => {
-                let s = size.resolve(frame);
+                let s = size.resolve(ctx);
                 kurbo::Ellipse::new((0.0, 0.0), (s.x / 2.0, s.y / 2.0), 0.0).to_path(0.1)
             }
         }

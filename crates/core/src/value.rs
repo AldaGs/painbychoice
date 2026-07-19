@@ -1,9 +1,11 @@
 //! The beating heart: every animatable property is a `Value<T>` that resolves
-//! to a concrete `T` at a given time. A value is never baked — it is a recipe
-//! (a constant, or a keyframe track, and later an expression / parametric IR).
+//! to a concrete `T` at a given time. A value is never baked — it is a recipe:
+//! a constant, a keyframe track, or an expression (see [`crate::expr`]).
 //! Non-destructive and non-linear scrubbing both fall out of this for free.
 
 use serde::{Deserialize, Serialize};
+
+use crate::expr::{eval_expr, EvalCtx, Expr, FromExpr, ToExpr};
 
 /// Anything that can be interpolated between two states.
 pub trait Animatable: Clone {
@@ -379,25 +381,77 @@ impl<T: Animatable> Track<T> {
     }
 }
 
-/// A property's value source. Adding `Expr` / `Parametric` variants later is
-/// how expressions and node-graph-driven values plug in — the same lowered-IR
-/// discipline EBN uses for control flow, applied to dataflow values.
+/// A property's value source: a constant, a keyframe track, or — the `Expr`
+/// arm — an expression computed from other values. Expressions and a node graph
+/// are two front-ends that lower to the same [`Expr`] IR; this is where a
+/// resolved property picks up whatever that IR produces.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Value<T> {
     Const(T),
     Keyframed(Track<T>),
+    Expr(Expr),
 }
 
-impl<T: Animatable> Value<T> {
+impl<T: Animatable + FromExpr + ToExpr> Value<T> {
     pub fn constant(v: T) -> Self {
         Value::Const(v)
     }
 
-    /// Resolve at `frame` (fractional allowed — see [`Track::sample`]).
-    pub fn resolve(&self, frame: f64) -> T {
+    /// An expression-driven value.
+    pub fn expr(e: Expr) -> Self {
+        Value::Expr(e)
+    }
+
+    /// Whether this value is expression-driven.
+    pub fn is_expr(&self) -> bool {
+        matches!(self, Value::Expr(_))
+    }
+
+    /// The expression, if this is an `Expr` value — for an editor to render or
+    /// walk the tree.
+    pub fn expr_ref(&self) -> Option<&Expr> {
+        match self {
+            Value::Expr(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// The expression mutably, for structured editing of the tree in place.
+    pub fn expr_mut(&mut self) -> Option<&mut Expr> {
+        match self {
+            Value::Expr(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Turn a constant/keyframed value into an expression, seeded with a literal
+    /// of the value it currently resolves to — so promoting a property doesn't
+    /// visibly change it until you edit the expression. No-op if already an expr.
+    pub fn promote_to_expr(&mut self, ctx: &mut EvalCtx) {
+        if !self.is_expr() {
+            let current = self.resolve(ctx);
+            *self = Value::Expr(Expr::Lit(current.to_expr()));
+        }
+    }
+
+    /// Bake an expression down to a constant of the value it currently resolves
+    /// to (freezing this frame's result). No-op if not an expression.
+    pub fn bake_to_const(&mut self, ctx: &mut EvalCtx) {
+        if self.is_expr() {
+            let current = self.resolve(ctx);
+            *self = Value::Const(current);
+        }
+    }
+
+    /// Resolve against `ctx` (fractional frame allowed — see [`Track::sample`]).
+    /// An `Expr` evaluates through the context and is converted back to `T`;
+    /// a kind mismatch (a colour expression on a scalar property) falls back to
+    /// `T`'s neutral value rather than failing the frame.
+    pub fn resolve(&self, ctx: &mut EvalCtx) -> T {
         match self {
             Value::Const(v) => v.clone(),
-            Value::Keyframed(track) => track.sample(frame),
+            Value::Keyframed(track) => track.sample(ctx.frame),
+            Value::Expr(e) => T::from_expr(eval_expr(e, ctx)).unwrap_or_else(T::fallback),
         }
     }
 
@@ -408,6 +462,8 @@ impl<T: Animatable> Value<T> {
         match self {
             Value::Const(v) => *v = value,
             Value::Keyframed(track) => track.set_key(frame, value),
+            // An expression computes its own value; there's nothing to auto-key.
+            Value::Expr(_) => {}
         }
     }
 
@@ -427,7 +483,7 @@ impl<T: Animatable> Value<T> {
     /// without caring about the value type `T`.
     pub fn key_frames(&self) -> Vec<i64> {
         match self {
-            Value::Const(_) => Vec::new(),
+            Value::Const(_) | Value::Expr(_) => Vec::new(),
             Value::Keyframed(track) => track.frames(),
         }
     }
@@ -442,7 +498,7 @@ impl<T: Animatable> Value<T> {
     /// Rigid-block move limits for `indices`. `None` on a constant.
     pub fn move_keys_limits(&self, indices: &[usize]) -> Option<(i64, i64)> {
         match self {
-            Value::Const(_) => None,
+            Value::Const(_) | Value::Expr(_) => None,
             Value::Keyframed(track) => track.move_keys_limits(indices),
         }
     }
@@ -450,7 +506,7 @@ impl<T: Animatable> Value<T> {
     /// Move `indices` as a rigid block; returns the delta actually applied.
     pub fn move_keys(&mut self, indices: &[usize], delta: i64) -> i64 {
         match self {
-            Value::Const(_) => 0,
+            Value::Const(_) | Value::Expr(_) => 0,
             Value::Keyframed(track) => track.move_keys(indices, delta),
         }
     }
@@ -458,7 +514,7 @@ impl<T: Animatable> Value<T> {
     /// Clone the keyframes at `indices` (empty for a constant).
     pub fn keys_at(&self, indices: &[usize]) -> Vec<Keyframe<T>> {
         match self {
-            Value::Const(_) => Vec::new(),
+            Value::Const(_) | Value::Expr(_) => Vec::new(),
             Value::Keyframed(track) => track.keys_at(indices),
         }
     }
@@ -479,6 +535,8 @@ impl<T: Animatable> Value<T> {
         match self {
             Value::Const(_) => unreachable!("promoted just above"),
             Value::Keyframed(track) => track.insert_keys(keys, offset),
+            // Pasting keyframes onto an expression is meaningless — leave it be.
+            Value::Expr(_) => Vec::new(),
         }
     }
 
@@ -506,7 +564,7 @@ impl<T: Animatable> Value<T> {
     /// the next). `None` for a constant or the last key.
     pub fn segment_handles(&self, index: usize) -> Option<(Handle, Handle)> {
         match self {
-            Value::Const(_) => None,
+            Value::Const(_) | Value::Expr(_) => None,
             Value::Keyframed(track) => track.segment_handles(index),
         }
     }
@@ -558,11 +616,17 @@ fn solve_ease(u: f64, p1: Handle, p2: Handle) -> f64 {
 mod tests {
     use super::*;
 
+    /// A resolve context at `frame`. These tests only sample constants and
+    /// tracks, so a document-less context (the frame alone) is all they need.
+    fn at(frame: f64) -> EvalCtx<'static> {
+        EvalCtx::at(frame)
+    }
+
     #[test]
     fn const_resolves_anywhere() {
         let v = Value::constant(5.0);
-        assert_eq!(v.resolve(0.0), 5.0);
-        assert_eq!(v.resolve(99.0), 5.0);
+        assert_eq!(v.resolve(&mut at(0.0)), 5.0);
+        assert_eq!(v.resolve(&mut at(99.0)), 5.0);
     }
 
     #[test]
@@ -571,7 +635,7 @@ mod tests {
             Keyframe::linear(0, 0.0),
             Keyframe::linear(24, 100.0),
         ]));
-        assert!((v.resolve(12.0) - 50.0).abs() < 1e-3, "got {}", v.resolve(12.0));
+        assert!((v.resolve(&mut at(12.0)) - 50.0).abs() < 1e-3, "got {}", v.resolve(&mut at(12.0)));
     }
 
     #[test]
@@ -580,8 +644,8 @@ mod tests {
             Keyframe::linear(24, 10.0),
             Keyframe::linear(48, 20.0),
         ]));
-        assert_eq!(v.resolve(0.0), 10.0);
-        assert_eq!(v.resolve(120.0), 20.0);
+        assert_eq!(v.resolve(&mut at(0.0)), 10.0);
+        assert_eq!(v.resolve(&mut at(120.0)), 20.0);
     }
 
     #[test]
@@ -591,7 +655,7 @@ mod tests {
             Keyframe::linear(0, 0.0),
             Keyframe::linear(10, 100.0),
         ]));
-        assert!((v.resolve(2.5) - 25.0).abs() < 1e-9, "got {}", v.resolve(2.5));
+        assert!((v.resolve(&mut at(2.5)) - 25.0).abs() < 1e-9, "got {}", v.resolve(&mut at(2.5)));
     }
 
     #[test]
@@ -601,16 +665,16 @@ mod tests {
             Keyframe::smooth(0, 0.0),
             Keyframe::smooth(24, 100.0),
         ]));
-        assert!((v.resolve(12.0) - 50.0).abs() < 1.0, "got {}", v.resolve(12.0));
+        assert!((v.resolve(&mut at(12.0)) - 50.0).abs() < 1.0, "got {}", v.resolve(&mut at(12.0)));
         // ...but eased slower at the start than linear would be.
-        assert!(v.resolve(6.0) < 25.0, "ease-in should lag: {}", v.resolve(6.0));
+        assert!(v.resolve(&mut at(6.0)) < 25.0, "ease-in should lag: {}", v.resolve(&mut at(6.0)));
     }
 
     #[test]
     fn set_at_overwrites_a_constant() {
         let mut v = Value::constant(3.0);
         v.set_at(24, 9.0);
-        assert_eq!(v.resolve(0.0), 9.0);
+        assert_eq!(v.resolve(&mut at(0.0)), 9.0);
         assert!(!v.is_animated());
     }
 
@@ -622,10 +686,10 @@ mod tests {
         ]));
         // Edit exactly on the first key: replaces its value, no new key.
         v.set_at(0, 50.0);
-        assert_eq!(v.resolve(0.0), 50.0);
+        assert_eq!(v.resolve(&mut at(0.0)), 50.0);
         // Edit between keys: inserts a new key on that frame.
         v.set_at(12, 75.0);
-        assert!((v.resolve(12.0) - 75.0).abs() < 1e-6);
+        assert!((v.resolve(&mut at(12.0)) - 75.0).abs() < 1e-6);
         if let Value::Keyframed(track) = &v {
             assert_eq!(track.keys().len(), 3, "a key should have been inserted");
         } else {
@@ -640,7 +704,7 @@ mod tests {
         v.insert_key(24);
         assert!(v.is_animated(), "constant should become a track");
         assert_eq!(v.key_frames(), vec![24]);
-        assert_eq!(v.resolve(24.0), 7.0, "the held value carries over");
+        assert_eq!(v.resolve(&mut at(24.0)), 7.0, "the held value carries over");
         // A second insert on a new frame adds a key holding the resolved value.
         v.insert_key(72);
         assert_eq!(v.key_frames().len(), 2);
@@ -674,7 +738,7 @@ mod tests {
         assert!(f[1] < f[2], "middle key must stay before the last");
         assert!(f[1] > f[0], "and after the first");
         // Order preserved, so sampling still works.
-        assert!(v.resolve(12.0).is_finite());
+        assert!(v.resolve(&mut at(12.0)).is_finite());
     }
 
     #[test]
@@ -811,7 +875,7 @@ mod tests {
         v.insert_keys(&clip, 30);
         assert!(v.is_animated());
         assert_eq!(v.key_frames(), vec![0, 30, 40], "seed key at 0 keeps it samplable");
-        assert_eq!(v.resolve(0.0), 7.0, "the old constant is the value before the paste");
+        assert_eq!(v.resolve(&mut at(0.0)), 7.0, "the old constant is the value before the paste");
     }
 
     #[test]
@@ -821,7 +885,7 @@ mod tests {
             Keyframe::linear(0, Vec2::new(0.0, 0.0)),
             Keyframe::linear(24, Vec2::new(10.0, 20.0)),
         ]));
-        let p = v.resolve(12.0);
+        let p = v.resolve(&mut at(12.0));
         assert!((p.x - 5.0).abs() < 1e-3 && (p.y - 10.0).abs() < 1e-3);
     }
 
