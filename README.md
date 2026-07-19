@@ -458,6 +458,30 @@ IR 🚧 → …**. Next up:
      with a seed so x and y are independent streams. Confirmed working in a live
      session.
 
+   - ~~**Exposed parameters** (the first half of `Value::Parametric`).~~ ✅ Done.
+     A node carries named, animatable knobs (`Param` / `ParamValue`) that
+     expressions read via an `Expr::Param` node and scripts via `param("x")` /
+     `param_of("node", "x")` — one control driving many properties, and (once
+     comps can nest) what a pre-comp will expose to its parent. Resolved
+     through the same memoized, cycle-guarded path as a property reference, so
+     a self-driving parameter warns instead of hanging. **A node-relative
+     `param()` needs to know whose property is resolving**: `EvalCtx::in_node`
+     marks that, and anything resolving a node's properties outside `evaluate`
+     (the properties readout, the script preview) must go through it or it will
+     show a fallback where the canvas shows the real value.
+   - **Procedural generators** (the other half) — 🚧 next. Typed knobs
+     (oscillator, noise, ramp, bounce) instead of free-text Rhai for the common
+     cases. Deliberately after parameters, since a generator's knobs are much
+     more useful once they can themselves be parameters or expressions.
+
+**Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps
+→ document-wide property graph → Blender-standard graph UI → the Nuke-style
+*image* graph. Pre-comps come before the big graph because a comp *is* a graph
+node, so building the graph first means rebuilding it; the image graph is last
+because it needs the raster compositor stage below, which isn't built. Note the
+distinction: today's graph is a **property** graph (values into properties);
+Nuke's is an **image** graph (operations on pixels). They're different machines.
+
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
 > **Design decisions** section below — read it before starting any of them.
