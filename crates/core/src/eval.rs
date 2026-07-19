@@ -47,6 +47,9 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
 }
 
 fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, scene: &mut Scene) {
+    // Everything resolved below belongs to this node, so a warning raised deep
+    // in an expression (a bad script, an ambiguous name) is tagged with it.
+    let prev_node = ctx.enter_node(node.id);
     let (local_xf, local_opacity) = node.transform.resolve(ctx);
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
@@ -76,6 +79,10 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, 
             });
         }
     }
+
+    // Children are walked *inside* this node's mark only in the sense that each
+    // re-marks itself; restore ours first so a sibling can't inherit it.
+    ctx.exit_node(prev_node);
 
     for child in &node.children {
         walk(child, xf, opacity, ctx, scene);
@@ -161,6 +168,67 @@ mod tests {
         let item = scene.items.iter().find(|i| i.source == NodeId(2)).unwrap();
         assert!((item.opacity - 0.4).abs() < 1e-9, "opacity = {}", item.opacity);
         assert!(scene.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_broken_script_warns_against_the_node_that_owns_it() {
+        use crate::expr::Expr;
+        // A script that can't compile: the frame still renders (the property
+        // falls back to a neutral value) but the scene says which node broke.
+        let square = Node::shape(
+            7,
+            "square",
+            Shape::Rect {
+                size: Value::constant(Vec2::new(10.0, 10.0)),
+                radius: Value::constant(0.0),
+            },
+        )
+        .with_transform(Transform {
+            opacity: Value::expr(Expr::Script("this is not rhai".into())),
+            ..Transform::default()
+        });
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square));
+        let scene = evaluate(&doc, 0.0);
+        assert_eq!(scene.items.len(), 1, "the frame still renders");
+        let (node, msg) = scene.warnings.first().expect("a warning reached the scene");
+        assert_eq!(*node, NodeId(7), "attributed to the node with the script");
+        assert!(msg.contains("script"), "{msg}");
+    }
+
+    #[test]
+    fn an_ambiguous_name_warns_rather_than_silently_picking() {
+        use crate::expr::Expr;
+        // Two nodes named "dup": a script referencing that name has to pick
+        // one, but the choice depends on tree order, so it says so.
+        let dup = |id: u64| {
+            Node::group(id, "dup")
+                .with_transform(Transform { opacity: Value::constant(0.5), ..Transform::default() })
+        };
+        let reader = Node::shape(
+            9,
+            "reader",
+            Shape::Rect {
+                size: Value::constant(Vec2::new(10.0, 10.0)),
+                radius: Value::constant(0.0),
+            },
+        )
+        .with_transform(Transform {
+            opacity: Value::expr(Expr::Script("value(\"dup\", \"opacity\")".into())),
+            ..Transform::default()
+        });
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(dup(1)).with_child(dup(2)).with_child(reader),
+        );
+        let scene = evaluate(&doc, 0.0);
+        let msg = scene
+            .warnings
+            .iter()
+            .find(|(_, m)| m.contains("named 'dup'"))
+            .map(|(_, m)| m.clone())
+            .expect("the ambiguity should reach the scene");
+        assert!(msg.contains('2'), "says how many: {msg}");
     }
 
     #[test]

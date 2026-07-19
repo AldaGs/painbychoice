@@ -636,11 +636,27 @@ fn comp_ui(
     presets: &[String],
     name_buf: &mut String,
     layout: &mut LayoutEdits,
+    warnings: &[(u64, String)],
 ) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.strong("Composition");
+        // A broken script or an ambiguous name resolves to a neutral value, so
+        // the frame looks deliberate. Say so here rather than only on stderr.
+        if !warnings.is_empty() {
+            let summary = warnings
+                .iter()
+                .map(|(id, msg)| format!("node {id}: {msg}"))
+                .collect::<Vec<_>>()
+                .join("
+");
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 60),
+                format!("! {}", warnings.len()),
+            )
+            .on_hover_text(summary);
+        }
         ui.separator();
 
         ui.label("Size");
@@ -2660,6 +2676,9 @@ struct App {
     cursor: (f64, f64),
     pending_pick: Option<(f64, f64)>,
     selected: Option<NodeId>,
+    /// The last frame's evaluation warnings (node id + message), kept so the
+    /// comp bar can show them and stderr only prints when the set changes.
+    warnings: Vec<(u64, String)>,
     /// The keyframes selected in the dopesheet. Empty = nothing selected.
     selected_keys: KeySelection,
     /// Copied keyframes, pasteable onto any node's matching properties.
@@ -2693,6 +2712,7 @@ impl App {
             context: RenderContext::new(),
             renderers: Vec::new(),
             state: RenderState::Suspended(None),
+            warnings: Vec::new(),
             vscene: VScene::new(),
             doc,
             egui_ctx: egui::Context::default(),
@@ -3356,9 +3376,19 @@ impl App {
         let t = frame as f64;
         let last_frame = self.doc.duration_frames().max(1);
         let scene = evaluate(&self.doc, t);
-        for (id, msg) in &scene.warnings {
-            eprintln!("warning [node {}]: {msg}", id.0);
+        // Warnings are re-derived every frame, so print only when the set
+        // actually changes — a broken script would otherwise spam stderr at the
+        // refresh rate. The current set is kept for the comp bar's indicator.
+        let warnings: Vec<(u64, String)> =
+            scene.warnings.iter().map(|(id, m)| (id.0, m.clone())).collect();
+        if warnings != self.warnings {
+            for (id, msg) in &warnings {
+                eprintln!("warning [node {id}]: {msg}");
+            }
         }
+        self.warnings = warnings;
+        // Cloned for the UI closure, which must not borrow `self`.
+        let warnings = self.warnings.clone();
 
         let size = window.inner_size();
         // egui works in points; the canvas fit works in physical pixels.
@@ -3467,6 +3497,7 @@ impl App {
                         &preset_names,
                         &mut preset_name_buf,
                         &mut layout,
+                        &warnings,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Transport => {

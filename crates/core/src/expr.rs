@@ -628,19 +628,35 @@ pub struct EvalCtx<'a> {
     doc: Option<&'a Document>,
     cache: ResolveCache,
     warnings: Vec<(NodeId, String)>,
+    /// Whose property is being resolved right now, so a warning raised deep in
+    /// a tree-walk (a bad script, an ambiguous name) can be attributed to the
+    /// node that owns it. `None` outside a walk.
+    current: Option<NodeId>,
 }
 
 impl<'a> EvalCtx<'a> {
     /// A context over `doc` at `frame` — the one `evaluate` uses.
     pub fn new(doc: &'a Document, frame: f64) -> Self {
-        Self { frame, doc: Some(doc), cache: ResolveCache::default(), warnings: Vec::new() }
+        Self {
+            frame,
+            doc: Some(doc),
+            cache: ResolveCache::default(),
+            warnings: Vec::new(),
+            current: None,
+        }
     }
 
     /// A document-less context at `frame`, for resolving values that don't
     /// reference the scene (constants and keyframe tracks). Expression
     /// references fall back to a neutral value.
     pub fn at(frame: f64) -> Self {
-        Self { frame, doc: None, cache: ResolveCache::default(), warnings: Vec::new() }
+        Self {
+            frame,
+            doc: None,
+            cache: ResolveCache::default(),
+            warnings: Vec::new(),
+            current: None,
+        }
     }
 
     /// Take the warnings gathered while resolving (cycles, dangling refs), so
@@ -652,8 +668,42 @@ impl<'a> EvalCtx<'a> {
     /// Find a node by name, for the script-facing `value("A", …)`. Names aren't
     /// unique in the model, so this takes the first match in tree order — the
     /// same rule the layers panel shows top-down.
-    fn find_named(&self, name: &str) -> Option<NodeId> {
-        self.doc?.root.find_named(name).map(|n| n.id)
+    fn find_named(&mut self, name: &str) -> Option<NodeId> {
+        let doc = self.doc?;
+        let mut matches = Vec::new();
+        collect_named(&doc.root, name, &mut matches);
+        match matches.as_slice() {
+            [] => None,
+            [only] => Some(*only),
+            [first, ..] => {
+                // Silently picking one of several would make a script's meaning
+                // depend on tree order — surface it instead.
+                self.warn_here(format!(
+                    "{} nodes are named '{name}'; a script reference takes the first",
+                    matches.len()
+                ));
+                Some(*first)
+            }
+        }
+    }
+
+    /// Mark `node` as the one being resolved, returning the previous mark to
+    /// hand back to [`EvalCtx::exit_node`]. The walk brackets each node with
+    /// this so warnings land on the right layer.
+    pub fn enter_node(&mut self, node: NodeId) -> Option<NodeId> {
+        self.current.replace(node)
+    }
+
+    /// Restore the mark [`EvalCtx::enter_node`] returned.
+    pub fn exit_node(&mut self, prev: Option<NodeId>) {
+        self.current = prev;
+    }
+
+    /// Warn against whichever node is being resolved. Falls back to the root
+    /// (id 0) outside a walk — a warning with no home is still worth surfacing.
+    fn warn_here(&mut self, msg: impl Into<String>) {
+        let node = self.current.unwrap_or(NodeId(0));
+        self.warn(node, msg);
     }
 
     fn warn(&mut self, node: NodeId, msg: impl Into<String>) {
@@ -684,7 +734,10 @@ impl<'a> EvalCtx<'a> {
         self.cache.visiting.insert(key);
         let saved = self.frame;
         self.frame = frame;
+        // Warnings raised while resolving the *target* belong to the target.
+        let prev = self.enter_node(node);
         let value = self.resolve_on(target, prop);
+        self.exit_node(prev);
         self.frame = saved;
         self.cache.visiting.remove(&key);
         self.cache.memo.insert(key, value);
@@ -730,6 +783,17 @@ impl<'a> EvalCtx<'a> {
     }
 }
 
+/// Every node named `name`, in tree order. Names aren't unique in the model, so
+/// a lookup has to know whether it's ambiguous rather than just taking one.
+fn collect_named(node: &crate::node::Node, name: &str, out: &mut Vec<NodeId>) {
+    if node.name == name {
+        out.push(node.id);
+    }
+    for c in &node.children {
+        collect_named(c, name, out);
+    }
+}
+
 /// Evaluate an expression against `ctx` into a dynamic [`ExprValue`]. The
 /// property's `resolve` converts the result back to its concrete `T`.
 pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
@@ -749,8 +813,18 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
         }
         Expr::Neg(a) => eval_expr(a, ctx).map(|x| -x),
         // A bad script (compile/run/type error) falls back to a neutral value
-        // rather than breaking the frame; the editor shows the error.
-        Expr::Script(src) => eval_script_ctx(src, ctx).unwrap_or(ExprValue::Num(0.0)),
+        // rather than breaking the frame. The error also becomes a scene
+        // warning, so a broken script is visible without opening the graph
+        // panel — the fallback is a real value and would otherwise look
+        // deliberate.
+        Expr::Script(src) => match eval_script_ctx(src, ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.lines().next().unwrap_or("error").to_string();
+                ctx.warn_here(format!("script: {msg}"));
+                ExprValue::Num(0.0)
+            }
+        },
     }
 }
 
