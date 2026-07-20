@@ -480,7 +480,7 @@ pub(crate) fn node_view_ui(ui: &mut egui::Ui, info: &GraphInfo, node: &NodeView,
                         if !info.modules.is_empty() {
                             egui::ComboBox::from_id_salt(("link", prop.kind.label()))
                                 .width(70.0)
-                                .selected_text("link")
+                                .selected_text(icon::text(icon::LINK))
                                 .show_ui(ui, |ui| {
                                     for m in &info.modules {
                                         if ui.selectable_label(false, &m.name).clicked() {
@@ -911,12 +911,16 @@ pub(crate) fn params_ui(
             egui::TextEdit::singleline(&mut buf).hint_text("new name").desired_width(90.0),
         );
         for (label, kind) in
-            [("+num", ParamKind::Num), ("+vec", ParamKind::Vec), ("+col", ParamKind::Color)]
+            [("num", ParamKind::Num), ("vec", ParamKind::Vec), ("col", ParamKind::Color)]
         {
             let taken = names.contains(&buf);
             let ok = !buf.trim().is_empty() && !taken;
+            // The plus lives on the glyph, so the label is just the type.
             if ui
-                .add_enabled(ok, egui::Button::new(label).small())
+                .add_enabled(
+                    ok,
+                    egui::Button::new(format!("{} {label}", icon::ADD)).small(),
+                )
                 .on_disabled_hover_text(if taken {
                     "that name is taken"
                 } else {

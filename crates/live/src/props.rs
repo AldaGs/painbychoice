@@ -142,20 +142,23 @@ pub(crate) type KeySelectionKinds = std::collections::BTreeSet<PropKind>;
 /// drawn from a glyph, since the circle/diamond glyphs are missing from egui's
 /// default font and render as tofu boxes.
 pub(crate) fn key_button(ui: &mut egui::Ui, animated: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-    let c = rect.center();
-    let painter = ui.painter();
-    if animated {
-        painter.circle_filled(c, 4.0, egui::Color32::from_rgb(255, 216, 51));
+    // This used to be two painted circles (filled = animated, hollow = not),
+    // because egui's font had no keyframe glyph. It has one now, so the state
+    // rides on colour instead: accent when the property is already a track,
+    // dim when clicking would *start* animating it.
+    let colour = if animated {
+        egui::Color32::from_rgb(255, 216, 51)
     } else {
-        let col = if resp.hovered() {
-            egui::Color32::from_gray(200)
-        } else {
-            egui::Color32::from_gray(120)
-        };
-        painter.circle_stroke(c, 4.0, egui::Stroke::new(1.5, col));
-    }
-    resp.on_hover_text("Insert a keyframe at the playhead").clicked()
+        egui::Color32::from_gray(120)
+    };
+    let tip = if animated {
+        "Insert a keyframe at the playhead"
+    } else {
+        "Start animating: insert the first keyframe at the playhead"
+    };
+    ui.add(egui::Button::new(icon::text(icon::KEYFRAME).color(colour)).frame(false))
+        .on_hover_text(tip)
+        .clicked()
 }
 
 /// The two normalized cubic-bezier control points of the selected keyframe's

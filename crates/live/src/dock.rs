@@ -469,17 +469,17 @@ pub(crate) fn area_header(ui: &mut egui::Ui, editor: Editor, path: &[Branch], cm
         // Split/close sit at the right edge. Plain ASCII glyphs on purpose — the
         // egui default font tofus most box-drawing characters (see README).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("x").on_hover_text("Close this area").clicked() {
+            if icon::button(ui, icon::CLOSE, "Close this area").clicked() {
                 *cmd = Some(DockCmd::Close { path: path.to_vec() });
             }
-            if ui.small_button("-").on_hover_text("Split top / bottom").clicked() {
+            if icon::button(ui, icon::SPLIT_H, "Split top / bottom").clicked() {
                 *cmd = Some(DockCmd::Split {
                     path: path.to_vec(),
                     side: DockSide::Top,
                     size: area.height() * 0.5,
                 });
             }
-            if ui.small_button("|").on_hover_text("Split left / right").clicked() {
+            if icon::button(ui, icon::SPLIT_V, "Split left / right").clicked() {
                 *cmd = Some(DockCmd::Split {
                     path: path.to_vec(),
                     side: DockSide::Left,
