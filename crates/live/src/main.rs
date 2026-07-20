@@ -22,6 +22,7 @@ use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
     demo::demo_document, evaluate, node::ParamValue, Color as MColor, Document, EvalCtx, Expr,
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
+    node::LayerTiming,
     Scene as MScene, Shape as MShape, Transform, Value, Waveform,
 };
 use serde::{Deserialize, Serialize};
@@ -1510,6 +1511,44 @@ struct DopeEdits {
     box_select: Option<KeySelection>,
     /// Zoom / pan produced a new visible window.
     set_view: Option<TimelineView>,
+    /// The selected layer's time range was edited (trim / slide / slip), or
+    /// cleared back to `None` — "live for the whole comp".
+    set_timing: Option<Option<LayerTiming>>,
+}
+
+/// What the clip bar needs to draw the selected layer's time range.
+#[derive(Clone, Copy)]
+struct ClipInfo {
+    /// `None` = the layer has no time range yet (live for the whole comp).
+    timing: Option<LayerTiming>,
+}
+
+/// Which part of a clip bar a drag grabbed. Decided once, at drag start, from
+/// where the press landed — so a slide can't turn into a trim mid-drag when the
+/// pointer crosses back over an edge handle.
+#[derive(Clone, Copy, PartialEq)]
+enum ClipGrab {
+    /// The left edge: moves `in_` only (the content stays where it is).
+    TrimIn,
+    /// The right edge: moves `out` only.
+    TrimOut,
+    /// The body: moves all three together, so the clip plays the same content
+    /// at a different comp time.
+    Slide,
+}
+
+/// Apply a drag of `delta` frames to `t`, given what the drag grabbed. Trims
+/// clamp against each other (a clip can't be shorter than one frame) and `in_`
+/// clamps at 0; sliding can't push the clip before frame 0 either.
+fn drag_clip(t: LayerTiming, grab: ClipGrab, delta: i64) -> LayerTiming {
+    match grab {
+        ClipGrab::TrimIn => LayerTiming { in_: (t.in_ + delta).clamp(0, t.out - 1), ..t },
+        ClipGrab::TrimOut => LayerTiming { out: (t.out + delta).max(t.in_ + 1), ..t },
+        ClipGrab::Slide => {
+            let d = delta.max(-t.in_);
+            LayerTiming { start: t.start + d, in_: t.in_ + d, out: t.out + d }
+        }
+    }
 }
 
 /// The visible frame window of the timeline. Zoom and pan only ever change
@@ -1629,6 +1668,7 @@ fn dopesheet_ui(
     tb: motion_core::Timebase,
     view: TimelineView,
     selected_keys: &KeySelection,
+    clip: Option<ClipInfo>,
     out: &mut DopeEdits,
 ) {
     ui.add_space(4.0);
@@ -1731,6 +1771,116 @@ fn dopesheet_ui(
     });
 
     let axis = axis.expect("ruler always allocates the axis");
+
+    // --- Clip bar: the selected layer's time range, drawn on the same axis as
+    // the keyframe rows. Drag an edge to trim, the body to slide. ---
+    if let Some(clip) = clip {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(LABEL_W, ROW_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| match clip.timing {
+                    // No range yet: one click gives the layer one covering the
+                    // whole comp, which is exactly what it does today — so
+                    // enabling trimming never moves anything on screen.
+                    None => {
+                        if ui.small_button("Trim…").clicked() {
+                            out.set_timing = Some(Some(LayerTiming::new(0, last_frame + 1)));
+                        }
+                    }
+                    Some(_) => {
+                        if ui.small_button("Clip ×").on_hover_text("Back to full comp").clicked() {
+                            out.set_timing = Some(None);
+                        }
+                    }
+                },
+            );
+
+            let (track, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width() - 8.0, ROW_H),
+                egui::Sense::click_and_drag(),
+            );
+            let painter = ui.painter_at(track);
+            painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
+
+            let Some(timing) = clip.timing else {
+                painter.text(
+                    egui::pos2(track.left() + 6.0, track.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "live for the whole comp",
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_gray(110),
+                );
+                return;
+            };
+
+            // The bar. Clamped to the track so a clip scrolled off-screen
+            // still paints a sliver at the edge instead of drawing outside.
+            let (x0, x1) = (axis.frame_to_x(timing.in_ as f64), axis.frame_to_x(timing.out as f64));
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x0.max(track.left()), track.top() + 3.0),
+                egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
+            );
+            if bar.width() > 0.0 {
+                painter.rect_filled(bar, 3.0, egui::Color32::from_rgb(58, 84, 120));
+                painter.rect_stroke(
+                    bar,
+                    3.0,
+                    egui::Stroke::new(1.0, accent),
+                    egui::StrokeKind::Inside,
+                );
+                // Where local frame 0 sits: the slip marker. Only meaningful
+                // when it's inside the visible window of the clip.
+                let sx = axis.frame_to_x(timing.start as f64);
+                if sx > bar.left() && sx < bar.right() {
+                    painter.line_segment(
+                        [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                    );
+                }
+            }
+
+            // Playhead over the bar, so the clip reads against the current time.
+            let px = axis.frame_to_x(frame);
+            painter.line_segment(
+                [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+                egui::Stroke::new(1.5, playhead_col),
+            );
+
+            // Drag. The grab mode and the timing the drag started from are both
+            // latched at press: applying the *total* delta to the original (not
+            // an incremental delta to the current) is what makes a drag that
+            // clamps at 0 spring back when you drag away again.
+            const HANDLE_W: f32 = 6.0;
+            let drag_id = ui.id().with("clip_drag");
+            if resp.drag_started() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let grab = if (p.x - x0).abs() <= HANDLE_W {
+                        ClipGrab::TrimIn
+                    } else if (p.x - x1).abs() <= HANDLE_W {
+                        ClipGrab::TrimOut
+                    } else {
+                        ClipGrab::Slide
+                    };
+                    let anchor = axis.x_to_frame(p.x);
+                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
+                }
+            }
+            if resp.dragged() {
+                let latched: Option<(ClipGrab, i64, LayerTiming)> =
+                    ui.ctx().data(|d| d.get_temp(drag_id));
+                if let (Some((grab, anchor, orig)), Some(p)) = (latched, resp.interact_pointer_pos())
+                {
+                    let next = drag_clip(orig, grab, axis.x_to_frame(p.x) - anchor);
+                    if next != timing {
+                        out.set_timing = Some(Some(next));
+                    }
+                }
+                dragging = true;
+            }
+        });
+    }
 
     // --- Zoom / pan. Scroll anywhere over the panel; zoom keeps the
     // frame under the cursor pinned, which is what makes it feel like
@@ -3646,6 +3796,10 @@ impl App {
         // scene (a doc-less context would show its fallback instead).
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, &self.doc, t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
+        // The clip bar only exists for a selected layer (the root isn't one).
+        let clip = sel_node
+            .filter(|n| Some(n.id) != Some(self.doc.root.id))
+            .map(|n| ClipInfo { timing: n.timing });
         // Snapshot for the graph panel (clones the selected node's expressions).
         let graph_info = GraphInfo::gather(&self.doc, self.selected, t);
 
@@ -3733,6 +3887,7 @@ impl App {
                         timebase,
                         view,
                         &selected_keys,
+                        clip,
                         &mut dope,
                     ),
                     Editor::Properties => {
@@ -3811,6 +3966,14 @@ impl App {
             if Some(id) != self.selected {
                 self.selected = Some(id);
                 self.selected_keys.clear();
+            }
+        }
+
+        // Clip bar: trim / slide / clear the selected layer's time range.
+        if let Some(timing) = dope.set_timing {
+            if let Some(node) = self.selected.and_then(|id| self.doc.root.find_mut(id)) {
+                node.timing = timing;
+                window.request_redraw();
             }
         }
 
@@ -4050,6 +4213,39 @@ mod tests {
         let x2 = a.frame_to_x(2.0);
         assert_eq!(a.x_to_frame(x2 + 13.0), 2);
         assert_eq!(a.x_to_frame(x2 + 27.0), 3);
+    }
+
+    /// Trimming an edge moves only that edge: the content keeps its place in
+    /// time, which is the whole difference between a trim and a slide.
+    #[test]
+    fn trimming_moves_one_edge_and_leaves_the_content_put() {
+        let t = LayerTiming { start: 10, in_: 10, out: 30 };
+        let a = drag_clip(t, ClipGrab::TrimIn, 5);
+        assert_eq!((a.start, a.in_, a.out), (10, 15, 30));
+        let b = drag_clip(t, ClipGrab::TrimOut, -5);
+        assert_eq!((b.start, b.in_, b.out), (10, 10, 25));
+    }
+
+    #[test]
+    fn sliding_moves_the_whole_clip_so_it_plays_the_same_content_later() {
+        let t = LayerTiming { start: 10, in_: 12, out: 30 };
+        let slid = drag_clip(t, ClipGrab::Slide, 7);
+        assert_eq!((slid.start, slid.in_, slid.out), (17, 19, 37));
+        // The offset between in and start (the slip) survives the move, so the
+        // clip shows the same local frames it did before.
+        assert_eq!(slid.local_frame(slid.in_ as f64), t.local_frame(t.in_ as f64));
+    }
+
+    /// The clamps: a clip can't invert, can't shrink past one frame, and can't
+    /// be dragged off the front of the comp.
+    #[test]
+    fn clip_drags_clamp_instead_of_inverting() {
+        let t = LayerTiming { start: 0, in_: 4, out: 8 };
+        assert_eq!(drag_clip(t, ClipGrab::TrimIn, 999).in_, 7, "stops one short of out");
+        assert_eq!(drag_clip(t, ClipGrab::TrimOut, -999).out, 5, "stops one past in");
+        assert_eq!(drag_clip(t, ClipGrab::TrimIn, -999).in_, 0, "in never goes negative");
+        let pushed = drag_clip(t, ClipGrab::Slide, -999);
+        assert_eq!((pushed.start, pushed.in_, pushed.out), (-4, 0, 4), "slide stops at frame 0");
     }
 
     #[test]

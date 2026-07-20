@@ -159,6 +159,57 @@ impl ParamValue {
     }
 }
 
+/// A layer's own time range, in **composition frames**.
+///
+/// Absent (`None`) means today's behaviour: the layer is live for the whole
+/// comp and its local time *is* comp time. Present, it does two separable
+/// things:
+///
+/// - **Trim** — the layer only draws while `comp_frame` is inside `[in_, out)`.
+///   Half-open so two clips that meet at frame N don't both draw on N.
+/// - **Slip** — `start` is the comp frame at which the layer's *local* frame 0
+///   lands, so `local = comp_frame − start`. Keyframes and expressions inside
+///   the layer are authored against that local frame, which is what lets one
+///   animation be reused at a different in-point without moving any keys.
+///
+/// `start` is independent of `in_` on purpose: dragging the whole clip moves
+/// all three together, but trimming an edge moves `in_`/`out` alone (the
+/// content stays put) and slipping moves `start` alone (the window stays put).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerTiming {
+    /// Comp frame where the layer's local frame 0 sits.
+    pub start: i64,
+    /// First comp frame the layer draws on.
+    pub in_: i64,
+    /// First comp frame it no longer draws on (exclusive).
+    pub out: i64,
+}
+
+impl LayerTiming {
+    /// A clip occupying `[in_, out)` with its local time starting at `in_` —
+    /// what a freshly-trimmed layer gets.
+    pub fn new(in_: i64, out: i64) -> Self {
+        Self { start: in_, in_, out }
+    }
+
+    /// This layer's local frame for a given comp frame. Fractional in, so a
+    /// playhead between frames stays between frames.
+    pub fn local_frame(&self, comp_frame: f64) -> f64 {
+        comp_frame - self.start as f64
+    }
+
+    /// Whether the layer draws at `comp_frame`. Half-open: `out` is the first
+    /// frame that no longer draws.
+    pub fn is_live(&self, comp_frame: f64) -> bool {
+        comp_frame >= self.in_ as f64 && comp_frame < self.out as f64
+    }
+
+    /// Length of the visible window in frames (never negative).
+    pub fn len(&self) -> i64 {
+        (self.out - self.in_).max(0)
+    }
+}
+
 /// One node in the scene graph. A group (no shape) just composes its children;
 /// a leaf carries a shape + paint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,6 +224,11 @@ pub struct Node {
     /// written before parameters existed still loads.
     #[serde(default)]
     pub params: Vec<Param>,
+    /// Per-layer time range. `None` = live for the whole comp, local time =
+    /// comp time (every layer before this field existed), so `#[serde(default)]`
+    /// is the whole migration: an old `.pbc` loads unchanged.
+    #[serde(default)]
+    pub timing: Option<LayerTiming>,
     pub children: Vec<Node>,
 }
 
@@ -186,6 +242,7 @@ impl Node {
             fill: None,
             stroke: None,
             params: Vec::new(),
+            timing: None,
             children: Vec::new(),
         }
     }
@@ -199,6 +256,7 @@ impl Node {
             fill: None,
             stroke: None,
             params: Vec::new(),
+            timing: None,
             children: Vec::new(),
         }
     }
@@ -244,6 +302,12 @@ impl Node {
     /// the whole [`Stroke`].
     pub fn with_stroke(mut self, stroke: Stroke) -> Self {
         self.stroke = Some(stroke);
+        self
+    }
+
+    /// Give this layer a time range (trim + slip). See [`LayerTiming`].
+    pub fn with_timing(mut self, timing: LayerTiming) -> Self {
+        self.timing = Some(timing);
         self
     }
 

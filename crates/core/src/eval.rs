@@ -47,6 +47,23 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
 }
 
 fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, scene: &mut Scene) {
+    // A trimmed layer outside its window contributes nothing — and neither do
+    // its children, which live in its time. Checked before anything resolves,
+    // so a hidden layer costs nothing.
+    if let Some(timing) = &node.timing {
+        if !timing.is_live(ctx.comp_frame) {
+            return;
+        }
+    }
+
+    // Inside its window, the layer resolves at its *local* frame. Saved and
+    // restored around the whole subtree (the same mechanism `resolve_target`
+    // uses for off-time sampling) so a sibling can't inherit the shift.
+    let prev_frame = ctx.frame;
+    if let Some(timing) = &node.timing {
+        ctx.frame = timing.local_frame(ctx.comp_frame);
+    }
+
     // Everything resolved below belongs to this node, so a warning raised deep
     // in an expression (a bad script, an ambiguous name) is tagged with it.
     let prev_node = ctx.enter_node(node.id);
@@ -87,6 +104,8 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, 
     for child in &node.children {
         walk(child, xf, opacity, ctx, scene);
     }
+
+    ctx.frame = prev_frame;
 }
 
 #[cfg(test)]
@@ -249,6 +268,152 @@ mod tests {
 
         let scene = evaluate(&doc, 0.0);
         assert!(!scene.warnings.is_empty(), "the cycle should reach the scene");
+    }
+
+    /// A layer with a time range draws only inside `[in, out)`, and `out` is
+    /// exclusive so two abutting clips never both draw on the seam frame.
+    #[test]
+    fn a_trimmed_layer_only_draws_inside_its_window() {
+        use crate::node::LayerTiming;
+        let square = Node::shape(
+            1,
+            "square",
+            Shape::Rect { size: Value::constant(Vec2::new(10.0, 10.0)), radius: Value::constant(0.0) },
+        )
+        .with_timing(LayerTiming::new(10, 20));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square));
+
+        let drawn = |f: f64| !evaluate(&doc, f).items.is_empty();
+        assert!(!drawn(9.0), "before in");
+        assert!(drawn(10.0), "on in");
+        assert!(drawn(19.5), "inside, between frames");
+        assert!(!drawn(20.0), "out is exclusive");
+    }
+
+    /// The payoff of local time: two layers share the *same* keyframes and play
+    /// them at different comp times, purely from their `start`.
+    #[test]
+    fn keyframes_are_sampled_in_layer_local_time() {
+        use crate::node::LayerTiming;
+        let clip = |id: u64, at: i64| {
+            Node::shape(
+                id,
+                "clip",
+                Shape::Rect {
+                    size: Value::constant(Vec2::new(10.0, 10.0)),
+                    radius: Value::constant(0.0),
+                },
+            )
+            .with_timing(LayerTiming::new(at, at + 24))
+            .with_transform(Transform {
+                position: Value::Keyframed(Track::new(vec![
+                    Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+                    Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                ])),
+                ..Transform::default()
+            })
+        };
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(clip(1, 0)).with_child(clip(2, 100)),
+        );
+
+        // 12 frames into each clip, both sit at the same *local* midpoint.
+        let x_of = |scene: &Scene, id: u64| {
+            scene.items.iter().find(|i| i.source == NodeId(id)).unwrap().transform.as_coeffs()[4]
+        };
+        let early = evaluate(&doc, 12.0);
+        let late = evaluate(&doc, 112.0);
+        assert_eq!(early.items.len(), 1, "only the first clip is live at 12");
+        assert!((x_of(&early, 1) - 120.0).abs() < 1e-6);
+        assert!((x_of(&late, 2) - 120.0).abs() < 1e-6, "same animation, retimed");
+    }
+
+    /// Slipping moves the content under a fixed window: same `[in, out)`, later
+    /// `start`, so the layer shows an earlier part of its animation.
+    #[test]
+    fn slipping_shifts_content_without_moving_the_window() {
+        use crate::node::LayerTiming;
+        let square = |start: i64| {
+            Node::shape(
+                1,
+                "square",
+                Shape::Rect {
+                    size: Value::constant(Vec2::new(10.0, 10.0)),
+                    radius: Value::constant(0.0),
+                },
+            )
+            .with_timing(LayerTiming { start, in_: 0, out: 24 })
+            .with_transform(Transform {
+                position: Value::Keyframed(Track::new(vec![
+                    Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+                    Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                ])),
+                ..Transform::default()
+            })
+        };
+        let x_at = |start: i64| {
+            let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square(start)));
+            evaluate(&doc, 12.0).items[0].transform.as_coeffs()[4]
+        };
+        assert!((x_at(0) - 120.0).abs() < 1e-6, "unslipped: local 12");
+        assert!((x_at(6) - 60.0).abs() < 1e-6, "slipped later: local 6");
+    }
+
+    /// A timed layer must not leak its local frame onto the sibling that
+    /// follows it — the shift is scoped to its own subtree.
+    #[test]
+    fn a_layers_local_time_does_not_leak_to_its_sibling() {
+        use crate::node::LayerTiming;
+        let animated = |id: u64| {
+            Node::shape(
+                id,
+                "s",
+                Shape::Rect {
+                    size: Value::constant(Vec2::new(10.0, 10.0)),
+                    radius: Value::constant(0.0),
+                },
+            )
+            .with_transform(Transform {
+                position: Value::Keyframed(Track::new(vec![
+                    Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+                    Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                ])),
+                ..Transform::default()
+            })
+        };
+        let shifted = animated(1).with_timing(LayerTiming { start: 6, in_: 0, out: 100 });
+        let plain = animated(2);
+        let doc =
+            Document::new(100.0, 100.0, Node::group(0, "root").with_child(shifted).with_child(plain));
+
+        let scene = evaluate(&doc, 12.0);
+        let x = |id: u64| {
+            scene.items.iter().find(|i| i.source == NodeId(id)).unwrap().transform.as_coeffs()[4]
+        };
+        assert!((x(1) - 60.0).abs() < 1e-6, "shifted layer at local 6");
+        assert!((x(2) - 120.0).abs() < 1e-6, "sibling still at comp frame 12");
+    }
+
+    /// Serde `default` *is* the migration: a `.pbc` written before layer timing
+    /// existed loads with `timing: None` and behaves exactly as it did.
+    #[test]
+    fn a_document_without_timing_still_loads() {
+        use crate::node::LayerTiming;
+        let json = r#"{"width":100.0,"height":100.0,"fps":24.0,"duration":5.0,
+            "root":{"id":0,"name":"root","transform":{"anchor":{"Const":[0.0,0.0]},
+            "position":{"Const":[0.0,0.0]},"rotation_deg":{"Const":0.0},
+            "scale":{"Const":[1.0,1.0]},"opacity":{"Const":1.0}},
+            "shape":null,"fill":null,"stroke":null,"children":[]}}"#;
+        let mut doc: Document = serde_json::from_str(json).unwrap();
+        doc.migrate();
+        assert_eq!(doc.root.timing, None);
+
+        // …and a timed layer round-trips.
+        doc.root.timing = Some(LayerTiming { start: 3, in_: 5, out: 9 });
+        let back: Document = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        assert_eq!(back.root.timing, Some(LayerTiming { start: 3, in_: 5, out: 9 }));
     }
 
     #[test]

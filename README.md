@@ -672,8 +672,25 @@ sample at a shifted time — the exact mechanism local time needs.
    compositor stage, which is later). Correct for subtitles; a known limit.
 
 **Staged build:**
-- **Stage 1 — layer time model** (`core` + minimal timeline UI; safe first PR,
-  shippable alone). `Node` gains `#[serde(default)] timing: Option<LayerTiming>`
+- ~~**Stage 1 — layer time model**~~ ✅ Done (2026-07-19). `Node.timing:
+  Option<LayerTiming>` (`{ start, in_, out }` in comp frames) lands exactly as
+  planned below, plus a **clip bar** at the top of the timeline for the selected
+  layer: drag an edge to trim, the body to slide, `Trim…` gives a layer a range
+  covering the whole comp (so enabling it never moves anything), `Clip ×` takes
+  it back to `None`. A tick inside the bar marks where local frame 0 sits.
+  - The trim window is **half-open** `[in, out)` so two clips meeting at frame N
+    don't both draw on N, and the liveness check happens *before* anything
+    resolves — a hidden layer and its subtree cost nothing.
+  - Drags latch their **grab mode and the timing they started from** at press,
+    then apply the total delta to that original. Incremental deltas would make a
+    drag that clamped at frame 0 refuse to spring back.
+  - `start` is deliberately separate from `in_`: trim moves an edge only, slide
+    moves all three, and slip (moving `start` alone) shifts the content under a
+    fixed window. Only slide and trim have UI so far.
+  - **Known limit, deliberate:** local time is `comp_frame − start`, so a timed
+    layer nested under another timed layer reads *comp* time, not its parent's
+    local time. Nested time is a comp-level concern — Stage 3's business.
+- The plan as written: `Node` gains `#[serde(default)] timing: Option<LayerTiming>`
   (`{ start, in_, out }` in frames; `None` = today's behaviour). Add
   `EvalCtx.comp_frame` (global) beside `frame` (now the current layer's *local*
   frame); `walk` computes `local = comp_frame − start`, skips drawing outside

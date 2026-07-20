@@ -965,9 +965,15 @@ struct ResolveCache {
 /// `&mut` because resolving an expression mutates the cache. Built once per
 /// evaluate and shared down the whole walk.
 pub struct EvalCtx<'a> {
-    /// The frame to resolve at. Fractional on purpose — keys sit on the grid,
-    /// the playhead need not.
+    /// The frame to resolve at, in the **current layer's local time**.
+    /// Fractional on purpose — keys sit on the grid, the playhead need not.
+    /// Equal to `comp_frame` for a layer with no [`crate::node::LayerTiming`],
+    /// which is every layer until one is given a time range.
     pub frame: f64,
+    /// The composition's own frame — the playhead, unshifted by any layer's
+    /// timing. Layer-local time is derived from this; expressions that want
+    /// comp time (and the timeline UI) read it directly.
+    pub comp_frame: f64,
     /// The document, for cross-property references. `None` for a context that
     /// only samples constants/keyframes (a value with no expressions) — a
     /// `Ref` then resolves to its neutral fallback.
@@ -985,6 +991,7 @@ impl<'a> EvalCtx<'a> {
     pub fn new(doc: &'a Document, frame: f64) -> Self {
         Self {
             frame,
+            comp_frame: frame,
             doc: Some(doc),
             cache: ResolveCache::default(),
             warnings: Vec::new(),
@@ -998,6 +1005,7 @@ impl<'a> EvalCtx<'a> {
     pub fn at(frame: f64) -> Self {
         Self {
             frame,
+            comp_frame: frame,
             doc: None,
             cache: ResolveCache::default(),
             warnings: Vec::new(),
