@@ -5,15 +5,55 @@
 
 use crate::*;
 
+/// What kind of thing a layer row is, for its icon. A group has no shape; a
+/// precomp is flagged separately (`TreeRow::precomp`) because it reads as a comp
+/// first and a layer second.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowKind {
+    Group,
+    Rect,
+    Ellipse,
+    Path,
+}
+
+impl RowKind {
+    /// Read a node's row kind from its shape. Precomp-ness is orthogonal and
+    /// lives on the row, not here.
+    pub(crate) fn of(node: &motion_core::Node) -> RowKind {
+        match &node.shape {
+            None => RowKind::Group,
+            Some(MShape::Rect { .. }) => RowKind::Rect,
+            Some(MShape::Ellipse { .. }) => RowKind::Ellipse,
+            Some(MShape::Path(_)) => RowKind::Path,
+        }
+    }
+}
+
 /// A flattened scene-tree row for the layers panel.
 pub(crate) struct TreeRow {
     pub(crate) id: NodeId,
     pub(crate) name: String,
     pub(crate) depth: usize,
-    pub(crate) is_group: bool,
+    pub(crate) kind: RowKind,
     /// Set when this layer instances a composition — the row then offers to
     /// open it, which is how you get *into* a precomp.
     pub(crate) precomp: Option<CompId>,
+}
+
+/// The icon a row shows. A precomp wins over its shape — the row is a comp
+/// first — and each shape kind gets its own glyph, so an ellipse no longer
+/// borrows the rectangle's square. Pure, so the mapping is unit-tested rather
+/// than only reachable by eye. A `Path` has no dedicated glyph in the subset, so
+/// it shares the rectangle's — the closest generic filled shape.
+pub(crate) fn row_glyph(row: &TreeRow) -> &'static str {
+    if row.precomp.is_some() {
+        return icon::PRECOMP;
+    }
+    match row.kind {
+        RowKind::Group => icon::GROUP,
+        RowKind::Rect | RowKind::Path => icon::RECT,
+        RowKind::Ellipse => icon::ELLIPSE,
+    }
 }
 
 /// Flatten the scene graph depth-first into indented rows.
@@ -22,7 +62,7 @@ pub(crate) fn tree_rows(node: &motion_core::Node, depth: usize, out: &mut Vec<Tr
         id: node.id,
         name: node.name.clone(),
         depth,
-        is_group: node.shape.is_none(),
+        kind: RowKind::of(node),
         precomp: node.precomp,
     });
     for c in &node.children {
@@ -98,14 +138,7 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
     for row in rows {
         ui.horizontal(|ui| {
             ui.add_space(6.0 + row.depth as f32 * 14.0);
-            // A precomp reads as a comp first and a layer second — it's the
-            // one row whose contents live somewhere else.
-            let glyph = match (row.precomp.is_some(), row.is_group) {
-                (true, _) => icon::PRECOMP,
-                (_, true) => icon::GROUP,
-                (_, false) => icon::RECT,
-            };
-            ui.label(icon::text(glyph));
+            ui.label(icon::text(row_glyph(row)));
             let label = row.name.clone();
             if ui
                 .selectable_label(selected == Some(row.id), label)

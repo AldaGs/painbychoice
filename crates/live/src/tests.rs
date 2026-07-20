@@ -1008,6 +1008,50 @@ fn optional_properties_are_absent_when_the_node_lacks_them() {
     assert!(prop_of(&p, PropKind::ShapeRadius).is_none());
 }
 
+/// Each layer kind gets its own icon: the bug was an ellipse borrowing the
+/// rectangle's square because the row only distinguished group/precomp/rect.
+#[test]
+fn layer_rows_pick_an_icon_per_shape() {
+    let rect = MNode::shape(1, "r", MShape::Rect {
+        size: Value::constant(Vec2::new(10.0, 10.0)),
+        radius: Value::constant(0.0),
+    });
+    let ellipse =
+        MNode::shape(2, "e", MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
+    let path = MNode::shape(3, "p", MShape::Path(kurbo::BezPath::new()));
+    let group = MNode::group(4, "g");
+    let root = MNode::group(0, "root")
+        .with_child(rect)
+        .with_child(ellipse)
+        .with_child(path)
+        .with_child(group);
+
+    let mut rows = Vec::new();
+    tree_rows(&root, 0, &mut rows);
+    let glyph = |name: &str| row_glyph(rows.iter().find(|r| r.name == name).unwrap());
+
+    assert_eq!(glyph("r"), icon::RECT);
+    assert_eq!(glyph("e"), icon::ELLIPSE, "an ellipse shows the ellipse glyph, not the square");
+    assert_eq!(glyph("g"), icon::GROUP);
+    assert_eq!(glyph("p"), icon::RECT, "a path shares the rect glyph (no dedicated one)");
+    assert_ne!(icon::RECT, icon::ELLIPSE, "the two glyphs really are different");
+}
+
+/// A precomp reads as a comp first: its glyph wins over whatever shape the
+/// instance layer happens to carry.
+#[test]
+fn a_precomp_row_shows_the_comp_icon_over_its_shape() {
+    let mut inst =
+        MNode::shape(1, "inst", MShape::Ellipse { size: Value::constant(Vec2::new(1.0, 1.0)) });
+    inst.precomp = Some(CompId(7));
+    let root = MNode::group(0, "root").with_child(inst);
+
+    let mut rows = Vec::new();
+    tree_rows(&root, 0, &mut rows);
+    let row = rows.iter().find(|r| r.name == "inst").unwrap();
+    assert_eq!(row_glyph(row), icon::PRECOMP);
+}
+
 #[test]
 fn dope_rows_lists_animated_shape_and_stroke_properties() {
     let mut n = full_node();
