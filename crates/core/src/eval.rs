@@ -573,6 +573,33 @@ mod tests {
         assert!((evaluate(&doc, 100.0).items[0].opacity - 1.0).abs() < 1e-9);
     }
 
+    /// `replace` must keep the node's place among its siblings — that ordering
+    /// is draw order, so pre-composing a layer must not restack it.
+    #[test]
+    fn replace_keeps_the_layers_place_in_draw_order() {
+        let mut root = Node::group(0, "root")
+            .with_child(dot(1))
+            .with_child(dot(2))
+            .with_child(dot(3));
+        let old = root.replace(NodeId(2), Node::group(9, "instance")).expect("found");
+        assert_eq!(old.id, NodeId(2), "the old node comes back");
+        let ids: Vec<u64> = root.children.iter().map(|c| c.id.0).collect();
+        assert_eq!(ids, vec![1, 9, 3], "swapped in place, not appended");
+    }
+
+    /// A comp always shows *something* in the switcher, including one loaded
+    /// from a file written before comps had names.
+    #[test]
+    fn a_nameless_comp_falls_back_to_a_generated_label() {
+        use crate::node::CompId;
+        let mut comp = Document::new(10.0, 10.0, Node::group(0, "r"));
+        assert_eq!(comp.label(CompId(0)), "Comp 1", "1-based for humans");
+        comp.name = "  ".into();
+        assert_eq!(comp.label(CompId(3)), "Comp 4", "blank is still nameless");
+        comp.name = "Subtitles".into();
+        assert_eq!(comp.label(CompId(3)), "Subtitles");
+    }
+
     // --- Multi-comp / pre-comps (stage 3) ---
 
     /// A 10x10 square at the origin, for building comps to nest.

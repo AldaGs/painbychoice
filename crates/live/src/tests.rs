@@ -1029,3 +1029,107 @@ fn a_color_clip_will_not_paste_onto_a_scalar_property() {
     assert!(landed.is_empty(), "color keys must not land on a width track");
     assert!(!is_anim(&n, PropKind::StrokeWidth), "width stays constant");
 }
+
+// --- Pre-composing (stage 4) ---
+
+/// A three-layer comp, to check what pre-composing does to the middle one.
+fn three_layer_comp() -> MProject {
+    let layer = |id: u64, name: &str| {
+        MNode::shape(
+            id,
+            name,
+            MShape::Rect {
+                size: Value::constant(Vec2::new(10.0, 10.0)),
+                radius: Value::constant(0.0),
+            },
+        )
+    };
+    MProject::single(Document::new(
+        640.0,
+        480.0,
+        MNode::group(0, "root")
+            .with_child(layer(1, "back"))
+            .with_child(layer(2, "middle"))
+            .with_child(layer(3, "front")),
+    ))
+}
+
+#[test]
+fn precomposing_replaces_the_layer_in_place_with_an_instance() {
+    let mut project = three_layer_comp();
+    let current = project.root;
+    let (comp_id, instance_id) =
+        precompose_into(&mut project, current, NodeId(2), 99).expect("a layer can be precomposed");
+
+    // Draw order is sibling order — the instance must land where the layer was.
+    let open = project.comp(current).unwrap();
+    let ids: Vec<u64> = open.root.children.iter().map(|c| c.id.0).collect();
+    assert_eq!(ids, vec![1, 99, 3], "instance sits in the layer's slot");
+
+    let inst = open.root.find(instance_id).unwrap();
+    assert_eq!(inst.precomp, Some(comp_id), "it instances the new comp");
+    assert_eq!(inst.name, "middle", "and inherits the layer's name");
+
+    // The layer itself now lives in the new comp, under its root.
+    let inner = project.comp(comp_id).unwrap();
+    assert_eq!(inner.root.children.len(), 1);
+    assert_eq!(inner.root.children[0].id, NodeId(2), "the original node moved");
+    assert_eq!(inner.name, "middle");
+}
+
+/// The new comp inherits the open one's format, so nested content keeps its
+/// coordinate space and timing rather than being silently rescaled or retimed.
+#[test]
+fn a_precomp_inherits_the_open_comps_format() {
+    let mut project = three_layer_comp();
+    let current = project.root;
+    {
+        let open = project.comp_mut(current).unwrap();
+        open.fps = 24.0;
+        open.duration = 7.5;
+    }
+    let (comp_id, _) = precompose_into(&mut project, current, NodeId(2), 99).unwrap();
+    let inner = project.comp(comp_id).unwrap();
+    assert_eq!((inner.width, inner.height), (640.0, 480.0));
+    assert_eq!(inner.fps, 24.0);
+    assert_eq!(inner.duration, 7.5);
+}
+
+/// Pre-composing must be visually a no-op: the layer's transform travels *into*
+/// the comp with it, and the instance is neutral. Applying it at both levels
+/// would double it — the classic way this goes wrong.
+#[test]
+fn precomposing_does_not_double_the_layers_transform() {
+    let mut project = three_layer_comp();
+    let current = project.root;
+    project
+        .comp_mut(current)
+        .unwrap()
+        .root
+        .find_mut(NodeId(2))
+        .unwrap()
+        .transform
+        .position = Value::constant(Vec2::new(100.0, 50.0));
+
+    let before = motion_core::evaluate_comp(&project, current, 0.0);
+    let x_of = |scene: &MScene, src: u64| {
+        scene.items.iter().find(|i| i.source == NodeId(src)).unwrap().transform.as_coeffs()[4]
+    };
+    assert!((x_of(&before, 2) - 100.0).abs() < 1e-9);
+
+    precompose_into(&mut project, current, NodeId(2), 99).unwrap();
+    let after = motion_core::evaluate_comp(&project, current, 0.0);
+    assert_eq!(after.items.len(), before.items.len(), "same layers on screen");
+    assert!(after.warnings.is_empty(), "{:?}", after.warnings);
+    // Still 100, not 200: the transform is applied once, inside the comp.
+    assert!((x_of(&after, 2) - 100.0).abs() < 1e-9, "transform applied twice");
+}
+
+/// The root of a comp *is* the comp, so it can't be precomposed into itself.
+#[test]
+fn the_root_cannot_be_precomposed() {
+    let mut project = three_layer_comp();
+    let current = project.root;
+    assert!(precompose_into(&mut project, current, NodeId(0), 99).is_none());
+    assert_eq!(project.comps.len(), 1, "no comp was created");
+}

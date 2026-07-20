@@ -380,6 +380,16 @@ impl Node {
         self.children.iter_mut().any(|c| c.reorder_child(id, delta))
     }
 
+    /// Swap the node with `id` for `new`, returning the old one. Keeps its
+    /// position among its siblings, which is draw order — pre-composing must
+    /// not restack the layer it replaces.
+    pub fn replace(&mut self, id: NodeId, new: Node) -> Option<Node> {
+        if let Some(i) = self.children.iter().position(|c| c.id == id) {
+            return Some(std::mem::replace(&mut self.children[i], new));
+        }
+        self.children.iter_mut().find_map(|c| c.replace(id, new.clone()))
+    }
+
     /// Remove the node with `id` from this subtree (cannot remove `self`).
     /// Returns the removed node, or `None` if not found.
     pub fn remove(&mut self, id: NodeId) -> Option<Node> {
@@ -416,6 +426,10 @@ impl Node {
 /// merely nested.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Comp {
+    /// What the comp switcher shows. `#[serde(default)]` so a pre-project
+    /// `.pbc` loads with an empty name and falls back to a generated label.
+    #[serde(default)]
+    pub name: String,
     pub width: f64,
     pub height: f64,
     pub fps: f64,
@@ -426,11 +440,22 @@ pub struct Comp {
 impl Comp {
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
+            name: String::new(),
             width,
             height,
             fps: 60.0,
             duration: 5.0,
             root,
+        }
+    }
+
+    /// The name to show, falling back to a generated one so a comp is never
+    /// nameless in the UI — old files and freshly split comps both land here.
+    pub fn label(&self, id: CompId) -> String {
+        if self.name.trim().is_empty() {
+            format!("Comp {}", id.0 + 1)
+        } else {
+            self.name.clone()
         }
     }
 

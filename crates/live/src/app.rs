@@ -57,6 +57,9 @@ pub(crate) struct App {
     pub(crate) presets: Vec<Preset>,
     /// The Layout menu's "save current as" name field, kept across frames.
     pub(crate) preset_name_buf: String,
+    /// Edit buffer for the open comp's name, so typing doesn't rewrite the
+    /// document on every keystroke. Same take/restore dance as the preset name.
+    pub(crate) comp_name_buf: String,
     /// Canvas area in physical pixels, measured from the layout tree's canvas
     /// leaf during the last UI pass. `None` until the first pass has run.
     pub(crate) canvas_rect: Option<kurbo::Rect>,
@@ -109,6 +112,7 @@ impl App {
             dock: Dock::default_layout(),
             presets: builtin_presets(),
             preset_name_buf: String::new(),
+            comp_name_buf: String::new(),
             canvas_rect: None,
             next_id,
         }
@@ -657,6 +661,41 @@ impl App {
         true
     }
 
+    /// Open a different composition for editing.
+    ///
+    /// Everything comp-scoped has to be rebuilt: node ids are per-comp, so a
+    /// stale `next_id` would hand out ids that collide with the newly opened
+    /// tree, and a stale selection would point at a node in the comp we left.
+    pub(crate) fn open_comp(&mut self, id: CompId) {
+        if self.project.comp(id).is_none() || id == self.current {
+            return;
+        }
+        self.current = id;
+        // Read everything off the comp before writing back — `doc()` borrows
+        // all of `self`, so the reads can't straddle an assignment.
+        let comp = self.doc();
+        let (next_id, frames, name) =
+            (max_id(&comp.root) + 1, comp.duration_frames(), comp.name.clone());
+        self.next_id = next_id;
+        self.view = TimelineView::full(frames);
+        self.comp_name_buf = name;
+        self.selected = None;
+        self.selected_keys.clear();
+    }
+
+    /// Move `id`'s subtree into a new composition and leave an instance in its
+    /// place — the core AE workflow. See [`precompose_into`] for the semantics.
+    pub(crate) fn precompose(&mut self, id: NodeId) {
+        let Some((_, instance)) =
+            precompose_into(&mut self.project, self.current, id, self.next_id)
+        else {
+            return;
+        };
+        self.next_id += 1;
+        self.selected = Some(instance);
+        self.selected_keys.clear();
+    }
+
     /// Serialize the document *and the current UI layout* to a `.pbc` (JSON)
     /// file chosen via a native save dialog. The layout (active dock + user
     /// presets) rides in a [`Project`] wrapper alongside the document; built-in
@@ -872,6 +911,15 @@ impl App {
         // the UI never borrows `self`, restored after), and the reported intent.
         let preset_names: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
         let mut preset_name_buf = std::mem::take(&mut self.preset_name_buf);
+        let mut comp_name_buf = std::mem::take(&mut self.comp_name_buf);
+        // Comps for the switcher, in id order (which is creation order).
+        let comp_entries: Vec<CompEntry> = self
+            .project
+            .comps
+            .iter()
+            .map(|(id, c)| CompEntry { id: *id, label: c.label(*id) })
+            .collect();
+        let current_comp = self.current;
         let mut layout = LayoutEdits::default();
         // Panels are drawn by walking the layout tree; each leaf dispatches to
         // the matching editor. Nothing here knows *where* a panel is — that's
@@ -902,6 +950,9 @@ impl App {
                         &mut preset_name_buf,
                         &mut layout,
                         &warnings,
+                        &comp_entries,
+                        current_comp,
+                        &mut comp_name_buf,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Transport => {
@@ -944,6 +995,7 @@ impl App {
         }
         // Restore the save-field buffer taken for the UI pass.
         self.preset_name_buf = preset_name_buf;
+        self.comp_name_buf = comp_name_buf;
         // Layout presets: switch to one, or save the current arrangement as a
         // session preset. Both re-lay out the panels, so a redraw is due.
         if let Some(i) = layout.apply {
@@ -987,6 +1039,19 @@ impl App {
         // window may now hang past the end of the comp.
         if comp.fps.is_some() || comp.duration.is_some() {
             self.view = self.view.clamped(self.doc().duration_frames());
+        }
+
+        if let Some(name) = comp.rename {
+            self.doc_mut().name = name.trim().to_string();
+        }
+        // Opening a comp — from the switcher, or from a precomp layer's button.
+        if let Some(id) = comp.open.or(tree_edits.open_comp) {
+            self.open_comp(id);
+        }
+        // Pre-compose: the selected layer moves into a fresh comp and an
+        // instance takes its place.
+        if let Some(id) = tree_edits.precompose {
+            self.precompose(id);
         }
 
         // Layers panel: selection + reorder.
@@ -1203,4 +1268,42 @@ impl App {
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
     }
+}
+
+/// Move the layer `id` out of `current` into a brand-new comp, leaving an
+/// instance behind. Returns `(new comp, instance node)`, or `None` if `id`
+/// isn't a movable layer (the root *is* the comp, so it can't be precomposed).
+///
+/// The new comp inherits the open one's size/fps/duration, so nested content
+/// keeps its coordinate space and timing.
+///
+/// The instance takes the layer's name and its **place among its siblings**
+/// (draw order), but a *neutral* transform: the layer's own transform travels
+/// inside the comp with it, and applying it at both levels would double it.
+/// This is also why pre-composing is visually a no-op, which is the point — it
+/// reorganizes without changing the frame.
+pub(crate) fn precompose_into(
+    project: &mut MProject,
+    current: CompId,
+    id: NodeId,
+    next_id: u64,
+) -> Option<(CompId, NodeId)> {
+    let open = project.comp(current)?;
+    if id == open.root.id {
+        return None;
+    }
+    let layer = open.root.find(id)?.clone();
+    let (w, h, fps, duration) = (open.width, open.height, open.fps, open.duration);
+    let name = if layer.name.trim().is_empty() { "Precomp".to_string() } else { layer.name.clone() };
+
+    let mut inner = Comp::new(w, h, MNode::group(0, "root").with_child(layer));
+    inner.fps = fps;
+    inner.duration = duration;
+    inner.name = name.clone();
+    let comp_id = project.insert(inner);
+
+    let instance = MNode::group(next_id, name).with_precomp(comp_id);
+    let instance_id = instance.id;
+    project.comp_mut(current)?.root.replace(id, instance);
+    Some((comp_id, instance_id))
 }

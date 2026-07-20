@@ -806,7 +806,26 @@ sample at a shifted time — the exact mechanism local time needs.
   `root` as the one comp and reconcile with the existing `Project { document,
   layout }` wrapper; old files still load. Cross-comp references stay out of
   scope for v1.
-- **Stage 4 — pre-comp UI.** Comp switcher in the comp bar; "pre-compose
+- ~~**Stage 4 — pre-comp UI.**~~ ✅ Done (2026-07-19), click-tested.
+  A comp switcher + rename field in the comp bar (the switcher hides itself
+  while there's only one comp, so a single-comp project looks exactly as it
+  did), `[c]` marking a precomp layer with an **open** button beside it, and
+  **Pre-compose selection** in the layers panel.
+  - Pre-composing is **visually a no-op**, which is the whole point: it
+    reorganizes without changing the frame. The layer's transform travels *into*
+    the new comp with it and the instance is left neutral — applying it at both
+    levels would double it, which is the classic way this goes wrong. Tested by
+    evaluating before and after and comparing.
+  - The instance keeps the layer's **place among its siblings** (`Node::replace`
+    swaps in position), since sibling order is draw order.
+  - The new comp inherits the open comp's size/fps/duration, so nested content
+    keeps its coordinate space and timing.
+  - Opening a comp rebuilds everything comp-scoped — selection, the id counter,
+    the timeline window. **Node ids are per-comp**, so a stale `next_id` would
+    hand out ids colliding with the newly opened tree.
+  - The operation itself lives in `precompose_into`, outside `App`, so it's unit
+    tested rather than only reachable by clicking.
+- The plan as written: **pre-comp UI.** Comp switcher in the comp bar; "pre-compose
   selection" (move selected layers into a new comp, replace with an instance —
   the core AE workflow); open/close a comp; precomp layer in the layers panel.
 

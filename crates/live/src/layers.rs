@@ -11,6 +11,9 @@ pub(crate) struct TreeRow {
     pub(crate) name: String,
     pub(crate) depth: usize,
     pub(crate) is_group: bool,
+    /// Set when this layer instances a composition — the row then offers to
+    /// open it, which is how you get *into* a precomp.
+    pub(crate) precomp: Option<CompId>,
 }
 
 /// Flatten the scene graph depth-first into indented rows.
@@ -20,6 +23,7 @@ pub(crate) fn tree_rows(node: &motion_core::Node, depth: usize, out: &mut Vec<Tr
         name: node.name.clone(),
         depth,
         is_group: node.shape.is_none(),
+        precomp: node.precomp,
     });
     for c in &node.children {
         tree_rows(c, depth + 1, out);
@@ -44,6 +48,11 @@ pub(crate) struct TreeEdits {
     pub(crate) delete: Option<NodeId>,
     pub(crate) save: bool,
     pub(crate) load: bool,
+    /// Move the selection into a new composition and leave an instance behind —
+    /// the core AE workflow.
+    pub(crate) precompose: Option<NodeId>,
+    /// Open the composition this precomp layer instances.
+    pub(crate) open_comp: Option<CompId>,
 }
 
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
@@ -71,17 +80,39 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
     });
     ui.weak("Adds into the selected node, else the root.");
+    // Pre-compose: only meaningful with a non-root layer selected, since the
+    // root *is* the comp.
+    if let Some(id) = selected.filter(|id| rows.iter().any(|r| r.id == *id && r.depth > 0)) {
+        if ui
+            .button("Pre-compose selection")
+            .on_hover_text("Move this layer into a new comp and leave an instance in its place")
+            .clicked()
+        {
+            out.precompose = Some(id);
+        }
+    }
     ui.separator();
     for row in rows {
         ui.horizontal(|ui| {
             ui.add_space(6.0 + row.depth as f32 * 14.0);
-            let icon = if row.is_group { "▶" } else { "•" };
+            // A precomp reads as a comp first and a layer second — it's the
+            // one row whose contents live somewhere else.
+            let icon = match (row.precomp.is_some(), row.is_group) {
+                (true, _) => "[c]",
+                (_, true) => "▶",
+                (_, false) => "•",
+            };
             let label = format!("{icon} {}", row.name);
             if ui
                 .selectable_label(selected == Some(row.id), label)
                 .clicked()
             {
                 out.select = Some(row.id);
+            }
+            if let Some(comp) = row.precomp {
+                if ui.small_button("open").on_hover_text("Edit this composition").clicked() {
+                    out.open_comp = Some(comp);
+                }
             }
             // Reorder + delete (not meaningful for the root).
             if row.depth > 0 {

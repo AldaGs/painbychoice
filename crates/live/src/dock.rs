@@ -498,6 +498,17 @@ pub(crate) struct CompEdits {
     pub(crate) height: Option<f64>,
     pub(crate) fps: Option<f64>,
     pub(crate) duration: Option<f64>,
+    /// Open a different composition. Everything comp-scoped (selection, the id
+    /// counter, the timeline window) is rebuilt when this is applied.
+    pub(crate) open: Option<CompId>,
+    /// Rename the open comp.
+    pub(crate) rename: Option<String>,
+}
+
+/// One entry in the comp switcher: its id and the label to show.
+pub(crate) struct CompEntry {
+    pub(crate) id: CompId,
+    pub(crate) label: String,
 }
 
 /// Layout-preset intent from the top bar's Layout menu. At most one per frame.
@@ -525,11 +536,43 @@ pub(crate) fn comp_ui(
     name_buf: &mut String,
     layout: &mut LayoutEdits,
     warnings: &[(u64, String)],
+    comps: &[CompEntry],
+    current: CompId,
+    comp_name_buf: &mut String,
 ) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.strong("Composition");
+
+        // The comp switcher. Only worth the space once there's more than one —
+        // a single-comp project should look exactly as it did before comps.
+        if comps.len() > 1 {
+            let open_label = comps
+                .iter()
+                .find(|c| c.id == current)
+                .map(|c| c.label.clone())
+                .unwrap_or_else(|| "?".into());
+            egui::ComboBox::from_id_salt("comp_switcher")
+                .selected_text(open_label)
+                .show_ui(ui, |ui| {
+                    for c in comps {
+                        if ui.selectable_label(c.id == current, &c.label).clicked() {
+                            out.open = Some(c.id);
+                        }
+                    }
+                });
+        }
+        // Renaming the open comp. Edits a buffer so a half-typed name doesn't
+        // rewrite the document on every keystroke.
+        let resp = ui.add(
+            egui::TextEdit::singleline(comp_name_buf)
+                .desired_width(110.0)
+                .hint_text("comp name"),
+        );
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            out.rename = Some(comp_name_buf.clone());
+        }
         // A broken script or an ambiguous name resolves to a neutral value, so
         // the frame looks deliberate. Say so here rather than only on stderr.
         if !warnings.is_empty() {
