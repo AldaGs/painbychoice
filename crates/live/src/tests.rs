@@ -531,6 +531,90 @@ fn a_bare_document_file_still_loads() {
     assert!(serde_json::from_str::<Document>(&json).is_ok(), "parses as a bare doc");
 }
 
+/// Renaming a comp is a trimmed assign to its `name`; the switcher reads
+/// `Comp::label`, which falls back to a positional "Comp N" when the name is
+/// blank. So renaming to whitespace can't produce an empty, unclickable entry —
+/// the one non-obvious edge a click-test of the rename field would catch.
+#[test]
+fn a_blank_comp_name_falls_back_to_a_positional_label() {
+    let mut comp = Document::new(100.0, 100.0, MNode::group(0, "root"));
+    comp.name = "Intro".into();
+    assert_eq!(comp.label(CompId(0)), "Intro", "a real name shows as-is");
+
+    // The rename path: trim the field, assign. Blank in, fallback out.
+    comp.name = "   ".trim().to_string();
+    assert_eq!(comp.label(CompId(2)), "Comp 3", "blank → positional (1-based)");
+}
+
+/// A genuinely multi-comp project — two comps, a precomp *instance* linking one
+/// into the other, and a shared module driving a property — must survive the
+/// full save→load path (serialize as the app's `SaveFile`, reparse, `migrate`)
+/// unchanged. This is the data risk behind "multi-comp save/load"; the native
+/// file dialog is just chrome around exactly this round-trip.
+#[test]
+fn a_multi_comp_project_round_trips_through_save_and_load() {
+    // The inner comp: a lone ellipse.
+    let mut project = MProject::single(Document::new(
+        200.0,
+        100.0,
+        MNode::group(0, "root"),
+    ));
+    let root = project.root;
+    let inner = project.insert(Document::new(
+        50.0,
+        50.0,
+        MNode::group(0, "inner_root").with_child(MNode::shape(
+            1,
+            "dot",
+            MShape::Ellipse { size: Value::constant(Vec2::new(20.0, 20.0)) },
+        )),
+    ));
+    // A module driving opacity to 0.5, linked from the instance layer.
+    let module = project.add_module(MModule::new("fade", Expr::Lit(ExprValue::Num(0.5))));
+    let mut instance = MNode::group(2, "instance").with_transform(Transform {
+        opacity: Value::expr(Expr::Use { module, overrides: Vec::new() }),
+        ..Transform::default()
+    });
+    instance.precomp = Some(inner);
+    project.comp_mut(root).unwrap().root.children.push(instance);
+
+    let before = motion_core::evaluate_comp(&project, root, 0.0);
+    assert!(before.warnings.is_empty(), "sanity: {:?}", before.warnings);
+
+    // Save exactly as `App::save` does, then load exactly as `App::load` does.
+    let file = SaveFile {
+        project: Some(project.clone()),
+        document: None,
+        layout: LayoutState { dock: Some(Dock::default_layout()), user_presets: vec![] },
+    };
+    let json = serde_json::to_string(&file).unwrap();
+    let back: SaveFile = serde_json::from_str(&json).unwrap();
+    let mut loaded = back.project.expect("the project survives");
+    loaded.migrate();
+
+    // The registry, the instance's target, and the module all come back.
+    assert_eq!(loaded.comps.len(), 2, "both comps");
+    assert!(loaded.comp(inner).is_some(), "the inner comp's id is preserved");
+    assert_eq!(loaded.modules.len(), 1, "the module survives");
+    let inst = loaded
+        .comp(root)
+        .unwrap()
+        .root
+        .children
+        .iter()
+        .find(|n| n.name == "instance")
+        .expect("the instance layer");
+    assert_eq!(inst.precomp, Some(inner), "it still instances the inner comp");
+
+    // And the frame is identical — the link still resolves post-load.
+    let after = motion_core::evaluate_comp(&loaded, root, 0.0);
+    assert!(after.warnings.is_empty(), "{:?}", after.warnings);
+    assert_eq!(after.items.len(), before.items.len(), "same number of drawn items");
+    for (a, b) in after.items.iter().zip(&before.items) {
+        assert!((a.opacity - b.opacity).abs() < 1e-9, "opacity via the module survives");
+    }
+}
+
 #[test]
 fn a_pre_comps_save_file_loads_as_a_one_comp_project() {
     // The middle format: a wrapper holding a single `document`. It must come
