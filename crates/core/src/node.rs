@@ -229,6 +229,15 @@ pub struct Node {
     /// is the whole migration: an old `.pbc` loads unchanged.
     #[serde(default)]
     pub timing: Option<LayerTiming>,
+    /// This layer *instances* another composition. Its own `shape`/`fill` still
+    /// draw (a precomp layer is a normal layer that also renders a comp), and
+    /// its `transform`/`opacity` fold into everything the nested comp emits.
+    ///
+    /// The nested comp is evaluated at this layer's **local** frame, so trimming
+    /// and slipping a precomp retimes its whole contents — the reason the time
+    /// model came first.
+    #[serde(default)]
+    pub precomp: Option<CompId>,
     pub children: Vec<Node>,
 }
 
@@ -243,6 +252,7 @@ impl Node {
             stroke: None,
             params: Vec::new(),
             timing: None,
+            precomp: None,
             children: Vec::new(),
         }
     }
@@ -257,6 +267,7 @@ impl Node {
             stroke: None,
             params: Vec::new(),
             timing: None,
+            precomp: None,
             children: Vec::new(),
         }
     }
@@ -302,6 +313,12 @@ impl Node {
     /// the whole [`Stroke`].
     pub fn with_stroke(mut self, stroke: Stroke) -> Self {
         self.stroke = Some(stroke);
+        self
+    }
+
+    /// Make this layer an instance of `comp`. See [`Node::precomp`].
+    pub fn with_precomp(mut self, comp: CompId) -> Self {
+        self.precomp = Some(comp);
         self
     }
 
@@ -391,9 +408,14 @@ impl Node {
     }
 }
 
-/// The whole animated document: a root node plus composition settings.
+/// One composition: a root node plus its own size, frame rate and length.
+///
+/// This is what `Document` always was — the rename is the whole point of the
+/// multi-comp step. A project holds several of these, and a layer can *instance*
+/// one (see [`Node::precomp`]), which is what makes a comp reusable rather than
+/// merely nested.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Document {
+pub struct Comp {
     pub width: f64,
     pub height: f64,
     pub fps: f64,
@@ -401,7 +423,7 @@ pub struct Document {
     pub root: Node,
 }
 
-impl Document {
+impl Comp {
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
             width,
@@ -431,5 +453,68 @@ impl Document {
     /// Total length of the composition in whole frames: 5s @ 24fps = 120.
     pub fn duration_frames(&self) -> i64 {
         self.timebase().seconds_to_frames(self.duration)
+    }
+}
+
+/// What a single-composition document used to be. Kept as an alias so the
+/// hundreds of existing `Document` mentions still read, and so a `.pbc` written
+/// before projects existed still deserializes into exactly this shape.
+pub type Document = Comp;
+
+/// Identifies a composition within a [`Project`]. Stable across edits — a
+/// precomp layer stores one, so renaming or reordering comps can't break an
+/// instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CompId(pub u64);
+
+/// A project: several compositions, one of which is the one you open.
+///
+/// **Registry + instances, not inline nesting.** A layer refers to a comp by
+/// [`CompId`], so the same comp can be placed twice and edited once — inline
+/// nesting would be less code but could never instance. It's also the shape the
+/// shared-module story needs later: a comp *is* a graph node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Project {
+    /// Keyed, not a `Vec`: a precomp layer holds an id, and ids must survive
+    /// a comp being removed from the middle.
+    pub comps: std::collections::BTreeMap<CompId, Comp>,
+    /// The comp a fresh open shows — the "main" one.
+    pub root: CompId,
+}
+
+impl Project {
+    /// Wrap a single composition as a whole project. This is also the `.pbc`
+    /// migration: a pre-project document loads as one comp, which becomes root.
+    pub fn single(comp: Comp) -> Self {
+        let root = CompId(0);
+        Self { comps: [(root, comp)].into_iter().collect(), root }
+    }
+
+    pub fn comp(&self, id: CompId) -> Option<&Comp> {
+        self.comps.get(&id)
+    }
+
+    pub fn comp_mut(&mut self, id: CompId) -> Option<&mut Comp> {
+        self.comps.get_mut(&id)
+    }
+
+    /// The comp a fresh open shows.
+    pub fn root_comp(&self) -> &Comp {
+        self.comps.get(&self.root).expect("a project always has its root comp")
+    }
+
+    /// Add a comp under a fresh id, returning it.
+    pub fn insert(&mut self, comp: Comp) -> CompId {
+        let id = CompId(self.comps.keys().map(|c| c.0).max().map_or(0, |m| m + 1));
+        self.comps.insert(id, comp);
+        id
+    }
+
+    /// Bring every comp up to the current format — see [`Comp::migrate`]. Must
+    /// be called after *every* load.
+    pub fn migrate(&mut self) {
+        for comp in self.comps.values_mut() {
+            comp.migrate();
+        }
     }
 }

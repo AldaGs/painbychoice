@@ -241,7 +241,7 @@ fn tick_step_never_returns_zero() {
 #[test]
 fn pick_hits_shape_and_misses_empty_space() {
     let doc = demo_document();
-    let scene = evaluate(&doc, 0.0);
+    let scene = motion_core::evaluate(&doc, 0.0);
     let fit = Affine::IDENTITY;
 
     // The square sits at (300, 540) at t=0 with a 200x200 body.
@@ -255,7 +255,7 @@ fn pick_prefers_front_most_item() {
     // The dot is a child drawn after the square, so where they overlap the
     // dot (front-most) wins. At t=0 the dot is above the square center.
     let doc = demo_document();
-    let scene = evaluate(&doc, 0.0);
+    let scene = motion_core::evaluate(&doc, 0.0);
     let fit = Affine::IDENTITY;
     // Dot center: square pos (300,540) + child offset (0,-120) = (300,420).
     assert_eq!(pick(&scene, fit, (300.0, 420.0)), Some(NodeId(2)));
@@ -486,8 +486,9 @@ fn project_round_trips_document_and_layout() {
     let mut dock = Dock::default_layout();
     let path = path_to(&dock, Editor::Properties).unwrap();
     dock.apply(DockCmd::Split { path, side: DockSide::Top, size: 60.0 });
-    let project = Project {
-        document: demo_document(),
+    let project = SaveFile {
+        project: Some(MProject::single(demo_document())),
+        document: None,
         layout: LayoutState {
             dock: Some(dock.clone()),
             user_presets: vec![Preset {
@@ -498,7 +499,8 @@ fn project_round_trips_document_and_layout() {
         },
     };
     let json = serde_json::to_string(&project).unwrap();
-    let back: Project = serde_json::from_str(&json).unwrap();
+    let back: SaveFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.project.expect("the project survives").comps.len(), 1);
     assert_eq!(dock_editors(&back.layout.dock.unwrap()), dock_editors(&dock));
     assert_eq!(back.layout.user_presets.len(), 1);
     assert_eq!(back.layout.user_presets[0].name, "Mine");
@@ -507,12 +509,30 @@ fn project_round_trips_document_and_layout() {
 
 #[test]
 fn a_bare_document_file_still_loads() {
-    // Old `.pbc` files are a bare Document with no layout wrapper; the loader
-    // tries Project first (which lacks a `document` field here and fails),
-    // then falls back to the plain document parse.
+    // Oldest format: a bare Document, no wrapper at all. Every `SaveFile` field
+    // defaults, so such a file *parses* as one — carrying neither a project nor
+    // a document. That empty-parse is the loader's signal to retry as a bare
+    // document, which is why the fallback can't be keyed on a parse failure.
     let json = serde_json::to_string(&demo_document()).unwrap();
-    assert!(serde_json::from_str::<Project>(&json).is_err(), "no `document` field");
+    let empty: SaveFile = serde_json::from_str(&json).expect("defaults let it parse");
+    assert!(empty.project.is_none() && empty.document.is_none(), "nothing usable in it");
     assert!(serde_json::from_str::<Document>(&json).is_ok(), "parses as a bare doc");
+}
+
+#[test]
+fn a_pre_comps_save_file_loads_as_a_one_comp_project() {
+    // The middle format: a wrapper holding a single `document`. It must come
+    // back as a one-comp project, with its layout intact.
+    let legacy = serde_json::json!({
+        "document": serde_json::to_value(demo_document()).unwrap(),
+        "layout": { "dock": serde_json::Value::Null, "user_presets": [] },
+    });
+    let file: SaveFile = serde_json::from_value(legacy).unwrap();
+    assert!(file.project.is_none(), "no project field in the old format");
+    let doc = file.document.expect("the single document is there");
+    let project = MProject::single(doc);
+    assert_eq!(project.comps.len(), 1);
+    assert_eq!(project.root_comp().root.children.len(), demo_document().root.children.len());
 }
 
 #[test]

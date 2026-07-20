@@ -359,8 +359,15 @@ pub(crate) fn builtin_presets() -> Vec<Preset> {
 /// layouts were saved are a *bare* `Document`; [`App::load`] falls back to that
 /// and defaults the layout, so old projects keep opening.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Project {
-    pub(crate) document: Document,
+pub(crate) struct SaveFile {
+    /// The multi-comp project. `None` in files written before comps existed —
+    /// those carry `document` instead.
+    #[serde(default)]
+    pub(crate) project: Option<MProject>,
+    /// A single composition, as every `.pbc` stored it before the project
+    /// registry. Read into a one-comp project; never written any more.
+    #[serde(default)]
+    pub(crate) document: Option<Document>,
     #[serde(default)]
     pub(crate) layout: LayoutState,
 }

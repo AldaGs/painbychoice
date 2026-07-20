@@ -16,11 +16,11 @@ pub mod node;
 pub mod timebase;
 pub mod value;
 
-pub use eval::{evaluate, RenderItem, Scene};
+pub use eval::{evaluate, evaluate_comp, evaluate_project, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
     PropPath, ToExpr, Waveform,
 };
-pub use node::{Document, Node, NodeId, Shape, Stroke, Transform};
+pub use node::{Comp, CompId, Document, Node, NodeId, Project, Shape, Stroke, Transform};
 pub use timebase::Timebase;
 pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};

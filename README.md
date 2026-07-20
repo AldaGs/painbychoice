@@ -772,7 +772,32 @@ sample at a shifted time — the exact mechanism local time needs.
   the Rhai scope. Now "ease in over the first N frames, hold, ease out over the
   last N" is **one** expression that auto-fits any layer — the subtitle payoff,
   before pre-comps even exist. Fully unit-testable.
-- **Stage 3 — multi-comp data model** (the big/risky one; minimal UI).
+- ~~**Stage 3 — multi-comp data model**~~ ✅ Done (2026-07-19), minimal UI.
+  `Comp` is what `Document` always was — the rename *is* the feature — with
+  `pub type Document = Comp;` kept so existing call sites still read.
+  `Project { comps: BTreeMap<CompId, Comp>, root: CompId }` is the registry, and
+  `Node.precomp: Option<CompId>` makes a layer an **instance**.
+  - **Registry + instances, not inline nesting**: the same comp placed twice
+    renders twice and is edited once. Proven by test.
+  - A precomp is evaluated at the **layer's local frame**, so trimming or
+    slipping an instance retimes everything inside it — and this is where nested
+    timing finally becomes properly relative, which stage 1 left open. Each comp
+    gets its own `EvalCtx`, so expressions and name lookups are scoped to their
+    own tree (cross-comp references stay out of scope for v1).
+  - **Comp-level cycle guard** is a stack of the comps currently being
+    evaluated, so it catches `A→A` *and* `A→B→A` rather than only self-reference.
+    A dangling `CompId` warns too — a silently blank frame is indistinguishable
+    from a broken one.
+  - **Three save formats load**, newest first: a project; the pre-comps wrapper
+    holding one `document`; and a bare `Document` from before the wrapper. Note
+    the trap: every `SaveFile` field defaults, so a *bare document parses as an
+    empty `SaveFile`* — the fallback keys on "parsed but carries nothing", not
+    on a parse failure. Only the project form is ever written.
+  - `App` holds `project` + `current` behind `doc()`/`doc_mut()`, so opening a
+    different comp (stage 4) is a one-field change. Two sites deliberately reach
+    through the field instead: an accessor borrows all of `self`, which loses the
+    field-level disjointness `selected_keys` needs.
+- The plan as written: **multi-comp data model** (the big/risky one; minimal UI).
   `Project { comps: Map<CompId, Comp>, root: CompId }`, `Comp = { size, fps,
   duration, root: Node }`; a `Precomp(CompId)` layer kind;
   `evaluate(project, comp_id, frame)` recurses into a precomp at the layer's

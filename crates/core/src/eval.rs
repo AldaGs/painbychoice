@@ -5,7 +5,7 @@
 use kurbo::{Affine, BezPath};
 
 use crate::expr::EvalCtx;
-use crate::node::{Document, Node, NodeId};
+use crate::node::{CompId, Document, Node, NodeId, Project};
 use crate::value::Color;
 
 /// One flat, ready-to-draw item. `source` traces it back to the node that
@@ -41,12 +41,64 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     // and warnings sink. Expression warnings gathered during the walk are folded
     // into the scene's provenance-tagged list afterward.
     let mut ctx = EvalCtx::new(doc, frame);
-    walk(&doc.root, Affine::IDENTITY, 1.0, &mut ctx, &mut scene);
+    walk(&doc.root, Affine::IDENTITY, 1.0, &mut ctx, None, &mut Vec::new(), &mut scene);
     scene.warnings.append(&mut ctx.take_warnings());
     scene
 }
 
-fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, scene: &mut Scene) {
+/// Evaluate one composition of a project at `frame`, recursing into any precomp
+/// layers it instances.
+///
+/// A comp's contents resolve against **that comp** — expressions inside a
+/// precomp reach its own nodes, not the parent's. Cross-comp references are
+/// deliberately out of scope for v1.
+pub fn evaluate_comp(project: &Project, comp: CompId, frame: f64) -> Scene {
+    let mut scene = Scene::default();
+    eval_comp(project, comp, frame, Affine::IDENTITY, 1.0, &mut Vec::new(), &mut scene);
+    scene
+}
+
+/// Evaluate a project's root composition — what opening a `.pbc` shows.
+pub fn evaluate_project(project: &Project, frame: f64) -> Scene {
+    evaluate_comp(project, project.root, frame)
+}
+
+/// Walk one comp's tree, with `stack` recording which comps are already being
+/// evaluated further up so a cycle can be caught rather than recursed into.
+fn eval_comp(
+    project: &Project,
+    id: CompId,
+    frame: f64,
+    xf: Affine,
+    opacity: f64,
+    stack: &mut Vec<CompId>,
+    scene: &mut Scene,
+) {
+    let Some(comp) = project.comp(id) else {
+        // A dangling instance: the comp was deleted but a layer still points at
+        // it. Warn against the *comp's* root id — there's no better provenance
+        // here, and silently drawing nothing would look like a broken frame.
+        scene.warnings.push((NodeId(0), format!("precomp {} no longer exists", id.0)));
+        return;
+    };
+    // Each comp gets its own resolve context: its cache and name lookups are
+    // scoped to its own tree, which is exactly what "a comp is a boundary" means.
+    let mut ctx = EvalCtx::new(comp, frame);
+    stack.push(id);
+    walk(&comp.root, xf, opacity, &mut ctx, Some(project), stack, scene);
+    stack.pop();
+    scene.warnings.append(&mut ctx.take_warnings());
+}
+
+fn walk(
+    node: &Node,
+    parent_xf: Affine,
+    parent_opacity: f64,
+    ctx: &mut EvalCtx,
+    project: Option<&Project>,
+    stack: &mut Vec<CompId>,
+    scene: &mut Scene,
+) {
     // A trimmed layer outside its window contributes nothing — and neither do
     // its children, which live in its time. Checked before anything resolves,
     // so a hidden layer costs nothing.
@@ -101,12 +153,43 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, 
         }
     }
 
+    // A precomp layer renders another comp *into* this one, folded through this
+    // layer's transform and opacity — the "vector paste-through" of the plan.
+    // No isolated rasterization, so no blend modes or 2D/3D collapse yet; those
+    // need the compositor stage.
+    if let Some(id) = node.precomp {
+        match project {
+            // The nested comp's own comp-time is this layer's *local* frame, so
+            // trimming or slipping a precomp retimes everything inside it. This
+            // is also where nested timing becomes properly relative — a comp
+            // boundary is what stage 1 left open.
+            Some(project) if !stack.contains(&id) => {
+                eval_comp(project, id, ctx.frame, xf, opacity, stack, scene);
+            }
+            // Comp-level cycle guard, mirroring the expression one: a comp that
+            // contains itself warns and stops rather than recursing forever.
+            Some(_) => {
+                scene.warnings.push((
+                    node.id,
+                    format!("precomp {} contains itself; not expanded", id.0),
+                ));
+            }
+            // Evaluated as a bare comp rather than through a project, so there
+            // is no registry to look the instance up in.
+            None => {
+                scene
+                    .warnings
+                    .push((node.id, "precomp layer needs a project to resolve".into()));
+            }
+        }
+    }
+
     // Children are walked *inside* this node's mark only in the sense that each
     // re-marks itself; restore ours first so a sibling can't inherit it.
     ctx.exit_node(prev_node);
 
     for child in &node.children {
-        walk(child, xf, opacity, ctx, scene);
+        walk(child, xf, opacity, ctx, project, stack, scene);
     }
 
     ctx.frame = prev_frame;
@@ -488,6 +571,226 @@ mod tests {
 
         assert!((evaluate(&doc, 50.0).items[0].opacity - 0.5).abs() < 1e-9);
         assert!((evaluate(&doc, 100.0).items[0].opacity - 1.0).abs() < 1e-9);
+    }
+
+    // --- Multi-comp / pre-comps (stage 3) ---
+
+    /// A 10x10 square at the origin, for building comps to nest.
+    fn dot(id: u64) -> Node {
+        Node::shape(
+            id,
+            "dot",
+            Shape::Rect {
+                size: Value::constant(Vec2::new(10.0, 10.0)),
+                radius: Value::constant(0.0),
+            },
+        )
+    }
+
+    /// The reason for the registry: **one comp, placed twice**. Both instances
+    /// render, each folded through its own layer's transform — which inline
+    /// nesting could never express.
+    #[test]
+    fn one_comp_instanced_twice_renders_twice() {
+        use crate::node::{CompId, Project};
+        let inner = Document::new(100.0, 100.0, Node::group(0, "inner-root").with_child(dot(1)));
+        let mut project = Project::single(inner);
+        let inner_id = project.root;
+
+        let place = |id: u64, x: f64| {
+            Node::group(id, "instance")
+                .with_precomp(inner_id)
+                .with_transform(Transform {
+                    position: Value::constant(Vec2::new(x, 0.0)),
+                    ..Transform::default()
+                })
+        };
+        let outer = Document::new(
+            100.0,
+            100.0,
+            Node::group(10, "outer-root").with_child(place(11, 50.0)).with_child(place(12, 200.0)),
+        );
+        let outer_id = project.insert(outer);
+        project.root = outer_id;
+
+        let scene = evaluate_project(&project, 0.0);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        assert_eq!(scene.items.len(), 2, "both placements render");
+        let mut xs: Vec<f64> =
+            scene.items.iter().map(|i| i.transform.as_coeffs()[4]).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((xs[0] - 50.0).abs() < 1e-9, "first instance at its layer's x");
+        assert!((xs[1] - 200.0).abs() < 1e-9, "second at its own");
+        // Provenance points at the *inner* node — both items came from it.
+        assert!(scene.items.iter().all(|i| i.source == NodeId(1)));
+    }
+
+    /// A precomp layer's opacity folds into everything the nested comp emits —
+    /// the "vector paste-through" compositing of v1.
+    #[test]
+    fn a_precomp_layer_folds_its_opacity_into_the_nested_comp() {
+        use crate::node::Project;
+        let inner_child = dot(1).with_transform(Transform {
+            opacity: Value::constant(0.5),
+            ..Transform::default()
+        });
+        let mut project =
+            Project::single(Document::new(100.0, 100.0, Node::group(0, "i").with_child(inner_child)));
+        let inner_id = project.root;
+        let outer = Document::new(
+            100.0,
+            100.0,
+            Node::group(10, "o").with_child(Node::group(11, "inst").with_precomp(inner_id).with_transform(
+                Transform { opacity: Value::constant(0.5), ..Transform::default() },
+            )),
+        );
+        project.root = project.insert(outer);
+
+        let scene = evaluate_project(&project, 0.0);
+        assert!((scene.items[0].opacity - 0.25).abs() < 1e-9, "0.5 × 0.5");
+    }
+
+    /// Trimming/slipping a precomp retimes **everything inside it**: the nested
+    /// comp's own time is the layer's local frame. This is also where nested
+    /// timing becomes properly relative, which stage 1 deliberately left open.
+    #[test]
+    fn a_precomp_is_retimed_by_its_layers_local_time() {
+        use crate::node::{LayerTiming, Project};
+        // Inner comp: a dot sliding 0 -> 240 over 24 frames of *its* time.
+        let inner_child = dot(1).with_transform(Transform {
+            position: Value::Keyframed(Track::new(vec![
+                Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+                Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+            ])),
+            ..Transform::default()
+        });
+        let mut project =
+            Project::single(Document::new(100.0, 100.0, Node::group(0, "i").with_child(inner_child)));
+        let inner_id = project.root;
+        // Placed starting at comp frame 100.
+        let outer = Document::new(
+            100.0,
+            100.0,
+            Node::group(10, "o").with_child(
+                Node::group(11, "inst").with_precomp(inner_id).with_timing(LayerTiming::new(100, 200)),
+            ),
+        );
+        project.root = project.insert(outer);
+
+        // Comp frame 112 = local 12 = the inner animation's midpoint.
+        let scene = evaluate_project(&project, 112.0);
+        assert_eq!(scene.items.len(), 1);
+        assert!((scene.items[0].transform.as_coeffs()[4] - 120.0).abs() < 1e-9);
+        // And outside the instance's window it doesn't draw at all.
+        assert!(evaluate_project(&project, 99.0).items.is_empty());
+    }
+
+    /// Comp-level cycle guard, mirroring the expression one: a comp that
+    /// contains itself must warn and stop, not recurse until the stack dies.
+    #[test]
+    fn a_self_containing_comp_warns_instead_of_hanging() {
+        use crate::node::Project;
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "a")));
+        let id = project.root;
+        project
+            .comp_mut(id)
+            .unwrap()
+            .root
+            .children
+            .push(Node::group(1, "self").with_precomp(id));
+
+        let scene = evaluate_project(&project, 0.0);
+        let (node, msg) = scene.warnings.first().expect("the cycle should warn");
+        assert_eq!(*node, NodeId(1), "attributed to the instancing layer");
+        assert!(msg.contains("itself"), "{msg}");
+    }
+
+    /// The indirect case: A instances B, B instances A. The guard is a stack of
+    /// comps being evaluated, so it catches a cycle of any length.
+    #[test]
+    fn a_mutual_comp_cycle_warns() {
+        use crate::node::{CompId, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "a")));
+        let a = project.root;
+        let b = project.insert(Document::new(100.0, 100.0, Node::group(10, "b")));
+        // a contains b …
+        project.comp_mut(a).unwrap().root.children.push(Node::group(1, "->b").with_precomp(b));
+        // … and b contains a.
+        project.comp_mut(b).unwrap().root.children.push(Node::group(11, "->a").with_precomp(a));
+
+        let scene = evaluate_project(&project, 0.0);
+        assert!(
+            scene.warnings.iter().any(|(_, m)| m.contains("itself")),
+            "expected a cycle warning, got {:?}",
+            scene.warnings
+        );
+        assert_eq!(project.root, a, "sanity: root untouched");
+        let _ = CompId(0);
+    }
+
+    /// An instance pointing at a deleted comp warns rather than drawing nothing
+    /// silently — a blank frame is indistinguishable from a broken one.
+    #[test]
+    fn a_dangling_precomp_reference_warns() {
+        use crate::node::{CompId, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "a")));
+        let id = project.root;
+        project
+            .comp_mut(id)
+            .unwrap()
+            .root
+            .children
+            .push(Node::group(1, "ghost").with_precomp(CompId(999)));
+
+        let scene = evaluate_project(&project, 0.0);
+        assert!(
+            scene.warnings.iter().any(|(_, m)| m.contains("no longer exists")),
+            "{:?}",
+            scene.warnings
+        );
+    }
+
+    /// **The `.pbc` migration.** A pre-project document is exactly one comp, so
+    /// an old file deserializes into `Comp` and `Project::single` wraps it —
+    /// and a project round-trips like anything else.
+    #[test]
+    fn a_single_comp_document_becomes_a_one_comp_project() {
+        use crate::node::Project;
+        let json = r#"{"width":640.0,"height":480.0,"fps":24.0,"duration":5.0,
+            "root":{"id":0,"name":"root","transform":{"anchor":{"Const":[0.0,0.0]},
+            "position":{"Const":[0.0,0.0]},"rotation_deg":{"Const":0.0},
+            "scale":{"Const":[1.0,1.0]},"opacity":{"Const":1.0}},
+            "shape":null,"fill":null,"stroke":null,"children":[]}}"#;
+        let legacy: Document = serde_json::from_str(json).unwrap();
+        let mut project = Project::single(legacy);
+        project.migrate();
+
+        assert_eq!(project.comps.len(), 1);
+        assert_eq!(project.root_comp().width, 640.0);
+
+        let back: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(back.root, project.root);
+        assert_eq!(back.root_comp().fps, 24.0);
+    }
+
+    /// A precomp layer evaluated through the single-comp entry point can't
+    /// resolve — there's no registry — so it says so rather than rendering an
+    /// empty frame that looks correct.
+    #[test]
+    fn a_precomp_without_a_project_warns() {
+        use crate::node::CompId;
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(Node::group(1, "inst").with_precomp(CompId(0))),
+        );
+        let scene = evaluate(&doc, 0.0);
+        assert!(
+            scene.warnings.iter().any(|(_, m)| m.contains("needs a project")),
+            "{:?}",
+            scene.warnings
+        );
     }
 
     /// Serde `default` *is* the migration: a `.pbc` written before layer timing

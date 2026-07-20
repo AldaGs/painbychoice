@@ -20,7 +20,12 @@ pub(crate) struct App {
     pub(crate) renderers: Vec<Option<Renderer>>,
     pub(crate) state: RenderState,
     pub(crate) vscene: VScene,
-    pub(crate) doc: Document,
+    /// Every composition in the project. The editor always edits *one* of them
+    /// (`current`); a precomp layer instances another.
+    pub(crate) project: MProject,
+    /// Which comp is open. Stage 4 adds the switcher — for now it is always the
+    /// project's root, but every read already goes through it.
+    pub(crate) current: CompId,
 
     // egui (created lazily in `resumed`, once we have a window + device).
     pub(crate) egui_ctx: egui::Context,
@@ -65,16 +70,30 @@ pub(crate) fn max_id(node: &MNode) -> u64 {
 }
 
 impl App {
+    /// The composition being edited. Every panel reads through this, so opening
+    /// a different comp (stage 4) is a one-field change rather than a rewrite.
+    pub(crate) fn doc(&self) -> &Comp {
+        self.project.comp(self.current).expect("the open comp always exists")
+    }
+
+    pub(crate) fn doc_mut(&mut self) -> &mut Comp {
+        let id = self.current;
+        self.project.comp_mut(id).expect("the open comp always exists")
+    }
+
     pub(crate) fn new(doc: Document) -> Self {
         let next_id = max_id(&doc.root) + 1;
         let view = TimelineView::full(doc.duration_frames());
+        let project = MProject::single(doc);
+        let current = project.root;
         Self {
             context: RenderContext::new(),
             renderers: Vec::new(),
             state: RenderState::Suspended(None),
             warnings: Vec::new(),
             vscene: VScene::new(),
-            doc,
+            project,
+            current,
             egui_ctx: egui::Context::default(),
             egui_state: None,
             egui_renderer: None,
@@ -104,8 +123,8 @@ impl App {
         } else {
             self.paused_t
         };
-        if self.doc.duration > 0.0 {
-            raw.rem_euclid(self.doc.duration)
+        if self.doc().duration > 0.0 {
+            raw.rem_euclid(self.doc().duration)
         } else {
             raw
         }
@@ -117,7 +136,7 @@ impl App {
     /// the way a projector does. Rounding would show frame N starting half a
     /// frame early and is the classic off-by-half in playback code.
     pub(crate) fn current_frame(&self) -> i64 {
-        let tb = self.doc.timebase();
+        let tb = self.doc().timebase();
         tb.seconds_to_frames_exact(self.raw_time()).floor() as i64
     }
 
@@ -125,19 +144,19 @@ impl App {
     /// what the canvas evaluates at, so playback actually steps at `doc.fps`
     /// instead of running at the monitor's refresh rate.
     pub(crate) fn current_time(&self) -> f64 {
-        self.doc.timebase().frames_to_seconds(self.current_frame() as f64)
+        self.doc().timebase().frames_to_seconds(self.current_frame() as f64)
     }
 
     /// Seek to a frame, wrapping around the composition length. All seeking
     /// goes through here, so the playhead can only ever land on the grid.
     pub(crate) fn seek_frame(&mut self, frame: i64) {
-        let total = self.doc.duration_frames().max(1);
+        let total = self.doc().duration_frames().max(1);
         let frame = frame.rem_euclid(total);
-        self.seek(self.doc.timebase().frames_to_seconds(frame as f64));
+        self.seek(self.doc().timebase().frames_to_seconds(frame as f64));
     }
 
     pub(crate) fn seek(&mut self, t: f64) {
-        let t = t.rem_euclid(self.doc.duration.max(f64::MIN_POSITIVE));
+        let t = t.rem_euclid(self.doc().duration.max(f64::MIN_POSITIVE));
         self.paused_t = t;
         self.anchor = Instant::now() - std::time::Duration::from_secs_f64(t);
     }
@@ -322,7 +341,8 @@ impl App {
         let Some(id) = self.selected else {
             return false;
         };
-        let Some(node) = self.doc.root.find_mut(id) else {
+        // Field path, not `doc_mut()` — see the note in `delete_selected_keys`.
+        let Some(node) = self.project.comp_mut(self.current).unwrap().root.find_mut(id) else {
             return false;
         };
         let tr = &mut node.transform;
@@ -373,7 +393,7 @@ impl App {
                 .retain(|(k, _)| !matches!(k, PropKind::StrokeColor | PropKind::StrokeWidth));
             changed = true;
         }
-        let node = self.doc.root.find_mut(id).expect("checked above");
+        let node = self.doc_mut().root.find_mut(id).expect("checked above");
         if let Some(rgb) = e.stroke_color {
             if let Some(s) = node.stroke.as_mut() {
                 s.color.set_at(frame, rgb_color(rgb));
@@ -424,7 +444,7 @@ impl App {
         let Some(id) = self.selected else {
             return false;
         };
-        let Some(node) = self.doc.root.find_mut(id) else {
+        let Some(node) = self.doc_mut().root.find_mut(id) else {
             return false;
         };
         let out = Handle::new(p1.0 as f64, p1.1 as f64);
@@ -445,7 +465,9 @@ impl App {
         if self.selected_keys.is_empty() {
             return false;
         }
-        let Some(node) = self.doc.root.find_mut(id) else {
+        // Reached through the field rather than `doc_mut()` on purpose: an
+        // accessor borrows all of `self`, and `selected_keys` is read below.
+        let Some(node) = self.project.comp_mut(self.current).unwrap().root.find_mut(id) else {
             return false;
         };
         // Descending index order: removing a key shifts every later index
@@ -462,7 +484,7 @@ impl App {
     /// Copy the selected keyframes (Ctrl+C). Whole keys — value and easing —
     /// so a paste reproduces the curve, not just the timing.
     pub(crate) fn copy_selected_keys(&mut self) -> bool {
-        let Some(node) = self.selected.and_then(|id| self.doc.root.find(id)) else {
+        let Some(node) = self.selected.and_then(|id| self.doc().root.find(id)) else {
             return false;
         };
         if self.selected_keys.is_empty() {
@@ -495,7 +517,7 @@ impl App {
             return false;
         };
         let offset = self.current_frame() - clip.origin;
-        let Some(node) = self.doc.root.find_mut(id) else {
+        let Some(node) = self.doc_mut().root.find_mut(id) else {
             return false;
         };
         let mut landed = KeySelection::new();
@@ -527,11 +549,11 @@ impl App {
         if self.selected_keys.is_empty() || delta == 0 {
             return false;
         }
-        let Some(node) = self.doc.root.find_mut(id) else {
+        // Grouped before the mutable borrow: `doc_mut()` borrows all of `self`.
+        let per_prop = group_selection_by_prop(&self.selected_keys);
+        let Some(node) = self.doc_mut().root.find_mut(id) else {
             return false;
         };
-
-        let per_prop = group_selection_by_prop(&self.selected_keys);
 
         // Intersect the allowed delta across every affected track.
         let (mut lo, mut hi) = (i64::MIN, i64::MAX);
@@ -546,8 +568,8 @@ impl App {
             return false; // the block is boxed in somewhere
         }
         // Also keep the whole selection inside the composition.
-        let last = self.doc.duration_frames().max(1);
-        let node = self.doc.root.find_mut(id).expect("checked above");
+        let last = self.doc().duration_frames().max(1);
+        let node = self.doc_mut().root.find_mut(id).expect("checked above");
         let mut min_frame = i64::MAX;
         let mut max_frame = i64::MIN;
         for (kind, idxs) in &per_prop {
@@ -586,7 +608,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
 
-        let center = Vec2::new(self.doc.width / 2.0, self.doc.height / 2.0);
+        let center = Vec2::new(self.doc().width / 2.0, self.doc().height / 2.0);
         let at_center = Transform {
             position: Value::constant(center),
             ..Transform::default()
@@ -623,10 +645,10 @@ impl App {
         };
 
         // Parent under the selected node if it still exists, else the root.
-        let target = self.selected.filter(|sid| self.doc.root.find(*sid).is_some());
+        let target = self.selected.filter(|sid| self.doc().root.find(*sid).is_some());
         let parent = match target {
-            Some(sid) => self.doc.root.find_mut(sid).unwrap(),
-            None => &mut self.doc.root,
+            Some(sid) => self.doc_mut().root.find_mut(sid).unwrap(),
+            None => &mut self.doc_mut().root,
         };
         parent.children.push(node);
 
@@ -647,8 +669,9 @@ impl App {
         else {
             return;
         };
-        let project = Project {
-            document: self.doc.clone(),
+        let project = SaveFile {
+            project: Some(self.project.clone()),
+            document: None,
             layout: LayoutState {
                 dock: Some(self.dock.clone()),
                 user_presets: self.presets.iter().filter(|p| !p.builtin).cloned().collect(),
@@ -686,22 +709,39 @@ impl App {
                 return false;
             }
         };
-        let (mut doc, layout) = match serde_json::from_str::<Project>(&text) {
-            Ok(p) => (p.document, Some(p.layout)),
-            Err(_) => match serde_json::from_str::<Document>(&text) {
-                Ok(d) => (d, None),
-                Err(e) => {
-                    eprintln!("parse failed: {e}");
-                    return false;
+        // Three formats, newest first: a project, a pre-comps wrapper holding a
+        // single document, and a bare document from before the wrapper existed.
+        // Each older one loads as a one-comp project, so nothing is stranded.
+        let (mut project, layout) = match serde_json::from_str::<SaveFile>(&text) {
+            Ok(f) => {
+                let layout = Some(f.layout);
+                match (f.project, f.document) {
+                    (Some(p), _) => (p, layout),
+                    (None, Some(d)) => (MProject::single(d), layout),
+                    // A `SaveFile` with neither is not one of our files: it
+                    // parsed only because every field defaults.
+                    (None, None) => match serde_json::from_str::<Document>(&text) {
+                        Ok(d) => (MProject::single(d), None),
+                        Err(e) => {
+                            eprintln!("parse failed: {e}");
+                            return false;
+                        }
+                    },
                 }
-            },
+            }
+            Err(e) => {
+                eprintln!("parse failed: {e}");
+                return false;
+            }
         };
         // Pre-frame-grid docs stored keyframes as float seconds; this converts
-        // them using the doc's own fps. No-op on new files.
-        doc.migrate();
-        self.next_id = max_id(&doc.root) + 1;
-        self.view = TimelineView::full(doc.duration_frames());
-        self.doc = doc;
+        // them using each comp's own fps. No-op on new files.
+        project.migrate();
+        let open = project.root_comp();
+        self.next_id = max_id(&open.root) + 1;
+        self.view = TimelineView::full(open.duration_frames());
+        self.project = project;
+        self.current = self.project.root;
         self.selected = None;
         self.selected_keys.clear();
 
@@ -734,8 +774,8 @@ impl App {
         // appear in the timecode string.
         let frame = self.current_frame();
         let t = frame as f64;
-        let last_frame = self.doc.duration_frames().max(1);
-        let scene = evaluate(&self.doc, t);
+        let last_frame = self.doc().duration_frames().max(1);
+        let scene = evaluate_comp(&self.project, self.current, t);
         // Warnings are re-derived every frame, so print only when the set
         // actually changes — a broken script would otherwise spam stderr at the
         // refresh rate. The current set is kept for the comp bar's indicator.
@@ -763,7 +803,7 @@ impl App {
             // First frame: nothing measured yet, so fill the window.
             kurbo::Rect::new(0.0, 0.0, size.width as f64, size.height as f64)
         });
-        let fit = fit_transform(&self.doc, canvas);
+        let fit = fit_transform(self.doc(), canvas);
 
         // Resolve any pending click into a selection (or a deselect). Changing
         // the selected node invalidates any keyframe selection.
@@ -775,21 +815,21 @@ impl App {
             }
         }
 
-        self.vscene = to_vello(&scene, fit, (self.doc.width, self.doc.height), self.selected);
+        self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), self.selected);
 
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
-        let sel_node = self.selected.and_then(|id| self.doc.root.find(id));
+        let sel_node = self.selected.and_then(|id| self.doc().root.find(id));
         // Pass the doc so an expression-driven property resolves against the
         // scene (a doc-less context would show its fallback instead).
-        let sel_info = sel_node.map(|node| NodeInfo::resolve(node, &self.doc, t));
+        let sel_info = sel_node.map(|node| NodeInfo::resolve(node, self.doc(), t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
         // The clip bar only exists for a selected layer (the root isn't one).
         let clip = sel_node
-            .filter(|n| Some(n.id) != Some(self.doc.root.id))
+            .filter(|n| Some(n.id) != Some(self.doc().root.id))
             .map(|n| ClipInfo { timing: n.timing });
         // Snapshot for the graph panel (clones the selected node's expressions).
-        let graph_info = GraphInfo::gather(&self.doc, self.selected, t);
+        let graph_info = GraphInfo::gather(self.doc(), self.selected, t);
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -811,12 +851,12 @@ impl App {
 
         // Flatten the scene tree for the layers panel.
         let mut tree = Vec::new();
-        tree_rows(&self.doc.root, 0, &mut tree);
+        tree_rows(&self.doc().root, 0, &mut tree);
 
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
-        let duration = self.doc.duration;
-        let timebase = self.doc.timebase();
+        let duration = self.doc().duration;
+        let timebase = self.doc().timebase();
         let view = self.view;
         let playing = self.playing;
         let mut transport = Transport::default();
@@ -827,7 +867,7 @@ impl App {
         let selected_node = self.selected;
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let mut comp = CompEdits::default();
-        let (doc_w, doc_h, doc_fps) = (self.doc.width, self.doc.height, self.doc.fps);
+        let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
         let preset_names: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
@@ -891,7 +931,7 @@ impl App {
         // Apply a graph edit (promote/bake/tree change) after the UI pass.
         if let Some(op) = graph_edits.op.take() {
             if let Some(id) = self.selected {
-                apply_graph_op(&mut self.doc, id, op, frame);
+                apply_graph_op(self.doc_mut(), id, op, frame);
                 window.request_redraw();
             }
         }
@@ -932,21 +972,21 @@ impl App {
 
         // Composition settings.
         if let Some(w) = comp.width {
-            self.doc.width = w.max(1.0);
+            self.doc_mut().width = w.max(1.0);
         }
         if let Some(h) = comp.height {
-            self.doc.height = h.max(1.0);
+            self.doc_mut().height = h.max(1.0);
         }
         if let Some(f) = comp.fps {
-            self.doc.fps = f.max(1.0);
+            self.doc_mut().fps = f.max(1.0);
         }
         if let Some(d) = comp.duration {
-            self.doc.duration = d.max(0.1);
+            self.doc_mut().duration = d.max(0.1);
         }
         // fps/duration changes resize the frame axis under the view, so the
         // window may now hang past the end of the comp.
         if comp.fps.is_some() || comp.duration.is_some() {
-            self.view = self.view.clamped(self.doc.duration_frames());
+            self.view = self.view.clamped(self.doc().duration_frames());
         }
 
         // Layers panel: selection + reorder.
@@ -959,7 +999,7 @@ impl App {
 
         // Clip bar: trim / slide / clear the selected layer's time range.
         if let Some(timing) = dope.set_timing {
-            if let Some(node) = self.selected.and_then(|id| self.doc.root.find_mut(id)) {
+            if let Some(node) = self.selected.and_then(|id| self.doc_mut().root.find_mut(id)) {
                 node.timing = timing;
                 window.request_redraw();
             }
@@ -1039,13 +1079,13 @@ impl App {
             dirty |= self.set_ease(kind, idx, p1, p2);
         }
         if let Some((id, delta)) = tree_edits.reorder {
-            dirty |= self.doc.root.reorder_child(id, delta);
+            dirty |= self.doc_mut().root.reorder_child(id, delta);
         }
         if let Some(kind) = tree_edits.add {
             dirty |= self.add_node(kind);
         }
         if let Some(id) = tree_edits.delete {
-            self.doc.root.remove(id);
+            self.doc_mut().root.remove(id);
             if self.selected == Some(id) {
                 self.selected = None;
                 self.selected_keys.clear();
@@ -1059,8 +1099,8 @@ impl App {
             dirty |= self.load();
         }
         if dirty {
-            let scene = evaluate(&self.doc, t);
-            self.vscene = to_vello(&scene, fit, (self.doc.width, self.doc.height), self.selected);
+            let scene = evaluate_comp(&self.project, self.current, t);
+            self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), self.selected);
         }
 
         self.egui_state
