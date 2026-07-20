@@ -124,6 +124,20 @@ and one row per knob reading either `inherit` or the overridden value.
   graph picker, and seeding a link needs a module picker, which belongs with the
   Blender-standard graph UI step.
 
+### Icons (`live/src/icon.rs`)
+
+Tabler Icons as a font (MIT, subsetted to 8 KB — see `live/assets/NOTICE.md`).
+Registered in its **own** family rather than as a fallback on the proportional
+one: a fallback would let any missing character silently resolve to an icon
+glyph, turning a text bug into a baffling picture. `icon::text` / `icon::button`
+ask for the family explicitly, so an icon is always deliberate.
+
+Every glyph is a **named const** — a raw `"\u{ea62}"` at a call site is
+unsearchable, and you can't tell a chevron from a trash can by reading the diff.
+Adding an icon means adding a const *and* re-running the subset with its
+codepoint; miss the second step and it renders as tofu, which is a visible
+failure rather than a blank button.
+
 ### Frames are the native time domain
 
 `core` thinks in **frames, not seconds**. `Keyframe.frame` is an `i64`, and
@@ -399,9 +413,12 @@ Two rules keep this safe:
 
 ## Known issues / gotchas
 
-- **egui default font lacks many glyphs** (◆ ◇ ● ○ ❚ ⟲ ▸) — they render as tofu
-  boxes. `▶` and `•` are safe; otherwise *paint* the indicator (see `key_button`)
-  or use plain words. Learned the hard way.
+- ~~**egui default font lacks many glyphs**~~ — fixed by bundling an icon font
+  (see *Icons* above). It used to be that `◆ ◇ ● ○ ❚ ⟲ ▸` rendered as tofu, only
+  `▶`/`•` were safe, and anything else had to be *painted* (see `key_button`) or
+  spelled out in words. Icons now come from `icon::*`; the painted indicators
+  that remain are kept because they encode state (a filled vs hollow stopwatch),
+  not because a glyph was unavailable.
 - **The box-select flag round-trips through egui memory.** Only a row's
   `Response` can tell us a drag began on empty track (a diamond grabs the press
   first), but the marquee rect is needed *before* the rows loop — so "a box is

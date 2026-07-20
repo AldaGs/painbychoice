@@ -351,13 +351,15 @@ pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, 
                 ui.horizontal(|ui| {
                     ui.strong(prop.label);
                     if prop.is_expr {
-                        if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
+                        if icon::button(ui, icon::BAKE, "Freeze to a constant").clicked() {
                             out.op = Some(GraphOp::Bake(prop.kind));
                         }
-                        if ui
-                            .small_button("-> module")
-                            .on_hover_text("Lift this recipe into a shared module and link it here")
-                            .clicked()
+                        if icon::button(
+                            ui,
+                            icon::MODULE,
+                            "Lift this recipe into a shared module and link it here",
+                        )
+                        .clicked()
                         {
                             out.op = Some(GraphOp::ExtractModule { kind: prop.kind });
                         }
@@ -365,11 +367,7 @@ pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, 
                             ui.weak(format!("= {printed}"));
                         }
                     } else {
-                        if ui
-                            .small_button("= fx")
-                            .on_hover_text("Drive with an expression")
-                            .clicked()
-                        {
+                        if icon::button(ui, icon::EXPR, "Drive with an expression").clicked() {
                             out.op = Some(GraphOp::Promote(prop.kind));
                         }
                         // Linking an existing module is the other way in, and
@@ -677,6 +675,7 @@ pub(crate) fn use_editor(
 /// made by extracting one from a property.
 pub(crate) fn modules_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdits) {
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::MODULE));
         ui.strong("Modules");
         ui.weak(format!("{}", info.modules.len()));
     });
@@ -693,10 +692,12 @@ pub(crate) fn modules_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdi
             {
                 out.op = Some(GraphOp::RenameModule { module: m.id, name });
             }
-            if ui
-                .small_button("✕")
-                .on_hover_text("Delete. Links to it warn and fall back, like any dangling reference.")
-                .clicked()
+            if icon::button(
+                ui,
+                icon::DELETE,
+                "Delete. Links to it warn and fall back, like any dangling reference.",
+            )
+            .clicked()
             {
                 out.op = Some(GraphOp::DeleteModule { module: m.id });
             }

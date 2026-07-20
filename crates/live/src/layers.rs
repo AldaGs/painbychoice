@@ -61,21 +61,21 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
     ui.add_space(8.0);
     ui.heading("Layers");
     ui.horizontal(|ui| {
-        if ui.button("Save…").clicked() {
+        if icon::button(ui, icon::SAVE, "Save the project (.pbc)").clicked() {
             out.save = true;
         }
-        if ui.button("Load…").clicked() {
+        if icon::button(ui, icon::LOAD, "Load a project").clicked() {
             out.load = true;
         }
     });
     ui.horizontal(|ui| {
-        if ui.button("+ Rect").clicked() {
+        if icon::button(ui, icon::RECT, "Add a rectangle").clicked() {
             out.add = Some(NewShape::Rect);
         }
-        if ui.button("+ Ellipse").clicked() {
+        if icon::button(ui, icon::ELLIPSE, "Add an ellipse").clicked() {
             out.add = Some(NewShape::Ellipse);
         }
-        if ui.button("+ Group").clicked() {
+        if icon::button(ui, icon::GROUP, "Add a group").clicked() {
             out.add = Some(NewShape::Group);
         }
     });
@@ -83,10 +83,13 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
     // Pre-compose: only meaningful with a non-root layer selected, since the
     // root *is* the comp.
     if let Some(id) = selected.filter(|id| rows.iter().any(|r| r.id == *id && r.depth > 0)) {
-        if ui
-            .button("Pre-compose selection")
-            .on_hover_text("Move this layer into a new comp and leave an instance in its place")
-            .clicked()
+        if icon::labeled(
+            ui,
+            icon::PRECOMPOSE,
+            "Pre-compose",
+            "Move this layer into a new comp and leave an instance in its place",
+        )
+        .clicked()
         {
             out.precompose = Some(id);
         }
@@ -97,12 +100,13 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
             ui.add_space(6.0 + row.depth as f32 * 14.0);
             // A precomp reads as a comp first and a layer second — it's the
             // one row whose contents live somewhere else.
-            let icon = match (row.precomp.is_some(), row.is_group) {
-                (true, _) => "[c]",
-                (_, true) => "▶",
-                (_, false) => "•",
+            let glyph = match (row.precomp.is_some(), row.is_group) {
+                (true, _) => icon::PRECOMP,
+                (_, true) => icon::GROUP,
+                (_, false) => icon::RECT,
             };
-            let label = format!("{icon} {}", row.name);
+            ui.label(icon::text(glyph));
+            let label = row.name.clone();
             if ui
                 .selectable_label(selected == Some(row.id), label)
                 .clicked()
@@ -110,19 +114,19 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
                 out.select = Some(row.id);
             }
             if let Some(comp) = row.precomp {
-                if ui.small_button("open").on_hover_text("Edit this composition").clicked() {
+                if icon::button(ui, icon::OPEN, "Edit this composition").clicked() {
                     out.open_comp = Some(comp);
                 }
             }
             // Reorder + delete (not meaningful for the root).
             if row.depth > 0 {
-                if ui.small_button("▲").clicked() {
+                if icon::button(ui, icon::UP, "Move up (draw later)").clicked() {
                     out.reorder = Some((row.id, -1));
                 }
-                if ui.small_button("▼").clicked() {
+                if icon::button(ui, icon::DOWN, "Move down (draw earlier)").clicked() {
                     out.reorder = Some((row.id, 1));
                 }
-                if ui.small_button("✕").clicked() {
+                if icon::button(ui, icon::DELETE, "Delete this layer").clicked() {
                     out.delete = Some(row.id);
                 }
             }

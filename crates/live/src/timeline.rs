@@ -19,10 +19,12 @@ pub(crate) fn transport_ui(
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
-        if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+        let (glyph, tip) =
+            if playing { (icon::PAUSE, "Pause") } else { (icon::PLAY, "Play") };
+        if icon::button(ui, glyph, tip).clicked() {
             out.toggle = true;
         }
-        if ui.button("Restart").clicked() {
+        if icon::button(ui, icon::RESTART, "Back to the start").clicked() {
             out.restart = true;
         }
         // Frame-domain readout: hh:mm:ss.ff plus the raw frame number,
@@ -466,19 +468,21 @@ pub(crate) fn dopesheet_ui(
                     // whole comp, which is exactly what it does today — so
                     // enabling trimming never moves anything on screen.
                     None => {
-                        if ui.small_button("Trim…").clicked() {
+                        if icon::button(ui, icon::TRIM, "Give this layer a time range")
+                            .clicked()
+                        {
                             out.set_timing = Some(Some(LayerTiming::new(0, last_frame + 1)));
                         }
                     }
                     Some(_) => {
-                        if ui
-                            .small_button("Clip ×")
-                            .on_hover_text(
-                                "Back to full comp.\n\
-                                 Drag an end to trim, the body to slide, \
-                                 alt+drag to slip (content moves, window stays).",
-                            )
-                            .clicked()
+                        if icon::button(
+                            ui,
+                            icon::CLOSE,
+                            "Back to full comp.\n\
+                             Drag an end to trim, the body to slide, \
+                             alt+drag to slip (content moves, window stays).",
+                        )
+                        .clicked()
                         {
                             out.set_timing = Some(None);
                         }

@@ -584,7 +584,11 @@ pub(crate) fn comp_ui(
 ");
             ui.colored_label(
                 egui::Color32::from_rgb(220, 160, 60),
-                format!("! {}", warnings.len()),
+                icon::text(icon::WARNING),
+            );
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 60),
+                format!("{}", warnings.len()),
             )
             .on_hover_text(summary);
         }

@@ -97,7 +97,13 @@ impl App {
             vscene: VScene::new(),
             project,
             current,
-            egui_ctx: egui::Context::default(),
+            egui_ctx: {
+                // The icon font has to be registered before the first UI pass,
+                // or the first frame draws tofu where every icon should be.
+                let ctx = egui::Context::default();
+                icon::install(&ctx);
+                ctx
+            },
             egui_state: None,
             egui_renderer: None,
             playing: true,

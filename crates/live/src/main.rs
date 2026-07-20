@@ -43,6 +43,7 @@ use winit::window::{Window, WindowId};
 mod app;
 mod dock;
 mod graph;
+mod icon;
 mod layers;
 mod props;
 mod scene;
