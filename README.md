@@ -229,6 +229,33 @@ Option<WorkArea>` sits beside `view` and resets the same way, when a comp opens.
   per-comp preview state is genuinely session-scoped; keeping it out of the
   `.pbc` avoids a format change for something you re-set constantly.
 
+### The preview camera (2026-07-20)
+
+Zoom + pan for the canvas, layered onto the fit that was already there. The
+state is `App::nav: CanvasNav { zoom: Option<f64>, pan: (f64, f64) }` — **view
+state**, like `view` and `work_area`, reset to Fit when a comp opens.
+
+- **Fit is `zoom == None`**, recomputed each frame from the (possibly resized)
+  canvas rect so the comp stays framed as panels move. It insets the canvas rect
+  by `FIT_MARGIN` (20 logical points) on every side — the deliberate gap from the
+  surrounding panels. `Some(z)` pins a fixed zoom at `z` *logical points per comp
+  pixel* (100% = 1.0), positioned by `pan`, an offset in physical pixels from the
+  centred placement.
+- **All the math is pure and lives in `scene.rs`**: `canvas_transform` (the one
+  the render path calls, replacing the bare `fit_transform`), `canvas_scale`,
+  `nav_zoom_about` (zoom about a point — keeps the comp point under the cursor
+  fixed, the invariant that makes the wheel feel right, and a unit test), and
+  `fit_area`. Scale is clamped to `[MIN_SCALE, MAX_SCALE]`.
+- **Input in the winit handler**: scroll = zoom about the cursor, middle-drag =
+  pan (`pan_drag` holds the press cursor + pan; pan tracks the cursor 1:1 in
+  physical pixels). Starting a pan from Fit first pins the current framing as an
+  explicit zoom so the pan has a fixed scale to move against.
+- **The toolbar is a stacked strip, not a floating card.** The canvas leaf gives
+  up a `CANVAS_BAR_H` strip at its bottom edge; `canvas_toolbar` fills it with
+  the panel fill and reports picks through `CanvasEdits`, applied after the UI
+  pass (the same defer-then-apply discipline as every other panel). Built to hold
+  more preview tools later.
+
 ### `live/` module layout
 
 `main.rs` grew to ~5,100 lines and was split by concern (2026-07-19). It was a
@@ -245,7 +272,7 @@ live/src/
   props.rs     properties panel, easing, and the PropKind enumeration
   dock.rs      panel layout tree, its editors, the composition bar
   layers.rs    scene-tree panel
-  scene.rs     evaluated Scene -> vello, canvas fit + pick
+  scene.rs     evaluated Scene -> vello, canvas fit/zoom/pan + pick, zoom toolbar
   tests.rs     the unit tests
 ```
 
@@ -283,6 +310,11 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   fit, playback, frame step, timeline. Comp bounds drawn with a fill + border.
 - **Canvas** — vello rasterizes `evaluate(doc, t)` each frame; click a shape to
   select (front-most, via `NodeId` provenance). Selection gets a yellow outline.
+  **Zoomable + pannable**: scroll zooms about the cursor, middle-drag pans, and a
+  stacked tool strip at the bottom offers **Fit** plus fixed zoom stops
+  (25/50/100/200/400/800%). **Fit** (the default) frames the comp in the canvas
+  area with a 20px gap from the surrounding panels, and re-fits as they resize.
+  See *The preview camera* below.
 - **Transport** — Play/Pause (Space), Restart (R), ←/→ frame step, scrubbable
   playhead (an integer slider, so it can only land on frames). Readout is
   `hh:mm:ss.ff` plus `[frame/last]`. Playback runs off the wall clock but
@@ -414,10 +446,14 @@ Two things are load-bearing:
   so the tree knows where the leftover hole is. It has to be the *innermost*
   one (there's a test): every other panel claims an edge, the canvas is what
   remains.
-- **`fit_transform` takes that leaf's measured rect**, not the window minus
-  hardcoded panel sizes. The constants version could not survive a draggable
-  splitter: `pick` inverts this transform, so stale geometry doesn't just
-  misdraw the canvas, it sends every click to the wrong shape.
+- **The fit takes that leaf's measured rect**, not the window minus hardcoded
+  panel sizes. The constants version could not survive a draggable splitter:
+  `pick` inverts this transform, so stale geometry doesn't just misdraw the
+  canvas, it sends every click to the wrong shape. The leaf measures itself with
+  **`available_rect_before_wrap()`, not `max_rect()`** — egui shrinks a `Ui`'s
+  *available* region for the sibling panels shown before the canvas leaf but
+  leaves `max_rect` at the full window, so `max_rect` would fit the comp to the
+  whole window and float the tool strip in the window corner (see *Known issues*).
 
 `size` is stored in the tree (and written back from the real panel rect each
 frame) rather than living only in egui's panel memory — that's what keeps the
@@ -511,6 +547,11 @@ Two rules keep this safe:
 - **egui eats the shift modifier on shift+wheel**, rewriting it into a
   *horizontal* scroll. So the pan signal is a nonzero `smooth_scroll_delta.x`,
   not `modifiers.shift` — checking `shift` silently does nothing.
+- **`ui.max_rect()` is the whole window, even for the canvas leaf.** egui shrinks
+  a `Ui`'s *available* region for sibling panels shown before it, but not
+  `max_rect`. Measuring the canvas leaf with `max_rect` fit the comp to the whole
+  window and floated the zoom strip in the window corner; use
+  `available_rect_before_wrap()` for the leftover central region.
 - **Redraw is event-driven** (`ControlFlow::Wait`). Anything that must keep
   animating while the pointer is held still (edge auto-pan) needs an explicit
   `ctx.request_repaint()`, or it stops the moment input stops.
