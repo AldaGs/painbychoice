@@ -88,6 +88,37 @@ drifting keyframes off their frames — the same thing After Effects does.
 Integer frames also killed two float-epsilon fudges (key matching, and
 neighbour clamping when dragging).
 
+### `live/` module layout
+
+`main.rs` grew to ~5,100 lines and was split by concern (2026-07-19). It was a
+**pure move** — the only edit was widening visibility to `pub(crate)`; no
+renames, no reordering, no logic changes, and the test count was identical
+either side of the split.
+
+```
+live/src/
+  main.rs      the `use` block, module decls, and `fn main` (~66 lines)
+  app.rs       App: window/GPU state, winit handler, the per-frame update
+  timeline.rs  transport bar, ruler, clip bar, dopesheet
+  graph.rs     expression / node-graph panel and its GraphOps
+  props.rs     properties panel, easing, and the PropKind enumeration
+  dock.rs      panel layout tree, its editors, the composition bar
+  layers.rs    scene-tree panel
+  scene.rs     evaluated Scene -> vello, canvas fit + pick
+  tests.rs     the unit tests
+```
+
+Every module opens with `use crate::*;`, and `main.rs` re-exports each module
+with `use <module>::*;`. So the crate root is one shared namespace and no module
+keeps its own import bookkeeping — moving an item between modules needs no
+import edits at either end. (Modules are children of the crate root, so this
+glob reaches root's private items too; that's why it works.)
+
+What the split deliberately did **not** do: `App::update` is still ~850 lines.
+Moving it made it findable, not simpler. Decomposing it is a separate job — the
+UI pass has real ordering constraints (measure the canvas → run egui → apply
+edits after) that a naive split would break.
+
 **UI discipline in `live/`:** the egui closure never borrows `App`. Each panel
 reads a plain snapshot gathered before the closure and reports intent into a
 small `*Edits` struct; `App` applies those after the closure. This keeps the
