@@ -63,6 +63,12 @@ pub(crate) struct App {
     /// Canvas area in physical pixels, measured from the layout tree's canvas
     /// leaf during the last UI pass. `None` until the first pass has run.
     pub(crate) canvas_rect: Option<kurbo::Rect>,
+    /// The preview's zoom + pan. `Fit` by default, so the comp stays framed as
+    /// panels resize; scroll, drag, or a preset button pins it to a fixed zoom.
+    pub(crate) nav: CanvasNav,
+    /// A middle-button pan in progress: `(cursor at press, nav.pan at press)`,
+    /// both in physical pixels. Pan tracks the cursor 1:1, so no scale is kept.
+    pub(crate) pan_drag: Option<((f64, f64), (f64, f64))>,
     /// Next unused node id, for shapes created in-app.
     pub(crate) next_id: u64,
     /// The module whose body is open on the graph canvas, if any. View state —
@@ -201,6 +207,8 @@ impl App {
             preset_name_buf: String::new(),
             comp_name_buf: String::new(),
             canvas_rect: None,
+            nav: CanvasNav::default(),
+            pan_drag: None,
             next_id,
             editing_module: None,
             work_area: None,
@@ -444,6 +452,13 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                // A middle-button pan tracks the cursor 1:1 in physical pixels.
+                if let Some((start_cursor, start_pan)) = self.pan_drag {
+                    self.nav.pan = (
+                        start_pan.0 + (position.x - start_cursor.0),
+                        start_pan.1 + (position.y - start_cursor.1),
+                    );
+                }
                 // Repaint so egui's hover/consumed state stays current even
                 // while paused — otherwise the next click is judged against a
                 // stale frame and canvas picking fires over the UI.
@@ -459,6 +474,53 @@ impl ApplicationHandler for App {
                 // fit transform for this exact frame are in hand.
                 self.pending_pick = Some(self.cursor);
                 window.request_redraw();
+            }
+
+            // Middle-button drag pans the preview. Grabbing anywhere on the
+            // canvas works, so it never fights click-to-select (left button).
+            // Starting from Fit pins the current framing as an explicit zoom
+            // first, so the pan has a fixed scale to move against.
+            WindowEvent::MouseInput { state, button, .. }
+                if button == winit::event::MouseButton::Middle =>
+            {
+                match state {
+                    ElementState::Pressed if !over_ui => {
+                        if self.nav.zoom.is_none() {
+                            if let Some(canvas) = self.canvas_rect {
+                                let ppp = window.scale_factor();
+                                let scale = canvas_scale(self.doc(), canvas, self.nav, ppp);
+                                self.nav = CanvasNav { zoom: Some(scale / ppp), pan: (0.0, 0.0) };
+                            }
+                        }
+                        self.pan_drag = Some((self.cursor, self.nav.pan));
+                    }
+                    ElementState::Released => self.pan_drag = None,
+                    _ => {}
+                }
+                window.request_redraw();
+            }
+
+            // Scroll over the canvas zooms about the cursor (AE-style). Uses the
+            // last measured canvas rect + fit to find the comp point under the
+            // pointer and keep it fixed across the zoom.
+            WindowEvent::MouseWheel { delta, .. } if !over_ui => {
+                if let Some(canvas) = self.canvas_rect {
+                    let ppp = window.scale_factor();
+                    let steps = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 60.0,
+                    };
+                    if steps != 0.0 {
+                        let scale = canvas_scale(self.doc(), canvas, self.nav, ppp);
+                        let comp_pt = canvas_transform(self.doc(), canvas, self.nav, ppp)
+                            .inverse()
+                            * Point::new(self.cursor.0, self.cursor.1);
+                        let new_scale = scale * 1.25_f64.powf(steps);
+                        self.nav =
+                            nav_zoom_about(self.doc(), canvas, comp_pt, self.cursor, new_scale, ppp);
+                        window.request_redraw();
+                    }
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -821,6 +883,8 @@ impl App {
         self.view = TimelineView::full(frames);
         // The work area is per-comp view state; a fresh open starts with none.
         self.work_area = None;
+        // A different comp has its own size; re-fit so it lands framed.
+        self.nav = CanvasNav::default();
         self.comp_name_buf = name;
         self.selected = None;
         self.selected_keys.clear();
@@ -987,7 +1051,7 @@ impl App {
             // First frame: nothing measured yet, so fill the window.
             kurbo::Rect::new(0.0, 0.0, size.width as f64, size.height as f64)
         });
-        let fit = fit_transform(self.doc(), canvas);
+        let fit = canvas_transform(self.doc(), canvas, self.nav, ppp);
 
         // Resolve any pending click into a selection (or a deselect). Changing
         // the selected node invalidates any keyframe selection.
@@ -1082,6 +1146,11 @@ impl App {
         // Panels are drawn by walking the layout tree; each leaf dispatches to
         // the matching editor. Nothing here knows *where* a panel is — that's
         // the tree's business, which is the whole point of the refactor.
+        // Live zoom read-out for the preview toolbar. `canvas` is last frame's
+        // rect (one frame stale, like the fit), which is plenty for a label.
+        let zoom_pct = (canvas_scale(self.doc(), canvas, self.nav, ppp) / ppp * 100.0).round() as i32;
+        let is_fit = self.nav.zoom.is_none();
+        let mut canvas_edits = CanvasEdits::default();
         let dock = &mut self.dock;
         let mut canvas_pts: Option<egui::Rect> = None;
         // At most one layout edit (split/join/retype) from an area header this
@@ -1140,8 +1209,28 @@ impl App {
                         properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
                     }
                     Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
-                    // vello paints here; egui only measures the hole.
-                    Editor::Canvas => canvas_pts = Some(ui.max_rect()),
+                    // vello paints the frame here; egui only measures the hole
+                    // and floats the zoom toolbar over it. `max_rect` is the
+                    // whole window (egui doesn't shrink it for the sibling
+                    // panels shown before this leaf); the leftover central
+                    // region — what the canvas actually owns — is what's still
+                    // available to lay into.
+                    Editor::Canvas => {
+                        // Split the leftover region: the canvas takes all but a
+                        // bottom strip, and the stacked tool bar fills that strip
+                        // so it sits below the frame instead of floating over it.
+                        let full = ui.available_rect_before_wrap();
+                        let split = (full.max.y - CANVAS_BAR_H).max(full.min.y);
+                        canvas_pts = Some(egui::Rect::from_min_max(
+                            full.min,
+                            egui::pos2(full.max.x, split),
+                        ));
+                        let bar = egui::Rect::from_min_max(
+                            egui::pos2(full.min.x, split),
+                            full.max,
+                        );
+                        canvas_toolbar(ui, bar, zoom_pct, is_fit, &mut canvas_edits);
+                    }
                 },
                 &mut dock_cmd,
             );
@@ -1201,6 +1290,25 @@ impl App {
                 r.max.y as f64 * ppp,
             )
         });
+
+        // Preview zoom toolbar: a menu pick sets the mode outright; the − / +
+        // buttons step the live scale about the canvas centre (which turns Fit
+        // into an explicit zoom, since a fixed step needs a fixed anchor).
+        if let Some(mode) = canvas_edits.set_zoom {
+            self.nav = match mode {
+                None => CanvasNav::default(),
+                Some(z) => CanvasNav { zoom: Some(z), pan: (0.0, 0.0) },
+            };
+            window.request_redraw();
+        }
+        if let Some(factor) = canvas_edits.zoom_by {
+            let scale = canvas_scale(self.doc(), canvas, self.nav, ppp);
+            let center = ((canvas.x0 + canvas.x1) * 0.5, (canvas.y0 + canvas.y1) * 0.5);
+            let comp_pt = canvas_transform(self.doc(), canvas, self.nav, ppp).inverse()
+                * Point::new(center.0, center.1);
+            self.nav = nav_zoom_about(self.doc(), canvas, comp_pt, center, scale * factor, ppp);
+            window.request_redraw();
+        }
 
         // Composition settings.
         if let Some(w) = comp.width {

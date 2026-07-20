@@ -1777,6 +1777,51 @@ fn zoom_in_then_out_round_trips() {
     assert!((back.visible - view.visible).abs() < 1e-9);
 }
 
+/// Scroll/`+`/`−` zoom about the cursor: the composition point under the
+/// pointer must stay under it across the zoom, the same invariant the timeline
+/// wheel has. Without it the canvas would jump out from under you.
+#[test]
+fn canvas_zoom_keeps_the_point_under_the_cursor() {
+    let doc = Document::new(320.0, 240.0, MNode::group(0, "root"));
+    let area = kurbo::Rect::new(0.0, 0.0, 800.0, 600.0);
+    let ppp = 1.5;
+    for cursor in [(120.0, 90.0), (400.0, 300.0), (760.0, 40.0)] {
+        // Start from Fit, then zoom about the cursor a few steps.
+        let mut nav = CanvasNav::default();
+        for factor in [1.25, 1.25, 0.8, 2.0] {
+            let scale = canvas_scale(&doc, area, nav, ppp);
+            let pt = canvas_transform(&doc, area, nav, ppp).inverse()
+                * Point::new(cursor.0, cursor.1);
+            nav = nav_zoom_about(&doc, area, pt, cursor, scale * factor, ppp);
+            // The same comp point must map back to the cursor after the zoom.
+            let landed = canvas_transform(&doc, area, nav, ppp) * pt;
+            assert!(
+                (landed.x - cursor.0).abs() < 1e-6 && (landed.y - cursor.1).abs() < 1e-6,
+                "cursor {cursor:?} drifted to ({}, {})",
+                landed.x,
+                landed.y
+            );
+        }
+    }
+}
+
+/// Fit leaves a `FIT_MARGIN`-point gap: the fitted comp touches neither the
+/// full canvas edge (there is a margin) nor overflows it (it still fits).
+#[test]
+fn fit_leaves_a_margin_around_the_comp() {
+    let doc = Document::new(400.0, 400.0, MNode::group(0, "root"));
+    let area = kurbo::Rect::new(0.0, 0.0, 500.0, 500.0);
+    let ppp = 1.0;
+    let xf = canvas_transform(&doc, area, CanvasNav::default(), ppp);
+    let tl = xf * Point::new(0.0, 0.0);
+    let br = xf * Point::new(doc.width, doc.height);
+    // A square comp in a square area is margin-bound on all four sides.
+    assert!((tl.x - FIT_MARGIN).abs() < 1e-6, "left gap {}", tl.x);
+    assert!((tl.y - FIT_MARGIN).abs() < 1e-6, "top gap {}", tl.y);
+    assert!((area.x1 - br.x - FIT_MARGIN).abs() < 1e-6, "right gap {}", area.x1 - br.x);
+    assert!((area.y1 - br.y - FIT_MARGIN).abs() < 1e-6, "bottom gap {}", area.y1 - br.y);
+}
+
 #[test]
 fn neighbor_key_finds_the_nearest_each_way() {
     let keys = [0i64, 12, 12, 30, 48];
