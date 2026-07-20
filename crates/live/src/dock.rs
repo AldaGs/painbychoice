@@ -497,6 +497,10 @@ pub(crate) struct CompEdits {
     pub(crate) width: Option<f64>,
     pub(crate) height: Option<f64>,
     pub(crate) fps: Option<f64>,
+    /// The FPS drag began this frame — snapshot the comp before retiming it.
+    pub(crate) fps_drag_started: bool,
+    /// The FPS drag ended this frame — the rate is settled, drop the snapshot.
+    pub(crate) fps_drag_stopped: bool,
     pub(crate) duration: Option<f64>,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
@@ -608,7 +612,13 @@ pub(crate) fn comp_ui(
 
         ui.label("FPS");
         let mut f = fps;
-        if ui.add(egui::DragValue::new(&mut f).speed(0.5).range(1.0..=240.0)).changed() {
+        // The drag edges bracket the retime: dragging the rate up or down
+        // resolves live on every delta, but each delta is applied to the
+        // pre-drag comp rather than stacked on the previous one.
+        let fps_res = ui.add(egui::DragValue::new(&mut f).speed(0.5).range(1.0..=240.0));
+        out.fps_drag_started = fps_res.drag_started();
+        out.fps_drag_stopped = fps_res.drag_stopped();
+        if fps_res.changed() {
             out.fps = Some(f);
         }
         ui.separator();

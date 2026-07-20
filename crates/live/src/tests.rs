@@ -1631,3 +1631,111 @@ fn renaming_a_module_keeps_its_links() {
     assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
     assert!((scene.items[0].opacity - 0.3).abs() < 1e-9);
 }
+
+/// Build a one-layer comp at `fps` with a rotation key on `frame`.
+fn comp_at_fps(fps: f64, frame: i64) -> motion_core::node::Comp {
+    use motion_core::value::{Keyframe, Track};
+    let mut transform = motion_core::node::Transform::default();
+    transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(frame, 90.0),
+    ]));
+    let layer = MNode::group(1, "layer").with_transform(transform);
+    let mut comp =
+        motion_core::node::Comp::new(640.0, 480.0, MNode::group(0, "root").with_child(layer));
+    comp.fps = fps;
+    comp
+}
+
+fn rot_keys(comp: &motion_core::node::Comp) -> Vec<i64> {
+    comp.root.children[0].transform.rotation_deg.key_frames()
+}
+
+fn fps_edit(fps: f64) -> CompEdits {
+    CompEdits { fps: Some(fps), ..Default::default() }
+}
+
+/// Dragging the spinner resolves the keys live, on every delta, in either
+/// direction — the user sees the dopesheet move as they drag.
+#[test]
+fn dragging_the_fps_spinner_retimes_on_every_delta() {
+    let mut comp = comp_at_fps(60.0, 120);
+    let mut drag = None;
+
+    let mut start = fps_edit(30.0);
+    start.fps_drag_started = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &start);
+    assert_eq!(rot_keys(&comp), vec![0, 60], "the first delta already moved the key");
+
+    // A later delta in the same drag, further down.
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(24.0));
+    assert_eq!(rot_keys(&comp), vec![0, 48], "2s is frame 48 @ 24fps");
+
+    // And back up, past where the drag began — still measured off the start.
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(120.0));
+    assert_eq!(rot_keys(&comp), vec![0, 240], "2s is frame 240 @ 120fps");
+}
+
+/// The point of snapshotting: a drag is one conversion off the grid it started
+/// on, so travelling over lossy intermediate rates costs nothing. Applied
+/// naively, each delta would round again and drag keys off their seconds.
+#[test]
+fn a_long_drag_does_not_compound_rounding() {
+    use motion_core::value::{Keyframe, Track};
+    // Keys one frame apart @ 60fps cannot all survive a 7fps grid.
+    let mut comp = comp_at_fps(60.0, 120);
+    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(120, 45.0),
+        Keyframe::linear(121, 90.0),
+    ]));
+    let mut drag = None;
+    let mut start = fps_edit(59.0);
+    start.fps_drag_started = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &start);
+    // Sweep all the way down through every intermediate rate, then back up.
+    for fps in (7..59).rev() {
+        crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(fps as f64));
+    }
+    for fps in 8..=60 {
+        crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(fps as f64));
+    }
+    let mut stop = fps_edit(60.0);
+    stop.fps_drag_stopped = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &stop);
+
+    assert_eq!(comp.fps, 60.0);
+    assert_eq!(rot_keys(&comp), vec![0, 120, 121], "returning to 60fps restores every key");
+    assert!(drag.is_none(), "releasing the drag drops the snapshot");
+}
+
+/// Once released, the next drag snapshots the *new* state — it must not rewind
+/// to a stale grid from a drag the user already committed.
+#[test]
+fn a_second_drag_starts_from_the_committed_rate() {
+    let mut comp = comp_at_fps(60.0, 120);
+    let mut drag = None;
+
+    let mut first = fps_edit(24.0);
+    first.fps_drag_started = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &first);
+    let mut stop = fps_edit(24.0);
+    stop.fps_drag_stopped = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &stop);
+    assert_eq!(rot_keys(&comp), vec![0, 48]);
+
+    let mut second = fps_edit(48.0);
+    second.fps_drag_started = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &second);
+    assert_eq!(rot_keys(&comp), vec![0, 96], "2s @ 48fps, measured from 24 not 60");
+}
+
+/// Typing a rate carries no drag, and applies as a plain one-shot retime.
+#[test]
+fn a_typed_fps_retimes_without_a_drag() {
+    let mut comp = comp_at_fps(60.0, 120);
+    let mut drag = None;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(24.0));
+    assert_eq!(rot_keys(&comp), vec![0, 48]);
+    assert!(drag.is_none());
+}

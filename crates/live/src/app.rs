@@ -73,6 +73,42 @@ pub(crate) struct App {
     /// loop. View state, like `view` — reset when a comp opens, never saved with
     /// the document. `None` = the whole comp. Set with `B`/`N` at the playhead.
     pub(crate) work_area: Option<WorkArea>,
+    /// The comp's state from before an in-progress FPS drag: `(fps, root)`.
+    ///
+    /// Retiming is lossy — keys land on whole frames — so applying it once per
+    /// drag delta would run 60→24 as thirty-six successive roundings and shred
+    /// dense keys on the way down. Every delta instead restores this snapshot
+    /// and retimes from it, making the whole drag a single conversion off the
+    /// grid the user started on. `None` when no drag is in flight.
+    pub(crate) fps_drag: Option<(f64, MNode)>,
+}
+
+/// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
+///
+/// A rate change re-grids the animation rather than re-timing it (see
+/// [`Comp::set_fps`]), and that conversion rounds to whole frames. Because the
+/// spinner reports a value on every drag delta, applying each one in turn would
+/// compound those roundings — a drag from 60 down to 24 would pass through
+/// thirty-six grids and merge keys at each. So `drag` holds the comp as it was
+/// when the drag began, and every delta retimes from *that*, making a drag in
+/// either direction a single conversion no matter what it travelled through.
+///
+/// Typed edits carry no drag, and are applied directly.
+pub(crate) fn apply_fps_edit(doc: &mut Comp, drag: &mut Option<(f64, MNode)>, edits: &CompEdits) {
+    // Snapshot first: egui reports a drag's start and its first delta together.
+    if edits.fps_drag_started {
+        *drag = Some((doc.fps, doc.root.clone()));
+    }
+    if let Some(fps) = edits.fps {
+        if let Some((base_fps, base_root)) = drag {
+            doc.root = base_root.clone();
+            doc.fps = *base_fps;
+        }
+        doc.set_fps(fps.max(1.0));
+    }
+    if edits.fps_drag_stopped {
+        *drag = None;
+    }
 }
 
 /// The largest node id in a subtree, for seeding the id counter.
@@ -131,6 +167,7 @@ impl App {
             next_id,
             editing_module: None,
             work_area: None,
+            fps_drag: None,
         }
     }
 
@@ -1121,12 +1158,7 @@ impl App {
         if let Some(h) = comp.height {
             self.doc_mut().height = h.max(1.0);
         }
-        if let Some(f) = comp.fps {
-            // Not a plain field write: the keys have to follow the seconds they
-            // sit on onto the new grid. The playhead needs no help — it's stored
-            // in seconds and re-derives its frame from the new timebase.
-            self.doc_mut().set_fps(f.max(1.0));
-        }
+        apply_fps_edit(self.project.comp_mut(self.current).expect("open comp"), &mut self.fps_drag, &comp);
         if let Some(d) = comp.duration {
             self.doc_mut().duration = d.max(0.1);
         }
