@@ -343,7 +343,8 @@ Two rules keep this safe:
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
 UX ✅ → shape/stroke params ✅ → dockable panels ✅ → node graph + expression
-IR 🚧 → …**. Next up:
+IR ✅ → …**. Items 1–5 are complete; the build order now continues under *Agreed
+order past #5* below (pre-comps first). The stages of each item:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -375,10 +376,10 @@ IR 🚧 → …**. Next up:
      uncreatable-to-manage, invisible to select/retime/delete. Rather than add a
      fifth special case, `PropKind` became the single enumeration of animatable
      properties behind `prop_of`/`prop_of_mut`.
-4. **Blender-style splittable/dockable panels** — 🚧 in progress. The layout
+4. ~~**Blender-style splittable/dockable panels**~~ — ✅ Done. The layout
    tree + draggable splitters are done (see *The panel layout tree* above), and
    the canvas fit now derives from the tree instead of hardcoded panel sizes.
-   Still to come, in order:
+   Delivered in order:
    - ~~**Split / join areas** and a per-area dropdown to change which `Editor`
      an area shows.~~ ✅ Done. Each content area carries a header with an editor
      picker and split (`|` left/right, `-` top/bottom) + close (`x`) buttons;
@@ -405,9 +406,9 @@ IR 🚧 → …**. Next up:
      files still open — the loader falls back to a plain document parse.
 
    With that, **item #4 is complete.** Next is the node/expression IR (#5).
-5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
-   differentiator; the IR/printer discipline borrowed from the EBN project.
-   🚧 in progress, being built in stages:
+5. ~~**Node graph + expression IR**~~ (`Value::Expr` / `Value::Parametric`) — the
+   big differentiator; the IR/printer discipline borrowed from the EBN project.
+   ✅ Done — built in stages:
    - ~~**The `EvalCtx` seam.**~~ ✅ Done. `resolve` takes an `EvalCtx` instead of
      a bare frame (see *The core idea* above).
    - ~~**`Value::Expr` + the IR.**~~ ✅ Done — the headless engine now evaluates
