@@ -684,6 +684,16 @@ sample at a shifted time — the exact mechanism local time needs.
   - Drags latch their **grab mode and the timing they started from** at press,
     then apply the total delta to that original. Incremental deltas would make a
     drag that clamped at frame 0 refuse to spring back.
+  - **egui gotcha, cost two rounds of debugging:** inside `drag_started()`,
+    `interact_pointer_pos()` is *not* where the press landed. egui only fires
+    `drag_started` once the pointer crosses its drag threshold, and by then that
+    call reports where the pointer is *now* — already off the handle — so every
+    trim silently read as a slide. Use `i.pointer.press_origin()` for anything
+    that hit-tests the press itself; the marquee already did.
+  - Hit-test the **painted** edges, not the raw ones: a clip can extend past the
+    visible window (the default range ends one frame past it), and an edge you
+    can't see is an edge you can't grab. Nearest edge wins where the two
+    handles overlap, or a clip a few pixels wide can never be trimmed shorter.
   - `start` is deliberately separate from `in_`: trim moves an edge only, slide
     moves all three, and slip (moving `start` alone) shifts the content under a
     fixed window. Only slide and trim have UI so far.

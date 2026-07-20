@@ -1881,7 +1881,13 @@ fn dopesheet_ui(
             const HANDLE_W: f32 = 6.0;
             let drag_id = ui.id().with("clip_drag");
             if resp.drag_started() {
-                if let Some(p) = resp.interact_pointer_pos() {
+                // `press_origin`, not `interact_pointer_pos`: egui only fires
+                // `drag_started` once the pointer has crossed its drag
+                // threshold, and by then `interact_pointer_pos` reports where
+                // the pointer is *now* — already off the handle and into the
+                // body, so every trim read as a slide. The marquee below uses
+                // the same input for the same reason.
+                if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
                     let grab = clip_grab_at(p.x, grab_l, grab_r, HANDLE_W);
                     let anchor = axis.x_to_frame(p.x);
                     ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
