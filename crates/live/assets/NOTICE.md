@@ -5,8 +5,8 @@
 Tabler Icons — https://tabler.io/icons — **MIT License**, © Paweł Kuna.
 
 Taken from `@tabler/icons-webfont` 3.31.0 and **subsetted** to only the
-codepoints named in `src/icon.rs`: 8 KB here versus 2.4 MB for the full
-5,937-glyph font.
+codepoints named in `src/icon.rs`: 10 KB here (31 glyphs) versus 2.4 MB for the
+full 5,937-glyph font.
 
 To add an icon: add its const to `src/icon.rs`, then regenerate this file with
 that codepoint included —

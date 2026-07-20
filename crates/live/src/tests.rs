@@ -1739,3 +1739,79 @@ fn a_typed_fps_retimes_without_a_drag() {
     assert_eq!(rot_keys(&comp), vec![0, 48]);
     assert!(drag.is_none());
 }
+
+/// Zooming about an anchor keeps that frame where it is — the property that
+/// makes the wheel feel like zooming rather than jumping, and the reason the
+/// buttons anchor at the playhead.
+#[test]
+fn zoom_keeps_the_anchor_frame_put() {
+    let view = TimelineView { start: 0.0, visible: 120.0 };
+    for anchor in [0.0, 30.0, 60.0, 119.0] {
+        for factor in [0.5, 0.7, 1.0, 2.0] {
+            let z = zoomed(view, factor, anchor);
+            let before = (anchor - view.start) / view.visible;
+            let after = (anchor - z.start) / z.visible;
+            assert!(
+                (before - after).abs() < 1e-9,
+                "anchor {anchor} moved at factor {factor}: {before} -> {after}"
+            );
+            assert!((z.visible - view.visible * factor).abs() < 1e-9);
+        }
+    }
+}
+
+/// Zoom in then out returns to where it started, so tapping the buttons an
+/// equal number of times is a no-op rather than a slow drift.
+#[test]
+fn zoom_in_then_out_round_trips() {
+    let view = TimelineView { start: 10.0, visible: 60.0 };
+    let there = zoomed(view, ZOOM_STEP, 40.0);
+    let back = zoomed(there, 1.0 / ZOOM_STEP, 40.0);
+    assert!((back.start - view.start).abs() < 1e-9);
+    assert!((back.visible - view.visible).abs() < 1e-9);
+}
+
+#[test]
+fn neighbor_key_finds_the_nearest_each_way() {
+    let keys = [0i64, 12, 12, 30, 48];
+    assert_eq!(neighbor_key(&keys, 12, true), Some(30), "strictly after, skipping the dupe");
+    assert_eq!(neighbor_key(&keys, 12, false), Some(0), "strictly before");
+    assert_eq!(neighbor_key(&keys, 0, false), None, "nothing before the first key");
+    assert_eq!(neighbor_key(&keys, 48, true), None, "nothing after the last key");
+    assert_eq!(neighbor_key(&keys, 20, true), Some(30), "from between keys");
+    assert_eq!(neighbor_key(&keys, 20, false), Some(12));
+    assert_eq!(neighbor_key(&[], 5, true), None, "an unanimated node has no neighbours");
+}
+
+/// Unsorted input is normal — rows are gathered per property and concatenated.
+#[test]
+fn neighbor_key_does_not_assume_sorted_input() {
+    let keys = [48i64, 0, 30, 12];
+    assert_eq!(neighbor_key(&keys, 20, true), Some(30));
+    assert_eq!(neighbor_key(&keys, 20, false), Some(12));
+}
+
+/// The label column must always leave room for the track, whatever is stored
+/// and however narrow the panel gets — the bug the two-column split fixes.
+#[test]
+fn the_label_column_can_never_swallow_the_panel() {
+    for panel in [60.0f32, 120.0, 400.0, 1600.0] {
+        for want in [-50.0f32, 0.0, 80.0, 5000.0] {
+            let w = clamp_label_w(want, panel);
+            assert!(w >= 44.0, "panel {panel} want {want} gave {w}, below the readable minimum");
+            assert!(
+                w <= (panel * 0.45).max(44.0),
+                "panel {panel} want {want} gave {w}, past the cap"
+            );
+        }
+    }
+}
+
+/// A width the user picked is kept verbatim when it already fits — clamping
+/// must not creep the column on every pass.
+#[test]
+fn a_fitting_label_width_is_left_alone() {
+    let w = clamp_label_w(120.0, 800.0);
+    assert_eq!(w, 120.0);
+    assert_eq!(clamp_label_w(w, 800.0), w, "re-clamping is idempotent");
+}

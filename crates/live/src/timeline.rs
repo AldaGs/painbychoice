@@ -8,47 +8,95 @@ use crate::*;
 /// Build the bottom transport bar. Reads the current time / playing state and
 /// writes user intent into `out`; it never touches `App` directly, so it can't
 /// collide with the borrows in `render`.
+///
+/// Modelled on Blender's timeline header rather than a scrub slider: a cluster
+/// of transport buttons, the frame readout, and the preview range as numeric
+/// Start/End fields.
+///
+/// There is deliberately **no playhead slider**. The ruler's red playhead is
+/// already a full-width scrubber over the same axis, and a second one that
+/// disagreed about its mapping (the slider spanned `0..=last_frame` regardless
+/// of zoom, the ruler spans the visible window) was two controls for one piece
+/// of state — you could drag the slider and watch the playhead land somewhere
+/// else once the timeline was zoomed.
 pub(crate) fn transport_ui(
     ui: &mut egui::Ui,
     frame: i64,
     last_frame: i64,
     tb: motion_core::Timebase,
     playing: bool,
+    key_frames: &[i64],
+    work_area: Option<WorkArea>,
     out: &mut Transport,
 ) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
-        let (glyph, tip) =
-            if playing { (icon::PAUSE, "Pause") } else { (icon::PLAY, "Play") };
+
+        // Outer pair jumps to the ends of the preview range; inner pair steps
+        // between keyframes. Both are disabled when there's nowhere to go, so
+        // the buttons report the state of the animation rather than always
+        // looking live.
+        let (lo, hi) = loop_bounds(work_area, last_frame + 1);
+        let prev = neighbor_key(key_frames, frame, false);
+        let next = neighbor_key(key_frames, frame, true);
+
+        if icon::button_enabled(ui, icon::RESTART, "Jump to the start of the preview range", frame != lo)
+            .clicked()
+        {
+            out.restart = true;
+        }
+        if icon::button_enabled(ui, icon::PREV_KEY, "Previous keyframe", prev.is_some()).clicked() {
+            out.scrub_to = prev;
+        }
+
+        let (glyph, tip) = if playing { (icon::PAUSE, "Pause") } else { (icon::PLAY, "Play") };
         if icon::button(ui, glyph, tip).clicked() {
             out.toggle = true;
         }
-        if icon::button(ui, icon::RESTART, "Back to the start").clicked() {
-            out.restart = true;
+
+        if icon::button_enabled(ui, icon::NEXT_KEY, "Next keyframe", next.is_some()).clicked() {
+            out.scrub_to = next;
         }
+        if icon::button_enabled(ui, icon::JUMP_END, "Jump to the end of the preview range", frame != hi - 1)
+            .clicked()
+        {
+            out.jump_end = true;
+        }
+
+        ui.separator();
         // Frame-domain readout: hh:mm:ss.ff plus the raw frame number,
         // monospaced so the digits don't jitter during playback.
         ui.label(
-            egui::RichText::new(format!(
-                "{}  [{frame}/{last_frame}]",
-                tb.timecode(frame as f64)
-            ))
-            .monospace(),
+            egui::RichText::new(format!("{}  [{frame}/{last_frame}]", tb.timecode(frame as f64)))
+                .monospace(),
         );
 
-        // Full-width playhead scrubber. An integer slider, so dragging
-        // it can only produce whole frames — snapping for free.
-        let mut val = frame.clamp(0, last_frame);
-        ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
-        let resp = ui.add(
-            egui::Slider::new(&mut val, 0..=last_frame.max(1))
-                .show_value(false)
-                .trailing_fill(true),
-        );
-        if resp.dragged() || resp.changed() {
-            out.scrub_to = Some(val);
-        }
+        // Preview range, as Blender's Start/End. These are the *same* state as
+        // the B/N keys and the blue band on the ruler — no work area means the
+        // whole comp, which is what the fields show by default. Both bounds are
+        // inclusive here, so End is the last frame that plays.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            let mut end = work_area.map_or(last_frame, |w| w.end - 1);
+            if ui
+                .add(egui::DragValue::new(&mut end).speed(1.0).range(0..=last_frame))
+                .on_hover_text("Last frame of the preview range (N)")
+                .changed()
+            {
+                out.set_work_end = Some(end);
+            }
+            ui.weak("End");
+            let mut start = work_area.map_or(0, |w| w.start);
+            if ui
+                .add(egui::DragValue::new(&mut start).speed(1.0).range(0..=last_frame))
+                .on_hover_text("First frame of the preview range (B)")
+                .changed()
+            {
+                out.set_work_start = Some(start);
+            }
+            ui.weak("Start");
+        });
     });
 }
 
@@ -160,6 +208,9 @@ pub(crate) struct DopeEdits {
     /// The selected layer's time range was edited (trim / slide / slip), or
     /// cleared back to `None` — "live for the whole comp".
     pub(crate) set_timing: Option<Option<LayerTiming>>,
+    /// The column splitter was dragged: the label column's new width. Already
+    /// clamped against the panel, so it is safe to store as-is.
+    pub(crate) set_label_w: Option<f32>,
 }
 
 /// What the clip bar needs to draw the selected layer's time range.
@@ -266,6 +317,39 @@ impl TimelineView {
         let start = self.start.clamp(0.0, (total - visible).max(0.0));
         Self { start, visible }
     }
+}
+
+/// Scale the visible window by `factor` about `anchor`, keeping the frame at
+/// `anchor` where it is. `factor < 1` zooms in. Shared by the wheel (anchored
+/// at the cursor) and the zoom buttons (anchored at the playhead), so both
+/// gestures agree about what zooming means.
+pub(crate) fn zoomed(view: TimelineView, factor: f64, anchor: f64) -> TimelineView {
+    let visible = view.visible * factor;
+    let ratio = (anchor - view.start) / view.visible.max(1e-9);
+    TimelineView { start: anchor - ratio * visible, visible }
+}
+
+/// The nearest keyframe strictly before / after `from`, for the transport's
+/// key-stepping buttons. `keys` need not be sorted or deduped — rows are
+/// gathered per property and then merged, so duplicates across properties are
+/// normal. `None` when there is no key that way, which is what greys the
+/// button out.
+pub(crate) fn neighbor_key(keys: &[i64], from: i64, forward: bool) -> Option<i64> {
+    if forward {
+        keys.iter().copied().filter(|&k| k > from).min()
+    } else {
+        keys.iter().copied().filter(|&k| k < from).max()
+    }
+}
+
+/// Keep the dopesheet's label column usable: wide enough to read a property
+/// name, never so wide it leaves no track to draw keyframes on. The upper
+/// bound is a fraction of the panel rather than a constant so the column can't
+/// swallow a narrow panel — the exact bug the split is meant to fix.
+pub(crate) fn clamp_label_w(w: f32, panel_w: f32) -> f32 {
+    const MIN: f32 = 44.0;
+    let max = (panel_w * 0.45).max(MIN);
+    w.clamp(MIN, max)
 }
 
 /// AE's **work area**: a comp-level preview range in frames, half-open
@@ -406,6 +490,10 @@ pub(crate) fn edge_pan_intensity(x: f32, left: f32, right: f32, edge: f32) -> f3
 
 pub(crate) const DOPESHEET_H: f32 = 178.0;
 pub(crate) const RULER_H: f32 = 20.0;
+/// What one press of the zoom buttons multiplies the visible span by. Matches
+/// roughly three wheel notches, so the buttons and the wheel feel like the same
+/// control at different granularities.
+pub(crate) const ZOOM_STEP: f64 = 0.7;
 /// Width of the auto-pan zone at each end of the track, in points.
 pub(crate) const EDGE_PAN_W: f32 = 36.0;
 
@@ -423,26 +511,53 @@ pub(crate) fn dopesheet_ui(
     selected_keys: &KeySelection,
     clip: Option<ClipInfo>,
     work_area: Option<WorkArea>,
+    label_w: f32,
     out: &mut DopeEdits,
 ) {
+    // The label column is user-resizable, but a panel that shrank since the
+    // last drag must not leave it wider than the panel — so it is re-clamped
+    // on every pass, not only when dragged.
+    let label_w = clamp_label_w(label_w, ui.max_rect().width());
+
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.strong("Timeline");
-        ui.weak(
-            "— ctrl+click or drag a box to multi-select, drag to move them \
-             together, ctrl+C/V copies, Del removes, B/N set the preview range",
-        );
+
+        // Zoom controls, right-aligned so they sit clear of the hint text and
+        // stay put as the panel resizes. Buttons anchor at the playhead rather
+        // than the view centre: the playhead is what you are looking at, and
+        // zooming it off-screen is the classic annoyance here.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            if icon::button(ui, icon::ZOOM_FIT, "Fit the whole comp (Home)").clicked() {
+                out.set_view = Some(TimelineView::full(last_frame));
+            }
+            if icon::button(ui, icon::ZOOM_OUT, "Zoom out").clicked() {
+                out.set_view = Some(zoomed(view, 1.0 / ZOOM_STEP, frame).clamped(last_frame));
+            }
+            if icon::button(ui, icon::ZOOM_IN, "Zoom in").clicked() {
+                out.set_view = Some(zoomed(view, ZOOM_STEP, frame).clamped(last_frame));
+            }
+            ui.weak(
+                "— ctrl+click or drag a box to multi-select, drag to move them \
+                 together, ctrl+C/V copies, Del removes, B/N set the preview range",
+            );
+        });
     });
     ui.separator();
 
-    pub(crate) const LABEL_W: f32 = 80.0;
     pub(crate) const ROW_H: f32 = 22.0;
+    // Gap between the two columns, where the splitter is drawn and grabbed.
+    pub(crate) const SPLIT_W: f32 = 5.0;
     let accent = egui::Color32::from_rgb(255, 216, 51);
     let playhead_col = egui::Color32::from_rgb(240, 90, 90);
     // Set by any drag on the timeline (ruler scrub or keyframe drag).
     // Gates the edge auto-pan below.
     let mut dragging = false;
+
+    // Top of the two-column area, for the full-height splitter drawn at the end.
+    let columns_top = ui.cursor().top();
 
     // --- Ruler. Allocated with the same layout as a property row, so
     // its axis geometry is exactly the rows' axis geometry. ---
@@ -450,12 +565,13 @@ pub(crate) fn dopesheet_ui(
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.allocate_ui_with_layout(
-            egui::vec2(LABEL_W, RULER_H),
+            egui::vec2(label_w, RULER_H),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.weak("Frame");
             },
         );
+        ui.add_space(SPLIT_W);
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width() - 8.0, RULER_H),
             egui::Sense::click_and_drag(),
@@ -556,7 +672,7 @@ pub(crate) fn dopesheet_ui(
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.allocate_ui_with_layout(
-                egui::vec2(LABEL_W, ROW_H),
+                egui::vec2(label_w, ROW_H),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| match clip.timing {
                     // No range yet: one click gives the layer one covering the
@@ -585,6 +701,7 @@ pub(crate) fn dopesheet_ui(
                 },
             );
 
+            ui.add_space(SPLIT_W);
             let (track, resp) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width() - 8.0, ROW_H),
                 egui::Sense::click_and_drag(),
@@ -718,12 +835,9 @@ pub(crate) fn dopesheet_ui(
                 visible: view.visible,
             })
         } else if scroll.y != 0.0 {
+            // Anchored at the cursor, where the buttons anchor at the playhead.
             let factor = (0.9f64).powf(scroll.y as f64 / 120.0);
-            let anchor = axis.x_to_frame_exact(p.x);
-            let visible = view.visible * factor;
-            // Keep `anchor` under the cursor at the new scale.
-            let ratio = (anchor - view.start) / view.visible.max(1e-9);
-            Some(TimelineView { start: anchor - ratio * visible, visible })
+            Some(zoomed(view, factor, axis.x_to_frame_exact(p.x)))
         } else {
             None
         };
@@ -771,14 +885,17 @@ pub(crate) fn dopesheet_ui(
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.allocate_ui_with_layout(
-                egui::vec2(LABEL_W, ROW_H),
+                egui::vec2(label_w, ROW_H),
                 egui::Layout::left_to_right(egui::Align::Center),
+                // Truncated, not wrapped: a long property name must never grow
+                // the row or bleed past the splitter into the track.
                 |ui| {
-                    ui.label(row.label);
+                    ui.add(egui::Label::new(row.label).truncate());
                 },
             );
 
             // The track: full remaining width, fixed height.
+            ui.add_space(SPLIT_W);
             let (track, track_resp) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width() - 8.0, ROW_H),
                 egui::Sense::click_and_drag(),
@@ -879,6 +996,46 @@ pub(crate) fn dopesheet_ui(
                 }
             }
         });
+    }
+
+    // --- Column splitter. One continuous strip spanning the ruler and every
+    // row, rather than a handle per row: the columns are a single division of
+    // the panel, so there is one thing to grab. Drawn last so it sits over the
+    // row backgrounds, and interacted with after the rows so a drag near the
+    // boundary resizes the column instead of scrubbing the track under it. ---
+    {
+        let columns_bottom = ui.cursor().top();
+        let x = ui.max_rect().left() + 8.0 + label_w;
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(x, columns_top),
+            egui::pos2(x + SPLIT_W, columns_bottom.max(columns_top + RULER_H)),
+        );
+        let resp = ui.interact(strip, ui.id().with("col_splitter"), egui::Sense::drag());
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if resp.dragged() {
+            // Drive the width from the pointer directly rather than
+            // accumulating `drag_delta`, so a drag that clamps at either end
+            // springs back the moment the pointer comes back in range.
+            if let Some(p) = resp.interact_pointer_pos() {
+                let w = p.x - (ui.max_rect().left() + 8.0) - SPLIT_W / 2.0;
+                out.set_label_w = Some(clamp_label_w(w, ui.max_rect().width()));
+            }
+            dragging = true;
+        }
+        // A hairline, brighter while grabbed — otherwise the columns read as
+        // one surface and the handle is invisible until you happen to hit it.
+        let col = if resp.dragged() || resp.hovered() {
+            egui::Color32::from_gray(150)
+        } else {
+            egui::Color32::from_gray(64)
+        };
+        let cx = strip.center().x;
+        ui.painter().line_segment(
+            [egui::pos2(cx, strip.top()), egui::pos2(cx, strip.bottom())],
+            egui::Stroke::new(1.0, col),
+        );
     }
 
     // Report and draw the marquee. Reported even when empty, so

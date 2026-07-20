@@ -21,10 +21,19 @@
 /// The font family icons are drawn with. Registered by [`install`].
 pub(crate) const FAMILY: &str = "icons";
 
-// Transport.
+// Transport. `RESTART`/`JUMP_END` are the outer pair (comp start / comp end);
+// `PREV_KEY`/`NEXT_KEY` step between keyframes, as Blender's transport does.
 pub(crate) const PLAY: &str = "\u{ed46}";
 pub(crate) const PAUSE: &str = "\u{ed45}";
 pub(crate) const RESTART: &str = "\u{ed48}";
+pub(crate) const JUMP_END: &str = "\u{ed49}";
+pub(crate) const PREV_KEY: &str = "\u{ed4c}";
+pub(crate) const NEXT_KEY: &str = "\u{ed4b}";
+
+// Timeline zoom. All three are magnifiers so they read as one control group.
+pub(crate) const ZOOM_IN: &str = "\u{eb56}";
+pub(crate) const ZOOM_OUT: &str = "\u{eb57}";
+pub(crate) const ZOOM_FIT: &str = "\u{f295}";
 
 // Project / layer management.
 pub(crate) const SAVE: &str = "\u{eb62}";
@@ -88,6 +97,19 @@ pub(crate) fn text(glyph: &str) -> egui::RichText {
 /// say what they did in words.
 pub(crate) fn button(ui: &mut egui::Ui, glyph: &str, tip: &str) -> egui::Response {
     ui.add(egui::Button::new(text(glyph)).min_size(egui::vec2(22.0, 0.0)))
+        .on_hover_text(tip)
+}
+
+/// [`button`], greyed out when `enabled` is false. For controls that have
+/// nowhere to go — a "next keyframe" past the last key — so the transport
+/// reflects the state of the animation instead of always looking live.
+pub(crate) fn button_enabled(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    tip: &str,
+    enabled: bool,
+) -> egui::Response {
+    ui.add_enabled(enabled, egui::Button::new(text(glyph)).min_size(egui::vec2(22.0, 0.0)))
         .on_hover_text(tip)
 }
 

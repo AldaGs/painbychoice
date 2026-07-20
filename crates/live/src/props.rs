@@ -10,9 +10,18 @@ use crate::*;
 #[derive(Default)]
 pub(crate) struct Transport {
     pub(crate) toggle: bool,
+    /// Jump to the start of the preview range.
     pub(crate) restart: bool,
-    /// Frame to scrub to. Snapped by the slider's integer step.
+    /// Jump to the last previewed frame.
+    pub(crate) jump_end: bool,
+    /// Seek to this frame. Already whole — every control that writes it works
+    /// in frames, so nothing here can produce an off-grid time.
     pub(crate) scrub_to: Option<i64>,
+    /// New work-area start / last previewed frame, from the Start/End fields.
+    /// Inclusive on both ends, as the fields present them; the exclusive `end`
+    /// is reconstructed by `with_work_end`.
+    pub(crate) set_work_start: Option<i64>,
+    pub(crate) set_work_end: Option<i64>,
 }
 
 /// A snapshot of the selected node's resolved properties at the current time,

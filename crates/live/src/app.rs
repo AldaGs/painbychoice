@@ -73,6 +73,10 @@ pub(crate) struct App {
     /// loop. View state, like `view` — reset when a comp opens, never saved with
     /// the document. `None` = the whole comp. Set with `B`/`N` at the playhead.
     pub(crate) work_area: Option<WorkArea>,
+    /// Width of the dopesheet's label column, in points. View state — how you
+    /// like the panel split isn't part of the document. Re-clamped against the
+    /// panel on every pass, so a stored width can't outlive a resize.
+    pub(crate) dope_label_w: f32,
     /// The comp's state from before an in-progress FPS drag: `(fps, root)`.
     ///
     /// Retiming is lossy — keys land on whole frames — so applying it once per
@@ -167,6 +171,7 @@ impl App {
             next_id,
             editing_module: None,
             work_area: None,
+            dope_label_w: 80.0,
             fps_drag: None,
         }
     }
@@ -970,6 +975,10 @@ impl App {
         // scene (a doc-less context would show its fallback instead).
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, self.doc(), t));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
+        // Every key on the selected node, flattened, for the transport's
+        // key-stepping buttons. Duplicates across properties are fine —
+        // `neighbor_key` takes a nearest, not a position in a list.
+        let key_frames: Vec<i64> = rows.iter().flat_map(|r| r.frames.iter().copied()).collect();
         // The clip bar only exists for a selected layer (the root isn't one).
         let clip = sel_node
             .filter(|n| Some(n.id) != Some(self.doc().root.id))
@@ -1012,6 +1021,7 @@ impl App {
         let timebase = self.doc().timebase();
         let view = self.view;
         let work_area = self.work_area;
+        let dope_label_w = self.dope_label_w;
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
@@ -1070,9 +1080,16 @@ impl App {
                         &mut comp_name_buf,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
-                    Editor::Transport => {
-                        transport_ui(ui, frame, last_frame, timebase, playing, &mut transport)
-                    }
+                    Editor::Transport => transport_ui(
+                        ui,
+                        frame,
+                        last_frame,
+                        timebase,
+                        playing,
+                        &key_frames,
+                        work_area,
+                        &mut transport,
+                    ),
                     Editor::Dopesheet => dopesheet_ui(
                         ui,
                         &rows,
@@ -1083,6 +1100,7 @@ impl App {
                         &selected_keys,
                         clip,
                         work_area,
+                        dope_label_w,
                         &mut dope,
                     ),
                     Editor::Properties => {
@@ -1232,9 +1250,24 @@ impl App {
             // no work area), matching the R key.
             self.seek_frame(self.loop_bounds_frames().0);
         }
+        if transport.jump_end {
+            // `hi` is exclusive, so the last previewed frame is one before it.
+            self.seek_frame(self.loop_bounds_frames().1 - 1);
+        }
         if let Some(nf) = transport.scrub_to.or(dope.seek_to) {
             self.playing = false;
             self.seek_frame(nf);
+        }
+        // Start/End fields write the same work area the B/N keys do.
+        let total = self.doc().duration_frames();
+        if let Some(f) = transport.set_work_start {
+            self.work_area = Some(with_work_start(self.work_area, f, total));
+        }
+        if let Some(f) = transport.set_work_end {
+            self.work_area = Some(with_work_end(self.work_area, f, total));
+        }
+        if let Some(w) = dope.set_label_w {
+            self.dope_label_w = w;
         }
 
         // Apply property edits + keyframe drags to the selected node, then
