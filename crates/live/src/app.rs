@@ -868,7 +868,8 @@ impl App {
             .filter(|n| Some(n.id) != Some(self.doc().root.id))
             .map(|n| ClipInfo { timing: n.timing });
         // Snapshot for the graph panel (clones the selected node's expressions).
-        let graph_info = GraphInfo::gather(self.doc(), self.selected, t);
+        let graph_info =
+            GraphInfo::gather(self.doc(), &self.project.modules, self.selected, t);
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -982,7 +983,7 @@ impl App {
         // Apply a graph edit (promote/bake/tree change) after the UI pass.
         if let Some(op) = graph_edits.op.take() {
             if let Some(id) = self.selected {
-                apply_graph_op(self.doc_mut(), id, op, frame);
+                apply_graph_op(&mut self.project, self.current, id, op, frame);
                 window.request_redraw();
             }
         }

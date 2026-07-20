@@ -78,10 +78,27 @@ pub(crate) struct GraphInfo {
     /// doc-less preview would report "no node named …" for a script that in
     /// fact resolves fine at render time.
     pub(crate) script_results: ScriptResults,
+    /// Every module in the project: id, name, and its knob names. Enough to
+    /// drive the link picker and the override rows without reaching into the
+    /// document from inside the UI pass.
+    pub(crate) modules: Vec<ModuleInfo>,
+}
+
+/// One module as the panel needs it.
+pub(crate) struct ModuleInfo {
+    pub(crate) id: ModuleId,
+    pub(crate) name: String,
+    /// Knob names, in the module's own display order.
+    pub(crate) params: Vec<String>,
 }
 
 impl GraphInfo {
-    pub(crate) fn gather(doc: &Document, selected: Option<NodeId>, frame: f64) -> Option<GraphInfo> {
+    pub(crate) fn gather(
+        doc: &Document,
+        modules: &std::collections::BTreeMap<ModuleId, MModule>,
+        selected: Option<NodeId>,
+        frame: f64,
+    ) -> Option<GraphInfo> {
         let id = selected?;
         let node = doc.root.find(id)?;
         let props: Vec<GraphProp> = PropKind::ALL
@@ -113,8 +130,17 @@ impl GraphInfo {
         }
         let params =
             node.params.iter().map(|p| (p.name.clone(), p.value.kind_name())).collect();
+        let modules = modules
+            .iter()
+            .map(|(id, m)| ModuleInfo {
+                id: *id,
+                name: m.name.clone(),
+                params: m.params.iter().map(|p| p.name.clone()).collect(),
+            })
+            .collect();
         Some(GraphInfo {
             node_id: id,
+            modules,
             node_name: node.name.clone(),
             props,
             nodes,
@@ -180,6 +206,20 @@ pub(crate) enum GraphOp {
     AddParam { name: String, kind: ParamKind },
     /// Remove a parameter. Expressions reading it aren't rewritten — they warn.
     RemoveParam { name: String },
+    /// Lift this property's whole expression into a new project-wide module and
+    /// leave a link in its place. How a module is *made*: you build the recipe
+    /// once on a real property, then promote it.
+    ExtractModule { kind: PropKind },
+    /// Point this property at an existing module (promoting it if needed).
+    LinkModule { kind: PropKind, module: ModuleId },
+    /// Repoint an existing link at a different module.
+    SetModule { kind: PropKind, path: Vec<usize>, module: ModuleId },
+    /// Override one knob at a link site, or clear it back to inheriting.
+    SetOverride { kind: PropKind, path: Vec<usize>, name: String, value: Option<ExprValue> },
+    RenameModule { module: ModuleId, name: String },
+    /// Delete a module. Links to it aren't rewritten — they warn and fall back,
+    /// exactly like any other dangling reference.
+    DeleteModule { module: ModuleId },
 }
 
 #[derive(Default)]
@@ -302,6 +342,8 @@ pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, 
     ui.separator();
     let param_names = params_ui(ui, info, out);
     ui.separator();
+    modules_ui(ui, info, out);
+    ui.separator();
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -312,15 +354,41 @@ pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, 
                         if ui.small_button("bake").on_hover_text("Freeze to a constant").clicked() {
                             out.op = Some(GraphOp::Bake(prop.kind));
                         }
+                        if ui
+                            .small_button("-> module")
+                            .on_hover_text("Lift this recipe into a shared module and link it here")
+                            .clicked()
+                        {
+                            out.op = Some(GraphOp::ExtractModule { kind: prop.kind });
+                        }
                         if let Some(printed) = &prop.printed {
                             ui.weak(format!("= {printed}"));
                         }
-                    } else if ui
-                        .small_button("= fx")
-                        .on_hover_text("Drive with an expression")
-                        .clicked()
-                    {
-                        out.op = Some(GraphOp::Promote(prop.kind));
+                    } else {
+                        if ui
+                            .small_button("= fx")
+                            .on_hover_text("Drive with an expression")
+                            .clicked()
+                        {
+                            out.op = Some(GraphOp::Promote(prop.kind));
+                        }
+                        // Linking an existing module is the other way in, and
+                        // the one that makes a module reusable at all.
+                        if !info.modules.is_empty() {
+                            egui::ComboBox::from_id_salt(("link", prop.kind.label()))
+                                .width(70.0)
+                                .selected_text("link")
+                                .show_ui(ui, |ui| {
+                                    for m in &info.modules {
+                                        if ui.selectable_label(false, &m.name).clicked() {
+                                            out.op = Some(GraphOp::LinkModule {
+                                                kind: prop.kind,
+                                                module: m.id,
+                                            });
+                                        }
+                                    }
+                                });
+                        }
                     }
                 });
                 if let Some(expr) = &prop.expr {
@@ -333,6 +401,7 @@ pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, 
                         &info.nodes,
                         &param_names,
                         &info.script_results,
+                        &info.modules,
                         out,
                     );
                     ui.separator();
@@ -362,6 +431,7 @@ pub(crate) fn expr_canvas(
     nodes: &[(u64, String)],
     params: &[String],
     results: &ScriptResults,
+    modules: &[ModuleInfo],
     out: &mut GraphEdits,
 ) {
     let boxes = layout_expr(expr);
@@ -432,7 +502,10 @@ pub(crate) fn expr_canvas(
             expr.at(parent).and_then(|p| p.slot_label(slot))
         });
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
-        expr_box(&mut child, node, kind, frame, &b.path, slot_label, nodes, params, results, out);
+        expr_box(
+            &mut child, node, kind, frame, &b.path, slot_label, nodes, params, results,
+            modules, out,
+        );
     }
 
     ui.data_mut(|d| d.insert_temp(mem_id, positions));
@@ -452,6 +525,7 @@ pub(crate) fn expr_box(
     nodes: &[(u64, String)],
     params: &[String],
     results: &ScriptResults,
+    modules: &[ModuleInfo],
     out: &mut GraphEdits,
 ) {
     if let Some(label) = slot_label {
@@ -478,12 +552,155 @@ pub(crate) fn expr_box(
             let result = results.get(&(kind, path.to_vec()));
             script_editor(ui, src, frame, result, kind, path, out)
         }
+        Expr::Use { module, overrides } => {
+            use_editor(ui, *module, overrides, kind, path, modules, out)
+        }
         // A generator's knobs are wired-in child boxes; the only in-box control
         // is the oscillator's waveform picker.
         Expr::Gen(Generator::Oscillator { wave, .. }) => {
             wave_editor(ui, *wave, kind, path, out)
         }
         _ => {}
+    }
+}
+
+
+/// A module link: which module, and one row per knob showing whether this link
+/// **inherits** the module's default or **overrides** it.
+///
+/// Inherit is the resting state and is spelled out rather than implied by a
+/// blank field — the whole point of a module is that unset knobs keep following
+/// the definition, and a UI that can't show the difference hides it.
+pub(crate) fn use_editor(
+    ui: &mut egui::Ui,
+    module: ModuleId,
+    overrides: &[(String, Expr)],
+    kind: PropKind,
+    path: &[usize],
+    modules: &[ModuleInfo],
+    out: &mut GraphEdits,
+) {
+    let current = modules.iter().find(|m| m.id == module);
+    let label = current.map(|m| m.name.clone()).unwrap_or_else(|| format!("<missing {}>", module.0));
+    egui::ComboBox::from_id_salt(("usemod", kind.label(), path))
+        .width(110.0)
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            for m in modules {
+                if ui.selectable_label(m.id == module, &m.name).clicked() && m.id != module {
+                    out.op =
+                        Some(GraphOp::SetModule { kind, path: path.to_vec(), module: m.id });
+                }
+            }
+        });
+    let Some(current) = current else { return };
+    for name in &current.params {
+        let overridden = overrides.iter().find(|(n, _)| n == name);
+        ui.horizontal(|ui| {
+            ui.small(name);
+            match overridden {
+                Some((_, Expr::Lit(v))) => {
+                    let mut value = *v;
+                    let changed = match &mut value {
+                        ExprValue::Num(n) => {
+                            ui.add(egui::DragValue::new(n).speed(0.01)).changed()
+                        }
+                        ExprValue::Vec2(v) => {
+                            let a = ui.add(egui::DragValue::new(&mut v.x).speed(0.5)).changed();
+                            let b = ui.add(egui::DragValue::new(&mut v.y).speed(0.5)).changed();
+                            a || b
+                        }
+                        ExprValue::Color(c) => {
+                            let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
+                            let changed = ui.color_edit_button_rgb(&mut rgb).changed();
+                            if changed {
+                                *c = MColor::rgba(
+                                    rgb[0] as f64,
+                                    rgb[1] as f64,
+                                    rgb[2] as f64,
+                                    c.a,
+                                );
+                            }
+                            changed
+                        }
+                    };
+                    if changed {
+                        out.op = Some(GraphOp::SetOverride {
+                            kind,
+                            path: path.to_vec(),
+                            name: name.clone(),
+                            value: Some(value),
+                        });
+                    }
+                    if ui.small_button("x").on_hover_text("Inherit from the module").clicked() {
+                        out.op = Some(GraphOp::SetOverride {
+                            kind,
+                            path: path.to_vec(),
+                            name: name.clone(),
+                            value: None,
+                        });
+                    }
+                }
+                // A non-literal override (an expression) is shown, not edited —
+                // editing it needs the graph canvas, which is the next step.
+                Some((_, expr)) => {
+                    ui.weak(expr.to_string());
+                    if ui.small_button("x").clicked() {
+                        out.op = Some(GraphOp::SetOverride {
+                            kind,
+                            path: path.to_vec(),
+                            name: name.clone(),
+                            value: None,
+                        });
+                    }
+                }
+                None => {
+                    if ui
+                        .small_button("inherit")
+                        .on_hover_text("Following the module — click to override here")
+                        .clicked()
+                    {
+                        out.op = Some(GraphOp::SetOverride {
+                            kind,
+                            path: path.to_vec(),
+                            name: name.clone(),
+                            value: Some(ExprValue::Num(0.0)),
+                        });
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// The project's modules: rename and delete, plus the reminder that a module is
+/// made by extracting one from a property.
+pub(crate) fn modules_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdits) {
+    ui.horizontal(|ui| {
+        ui.strong("Modules");
+        ui.weak(format!("{}", info.modules.len()));
+    });
+    if info.modules.is_empty() {
+        ui.weak("None yet — build a recipe on a property, then press -> module.");
+        return;
+    }
+    for m in &info.modules {
+        ui.horizontal(|ui| {
+            let mut name = m.name.clone();
+            if ui
+                .add(egui::TextEdit::singleline(&mut name).desired_width(120.0))
+                .changed()
+            {
+                out.op = Some(GraphOp::RenameModule { module: m.id, name });
+            }
+            if ui
+                .small_button("✕")
+                .on_hover_text("Delete. Links to it warn and fall back, like any dangling reference.")
+                .clicked()
+            {
+                out.op = Some(GraphOp::DeleteModule { module: m.id });
+            }
+        });
     }
 }
 
@@ -747,14 +964,34 @@ pub(crate) fn ref_editor(
 /// Apply a deferred graph-panel edit to `selected`'s property in `doc`. A free
 /// function (not an `App` method) so the whole promote/edit/bake flow is unit-
 /// testable against a plain `Document`, no window required.
-pub(crate) fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, frame: i64) {
+/// Apply one graph edit.
+///
+/// Takes the whole project, not just the open comp: modules are project-wide,
+/// so extracting or relinking one reaches past the comp being edited.
+pub(crate) fn apply_graph_op(
+    project: &mut MProject,
+    comp: CompId,
+    selected: NodeId,
+    op: GraphOp,
+    frame: i64,
+) {
     let t = frame as f64;
+    // Every arm below edits the open comp; the module arms also touch the
+    // registry, which is why this can't take a bare `&mut Comp`.
+    macro_rules! doc {
+        () => {
+            match project.comp_mut(comp) {
+                Some(c) => c,
+                None => return,
+            }
+        };
+    }
     match op {
         GraphOp::Promote(kind) => {
             // Promoting a constant/keyframed value only reads its own current
             // value, so a document-less context is enough.
             let mut ctx = EvalCtx::at(t);
-            if let Some(node) = doc.root.find_mut(selected) {
+            if let Some(node) = doc!().root.find_mut(selected) {
                 if let Some(mut p) = prop_of_mut(node, kind) {
                     p.promote_to_expr(&mut ctx);
                 }
@@ -764,44 +1001,109 @@ pub(crate) fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, 
             // Baking resolves the *expression*, which may reference other nodes —
             // so it needs the document. Resolve against a clone so the read
             // context doesn't alias the node being mutated.
-            let snapshot = doc.clone();
+            let snapshot = doc!().clone();
             let mut ctx = EvalCtx::new(&snapshot, t);
-            if let Some(node) = doc.root.find_mut(selected) {
+            if let Some(node) = doc!().root.find_mut(selected) {
                 if let Some(mut p) = prop_of_mut(node, kind) {
                     p.bake_to_const(&mut ctx);
                 }
             }
         }
         GraphOp::SetKind { kind, path, new } => {
-            edit_expr(doc, selected, kind, &path, |e| *e = Expr::seed(new));
+            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::seed(new));
         }
         GraphOp::SetLit { kind, path, value } => {
-            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Lit(value));
+            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::Lit(value));
         }
         GraphOp::SetRef { kind, path, node, prop, offset } => {
-            edit_expr(doc, selected, kind, &path, |e| {
+            edit_expr(doc!(), selected, kind, &path, |e| {
                 *e = Expr::Ref { node, prop, time_offset: offset }
             });
         }
         GraphOp::AddParam { name, kind } => {
-            if let Some(node) = doc.root.find_mut(selected) {
+            if let Some(node) = doc!().root.find_mut(selected) {
                 node.set_param(name, kind.seed());
             }
         }
+
+        // Lift a property's whole recipe into a shared module, then link it back
+        // in its place. The link starts with no overrides: it *is* the module,
+        // so the frame is unchanged the instant you press the button.
+        GraphOp::ExtractModule { kind } => {
+            let name = {
+                let doc = doc!();
+                let Some(node) = doc.root.find(selected) else { return };
+                format!("{} {}", node.name, kind.label())
+            };
+            let body = {
+                let doc = doc!();
+                let Some(node) = doc.root.find(selected) else { return };
+                match prop_of(node, kind).and_then(|p| p.expr().cloned()) {
+                    Some(e) => e,
+                    None => return,
+                }
+            };
+            let module = project.add_module(MModule::new(name, body));
+            if let Some(node) = doc!().root.find_mut(selected) {
+                if let Some(mut p) = prop_of_mut(node, kind) {
+                    p.set_expr(Expr::Use { module, overrides: Vec::new() });
+                }
+            }
+        }
+        // Point a property at an existing module, promoting it if it was still
+        // a constant — otherwise linking would silently do nothing.
+        GraphOp::LinkModule { kind, module } => {
+            if let Some(node) = doc!().root.find_mut(selected) {
+                if let Some(mut p) = prop_of_mut(node, kind) {
+                    p.set_expr(Expr::Use { module, overrides: Vec::new() });
+                }
+            }
+        }
+        GraphOp::SetModule { kind, path, module } => {
+            edit_expr(doc!(), selected, kind, &path, |e| {
+                // Repointing keeps the overrides: knobs are matched by name, and
+                // any that the new module lacks warn rather than vanishing.
+                let overrides = match e {
+                    Expr::Use { overrides, .. } => std::mem::take(overrides),
+                    _ => Vec::new(),
+                };
+                *e = Expr::Use { module, overrides };
+            });
+        }
+        GraphOp::SetOverride { kind, path, name, value } => {
+            edit_expr(doc!(), selected, kind, &path, |e| {
+                if let Expr::Use { overrides, .. } = e {
+                    overrides.retain(|(n, _)| n != &name);
+                    // `None` means "inherit" — removing the entry *is* the
+                    // inherit, since a knob with no override follows the module.
+                    if let Some(v) = value {
+                        overrides.push((name.clone(), Expr::Lit(v)));
+                    }
+                }
+            });
+        }
+        GraphOp::RenameModule { module, name } => {
+            if let Some(m) = project.module_mut(module) {
+                m.name = name;
+            }
+        }
+        GraphOp::DeleteModule { module } => {
+            project.modules.remove(&module);
+        }
         GraphOp::RemoveParam { name } => {
-            if let Some(node) = doc.root.find_mut(selected) {
+            if let Some(node) = doc!().root.find_mut(selected) {
                 node.remove_param(&name);
             }
         }
         GraphOp::SetParam { kind, path, name } => {
-            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Param { node: None, name });
+            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::Param { node: None, name });
         }
         GraphOp::SetScript { kind, path, src } => {
-            edit_expr(doc, selected, kind, &path, |e| *e = Expr::Script(src));
+            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::Script(src));
         }
         GraphOp::SetWaveform { kind, path, wave } => {
             // Only touches the waveform; the knobs are left as they are.
-            edit_expr(doc, selected, kind, &path, |e| {
+            edit_expr(doc!(), selected, kind, &path, |e| {
                 if let Expr::Gen(Generator::Oscillator { wave: w, .. }) = e {
                     *w = wave;
                 }

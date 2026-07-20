@@ -579,6 +579,13 @@ impl PropRefMut<'_> {
         on_prop_mut!(self, v => v.bake_to_const(ctx))
     }
     /// The expression tree mutably, for structured editing by path.
+    /// Replace the whole value with an expression, whatever it was before.
+    /// Unlike `promote_to_expr` (which seeds from the current value), this is
+    /// for handing a property a recipe outright — linking a module, say.
+    pub(crate) fn set_expr(&mut self, expr: Expr) {
+        on_prop_mut!(self, v => **v = Value::expr(expr.clone()))
+    }
+
     pub(crate) fn expr_mut(&mut self) -> Option<&mut Expr> {
         on_prop_mut!(self, v => v.expr_mut())
     }

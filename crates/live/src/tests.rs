@@ -5,6 +5,18 @@
 
 use crate::*;
 
+/// Apply a graph op to a bare `Document`, for the tests that predate projects.
+///
+/// `apply_graph_op` takes the whole project now (modules are project-wide), so
+/// this wraps the doc, applies, and unwraps it again. Tests that exercise the
+/// module ops themselves use a real project instead.
+fn apply_op(doc: &mut Document, id: NodeId, op: GraphOp, frame: i64) {
+    let mut project = MProject::single(doc.clone());
+    let comp = project.root;
+    apply_graph_op(&mut project, comp, id, op, frame);
+    *doc = project.comps.remove(&comp).expect("the comp survives");
+}
+
 
 fn test_axis(view: TimelineView) -> Axis {
     // 8px pad each side → a 400px usable span.
@@ -565,7 +577,7 @@ fn resolved_opacity(doc: &Document, id: NodeId) -> f64 {
 #[test]
 fn gather_lists_the_selected_nodes_properties() {
     let (doc, id) = graph_doc(Value::constant(0.5));
-    let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), 0.0).unwrap();
     let opacity = info.props.iter().find(|p| p.kind == PropKind::Opacity).unwrap();
     assert!(!opacity.is_expr, "starts as a plain value");
     assert!(opacity.expr.is_none());
@@ -584,7 +596,7 @@ fn the_script_preview_resolves_against_the_document() {
     )));
     // Give the root a distinctive opacity to read back.
     doc.root.transform.opacity = Value::constant(0.25);
-    let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), 0.0).unwrap();
     let result = info.script_results.get(&(PropKind::Opacity, vec![])).unwrap();
     assert_eq!(result.as_ref().unwrap(), "0.25");
 }
@@ -594,15 +606,15 @@ fn the_script_preview_is_addressed_by_tree_path() {
     // A script nested under an operator is keyed by its path, so two
     // scripts in one tree can't show each other's result.
     let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Add },
         0,
     );
     for (slot, src) in [(0usize, "1.0"), (1, "2.0")] {
-        apply_graph_op(
+        apply_op(
             &mut doc,
             id,
             GraphOp::SetKind {
@@ -612,7 +624,7 @@ fn the_script_preview_is_addressed_by_tree_path() {
             },
             0,
         );
-        apply_graph_op(
+        apply_op(
             &mut doc,
             id,
             GraphOp::SetScript {
@@ -623,7 +635,7 @@ fn the_script_preview_is_addressed_by_tree_path() {
             0,
         );
     }
-    let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), 0.0).unwrap();
     let at = |path: Vec<usize>| {
         info.script_results.get(&(PropKind::Opacity, path)).unwrap().clone().unwrap()
     };
@@ -639,7 +651,7 @@ fn the_script_preview_is_addressed_by_tree_path() {
 fn a_bad_script_shows_one_line_of_error_in_the_preview() {
     let (doc, id) =
         graph_doc(Value::expr(Expr::Script("value(\"nope\", \"opacity\")".into())));
-    let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), 0.0).unwrap();
     let err = info.script_results[&(PropKind::Opacity, vec![])].clone().unwrap_err();
     assert!(err.contains("nope"), "{err}");
     assert!(!err.contains('\n'), "one line, so it fits under the field");
@@ -648,7 +660,7 @@ fn a_bad_script_shows_one_line_of_error_in_the_preview() {
 #[test]
 fn add_param_then_remove_it_through_the_graph_ops() {
     let (mut doc, id) = graph_doc(Value::constant(0.5));
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::AddParam { name: "gain".into(), kind: ParamKind::Num },
@@ -656,10 +668,10 @@ fn add_param_then_remove_it_through_the_graph_ops() {
     );
     assert!(doc.root.find(id).unwrap().param("gain").is_some());
     // The panel lists it, so a `param` node can pick it.
-    let info = GraphInfo::gather(&doc, Some(id), 0.0).unwrap();
+    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), 0.0).unwrap();
     assert_eq!(info.params, vec![("gain".to_string(), "number")]);
 
-    apply_graph_op(&mut doc, id, GraphOp::RemoveParam { name: "gain".into() }, 0);
+    apply_op(&mut doc, id, GraphOp::RemoveParam { name: "gain".into() }, 0);
     assert!(doc.root.find(id).unwrap().param("gain").is_none());
 }
 
@@ -668,7 +680,7 @@ fn a_param_node_drives_a_property_end_to_end() {
     // The whole flow through the panel's ops: add a knob, point the
     // property's expression at it, and see the property take its value.
     let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::AddParam { name: "gain".into(), kind: ParamKind::Num },
@@ -678,14 +690,14 @@ fn a_param_node_drives_a_property_end_to_end() {
         .find_mut(id)
         .unwrap()
         .set_param("gain", ParamValue::Num(Value::constant(0.8)));
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Param },
         0,
     );
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetParam { kind: PropKind::Opacity, path: vec![], name: "gain".into() },
@@ -698,11 +710,11 @@ fn a_param_node_drives_a_property_end_to_end() {
 fn promote_edit_then_bake_round_trips_a_property() {
     let (mut doc, id) = graph_doc(Value::constant(0.5));
     // Promote seeds a literal of the current value — unchanged.
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
     assert!(doc.root.find(id).unwrap().transform.opacity.is_expr());
     assert_eq!(resolved_opacity(&doc, id), 0.5);
     // Edit the literal.
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetLit { kind: PropKind::Opacity, path: vec![], value: ExprValue::Num(0.9) },
@@ -710,7 +722,7 @@ fn promote_edit_then_bake_round_trips_a_property() {
     );
     assert_eq!(resolved_opacity(&doc, id), 0.9);
     // Bake back to a constant, freezing the value.
-    apply_graph_op(&mut doc, id, GraphOp::Bake(PropKind::Opacity), 0);
+    apply_op(&mut doc, id, GraphOp::Bake(PropKind::Opacity), 0);
     assert!(!doc.root.find(id).unwrap().transform.opacity.is_expr());
     assert_eq!(resolved_opacity(&doc, id), 0.9);
 }
@@ -719,20 +731,20 @@ fn promote_edit_then_bake_round_trips_a_property() {
 fn set_kind_grows_a_tree_that_evaluates() {
     // Promote, turn the root into Add, then set its two children: 0.2 + 0.3.
     let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Add },
         0,
     );
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetLit { kind: PropKind::Opacity, path: vec![0], value: ExprValue::Num(0.2) },
         0,
     );
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetLit { kind: PropKind::Opacity, path: vec![1], value: ExprValue::Num(0.3) },
@@ -805,14 +817,14 @@ fn taller_nodes_reserve_more_vertical_room() {
 #[test]
 fn set_script_drives_a_property_from_the_frame() {
     let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Script },
         0,
     );
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetScript { kind: PropKind::Opacity, path: vec![], src: "frame + 0.25".into() },
@@ -830,8 +842,8 @@ fn set_ref_links_one_property_to_another() {
     let b = MNode::group(2, "b");
     let mut doc =
         Document::new(100.0, 100.0, MNode::group(0, "root").with_child(a).with_child(b));
-    apply_graph_op(&mut doc, NodeId(2), GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, NodeId(2), GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         NodeId(2),
         GraphOp::SetRef {
@@ -851,14 +863,14 @@ fn set_kind_to_a_generator_drives_the_property() {
     // Promote, then retype the root to a ramp, and edit its `to` knob (slot
     // 1) to 5 — at frame 30 (its default `end`) the ramp is fully at `to`.
     let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Ramp },
         0,
     );
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetLit { kind: PropKind::Opacity, path: vec![1], value: ExprValue::Num(5.0) },
@@ -876,15 +888,15 @@ fn set_waveform_retunes_an_oscillator_without_touching_its_knobs() {
     // 0 but saw gives 0; use a clearer split — sine(0.25 cycle)=1, square=1,
     // saw(0.25)=−0.5. Switch sine→saw and read the change at a quarter cycle.
     let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_graph_op(
+    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Oscillator },
         0,
     );
     // freq 1.0 so `frame` counts cycles directly; amp 1, phase/offset 0.
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetLit { kind: PropKind::Opacity, path: vec![0], value: ExprValue::Num(1.0) },
@@ -896,7 +908,7 @@ fn set_waveform_retunes_an_oscillator_without_touching_its_knobs() {
         ctx.in_node(id, |ctx| node.transform.opacity.resolve(ctx))
     };
     assert!((sample(&doc) - 1.0).abs() < 1e-9, "sine at a quarter cycle is +1");
-    apply_graph_op(
+    apply_op(
         &mut doc,
         id,
         GraphOp::SetWaveform {
@@ -1132,4 +1144,186 @@ fn the_root_cannot_be_precomposed() {
     let current = project.root;
     assert!(precompose_into(&mut project, current, NodeId(0), 99).is_none());
     assert_eq!(project.comps.len(), 1, "no comp was created");
+}
+
+
+// --- Module ops (the module UI) ---
+
+/// A one-node project whose opacity is expression-driven, ready to extract.
+fn project_with_expr_opacity() -> (MProject, CompId, NodeId) {
+    let node = MNode::shape(
+        1,
+        "dot",
+        MShape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::constant(0.0),
+        },
+    )
+    .with_transform(Transform {
+        opacity: Value::expr(Expr::Lit(ExprValue::Num(0.25))),
+        ..Transform::default()
+    });
+    let project = MProject::single(Document::new(
+        100.0,
+        100.0,
+        MNode::group(0, "root").with_child(node),
+    ));
+    let comp = project.root;
+    (project, comp, NodeId(1))
+}
+
+/// Extracting must be a **no-op on the rendered frame**: the recipe moves to the
+/// module and the property links it, so the value is identical either side.
+/// That's what makes it safe to press on work you care about.
+#[test]
+fn extracting_a_module_leaves_the_value_unchanged() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    let before = motion_core::evaluate_comp(&project, comp, 0.0).items[0].opacity;
+
+    apply_graph_op(&mut project, comp, id, GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
+
+    assert_eq!(project.modules.len(), 1, "a module was created");
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+    assert!((scene.items[0].opacity - before).abs() < 1e-9, "the frame is unchanged");
+
+    // And the property is now a link, not a copy of the recipe.
+    let node = project.comp(comp).unwrap().root.find(id).unwrap();
+    let expr = prop_of(node, PropKind::Opacity).unwrap().expr().cloned().unwrap();
+    assert!(matches!(expr, Expr::Use { .. }), "the property links the module");
+}
+
+/// The extracted module keeps the recipe itself, so editing the module is what
+/// changes the frame from then on.
+#[test]
+fn editing_the_extracted_module_drives_the_property() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    apply_graph_op(&mut project, comp, id, GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
+    let module = *project.modules.keys().next().unwrap();
+
+    project.module_mut(module).unwrap().body = Expr::Lit(ExprValue::Num(0.75));
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!((scene.items[0].opacity - 0.75).abs() < 1e-9);
+}
+
+/// Overriding a knob and then clearing it must return the link to *inheriting*,
+/// not to some captured copy of the old value — that distinction is the whole
+/// point of a module.
+#[test]
+fn clearing_an_override_returns_the_link_to_inheriting() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    let module = project.add_module(
+        MModule::new("level", Expr::Param { node: None, name: "amount".into() })
+            .with_param("amount", ParamValue::Num(Value::constant(0.4))),
+    );
+    apply_graph_op(&mut project, comp, id, GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
+    let opacity = |p: &MProject| motion_core::evaluate_comp(p, comp, 0.0).items[0].opacity;
+    assert!((opacity(&project) - 0.4).abs() < 1e-9, "inherits the module default");
+
+    // Override this one link.
+    apply_graph_op(
+        &mut project,
+        comp,
+        id,
+        GraphOp::SetOverride {
+            kind: PropKind::Opacity,
+            path: Vec::new(),
+            name: "amount".into(),
+            value: Some(ExprValue::Num(0.9)),
+        },
+        0,
+    );
+    assert!((opacity(&project) - 0.9).abs() < 1e-9, "the override wins");
+
+    // Now change the module's default and clear the override: the link must
+    // follow the *new* default, proving it inherits rather than restoring 0.4.
+    project.module_mut(module).unwrap().params[0].value =
+        ParamValue::Num(Value::constant(0.1));
+    apply_graph_op(
+        &mut project,
+        comp,
+        id,
+        GraphOp::SetOverride {
+            kind: PropKind::Opacity,
+            path: Vec::new(),
+            name: "amount".into(),
+            value: None,
+        },
+        0,
+    );
+    assert!((opacity(&project) - 0.1).abs() < 1e-9, "back to inheriting, at the new default");
+}
+
+/// Repointing a link keeps its overrides: knobs are matched by name, so a knob
+/// the two modules share carries over rather than being silently dropped.
+#[test]
+fn repointing_a_link_keeps_overrides_that_still_apply() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    let knob = |name: &str, default: f64| {
+        MModule::new(name, Expr::Param { node: None, name: "amount".into() })
+            .with_param("amount", ParamValue::Num(Value::constant(default)))
+    };
+    let a = project.add_module(knob("a", 0.2));
+    let b = project.add_module(knob("b", 0.8));
+
+    apply_graph_op(&mut project, comp, id, GraphOp::LinkModule { kind: PropKind::Opacity, module: a }, 0);
+    apply_graph_op(
+        &mut project,
+        comp,
+        id,
+        GraphOp::SetOverride {
+            kind: PropKind::Opacity,
+            path: Vec::new(),
+            name: "amount".into(),
+            value: Some(ExprValue::Num(0.55)),
+        },
+        0,
+    );
+    apply_graph_op(
+        &mut project,
+        comp,
+        id,
+        GraphOp::SetModule { kind: PropKind::Opacity, path: Vec::new(), module: b },
+        0,
+    );
+
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+    assert!((scene.items[0].opacity - 0.55).abs() < 1e-9, "the override carried over");
+}
+
+/// Deleting a module doesn't rewrite its links — they warn and fall back, the
+/// same as any other dangling reference. A silent revert would hide the loss.
+#[test]
+fn deleting_a_module_leaves_its_links_warning() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    let module = project.add_module(MModule::new("gone", Expr::Lit(ExprValue::Num(0.3))));
+    apply_graph_op(&mut project, comp, id, GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
+    apply_graph_op(&mut project, comp, id, GraphOp::DeleteModule { module }, 0);
+
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!(
+        scene.warnings.iter().any(|(_, m)| m.contains("no longer exists")),
+        "{:?}",
+        scene.warnings
+    );
+}
+
+/// Renaming is just a label — every link is by id, so nothing breaks.
+#[test]
+fn renaming_a_module_keeps_its_links() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    let module = project.add_module(MModule::new("old", Expr::Lit(ExprValue::Num(0.3))));
+    apply_graph_op(&mut project, comp, id, GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
+    apply_graph_op(
+        &mut project,
+        comp,
+        id,
+        GraphOp::RenameModule { module, name: "new".into() },
+        0,
+    );
+    assert_eq!(project.module(module).unwrap().name, "new");
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+    assert!((scene.items[0].opacity - 0.3).abs() < 1e-9);
 }

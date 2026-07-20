@@ -75,8 +75,7 @@ you *build* them is the next #5 step.
 
 ### Shared animation modules (`Module` + `Expr::Use`)
 
-The document-wide property graph, made concrete (2026-07-19). Core only so far —
-**no UI yet**, so modules are reachable from code and a hand-edited `.pbc`.
+The document-wide property graph, made concrete (2026-07-19), with UI.
 
 A `Module { name, params, body }` lives on the `Project`, not a node: one
 definition, addressable from every comp. A property links it with
@@ -104,6 +103,23 @@ automatic retiming.
 - **Third cycle guard, same discipline** as the property and comp ones: a module
   that links itself warns and falls back rather than recursing. An override
   naming a knob the module lacks warns too — a silent no-op would be a typo trap.
+
+**The UI**, in the graph panel: a **Modules** list (rename / delete), a
+**`-> module`** button on any expression-driven property, and a **`link`**
+picker on any property that isn't one yet. A link's box shows a module picker
+and one row per knob reading either `inherit` or the overridden value.
+
+- **Extract is a no-op on the frame.** The recipe moves to the module and the
+  property links it, so pressing `-> module` on work you care about is safe.
+  Unit-tested by evaluating either side and comparing.
+- **`inherit` is spelled out, not implied by a blank field.** The point of a
+  module is that unset knobs keep following the definition; a UI that can't show
+  the difference between "inheriting 0.4" and "overridden to 0.4" hides it.
+- Repointing a link keeps overrides whose knob names still exist, and deleting a
+  module leaves its links warning rather than silently reverting.
+- `apply_graph_op` takes the whole `Project` now, since modules are project-wide.
+  The tests that predate projects go through an `apply_op` shim.
+
 - `ExprKind::Use` is deliberately **not** in `ExprKind::ALL`: that list is the
   graph picker, and seeding a link needs a module picker, which belongs with the
   Blender-standard graph UI step.
