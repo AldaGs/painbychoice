@@ -199,6 +199,36 @@ drifting keyframes off their frames — the same thing After Effects does.
 Integer frames also killed two float-epsilon fudges (key matching, and
 neighbour clamping when dragging).
 
+### The work area (2026-07-20)
+
+AE's work area: a comp-level **preview** range that bounds the playback loop.
+The deliberate distinction it turns on — recorded back when the layer time model
+landed — is **view state vs document state**: the work area bounds *playback*,
+so it changes nothing the renderer sees and is never saved with the `.pbc`;
+per-layer in/out points change *evaluation*, so they are. `App::work_area:
+Option<WorkArea>` sits beside `view` and resets the same way, when a comp opens.
+
+- **The loop is the only thing confined.** `raw_time()` folds the wall clock
+  into the work-area span *while playing* (`wrap_into` over `loop_bounds_secs`);
+  **while paused** the playhead sits exactly where it was placed. So scrubbing
+  and `←/→` still reach the whole comp — you can park on a frame outside the
+  band to inspect it — and only *looping* stays inside. Restart (`R` / the
+  button) returns to the work-area start, not always frame 0.
+- **Set with `B`/`N` at the playhead** (AE's keys): `B` the start, `N` the end.
+  The end is **exclusive** (like a layer clip's `[in, out)`), so `N` at frame F
+  keeps F as the last previewed frame. The first press seeds the other edge from
+  the comp extent, so one keystroke makes a valid range.
+- **The math is pure and tested.** `loop_bounds` (work area clamped into the
+  comp, `hi > lo` always — the span can't invert or empty), `wrap_into` (the
+  cyclic fold, holding at `lo` on a collapsed span), and `with_work_start` /
+  `with_work_end` (the edge-seeding) are free functions in `timeline.rs`, unit-
+  tested without a window; `App`'s methods are thin wrappers. The ruler band is
+  drawn from `loop_bounds` on the same `Axis` the playhead uses, so they can't
+  drift.
+- **Ephemeral, by choice.** It could persist with the layout later, but AE-style
+  per-comp preview state is genuinely session-scoped; keeping it out of the
+  `.pbc` avoids a format change for something you re-set constantly.
+
 ### `live/` module layout
 
 `main.rs` grew to ~5,100 lines and was split by concern (2026-07-19). It was a
@@ -258,6 +288,13 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   `hh:mm:ss.ff` plus `[frame/last]`. Playback runs off the wall clock but
   *quantizes* to the frame grid, so changing FPS visibly changes the playback
   cadence.
+- **Work area** (AE's) — a comp-level **preview range** shown as a translucent
+  band on the ruler. `B` sets its start at the playhead, `N` its end; **playback
+  loops within it** and Restart returns to its start. It's **view state** — it
+  bounds the loop, never evaluation — so it isn't saved with the document and
+  resets when a comp opens. Scrubbing and frame-stepping still reach the whole
+  comp (only *looping* is confined), so you can inspect a frame outside the band
+  while paused. See *The work area* below.
 - **Layers** (left) — scene tree; select, reorder (▲/▼), add Rect/Ellipse/Group,
   delete (✕), Save…/Load… (`.pbc` JSON via serde — document *and* panel layout).
 - **Properties** (right) — resolved values for the selection; drag or click-type
@@ -854,9 +891,15 @@ sample at a shifted time — the exact mechanism local time needs.
   - Slip's only feedback is the local-0 marker inside the bar (the bar itself
     doesn't move), so when `start` slips out of the visible clip the marker
     becomes a `<`/`>` pinned to the edge it went past rather than vanishing.
-  - Not to be confused with **AE's work area**, which PBC doesn't have: that is
-    a comp-level *preview/render* range (view state), while these are per-layer
-    in/out points that change evaluation (document state).
+  - Not to be confused with **AE's work area** (now built — see *The work area*
+    below): that is a comp-level *preview* range (view state), while these are
+    per-layer in/out points that change evaluation (document state).
+  - **Out-of-bounds is allowed, by decision (2026-07-20):** `drag_clip` has no
+    upper clamp against the comp's duration, so a layer's `out` can extend past
+    the comp end — a layer **may outlive the comp**, as in AE. It's harmless
+    (eval is half-open `[in, out)` and the comp only renders `[0, duration)`, so
+    the overhang never draws) and keeps `drag_clip` a pure function of the clip.
+    Pinned by a test so a future clamp can't slip in unnoticed.
   - **Known limit, deliberate:** local time is `comp_frame − start`, so a timed
     layer nested under another timed layer reads *comp* time, not its parent's
     local time. Nested time is a comp-level concern — Stage 3's business.

@@ -130,6 +130,70 @@ fn clip_drags_clamp_instead_of_inverting() {
     assert_eq!((pushed.start, pushed.in_, pushed.out), (-4, 0, 4), "slide stops at frame 0");
 }
 
+/// Pins the decided behaviour (2026-07-20): a layer **may outlive the comp**.
+/// `drag_clip` has no upper clamp against comp duration — it's comp-agnostic by
+/// design — so trimming or sliding can push `out` well past any comp end. This
+/// is deliberate (eval is half-open and the comp only renders `[0, duration)`),
+/// not an oversight; a regression that clamped here would fail this.
+#[test]
+fn a_clip_may_extend_past_the_comp_end() {
+    let t = LayerTiming { start: 0, in_: 4, out: 8 };
+    // Trim the out-point way past a nominal 30-frame comp.
+    assert_eq!(drag_clip(t, ClipGrab::TrimOut, 999).out, 1007, "out is unclamped upward");
+    // Sliding right carries the whole window past the end too.
+    let slid = drag_clip(t, ClipGrab::Slide, 999);
+    assert_eq!((slid.in_, slid.out), (1003, 1007), "the window rides past the comp");
+}
+
+/// The work area's loop bounds: clamped into the comp, never inverted, and the
+/// whole comp when there's none.
+#[test]
+fn work_area_loop_bounds_stay_inside_the_comp() {
+    // No work area → the whole comp.
+    assert_eq!(loop_bounds(None, 30), (0, 30));
+    // A sane range passes through.
+    assert_eq!(loop_bounds(Some(WorkArea { start: 5, end: 20 }), 30), (5, 20));
+    // start past the comp is pulled back to the last frame; end can't cross it.
+    assert_eq!(loop_bounds(Some(WorkArea { start: 40, end: 50 }), 30), (29, 30));
+    // An inverted range still yields a non-empty span (hi >= lo + 1).
+    let (lo, hi) = loop_bounds(Some(WorkArea { start: 10, end: 3 }), 30);
+    assert!(hi > lo, "the loop span is never empty: {lo}..{hi}");
+    // A zero-duration comp still gives a usable span.
+    assert_eq!(loop_bounds(None, 0), (0, 1));
+}
+
+/// `wrap_into` folds the wall clock into the loop span, cycling within it.
+#[test]
+fn wrap_into_cycles_within_the_span() {
+    // Inside the span: unchanged.
+    assert!((wrap_into(7.0, 5.0, 10.0) - 7.0).abs() < 1e-9);
+    // One past the end wraps back to the start.
+    assert!((wrap_into(10.0, 5.0, 10.0) - 5.0).abs() < 1e-9);
+    // Well past wraps around by the span (width 5): 13 → 8.
+    assert!((wrap_into(13.0, 5.0, 10.0) - 8.0).abs() < 1e-9);
+    // Before the start wraps up from the top.
+    assert!((wrap_into(4.0, 5.0, 10.0) - 9.0).abs() < 1e-9);
+    // A collapsed span holds at the start rather than dividing by zero.
+    assert!((wrap_into(42.0, 5.0, 5.0) - 5.0).abs() < 1e-9);
+}
+
+/// Setting one work-area edge seeds the other from the comp on the first press,
+/// so a single B or N keystroke makes a valid range.
+#[test]
+fn setting_a_work_edge_seeds_the_other_from_the_comp() {
+    // First B at frame 8, in a 30-frame comp: end seeds to the comp extent.
+    let a = with_work_start(None, 8, 30);
+    assert_eq!(a, WorkArea { start: 8, end: 30 });
+    // Then N at frame 20: end is exclusive, so 20 stays the last frame.
+    let b = with_work_end(Some(a), 20, 30);
+    assert_eq!(b, WorkArea { start: 8, end: 21 });
+    // First N (no prior area) seeds the start from 0.
+    assert_eq!(with_work_end(None, 12, 30), WorkArea { start: 0, end: 13 });
+    // Edges are clamped into the comp.
+    assert_eq!(with_work_start(None, 99, 30), WorkArea { start: 29, end: 30 });
+    assert_eq!(with_work_end(None, 99, 30), WorkArea { start: 0, end: 30 });
+}
+
 #[test]
 fn zoom_keeps_the_anchored_frame_under_the_cursor() {
     // This is the property that makes zooming feel like zooming: whatever

@@ -69,6 +69,10 @@ pub(crate) struct App {
     /// which module you're editing isn't part of the document. A delete clears
     /// it (see the graph-op apply) so it can't dangle.
     pub(crate) editing_module: Option<ModuleId>,
+    /// AE's work area: a comp-level *preview* range that bounds the playback
+    /// loop. View state, like `view` — reset when a comp opens, never saved with
+    /// the document. `None` = the whole comp. Set with `B`/`N` at the playhead.
+    pub(crate) work_area: Option<WorkArea>,
 }
 
 /// The largest node id in a subtree, for seeding the id counter.
@@ -126,23 +130,62 @@ impl App {
             canvas_rect: None,
             next_id,
             editing_module: None,
+            work_area: None,
+        }
+    }
+
+    /// The playback loop's frame bounds `[lo, hi)` — the work area clamped into
+    /// the comp, or the whole comp.
+    pub(crate) fn loop_bounds_frames(&self) -> (i64, i64) {
+        loop_bounds(self.work_area, self.doc().duration_frames())
+    }
+
+    /// The same bounds in seconds, for the wall-clock playback loop. The
+    /// no-work-area case returns the comp's exact `duration` (not a frame
+    /// round-trip) so playback timing is byte-for-byte what it was before work
+    /// areas existed.
+    fn loop_bounds_secs(&self) -> (f64, f64) {
+        match self.work_area {
+            None => (0.0, self.doc().duration),
+            Some(_) => {
+                let tb = self.doc().timebase();
+                let (lo, hi) = self.loop_bounds_frames();
+                (tb.frames_to_seconds(lo as f64), tb.frames_to_seconds(hi as f64))
+            }
         }
     }
 
     /// Current looped position on the wall clock, in seconds. Continuous — this
     /// is the clock, not the frame grid. Use `current_frame` / `current_time`
     /// for anything that evaluates or displays.
+    ///
+    /// **While playing**, the wall clock folds into the work-area span, so a
+    /// preview loops within it. **While paused**, the playhead sits exactly
+    /// where it was placed (wrapped only at the comp bounds) — so you can still
+    /// scrub *outside* the work area to inspect a frame, the way AE lets you.
     pub(crate) fn raw_time(&self) -> f64 {
-        let raw = if self.playing {
-            self.anchor.elapsed().as_secs_f64()
+        if self.playing {
+            let (lo, hi) = self.loop_bounds_secs();
+            wrap_into(self.anchor.elapsed().as_secs_f64(), lo, hi)
+        } else if self.doc().duration > 0.0 {
+            self.paused_t.rem_euclid(self.doc().duration)
         } else {
             self.paused_t
-        };
-        if self.doc().duration > 0.0 {
-            raw.rem_euclid(self.doc().duration)
-        } else {
-            raw
         }
+    }
+
+    /// Set the work area's start (`B`) or end (`N`) at `frame`. Thin wrappers
+    /// over the pure `with_work_*` (which own the seeding + clamping, so it's
+    /// unit-tested); a degenerate range is re-clamped by `loop_bounds` at read
+    /// time, so the loop span can never invert.
+    pub(crate) fn set_work_start(&mut self, frame: i64) {
+        let total = self.doc().duration_frames();
+        self.work_area = Some(with_work_start(self.work_area, frame, total));
+    }
+
+    pub(crate) fn set_work_end(&mut self, frame: i64) {
+        let total = self.doc().duration_frames();
+        self.work_area = Some(with_work_end(self.work_area, frame, total));
     }
 
     /// The frame the playhead currently sits on.
@@ -303,7 +346,19 @@ impl ApplicationHandler for App {
                         self.playing = false;
                         self.seek_frame(self.current_frame() - 1);
                     }
-                    Key::Character(ref s) if s == "r" || s == "R" => self.seek_frame(0),
+                    Key::Character(ref s) if s == "r" || s == "R" => {
+                        // Restart the *preview*: to the work-area start, not
+                        // always frame 0.
+                        self.seek_frame(self.loop_bounds_frames().0);
+                    }
+                    // AE's work-area keys: B sets the start at the playhead, N
+                    // the end. View state — nothing in the document changes.
+                    Key::Character(ref s) if s == "b" || s == "B" => {
+                        self.set_work_start(self.current_frame());
+                    }
+                    Key::Character(ref s) if s == "n" || s == "N" => {
+                        self.set_work_end(self.current_frame());
+                    }
                     Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
                         self.delete_selected_keys();
                     }
@@ -689,6 +744,8 @@ impl App {
             (max_id(&comp.root) + 1, comp.duration_frames(), comp.name.clone());
         self.next_id = next_id;
         self.view = TimelineView::full(frames);
+        // The work area is per-comp view state; a fresh open starts with none.
+        self.work_area = None;
         self.comp_name_buf = name;
         self.selected = None;
         self.selected_keys.clear();
@@ -790,6 +847,8 @@ impl App {
         let open = project.root_comp();
         self.next_id = max_id(&open.root) + 1;
         self.view = TimelineView::full(open.duration_frames());
+        // The work area is view state, not saved with the document.
+        self.work_area = None;
         self.project = project;
         self.current = self.project.root;
         self.selected = None;
@@ -915,6 +974,7 @@ impl App {
         let duration = self.doc().duration;
         let timebase = self.doc().timebase();
         let view = self.view;
+        let work_area = self.work_area;
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
@@ -985,6 +1045,7 @@ impl App {
                         view,
                         &selected_keys,
                         clip,
+                        work_area,
                         &mut dope,
                     ),
                     Editor::Properties => {
@@ -1132,7 +1193,9 @@ impl App {
             self.toggle_play();
         }
         if transport.restart {
-            self.seek_frame(0);
+            // Restart the preview at the work-area start (frame 0 when there's
+            // no work area), matching the R key.
+            self.seek_frame(self.loop_bounds_frames().0);
         }
         if let Some(nf) = transport.scrub_to.or(dope.seek_to) {
             self.playing = false;
