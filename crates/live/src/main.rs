@@ -21,8 +21,8 @@ use std::time::Instant;
 use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
     demo::demo_document, evaluate, node::ParamValue, Color as MColor, Document, EvalCtx, Expr,
-    ExprKind, ExprValue, Handle, Keyframe, Node as MNode, NodeId, PropPath, Scene as MScene,
-    Shape as MShape, Transform, Value,
+    ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
+    Scene as MScene, Shape as MShape, Transform, Value, Waveform,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
@@ -2220,6 +2220,8 @@ enum GraphOp {
     SetRef { kind: PropKind, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
     /// Set the script source at `path`.
     SetScript { kind: PropKind, path: Vec<usize>, src: String },
+    /// Set an oscillator's waveform at `path`.
+    SetWaveform { kind: PropKind, path: Vec<usize>, wave: Waveform },
     /// Point a `param` node at a parameter of the node that owns the property.
     SetParam { kind: PropKind, path: Vec<usize>, name: String },
     /// Add a parameter to the selected node, seeded with a neutral value.
@@ -2239,18 +2241,26 @@ const GRAPH_COL_W: f32 = 172.0;
 const GRAPH_BOX_W: f32 = 152.0;
 const GRAPH_V_GAP: f32 = 12.0;
 const GRAPH_MARGIN: f32 = 10.0;
+/// Extra height reserved for a knob box's slot-label line (`freq`/`amp`/…).
+const GRAPH_LABEL_H: f32 = 15.0;
 
-/// How tall a node's box needs to be, by kind — enough for its controls. A
-/// `ref` node stacks three pickers plus an offset, a `script` a field and its
-/// result line, a `value` its editor, and an operator just its kind picker.
-fn box_height(expr: &Expr) -> f32 {
-    match expr {
+/// How tall a node's box needs to be, by kind — enough for its controls, plus a
+/// line for its slot label when it's a labelled generator knob. A `ref` node
+/// stacks three pickers plus an offset, a `script` a field and its result line, a
+/// `value` its editor, an oscillator its kind + waveform pickers, another
+/// generator just its kind picker (its knobs are separate boxes), and an
+/// operator just its kind picker.
+fn box_height(expr: &Expr, labeled: bool) -> f32 {
+    let base = match expr {
         Expr::Ref { .. } => 100.0,
         Expr::Script(_) => 66.0,
         Expr::Param { .. } => 66.0,
         Expr::Lit(_) => 50.0,
+        Expr::Gen(Generator::Oscillator { .. }) => 56.0,
+        Expr::Gen(_) => 30.0,
         Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
-    }
+    };
+    base + if labeled { GRAPH_LABEL_H } else { 0.0 }
 }
 
 /// A node's place in the auto-laid-out expression tree: its `path`, tree `depth`
@@ -2276,15 +2286,18 @@ impl ExprBox {
 /// right, leaves stacked top-to-bottom (each reserving its own height + a gap)
 /// and every parent centred on the span of its children.
 fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
-    // Returns the laid-out node's centre-y, so a parent can centre on its kids.
+    // `labeled` reserves the extra line a generator knob's slot label needs, so
+    // the box below still clears it. Returns the laid-out node's centre-y, so a
+    // parent can centre on its kids.
     fn rec(
         expr: &Expr,
         path: &mut Vec<usize>,
         depth: usize,
+        labeled: bool,
         cursor_y: &mut f32,
         out: &mut Vec<ExprBox>,
     ) -> f32 {
-        let height = box_height(expr);
+        let height = box_height(expr, labeled);
         if expr.arity() == 0 {
             let y = *cursor_y;
             *cursor_y += height + GRAPH_V_GAP;
@@ -2293,8 +2306,16 @@ fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
         } else {
             let (mut first, mut last) = (0.0, 0.0);
             for slot in 0..expr.arity() {
+                let child_labeled = expr.slot_label(slot).is_some();
                 path.push(slot);
-                let c = rec(child_ref(expr, slot).unwrap(), path, depth + 1, cursor_y, out);
+                let c = rec(
+                    child_ref(expr, slot).unwrap(),
+                    path,
+                    depth + 1,
+                    child_labeled,
+                    cursor_y,
+                    out,
+                );
                 path.pop();
                 if slot == 0 {
                     first = c;
@@ -2307,7 +2328,7 @@ fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
         }
     }
     let mut out = Vec::new();
-    rec(expr, &mut Vec::new(), 0, &mut 0.0, &mut out);
+    rec(expr, &mut Vec::new(), 0, false, &mut 0.0, &mut out);
     out
 }
 
@@ -2447,8 +2468,14 @@ fn expr_canvas(
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             egui::StrokeKind::Inside,
         );
+        // A generator knob shows its name (`freq`/`amp`/…) so a wired box is
+        // read the same as the labelled slot it fills; operator operands are
+        // positional and unlabelled.
+        let slot_label = b.path.split_last().and_then(|(&slot, parent)| {
+            expr.at(parent).and_then(|p| p.slot_label(slot))
+        });
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
-        expr_box(&mut child, node, kind, frame, &b.path, nodes, params, results, out);
+        expr_box(&mut child, node, kind, frame, &b.path, slot_label, nodes, params, results, out);
     }
 
     ui.data_mut(|d| d.insert_temp(mem_id, positions));
@@ -2464,11 +2491,15 @@ fn expr_box(
     kind: PropKind,
     frame: f64,
     path: &[usize],
+    slot_label: Option<&str>,
     nodes: &[(u64, String)],
     params: &[String],
     results: &ScriptResults,
     out: &mut GraphEdits,
 ) {
+    if let Some(label) = slot_label {
+        ui.small(label);
+    }
     let cur = expr.kind();
     egui::ComboBox::from_id_salt(("ek", kind.label(), path))
         .width(60.0)
@@ -2490,8 +2521,33 @@ fn expr_box(
             let result = results.get(&(kind, path.to_vec()));
             script_editor(ui, src, frame, result, kind, path, out)
         }
+        // A generator's knobs are wired-in child boxes; the only in-box control
+        // is the oscillator's waveform picker.
+        Expr::Gen(Generator::Oscillator { wave, .. }) => {
+            wave_editor(ui, *wave, kind, path, out)
+        }
         _ => {}
     }
+}
+
+/// The oscillator's waveform picker (`sine`/`triangle`/`square`/`saw`).
+fn wave_editor(
+    ui: &mut egui::Ui,
+    wave: Waveform,
+    kind: PropKind,
+    path: &[usize],
+    out: &mut GraphEdits,
+) {
+    egui::ComboBox::from_id_salt(("wave", kind.label(), path))
+        .width(90.0)
+        .selected_text(wave.label())
+        .show_ui(ui, |ui| {
+            for w in Waveform::ALL {
+                if ui.selectable_label(w == wave, w.label()).clicked() && w != wave {
+                    out.op = Some(GraphOp::SetWaveform { kind, path: path.to_vec(), wave: w });
+                }
+            }
+        });
 }
 
 /// The selected node's parameters: what exists, plus add/remove. Returns the
@@ -2648,13 +2704,11 @@ prop: position, rotation, scale, opacity, anchor, fill,
 
 Nodes are named, not id'd; a vec/colour comes back as an array.";
 
-/// The child expression at `slot` (0/1 for `Add`/`Mul`, 0 for `Neg`).
+/// The child expression at `slot` — an operator operand (0/1 for `Add`/`Mul`,
+/// 0 for `Neg`) or a generator's knob. Delegates to the core so the canvas walks
+/// the same slots the engine addresses.
 fn child_ref(expr: &Expr, slot: usize) -> Option<&Expr> {
-    match (expr, slot) {
-        (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => Some(a),
-        (Expr::Add(_, b) | Expr::Mul(_, b), 1) => Some(b),
-        _ => None,
-    }
+    expr.child(slot)
 }
 
 fn lit_editor(ui: &mut egui::Ui, v: ExprValue, kind: PropKind, path: &[usize], out: &mut GraphEdits) {
@@ -2784,6 +2838,14 @@ fn apply_graph_op(doc: &mut Document, selected: NodeId, op: GraphOp, frame: i64)
         }
         GraphOp::SetScript { kind, path, src } => {
             edit_expr(doc, selected, kind, &path, |e| *e = Expr::Script(src));
+        }
+        GraphOp::SetWaveform { kind, path, wave } => {
+            // Only touches the waveform; the knobs are left as they are.
+            edit_expr(doc, selected, kind, &path, |e| {
+                if let Expr::Gen(Generator::Oscillator { wave: w, .. }) = e {
+                    *w = wave;
+                }
+            });
         }
     }
 }
@@ -4696,6 +4758,93 @@ mod tests {
             0,
         );
         assert_eq!(resolved_opacity(&doc, NodeId(2)), 0.4, "b now mirrors a");
+    }
+
+    #[test]
+    fn set_kind_to_a_generator_drives_the_property() {
+        // Promote, then retype the root to a ramp, and edit its `to` knob (slot
+        // 1) to 5 — at frame 30 (its default `end`) the ramp is fully at `to`.
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Ramp },
+            0,
+        );
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetLit { kind: PropKind::Opacity, path: vec![1], value: ExprValue::Num(5.0) },
+            0,
+        );
+        let node = doc.root.find(id).unwrap();
+        let mut ctx = EvalCtx::new(&doc, 30.0);
+        let v = ctx.in_node(id, |ctx| node.transform.opacity.resolve(ctx));
+        assert!((v - 5.0).abs() < 1e-9, "ramp reaches its edited `to` at end");
+    }
+
+    #[test]
+    fn set_waveform_retunes_an_oscillator_without_touching_its_knobs() {
+        // A saw at freq 1.0 (one cycle per frame), amp 1: at frame 0.5 sine gives
+        // 0 but saw gives 0; use a clearer split — sine(0.25 cycle)=1, square=1,
+        // saw(0.25)=−0.5. Switch sine→saw and read the change at a quarter cycle.
+        let (mut doc, id) = graph_doc(Value::constant(0.0));
+        apply_graph_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetKind { kind: PropKind::Opacity, path: vec![], new: ExprKind::Oscillator },
+            0,
+        );
+        // freq 1.0 so `frame` counts cycles directly; amp 1, phase/offset 0.
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetLit { kind: PropKind::Opacity, path: vec![0], value: ExprValue::Num(1.0) },
+            0,
+        );
+        let sample = |doc: &Document| {
+            let node = doc.root.find(id).unwrap();
+            let mut ctx = EvalCtx::new(doc, 0.25);
+            ctx.in_node(id, |ctx| node.transform.opacity.resolve(ctx))
+        };
+        assert!((sample(&doc) - 1.0).abs() < 1e-9, "sine at a quarter cycle is +1");
+        apply_graph_op(
+            &mut doc,
+            id,
+            GraphOp::SetWaveform {
+                kind: PropKind::Opacity,
+                path: vec![],
+                wave: Waveform::Saw,
+            },
+            0,
+        );
+        assert!((sample(&doc) + 0.5).abs() < 1e-9, "saw at a quarter cycle is −0.5");
+        // The knobs are untouched — freq is still the 1.0 we set.
+        let opacity = &doc.root.find(id).unwrap().transform.opacity;
+        match opacity {
+            Value::Expr(Expr::Gen(Generator::Oscillator { freq, wave, .. })) => {
+                assert_eq!(freq.to_string(), "1");
+                assert_eq!(*wave, Waveform::Saw);
+            }
+            _ => panic!("still an oscillator"),
+        }
+    }
+
+    #[test]
+    fn a_generator_knob_box_reserves_room_for_its_label() {
+        // A noise generator lays out with its three knobs as child boxes; each
+        // knob box is taller than a bare literal because it reserves a line for
+        // its slot label, and the stack still clears (no overlap).
+        let e = Expr::seed(ExprKind::Noise);
+        let boxes = layout_expr(&e);
+        assert_eq!(boxes.len(), 4, "the generator plus three knob boxes");
+        let bare = box_height(&Expr::num(0.0), false);
+        let freq = box_at_path(&boxes, &[0]);
+        assert!(freq.height > bare, "a labelled knob reserves more than a bare value");
+        let amp = box_at_path(&boxes, &[1]);
+        assert!(amp.y >= freq.y + freq.height, "the knob below clears the labelled one");
     }
 
     /// A rect with every optional property present.

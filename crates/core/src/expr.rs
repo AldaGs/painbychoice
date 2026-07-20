@@ -234,6 +234,233 @@ pub enum Expr {
     /// a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`). A leaf: it
     /// pulls its inputs from `frame`, not from wired-in child nodes.
     Script(String),
+    /// A procedural generator — a typed-knob motion primitive (oscillator, noise,
+    /// ramp, bounce) that computes a number from the frame, without a script. Its
+    /// knobs are themselves `Expr`s (children in the graph), so a knob can be a
+    /// literal, a `Param`, or any expression — the point of shipping generators
+    /// after parameters. Always resolves to a `Num`; feed it through `Mul` to
+    /// broadcast onto a vec/colour property.
+    Gen(Generator),
+}
+
+/// A periodic waveform for [`Generator::Oscillator`]. Sampled over a phase in
+/// *cycles* (`1.0` = one full period), so every shape shares the oscillator's
+/// `freq`/`phase` units. Each returns a value in `[-1, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Waveform {
+    Sine,
+    Triangle,
+    Square,
+    Saw,
+}
+
+impl Waveform {
+    /// Every waveform, in picker order.
+    pub const ALL: [Waveform; 4] = [Waveform::Sine, Waveform::Triangle, Waveform::Square, Waveform::Saw];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Waveform::Sine => "sine",
+            Waveform::Triangle => "triangle",
+            Waveform::Square => "square",
+            Waveform::Saw => "saw",
+        }
+    }
+
+    /// Sample the wave at `phase` cycles. Sine is the true trig curve; the other
+    /// three are built off the fractional cycle `u ∈ [0, 1)` so they stay exactly
+    /// periodic and land on `±1`.
+    pub fn sample(self, phase: f64) -> f64 {
+        let u = phase - phase.floor();
+        match self {
+            Waveform::Sine => (std::f64::consts::TAU * phase).sin(),
+            // Peaks at u = 0.5, troughs at the ends — a symmetric triangle.
+            Waveform::Triangle => 1.0 - 4.0 * (u - 0.5).abs(),
+            Waveform::Square => {
+                if u < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            Waveform::Saw => 2.0 * u - 1.0,
+        }
+    }
+}
+
+/// A procedural generator: a named motion primitive with typed knobs. Each knob
+/// is a boxed [`Expr`], so it defaults to a literal you drag in the canvas but
+/// can be rewired to a `Param`/`Ref`/expression like any other node. All four
+/// are pure functions of the frame — deterministic, so scrubbing is stable and a
+/// render matches the preview, the same contract as `wiggle`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Generator {
+    /// `offset + amp · wave(freq · frame + phase)`. `freq` is cycles per frame,
+    /// `phase` is in cycles. A steady periodic wobble.
+    Oscillator {
+        freq: Box<Expr>,
+        amp: Box<Expr>,
+        phase: Box<Expr>,
+        offset: Box<Expr>,
+        wave: Waveform,
+    },
+    /// `amp · noise(freq · frame, seed)` — smooth value noise in `[-amp, amp]`,
+    /// the same generator behind the `wiggle()` script fn. `seed` picks an
+    /// independent stream so two channels can wobble differently.
+    Noise { freq: Box<Expr>, amp: Box<Expr>, seed: Box<Expr> },
+    /// A linear ramp from `from` to `to` across frames `start..end`, clamped flat
+    /// outside that window. A keyframe pair as a knob you can drive.
+    Ramp { from: Box<Expr>, to: Box<Expr>, start: Box<Expr>, end: Box<Expr> },
+    /// `amp · e^(−decay · frame) · cos(2π · freq · frame)` — a damped oscillation
+    /// that overshoots and settles to zero: the classic bounce/elastic settle.
+    Bounce { amp: Box<Expr>, freq: Box<Expr>, decay: Box<Expr> },
+}
+
+impl Generator {
+    /// The kind, for the editor's picker.
+    pub fn kind(&self) -> ExprKind {
+        match self {
+            Generator::Oscillator { .. } => ExprKind::Oscillator,
+            Generator::Noise { .. } => ExprKind::Noise,
+            Generator::Ramp { .. } => ExprKind::Ramp,
+            Generator::Bounce { .. } => ExprKind::Bounce,
+        }
+    }
+
+    /// This generator's knob labels, in slot order — the canvas labels each knob
+    /// box with these, and they name the child slots `at`/`at_mut` address.
+    pub fn knob_labels(&self) -> &'static [&'static str] {
+        match self {
+            Generator::Oscillator { .. } => &["freq", "amp", "phase", "offset"],
+            Generator::Noise { .. } => &["freq", "amp", "seed"],
+            Generator::Ramp { .. } => &["from", "to", "start", "end"],
+            Generator::Bounce { .. } => &["amp", "freq", "decay"],
+        }
+    }
+
+    /// How many knob slots — the generator node's arity in the graph.
+    pub fn arity(&self) -> usize {
+        self.knob_labels().len()
+    }
+
+    /// Borrow the knob at `slot`, in the order [`Generator::knob_labels`] gives.
+    pub fn knob(&self, slot: usize) -> Option<&Expr> {
+        let b = match (self, slot) {
+            (Generator::Oscillator { freq, .. }, 0) => freq,
+            (Generator::Oscillator { amp, .. }, 1) => amp,
+            (Generator::Oscillator { phase, .. }, 2) => phase,
+            (Generator::Oscillator { offset, .. }, 3) => offset,
+            (Generator::Noise { freq, .. }, 0) => freq,
+            (Generator::Noise { amp, .. }, 1) => amp,
+            (Generator::Noise { seed, .. }, 2) => seed,
+            (Generator::Ramp { from, .. }, 0) => from,
+            (Generator::Ramp { to, .. }, 1) => to,
+            (Generator::Ramp { start, .. }, 2) => start,
+            (Generator::Ramp { end, .. }, 3) => end,
+            (Generator::Bounce { amp, .. }, 0) => amp,
+            (Generator::Bounce { freq, .. }, 1) => freq,
+            (Generator::Bounce { decay, .. }, 2) => decay,
+            _ => return None,
+        };
+        Some(b.as_ref())
+    }
+
+    /// Mutably borrow the knob at `slot` — the write path `at_mut` recurses into.
+    pub fn knob_mut(&mut self, slot: usize) -> Option<&mut Expr> {
+        let b = match (self, slot) {
+            (Generator::Oscillator { freq, .. }, 0) => freq,
+            (Generator::Oscillator { amp, .. }, 1) => amp,
+            (Generator::Oscillator { phase, .. }, 2) => phase,
+            (Generator::Oscillator { offset, .. }, 3) => offset,
+            (Generator::Noise { freq, .. }, 0) => freq,
+            (Generator::Noise { amp, .. }, 1) => amp,
+            (Generator::Noise { seed, .. }, 2) => seed,
+            (Generator::Ramp { from, .. }, 0) => from,
+            (Generator::Ramp { to, .. }, 1) => to,
+            (Generator::Ramp { start, .. }, 2) => start,
+            (Generator::Ramp { end, .. }, 3) => end,
+            (Generator::Bounce { amp, .. }, 0) => amp,
+            (Generator::Bounce { freq, .. }, 1) => freq,
+            (Generator::Bounce { decay, .. }, 2) => decay,
+            _ => return None,
+        };
+        Some(b.as_mut())
+    }
+
+    /// A fresh generator of `kind`, with knobs seeded to sensible literal
+    /// defaults so a just-created generator already animates.
+    fn seed(kind: ExprKind) -> Generator {
+        let lit = |n: f64| Box::new(Expr::num(n));
+        match kind {
+            ExprKind::Oscillator => Generator::Oscillator {
+                freq: lit(0.05),
+                amp: lit(1.0),
+                phase: lit(0.0),
+                offset: lit(0.0),
+                wave: Waveform::Sine,
+            },
+            ExprKind::Noise => Generator::Noise { freq: lit(0.1), amp: lit(1.0), seed: lit(0.0) },
+            ExprKind::Ramp => {
+                Generator::Ramp { from: lit(0.0), to: lit(1.0), start: lit(0.0), end: lit(30.0) }
+            }
+            ExprKind::Bounce => Generator::Bounce { amp: lit(1.0), freq: lit(0.1), decay: lit(0.05) },
+            // Not a generator kind — the callers only pass the four above.
+            _ => Generator::Noise { freq: lit(0.1), amp: lit(1.0), seed: lit(0.0) },
+        }
+    }
+
+    /// Evaluate the generator at `ctx`'s frame. Knobs resolve first (so a knob
+    /// can be a param or expression); each is coerced to a scalar. Deterministic.
+    fn eval(&self, ctx: &mut EvalCtx) -> f64 {
+        let frame = ctx.frame;
+        let knob = |i: usize, ctx: &mut EvalCtx| -> f64 {
+            match self.knob(i) {
+                Some(e) => eval_num(e, ctx),
+                None => 0.0,
+            }
+        };
+        match self {
+            Generator::Oscillator { wave, .. } => {
+                let (freq, amp, phase, offset) =
+                    (knob(0, ctx), knob(1, ctx), knob(2, ctx), knob(3, ctx));
+                offset + amp * wave.sample(freq * frame + phase)
+            }
+            Generator::Noise { .. } => {
+                let (freq, amp, seed) = (knob(0, ctx), knob(1, ctx), knob(2, ctx));
+                amp * value_noise(freq * frame, seed)
+            }
+            Generator::Ramp { .. } => {
+                let (from, to, start, end) =
+                    (knob(0, ctx), knob(1, ctx), knob(2, ctx), knob(3, ctx));
+                let t = if end <= start {
+                    // A zero/negative window is a step at `start`.
+                    if frame >= start {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    ((frame - start) / (end - start)).clamp(0.0, 1.0)
+                };
+                from + (to - from) * t
+            }
+            Generator::Bounce { .. } => {
+                let (amp, freq, decay) = (knob(0, ctx), knob(1, ctx), knob(2, ctx));
+                amp * (-decay * frame).exp() * (std::f64::consts::TAU * freq * frame).cos()
+            }
+        }
+    }
+}
+
+/// Evaluate a knob expression down to a scalar. A knob is usually a `Num`; a vec
+/// or colour knob (say a `Param` of the wrong kind) coerces to its first
+/// component rather than erroring, so a generator always produces a value.
+fn eval_num(expr: &Expr, ctx: &mut EvalCtx) -> f64 {
+    match eval_expr(expr, ctx) {
+        ExprValue::Num(n) => n,
+        ExprValue::Vec2(v) => v.x,
+        ExprValue::Color(c) => c.r,
+    }
 }
 
 impl Expr {
@@ -261,6 +488,7 @@ impl Expr {
             Expr::Neg(..) => ExprKind::Neg,
             Expr::Param { .. } => ExprKind::Param,
             Expr::Script(_) => ExprKind::Script,
+            Expr::Gen(g) => g.kind(),
         }
     }
 
@@ -281,6 +509,9 @@ impl Expr {
             ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
             ExprKind::Param => Expr::Param { node: None, name: String::new() },
             ExprKind::Script => Expr::Script(String::new()),
+            ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {
+                Expr::Gen(Generator::seed(kind))
+            }
         }
     }
 
@@ -290,7 +521,29 @@ impl Expr {
         match self {
             Expr::Add(..) | Expr::Mul(..) => 2,
             Expr::Neg(..) => 1,
+            Expr::Gen(g) => g.arity(),
             Expr::Lit(_) | Expr::Ref { .. } | Expr::Param { .. } | Expr::Script(_) => 0,
+        }
+    }
+
+    /// Borrow this node's child at `slot` (one level), whatever the kind — the
+    /// operator operands *or* a generator's knobs. Lets an editor walk inputs
+    /// without matching on the variant.
+    pub fn child(&self, slot: usize) -> Option<&Expr> {
+        match (self, slot) {
+            (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => Some(a),
+            (Expr::Add(_, b) | Expr::Mul(_, b), 1) => Some(b),
+            (Expr::Gen(g), _) => g.knob(slot),
+            _ => None,
+        }
+    }
+
+    /// The label for child `slot`, if it has one: a generator names its knobs
+    /// (`freq`/`amp`/…); operator operands are positional and return `None`.
+    pub fn slot_label(&self, slot: usize) -> Option<&'static str> {
+        match self {
+            Expr::Gen(g) => g.knob_labels().get(slot).copied(),
+            _ => None,
         }
     }
 
@@ -303,6 +556,7 @@ impl Expr {
         let child = match (self, slot) {
             (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_ref(),
             (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_ref(),
+            (Expr::Gen(g), _) => g.knob(slot)?,
             _ => return None,
         };
         child.at(rest)
@@ -317,6 +571,7 @@ impl Expr {
         let child = match (self, slot) {
             (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_mut(),
             (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_mut(),
+            (Expr::Gen(g), _) => g.knob_mut(slot)?,
             _ => return None,
         };
         child.at_mut(rest)
@@ -333,11 +588,15 @@ pub enum ExprKind {
     Neg,
     Param,
     Script,
+    Oscillator,
+    Noise,
+    Ramp,
+    Bounce,
 }
 
 impl ExprKind {
-    /// Every kind, in picker order.
-    pub const ALL: [ExprKind; 7] = [
+    /// Every kind, in picker order — the generators grouped after the primitives.
+    pub const ALL: [ExprKind; 11] = [
         ExprKind::Lit,
         ExprKind::Ref,
         ExprKind::Add,
@@ -345,6 +604,10 @@ impl ExprKind {
         ExprKind::Neg,
         ExprKind::Param,
         ExprKind::Script,
+        ExprKind::Oscillator,
+        ExprKind::Noise,
+        ExprKind::Ramp,
+        ExprKind::Bounce,
     ];
 
     pub fn label(self) -> &'static str {
@@ -356,7 +619,16 @@ impl ExprKind {
             ExprKind::Neg => "neg",
             ExprKind::Param => "param",
             ExprKind::Script => "script",
+            ExprKind::Oscillator => "osc",
+            ExprKind::Noise => "noise",
+            ExprKind::Ramp => "ramp",
+            ExprKind::Bounce => "bounce",
         }
+    }
+
+    /// Whether this kind is a procedural generator (vs. a primitive/operator).
+    pub fn is_generator(self) -> bool {
+        matches!(self, ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce)
     }
 }
 
@@ -389,7 +661,32 @@ impl fmt::Display for Expr {
             Expr::Param { node: None, name } => write!(f, "param({name})"),
             Expr::Param { node: Some(n), name } => write!(f, "param(#{}, {name})", n.0),
             Expr::Script(src) => write!(f, "{{ {src} }}"),
+            Expr::Gen(g) => write!(f, "{g}"),
         }
+    }
+}
+
+impl fmt::Display for Waveform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// `osc(freq: .., amp: .., …)` — the generator's label with its knobs named, so
+/// a printed tree reads the same as the canvas boxes.
+impl fmt::Display for Generator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.kind().label())?;
+        for (slot, label) in self.knob_labels().iter().enumerate() {
+            if slot > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{label}: {}", self.knob(slot).unwrap())?;
+        }
+        if let Generator::Oscillator { wave, .. } = self {
+            write!(f, ", {wave}")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -936,6 +1233,9 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
                 ExprValue::Num(0.0)
             }
         },
+        // A generator always produces a scalar; a vec/colour property broadcasts
+        // it through the same `Num` edge a literal number would.
+        Expr::Gen(g) => ExprValue::Num(g.eval(ctx)),
     }
 }
 
@@ -1065,6 +1365,11 @@ mod tests {
                 ExprKind::Add | ExprKind::Mul => 2,
                 ExprKind::Neg => 1,
                 ExprKind::Lit | ExprKind::Ref | ExprKind::Param | ExprKind::Script => 0,
+                // Generators carry their own knob count — assert it's non-empty
+                // and matches the labels, checked in full elsewhere.
+                ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {
+                    e.arity()
+                }
             };
             assert_eq!(e.arity(), expected, "{k:?}");
         }
@@ -1439,6 +1744,189 @@ mod tests {
         assert_ne!(at(0.0, "wiggle(0.5, 10.0)"), at(7.0, "wiggle(0.5, 10.0)"));
         // Different seeds are independent streams — x and y can differ.
         assert_ne!(at(7.0, "wiggle(0.5, 10.0)"), at(7.0, "wiggle(0.5, 10.0, 2.0)"));
+    }
+
+    // ---- procedural generators ----
+
+    /// Resolve a bare generator expression at `frame`, document-less (its knobs
+    /// are literals here), and unwrap the `Num`.
+    fn gen_at(g: Generator, frame: f64) -> f64 {
+        let mut ctx = EvalCtx::at(frame);
+        match eval_expr(&Expr::Gen(g), &mut ctx) {
+            ExprValue::Num(n) => n,
+            other => panic!("a generator must resolve to a number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oscillator_is_a_sine_around_its_offset() {
+        // offset 5, amp 2, freq 0.25 (a full cycle over 4 frames), no phase.
+        let g = || Generator::Oscillator {
+            freq: Box::new(Expr::num(0.25)),
+            amp: Box::new(Expr::num(2.0)),
+            phase: Box::new(Expr::num(0.0)),
+            offset: Box::new(Expr::num(5.0)),
+            wave: Waveform::Sine,
+        };
+        assert!((gen_at(g(), 0.0) - 5.0).abs() < 1e-9, "sin(0) = 0 → the offset");
+        assert!((gen_at(g(), 1.0) - 7.0).abs() < 1e-9, "quarter cycle → +amp");
+        assert!((gen_at(g(), 3.0) - 3.0).abs() < 1e-9, "three-quarter cycle → −amp");
+    }
+
+    #[test]
+    fn every_waveform_stays_in_unit_range_and_hits_its_shape() {
+        // Sampled densely, each wave is bounded by [-1, 1].
+        for w in Waveform::ALL {
+            for k in 0..400 {
+                let v = w.sample(k as f64 * 0.013);
+                assert!(v.abs() <= 1.0 + 1e-9, "{w:?} at {k}: {v}");
+            }
+        }
+        // Signature points: saw ramps -1→1 across a cycle; square flips at 0.5;
+        // triangle peaks at 0.5.
+        assert!((Waveform::Saw.sample(0.0) + 1.0).abs() < 1e-9);
+        assert!((Waveform::Saw.sample(0.999) - 0.998).abs() < 1e-2);
+        assert_eq!(Waveform::Square.sample(0.25), 1.0);
+        assert_eq!(Waveform::Square.sample(0.75), -1.0);
+        assert!((Waveform::Triangle.sample(0.5) - 1.0).abs() < 1e-9);
+        assert!((Waveform::Triangle.sample(0.0) + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn noise_matches_wiggle_and_is_bounded() {
+        // The Noise generator is the same value noise `wiggle()` uses, so equal
+        // freq/amp/seed give equal results — one source of truth.
+        let freq = 0.5;
+        let amp = 10.0;
+        for f in 0..50 {
+            let frame = f as f64 * 0.37;
+            let g = Generator::Noise {
+                freq: Box::new(Expr::num(freq)),
+                amp: Box::new(Expr::num(amp)),
+                seed: Box::new(Expr::num(0.0)),
+            };
+            let via_gen = gen_at(g, frame);
+            let via_script = value_noise(frame * freq, 0.0) * amp;
+            assert!((via_gen - via_script).abs() < 1e-12, "frame {frame}");
+            assert!(via_gen.abs() <= amp, "bounded by amp");
+        }
+    }
+
+    #[test]
+    fn ramp_clamps_flat_outside_its_window_and_lerps_inside() {
+        let g = || Generator::Ramp {
+            from: Box::new(Expr::num(10.0)),
+            to: Box::new(Expr::num(20.0)),
+            start: Box::new(Expr::num(4.0)),
+            end: Box::new(Expr::num(8.0)),
+        };
+        assert_eq!(gen_at(g(), 0.0), 10.0, "before start: flat at from");
+        assert_eq!(gen_at(g(), 4.0), 10.0, "at start");
+        assert_eq!(gen_at(g(), 6.0), 15.0, "midpoint");
+        assert_eq!(gen_at(g(), 8.0), 20.0, "at end");
+        assert_eq!(gen_at(g(), 100.0), 20.0, "after end: flat at to");
+        // A degenerate (zero-width) window is a clean step at `start`, not a
+        // divide-by-zero.
+        let step = || Generator::Ramp {
+            from: Box::new(Expr::num(1.0)),
+            to: Box::new(Expr::num(2.0)),
+            start: Box::new(Expr::num(5.0)),
+            end: Box::new(Expr::num(5.0)),
+        };
+        assert_eq!(gen_at(step(), 4.9), 1.0, "before the step");
+        assert_eq!(gen_at(step(), 5.0), 2.0, "at and after the step");
+    }
+
+    #[test]
+    fn bounce_overshoots_then_settles_to_zero() {
+        let g = || Generator::Bounce {
+            amp: Box::new(Expr::num(3.0)),
+            freq: Box::new(Expr::num(0.1)),
+            decay: Box::new(Expr::num(0.1)),
+        };
+        assert!((gen_at(g(), 0.0) - 3.0).abs() < 1e-9, "starts at full amplitude");
+        // The envelope amp·e^(−decay·frame) decays, so a late frame is small.
+        assert!(gen_at(g(), 200.0).abs() < 1e-3, "settles toward zero");
+        // Deterministic: the same frame gives the same value.
+        assert_eq!(gen_at(g(), 12.0), gen_at(g(), 12.0));
+    }
+
+    #[test]
+    fn a_generator_knob_can_be_a_parameter() {
+        use crate::node::ParamValue;
+        // b.opacity = osc whose `amp` knob reads b's `gain` parameter — the whole
+        // point of shipping generators after parameters. gain = 4, sine at a
+        // quarter cycle → offset(0) + 4·1 = 4.
+        let mut doc = doc_with(
+            Value::constant(0.5),
+            Value::expr(Expr::Gen(Generator::Oscillator {
+                freq: Box::new(Expr::num(0.25)),
+                amp: Box::new(Expr::Param { node: None, name: "gain".into() }),
+                phase: Box::new(Expr::num(0.0)),
+                offset: Box::new(Expr::num(0.0)),
+                wave: Waveform::Sine,
+            })),
+        );
+        doc.root
+            .find_mut(NodeId(2))
+            .unwrap()
+            .set_param("gain", ParamValue::Num(Value::constant(4.0)));
+        assert!((opacity_of(&doc, 2, 1.0) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn generator_seed_arity_and_knob_addressing_line_up() {
+        for k in [ExprKind::Oscillator, ExprKind::Noise, ExprKind::Ramp, ExprKind::Bounce] {
+            let e = Expr::seed(k);
+            assert_eq!(e.kind(), k);
+            assert!(k.is_generator());
+            let Expr::Gen(g) = &e else { panic!("seed({k:?}) should be a generator") };
+            // Arity equals the number of labelled knobs, and every slot resolves
+            // both by label and by `child`/`at`.
+            assert_eq!(e.arity(), g.knob_labels().len());
+            for slot in 0..e.arity() {
+                assert!(g.knob(slot).is_some(), "{k:?} knob {slot}");
+                assert!(e.child(slot).is_some(), "{k:?} child {slot}");
+                assert!(e.at(&[slot]).is_some(), "{k:?} at [{slot}]");
+                assert!(e.slot_label(slot).is_some(), "{k:?} slot label {slot}");
+            }
+            // One past the last slot is out of range everywhere.
+            assert!(e.child(e.arity()).is_none());
+            assert!(e.at(&[e.arity()]).is_none());
+        }
+    }
+
+    #[test]
+    fn at_mut_edits_a_generator_knob_in_place() {
+        // An oscillator whose `amp` (slot 1) starts at 1, edited to 9.
+        let mut e = Expr::seed(ExprKind::Oscillator);
+        *e.at_mut(&[1]).unwrap() = Expr::num(9.0);
+        match &e {
+            Expr::Gen(g) => assert_eq!(g.knob(1).unwrap().to_string(), "9"),
+            _ => panic!("still a generator"),
+        }
+        // And the change is what drives the value: freq 0 → sine of phase 0 = 0,
+        // so at frame 0 the value is offset(0) + amp·0 = 0 regardless; use a
+        // quarter-cycle phase instead to read amp back out.
+        *e.at_mut(&[0]).unwrap() = Expr::num(0.0); // freq
+        *e.at_mut(&[2]).unwrap() = Expr::num(0.25); // phase (quarter cycle)
+        assert!((gen_at(match e { Expr::Gen(g) => g, _ => unreachable!() }, 0.0) - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_generator_round_trips_through_json_and_prints_readably() {
+        let v: Value<f64> = Value::expr(Expr::seed(ExprKind::Ramp));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Value<f64> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Value::Expr(Expr::Gen(Generator::Ramp { .. }))));
+        assert_eq!(
+            Expr::seed(ExprKind::Ramp).to_string(),
+            "ramp(from: 0, to: 1, start: 0, end: 30)"
+        );
+        assert_eq!(
+            Expr::seed(ExprKind::Oscillator).to_string(),
+            "osc(freq: 0.05, amp: 1, phase: 0, offset: 0, sine)"
+        );
     }
 
     #[test]

@@ -343,7 +343,8 @@ Two rules keep this safe:
 
 Decided sequence: **composition settings ✅ → frame-based timeline ✅ → keyframe
 UX ✅ → shape/stroke params ✅ → dockable panels ✅ → node graph + expression
-IR 🚧 → …**. Next up:
+IR ✅ → …**. Items 1–5 are complete; the build order now continues under *Agreed
+order past #5* below (pre-comps first). The stages of each item:
 
 1. ~~**Frame-based timeline.**~~ ✅ Done. Frames are `core`'s native time domain,
    with a ruler, timecode readout, snapping at any zoom, zoom/pan, and edge
@@ -375,10 +376,10 @@ IR 🚧 → …**. Next up:
      uncreatable-to-manage, invisible to select/retime/delete. Rather than add a
      fifth special case, `PropKind` became the single enumeration of animatable
      properties behind `prop_of`/`prop_of_mut`.
-4. **Blender-style splittable/dockable panels** — 🚧 in progress. The layout
+4. ~~**Blender-style splittable/dockable panels**~~ — ✅ Done. The layout
    tree + draggable splitters are done (see *The panel layout tree* above), and
    the canvas fit now derives from the tree instead of hardcoded panel sizes.
-   Still to come, in order:
+   Delivered in order:
    - ~~**Split / join areas** and a per-area dropdown to change which `Editor`
      an area shows.~~ ✅ Done. Each content area carries a header with an editor
      picker and split (`|` left/right, `-` top/bottom) + close (`x`) buttons;
@@ -405,9 +406,9 @@ IR 🚧 → …**. Next up:
      files still open — the loader falls back to a plain document parse.
 
    With that, **item #4 is complete.** Next is the node/expression IR (#5).
-5. **Node graph + expression IR** (`Value::Expr` / `Value::Parametric`) — the big
-   differentiator; the IR/printer discipline borrowed from the EBN project.
-   🚧 in progress, being built in stages:
+5. ~~**Node graph + expression IR**~~ (`Value::Expr` / `Value::Parametric`) — the
+   big differentiator; the IR/printer discipline borrowed from the EBN project.
+   ✅ Done — built in stages:
    - ~~**The `EvalCtx` seam.**~~ ✅ Done. `resolve` takes an `EvalCtx` instead of
      a bare frame (see *The core idea* above).
    - ~~**`Value::Expr` + the IR.**~~ ✅ Done — the headless engine now evaluates
@@ -469,10 +470,22 @@ IR 🚧 → …**. Next up:
      marks that, and anything resolving a node's properties outside `evaluate`
      (the properties readout, the script preview) must go through it or it will
      show a fallback where the canvas shows the real value.
-   - **Procedural generators** (the other half) — 🚧 next. Typed knobs
-     (oscillator, noise, ramp, bounce) instead of free-text Rhai for the common
-     cases. Deliberately after parameters, since a generator's knobs are much
-     more useful once they can themselves be parameters or expressions.
+   - ~~**Procedural generators** (the other half).~~ ✅ Done. Typed-knob motion
+     primitives instead of free-text Rhai for the common cases: **`osc`**
+     (`offset + amp·wave(freq·frame + phase)`, with a sine/triangle/square/saw
+     waveform), **`noise`** (the same value noise behind `wiggle()`, as a knobbed
+     node), **`ramp`** (a linear `from→to` across a frame window, clamped flat
+     outside), and **`bounce`** (`amp·e^(−decay·frame)·cos(2π·freq·frame)`, the
+     classic overshoot-and-settle). Each is a new `Expr::Gen(Generator)` arm
+     resolving to a `Num` (feed it through `mul` to broadcast onto a vec/colour),
+     and — the reason this waited for parameters — **every knob is itself an
+     `Expr`**: it defaults to a literal you drag in the canvas but can be rewired
+     to a `param`/`ref`/expression like any other node. Frame-native and
+     deterministic (the same contract as `wiggle`: scrubbing is stable, a render
+     matches the preview). In the graph canvas a generator's knobs are wired-in
+     child boxes labelled by name (`freq`/`amp`/…); picking a generator from any
+     box's kind menu seeds it, and edits route through the same `GraphOp` /
+     `apply_graph_op` path as every other node, so the whole flow is unit-tested.
 
 **Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps
 → document-wide property graph → Blender-standard graph UI → the Nuke-style
@@ -481,6 +494,14 @@ node, so building the graph first means rebuilding it; the image graph is last
 because it needs the raster compositor stage below, which isn't built. Note the
 distinction: today's graph is a **property** graph (values into properties);
 Nuke's is an **image** graph (operations on pixels). They're different machines.
+
+> Two riders on this order, both feeding the *reusable animation modules* feature
+> spec'd in the design section below: the **pre-comps** step also introduces the
+> **per-layer in/out time model** (a pre-comp is a layer with a time range) and
+> the **layer-local time sources** expressions need to retime one animation to
+> each clip; the **document-wide property graph** step is where a shared,
+> overridable animation *module* becomes first-class. **Text layers** are a
+> separate near-term primitive, independent of the graph work.
 
 > The bigger, further-out features (renderer/compositor model, 2.5D, footage
 > import, export, plugins, expressions) have their architecture decided in the
@@ -623,6 +644,151 @@ to the **same IR** (the EBN IR + dumb-printer discipline).
 - Engine: start with **Rhai** (pure-Rust, easy, safe) — *not yet wired*; the IR
   and evaluator are in place for it to lower into. Swap behind the IR later if
   AE-JS compatibility (`boa`/v8) or Lua (`mlua`) is wanted.
+
+### Pre-comps + the layer time model — implementation plan (proposed)
+
+The next step past #5. Two intertwined-but-separable deliverables: a **per-layer
+time model** (cheap, foundational) and **nested comps** (the data-model change it
+unblocks). Grounding: today `Document = { width, height, fps, duration, root:
+Node }` is *one* composition; `Node` has **no time range** (every layer is live
+the whole comp); `evaluate(doc, frame)` walks the tree with a single **absolute**
+`EvalCtx.frame`. Note `resolve_target` already saves/restores `ctx.frame` to
+sample at a shifted time — the exact mechanism local time needs.
+
+**Three decisions (recommendations, not yet locked):**
+1. **Multi-comp model — registry + instances** (recommended) over inline nesting.
+   `Document` becomes a project of comps keyed by `CompId`; a layer can be a
+   `Precomp(CompId)` *instance*. Only this gives **reuse** (one comp placed
+   twice) and sets up the shared-module/override story; inline nesting is less
+   code but can't instance. ("A comp *is* a graph node," as the agreed order
+   says.)
+2. **Keyframes stored in local frames** (recommended) — a layer's own keys and
+   expressions are authored relative to its `start`, so two subtitles with
+   different in-points play the *same* local keyframes at different comp times.
+   This is what makes "one animation, retimed per clip" fall out for free.
+3. **v1 precomp compositing = "vector paste-through"** — geometry composes
+   correctly (fold the precomp layer's xf/opacity into its items), but **no**
+   isolated rasterization / blend modes / 2D-vs-3D collapse (those need the
+   compositor stage, which is later). Correct for subtitles; a known limit.
+
+**Staged build:**
+- **Stage 1 — layer time model** (`core` + minimal timeline UI; safe first PR,
+  shippable alone). `Node` gains `#[serde(default)] timing: Option<LayerTiming>`
+  (`{ start, in_, out }` in frames; `None` = today's behaviour). Add
+  `EvalCtx.comp_frame` (global) beside `frame` (now the current layer's *local*
+  frame); `walk` computes `local = comp_frame − start`, skips drawing outside
+  `[in, out)`, and sets `ctx.frame` for the subtree via the existing
+  save/restore. Serde `default` covers migration (no `migrate()` change);
+  trim/slip eval + round-trip tests. UI: in/out clip bars in the timeline (lean
+  on the existing `ClipTrack`/`tracks` scaffold), drag to trim/slide.
+- **Stage 2 — local-time expression sources** (small, rides on Stage 1).
+  `Expr::LocalTime / InPoint / OutPoint` + a `t01` convenience
+  (`clamp((frame−in)/(out−in), 0, 1)`), and `inPoint`/`outPoint`/`localTime` in
+  the Rhai scope. Now "ease in over the first N frames, hold, ease out over the
+  last N" is **one** expression that auto-fits any layer — the subtitle payoff,
+  before pre-comps even exist. Fully unit-testable.
+- **Stage 3 — multi-comp data model** (the big/risky one; minimal UI).
+  `Project { comps: Map<CompId, Comp>, root: CompId }`, `Comp = { size, fps,
+  duration, root: Node }`; a `Precomp(CompId)` layer kind;
+  `evaluate(project, comp_id, frame)` recurses into a precomp at the layer's
+  local frame and folds in xf/opacity. **Comp-level cycle guard** (A→B→A → warn
+  + skip, mirroring the expr guard). **`.pbc` migration**: wrap today's single
+  `root` as the one comp and reconcile with the existing `Project { document,
+  layout }` wrapper; old files still load. Cross-comp references stay out of
+  scope for v1.
+- **Stage 4 — pre-comp UI.** Comp switcher in the comp bar; "pre-compose
+  selection" (move selected layers into a new comp, replace with an instance —
+  the core AE workflow); open/close a comp; precomp layer in the layers panel.
+
+**Blast radius to record before saved multi-comp docs exist** (same discipline
+as the 2.5D note): the `Document`→`Project` shape, the `evaluate` signature,
+hit-testing/selection, the `.pbc` loader, and every live-app assumption of a
+single `doc`. All cheap now, expensive once multi-comp docs are in the wild.
+
+### Reusable animation modules — shared, auto-retimed, overridable
+
+*The target user story* (recorded so the pieces below have a home): drop a video
+layer, lay subtitles over it, define **one** entrance/exit animation, and have
+every subtitle play it **fitted to its own clip** — the animation starts at each
+layer's in-point and finishes at its out-point. Edit the one definition and all
+of them update; but any single subtitle can **override** it and diverge.
+
+This is not one feature — it's the intersection of five, most already on the
+roadmap. What it needs, and where each piece lands:
+
+1. **Text layers** (new authoring primitive) — a `Shape::Text` (or a dedicated
+   node kind) with a `Value<String>` content plus font/size/alignment. Vello's
+   text support is thin, so this pulls in a shaper (`parley` / `cosmic-text` →
+   glyph runs → vello). Subtitles are just text layers whose in/out match each
+   caption's timing. *When:* a near-term primitive, **independent of the graph
+   work** — it can land any time, but the story can't start without it.
+
+2. **A layer time model — in/out points** (`core` change) — today a node has no
+   time range: the comp has a single `duration` and every layer is live for all
+   of it. Add per-layer `in`/`out` (and a `start`, for slipping) in frames, with
+   trims honoured by `evaluate` (a layer outside its range doesn't draw). *When:*
+   **with pre-comps** (the next agreed step past #5) — a pre-comp *is* a layer
+   with an in/out, so the two share the model; do it once. This is the
+   prerequisite that makes "retime to each clip" mean anything.
+
+3. **Layer-local time in expressions** (small expression-surface addition) — the
+   reason one module fits every clip: the animation reads **normalized progress**
+   `t01 = clamp((frame − in) / (out − in), 0, 1)` (and raw `localTime = frame −
+   in`) instead of the absolute `frame`. New leaf sources — an `Expr::InPoint` /
+   `OutPoint` / `LocalTime` family and the `t01` convenience — plus
+   `inPoint`/`outPoint` in the script scope, alongside today's `frame`/`time`.
+   *When:* rides directly on (2). With it, "ease in over the first N frames,
+   hold, ease out over the last N" is **one** expression that auto-fits any
+   layer's duration — no per-layer retiming wiring.
+
+4. **The shared, linked animation module + override** (the heart of it) — this is
+   the **document-wide property graph** step (agreed order past #5) made concrete.
+   Today the graph is *per-node, per-property*: a property's `Expr` can `Ref`
+   another node or read a `param`, but the recipe lives on that one property. A
+   *module* is a **named driver stored once at the document level** that many
+   properties **link** to; editing it edits every link. Mechanism, in the grain
+   of what already exists:
+   - A module is a **parameterized, time-relative graph fragment** — an `Expr`
+     tree that reads `t01` / `localTime` (so it retimes per layer, item 3) and
+     whose tunables are exposed `Param`s (amplitude, ease, direction — the knobs
+     you tweak once). The procedural generators (`osc`/`ramp`/…) are the
+     ready-made bodies for these.
+   - A property **links** it with a new `Expr` arm — `Expr::Use { module,
+     overrides }` — resolved through the **same memoized, cycle-guarded
+     `EvalCtx`** as every other reference: a module referenced by 50 layers
+     collapses shared sub-results through the frame memo, and a module that reads
+     a layer it drives warns and falls back exactly as a cycle does today. Build
+     the sandbox once (see *the two unifying insights* below) and this is nearly
+     free.
+   - **Override is a layering, not a fork:** the instance stores *only* the knob
+     values (or, at the extreme, a whole sub-expression) it wants different;
+     unset knobs inherit the module. Same shape as `Value`'s
+     const→keyframe→expr layering, and the same as a pre-comp instance overriding
+     an exposed parameter — so design the override model **once** for both.
+   *When:* **after pre-comps** — it needs the layer-time model (2) and reuses the
+   pre-comp instance/override machinery, so it belongs *in* the document-wide
+   graph step, not before it.
+
+5. **Video footage** (parallel subsystem) — only the *background* needs it, and
+   it's the already-decided **asset registry + compositor** work (see *Footage
+   import* above). It does **not** block the subtitle-animation story; the two are
+   independent tracks and can be built in either order.
+
+**Already possible today, as a manual prototype** (the honest through-line): the
+seed of item 4 exists. Put the animation on a "controller" node's exposed
+parameters and drive each text layer's property with an `Expr` that reads the
+controller (`param_of` / `Ref`); change the controller once and all linked layers
+update. What's missing is (a) auto-retiming to each layer's clip (items 2–3),
+(b) a first-class *module* edited in one place rather than a convention around
+one node, and (c) per-instance override. So this feature is less "new engine"
+than **promoting a pattern the expression graph already supports into a named,
+retimed, overridable first-class object** — which is why it maps onto the
+document-wide-graph step rather than inventing a sixth subsystem.
+
+**Net build order for this story:** text layers (anytime) → layer time model +
+local-time sources (with pre-comps) → the linked module + override (with the
+document-wide property graph); footage rides its own track and gates only the
+video background.
 
 ### The two unifying insights (why this isn't N separate projects)
 
