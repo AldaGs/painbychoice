@@ -1526,7 +1526,7 @@ struct ClipInfo {
 /// Which part of a clip bar a drag grabbed. Decided once, at drag start, from
 /// where the press landed — so a slide can't turn into a trim mid-drag when the
 /// pointer crosses back over an edge handle.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ClipGrab {
     /// The left edge: moves `in_` only (the content stays where it is).
     TrimIn,
@@ -1535,6 +1535,26 @@ enum ClipGrab {
     /// The body: moves all three together, so the clip plays the same content
     /// at a different comp time.
     Slide,
+}
+
+/// Decide what a press at `px` grabbed, given the clip bar's **painted** edges.
+///
+/// Painted, not raw: a clip can extend past the visible window (the default
+/// range runs one frame past the view), and an edge you can't see is an edge
+/// you can't grab — so the clamped end of the bar is what the drag reaches for.
+///
+/// Nearest edge wins when the handles overlap, which they do on a short clip or
+/// one zoomed out to a few pixels wide. Testing `in_` first instead would let it
+/// always claim the press, leaving the right edge of a narrow clip untrimmable.
+fn clip_grab_at(px: f32, left: f32, right: f32, handle_w: f32) -> ClipGrab {
+    let (dl, dr) = ((px - left).abs(), (px - right).abs());
+    if dl.min(dr) > handle_w {
+        ClipGrab::Slide
+    } else if dl <= dr {
+        ClipGrab::TrimIn
+    } else {
+        ClipGrab::TrimOut
+    }
 }
 
 /// Apply a drag of `delta` frames to `t`, given what the drag grabbed. Trims
@@ -1822,6 +1842,12 @@ fn dopesheet_ui(
                 egui::pos2(x0.max(track.left()), track.top() + 3.0),
                 egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
             );
+            // Handles live on the *painted* edges, not the raw ones. A clip can
+            // extend past the visible window in either direction (the default
+            // range runs to `last_frame + 1`, one frame past the view), and an
+            // edge you can't see is an edge you can't grab — so the clamped end
+            // of the bar is what a drag reaches for.
+            let (grab_l, grab_r) = (bar.left(), bar.right());
             if bar.width() > 0.0 {
                 painter.rect_filled(bar, 3.0, egui::Color32::from_rgb(58, 84, 120));
                 painter.rect_stroke(
@@ -1856,13 +1882,7 @@ fn dopesheet_ui(
             let drag_id = ui.id().with("clip_drag");
             if resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let grab = if (p.x - x0).abs() <= HANDLE_W {
-                        ClipGrab::TrimIn
-                    } else if (p.x - x1).abs() <= HANDLE_W {
-                        ClipGrab::TrimOut
-                    } else {
-                        ClipGrab::Slide
-                    };
+                    let grab = clip_grab_at(p.x, grab_l, grab_r, HANDLE_W);
                     let anchor = axis.x_to_frame(p.x);
                     ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
                 }
@@ -4213,6 +4233,26 @@ mod tests {
         let x2 = a.frame_to_x(2.0);
         assert_eq!(a.x_to_frame(x2 + 13.0), 2);
         assert_eq!(a.x_to_frame(x2 + 27.0), 3);
+    }
+
+    /// The regression that shipped in the first cut: the default range ends one
+    /// frame *past* the visible window, so hit-testing the raw right edge put
+    /// the handle off-screen and every press near it read as a slide. Handles
+    /// are on the painted edges, so the clamped end stays grabbable.
+    #[test]
+    fn the_right_handle_is_grabbable_when_the_clip_runs_past_the_view() {
+        // Bar painted from 100 to 500, clamped at the track's right edge.
+        assert_eq!(clip_grab_at(499.0, 100.0, 500.0, 6.0), ClipGrab::TrimOut);
+        assert_eq!(clip_grab_at(101.0, 100.0, 500.0, 6.0), ClipGrab::TrimIn);
+        assert_eq!(clip_grab_at(300.0, 100.0, 500.0, 6.0), ClipGrab::Slide);
+    }
+
+    /// Handles overlap on a clip only a few pixels wide. The nearer edge has to
+    /// win, or the right one can never be grabbed.
+    #[test]
+    fn a_narrow_clip_splits_its_overlapping_handles_by_nearest_edge() {
+        assert_eq!(clip_grab_at(100.5, 100.0, 104.0, 6.0), ClipGrab::TrimIn);
+        assert_eq!(clip_grab_at(103.5, 100.0, 104.0, 6.0), ClipGrab::TrimOut);
     }
 
     /// Trimming an edge moves only that edge: the content keeps its place in
