@@ -1122,7 +1122,10 @@ impl App {
             self.doc_mut().height = h.max(1.0);
         }
         if let Some(f) = comp.fps {
-            self.doc_mut().fps = f.max(1.0);
+            // Not a plain field write: the keys have to follow the seconds they
+            // sit on onto the new grid. The playhead needs no help — it's stored
+            // in seconds and re-derives its frame from the new timebase.
+            self.doc_mut().set_fps(f.max(1.0));
         }
         if let Some(d) = comp.duration {
             self.doc_mut().duration = d.max(0.1);

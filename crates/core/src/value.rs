@@ -307,6 +307,18 @@ impl<T: Animatable> Track<T> {
         }
     }
 
+    /// Move every key to the frame holding the same wall-clock time on a new
+    /// grid: a key at frame 120 @ 60fps lands on frame 48 @ 24fps. Slowing the
+    /// grid can round two keys onto one frame; the earlier one wins, as in
+    /// [`Track::migrate_frames`].
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        for k in &mut self.keys {
+            k.frame = (k.frame as f64 * ratio).round() as i64;
+        }
+        self.keys.sort_by_key(|k| k.frame);
+        self.keys.dedup_by_key(|k| k.frame);
+    }
+
     /// Remove keyframe `index`. A track is never emptied below one key.
     pub fn remove_key(&mut self, index: usize) {
         if self.keys.len() > 1 && index < self.keys.len() {
@@ -471,6 +483,13 @@ impl<T: Animatable + FromExpr + ToExpr> Value<T> {
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
         if let Value::Keyframed(track) = self {
             track.migrate_frames(fps);
+        }
+    }
+
+    /// Rescale keyframe positions onto a new frame grid (no-op otherwise).
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        if let Value::Keyframed(track) = self {
+            track.retime(ratio);
         }
     }
 

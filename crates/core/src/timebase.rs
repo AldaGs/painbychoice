@@ -4,8 +4,11 @@
 //! function of frames, and only the composition knows the wall-clock meaning of
 //! one. Seconds are a *presentation* unit, converted at the edges through a
 //! `Timebase`. Keeping every conversion here means fps never has to be threaded
-//! into the value engine, and changing fps moves the wall-clock timing of a
-//! document without silently drifting its keyframes off their frames.
+//! into the value engine.
+//!
+//! Changing fps re-grids a document rather than re-timing it: see
+//! [`crate::node::Comp::set_fps`], which moves every key to the frame holding
+//! the same second on the new grid.
 
 use serde::{Deserialize, Serialize};
 

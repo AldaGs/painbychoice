@@ -59,6 +59,14 @@ impl Transform {
         self.scale.migrate_frames(fps);
         self.opacity.migrate_frames(fps);
     }
+
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        self.anchor.retime(ratio);
+        self.position.retime(ratio);
+        self.rotation_deg.retime(ratio);
+        self.scale.retime(ratio);
+        self.opacity.retime(ratio);
+    }
 }
 
 /// A drawable shape. Parametric variants resolve their geometry at time `t`,
@@ -101,6 +109,17 @@ impl Shape {
                 radius.migrate_frames(fps);
             }
             Shape::Ellipse { size } => size.migrate_frames(fps),
+        }
+    }
+
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        match self {
+            Shape::Path(_) => {}
+            Shape::Rect { size, radius } => {
+                size.retime(ratio);
+                radius.retime(ratio);
+            }
+            Shape::Ellipse { size } => size.retime(ratio),
         }
     }
 }
@@ -202,6 +221,16 @@ impl LayerTiming {
     /// frame that no longer draws.
     pub fn is_live(&self, comp_frame: f64) -> bool {
         comp_frame >= self.in_ as f64 && comp_frame < self.out as f64
+    }
+
+    /// Rescale this window onto a new frame grid, keeping its wall-clock
+    /// position and length. `start` moves with it so the layer's local time —
+    /// and therefore its keyframes — stays aligned to the same comp instants.
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        let scale = |f: i64| (f as f64 * ratio).round() as i64;
+        self.start = scale(self.start);
+        self.in_ = scale(self.in_);
+        self.out = scale(self.out);
     }
 
     /// Length of the visible window in frames (never negative).
@@ -416,6 +445,28 @@ impl Node {
             child.migrate_frames(fps);
         }
     }
+
+    /// Recursively move every frame position in this subtree onto a new frame
+    /// grid. `ratio` is `new_fps / old_fps`.
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        self.transform.retime(ratio);
+        if let Some(shape) = &mut self.shape {
+            shape.retime(ratio);
+        }
+        if let Some(fill) = &mut self.fill {
+            fill.retime(ratio);
+        }
+        if let Some(stroke) = &mut self.stroke {
+            stroke.color.retime(ratio);
+            stroke.width.retime(ratio);
+        }
+        if let Some(timing) = &mut self.timing {
+            timing.retime(ratio);
+        }
+        for child in &mut self.children {
+            child.retime(ratio);
+        }
+    }
 }
 
 /// One composition: a root node plus its own size, frame rate and length.
@@ -473,6 +524,29 @@ impl Comp {
     pub fn migrate(&mut self) {
         let fps = self.timebase().fps();
         self.root.migrate_frames(fps);
+    }
+
+    /// Change the comp's frame rate, keeping every animated thing at the same
+    /// **wall-clock time**. A key at frame 120 @ 60fps (two seconds in) is at
+    /// frame 48 after switching to 24fps — the grid changes underneath the
+    /// animation, the animation does not re-time.
+    ///
+    /// This is the only supported way to write `fps` on a comp that already has
+    /// content: assigning the field directly leaves keys on their old frame
+    /// numbers, which silently shifts them in seconds.
+    ///
+    /// Frames are whole, so a rate change is lossy — keys land on the nearest
+    /// frame of the new grid, and two keys less than a frame apart can merge.
+    /// Returns whether anything changed.
+    pub fn set_fps(&mut self, fps: f64) -> bool {
+        let old = self.timebase().fps();
+        self.fps = fps;
+        let new = self.timebase().fps();
+        if new == old {
+            return false;
+        }
+        self.root.retime(new / old);
+        true
     }
 
     /// Total length of the composition in whole frames: 5s @ 24fps = 120.
@@ -623,5 +697,77 @@ impl Project {
         for comp in self.comps.values_mut() {
             comp.migrate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{Keyframe, Track};
+
+    /// Build a one-layer comp at `fps` with a position key on `frame`.
+    fn comp_with_key(fps: f64, frame: i64) -> Comp {
+        let mut transform = Transform::default();
+        transform.rotation_deg = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(frame, 90.0),
+        ]));
+        let layer = Node::group(1, "layer").with_transform(transform);
+        let mut comp = Comp::new(1920.0, 1080.0, Node::group(0, "root").with_child(layer));
+        comp.fps = fps;
+        comp
+    }
+
+    fn key_frames(comp: &Comp) -> Vec<i64> {
+        comp.root.children[0].transform.rotation_deg.key_frames()
+    }
+
+    #[test]
+    fn changing_fps_keeps_keys_at_their_wall_clock_time() {
+        // Frame 120 @ 60fps is two seconds in; at 24fps that instant is frame 48.
+        let mut comp = comp_with_key(60.0, 120);
+        assert!(comp.set_fps(24.0));
+        assert_eq!(key_frames(&comp), vec![0, 48]);
+
+        // And the reverse direction, from a slow grid to a fast one.
+        let mut comp = comp_with_key(24.0, 48);
+        assert!(comp.set_fps(60.0));
+        assert_eq!(key_frames(&comp), vec![0, 120]);
+    }
+
+    #[test]
+    fn round_tripping_fps_is_stable() {
+        let mut comp = comp_with_key(60.0, 120);
+        comp.set_fps(24.0);
+        comp.set_fps(60.0);
+        assert_eq!(key_frames(&comp), vec![0, 120]);
+    }
+
+    #[test]
+    fn setting_the_same_fps_moves_nothing() {
+        let mut comp = comp_with_key(60.0, 121);
+        assert!(!comp.set_fps(60.0), "an unchanged rate is not a retime");
+        assert_eq!(key_frames(&comp), vec![0, 121]);
+    }
+
+    #[test]
+    fn clip_windows_follow_the_new_grid() {
+        let mut comp = comp_with_key(60.0, 120);
+        comp.root.children[0].timing = Some(LayerTiming { start: 30, in_: 60, out: 120 });
+        comp.set_fps(30.0);
+        assert_eq!(
+            comp.root.children[0].timing,
+            Some(LayerTiming { start: 15, in_: 30, out: 60 }),
+            "a clip covering 1s..2s must still cover 1s..2s"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_rate_does_not_move_keys_to_nowhere() {
+        // `Timebase` clamps bad rates to 1.0, and `set_fps` retimes against the
+        // clamped value — never against a NaN ratio that would erase the keys.
+        let mut comp = comp_with_key(60.0, 120);
+        comp.set_fps(f64::NAN);
+        assert_eq!(key_frames(&comp), vec![0, 2], "120 frames @ 60fps is 2s, so frame 2 @ 1fps");
     }
 }
