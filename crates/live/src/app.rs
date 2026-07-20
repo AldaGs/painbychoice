@@ -65,6 +65,10 @@ pub(crate) struct App {
     pub(crate) canvas_rect: Option<kurbo::Rect>,
     /// Next unused node id, for shapes created in-app.
     pub(crate) next_id: u64,
+    /// The module whose body is open on the graph canvas, if any. View state —
+    /// which module you're editing isn't part of the document. A delete clears
+    /// it (see the graph-op apply) so it can't dangle.
+    pub(crate) editing_module: Option<ModuleId>,
 }
 
 /// The largest node id in a subtree, for seeding the id counter.
@@ -121,6 +125,7 @@ impl App {
             comp_name_buf: String::new(),
             canvas_rect: None,
             next_id,
+            editing_module: None,
         }
     }
 
@@ -873,9 +878,15 @@ impl App {
         let clip = sel_node
             .filter(|n| Some(n.id) != Some(self.doc().root.id))
             .map(|n| ClipInfo { timing: n.timing });
-        // Snapshot for the graph panel (clones the selected node's expressions).
-        let graph_info =
-            GraphInfo::gather(self.doc(), &self.project.modules, self.selected, t);
+        // Snapshot for the graph panel (clones the selected node's expressions
+        // and the module body being edited, if any).
+        let graph_info = GraphInfo::gather(
+            self.doc(),
+            &self.project.modules,
+            self.selected,
+            self.editing_module,
+            t,
+        );
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -986,12 +997,25 @@ impl App {
                 &mut dock_cmd,
             );
         });
-        // Apply a graph edit (promote/bake/tree change) after the UI pass.
+        // Open/close a module for editing (view state) before applying any op,
+        // so a delete-then-nothing leaves the panel in a sane place.
+        if let Some(change) = graph_edits.edit_module.take() {
+            self.editing_module = change;
+            window.request_redraw();
+        }
+        // Apply a graph edit (promote/bake/tree change, or a module-body edit)
+        // after the UI pass. Node-scoped ops no-op without a selection; module
+        // ops don't need one, so this runs regardless.
         if let Some(op) = graph_edits.op.take() {
-            if let Some(id) = self.selected {
-                apply_graph_op(&mut self.project, self.current, id, op, frame);
-                window.request_redraw();
+            // A module delete must also close it if it was the one open, or the
+            // panel would keep editing a body that no longer exists.
+            if let GraphOp::DeleteModule { module } = &op {
+                if self.editing_module == Some(*module) {
+                    self.editing_module = None;
+                }
             }
+            apply_graph_op(&mut self.project, self.current, self.selected, op, frame);
+            window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area
         // header asked to. Doing it here (not mid-pass) keeps the panels and

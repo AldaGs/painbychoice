@@ -47,6 +47,44 @@ impl ParamKind {
     }
 }
 
+/// Which expression tree an edit addresses. The graph canvas, its editors, and
+/// the `SetKind`/`SetLit`/… ops are all identical whether you're driving a
+/// node's property or a **module's body** — the target just says which root the
+/// `(path)` walks from. This is what gives module bodies a real editing surface
+/// rather than only the value they were extracted with.
+///
+/// Derives `Hash` so it can salt egui ids directly (combobox ids, the canvas'
+/// per-target box-position memory), the way `PropKind::label()` used to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum GraphTarget {
+    /// The selected node's property — today's behaviour.
+    Prop(PropKind),
+    /// A project-wide module's body.
+    Module(ModuleId),
+}
+
+impl GraphTarget {
+    /// The `PropKind` this target's script-result address is keyed by — the
+    /// property itself, or the module-body placeholder ([`MODULE_BODY_KIND`]).
+    pub(crate) fn result_kind(self) -> PropKind {
+        match self {
+            GraphTarget::Prop(k) => k,
+            GraphTarget::Module(_) => MODULE_BODY_KIND,
+        }
+    }
+}
+
+/// Whose knobs the parameters section is editing: the selected node's, or a
+/// module's. A module body reads its knobs with `param("…")`, so editing a
+/// module needs the same add/remove/rename knob surface a node has.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ParamOwner {
+    /// A node, by id — carried so a param op needn't lean on the selection.
+    Node(NodeId),
+    /// A project-wide module.
+    Module(ModuleId),
+}
+
 /// Every script node's current result, keyed by its `(property, tree-path)`
 /// address. `Ok` is the formatted value, `Err` the first line of the error.
 type ScriptResults = HashMap<(PropKind, Vec<usize>), Result<String, String>>;
@@ -61,16 +99,29 @@ pub(crate) struct GraphProp {
     pub(crate) printed: Option<String>,
 }
 
-/// What the graph panel renders: the selected node, its editable properties, and
-/// every node (for a reference target picker). Cloned before the UI pass so the
-/// panel never borrows `App`.
+/// What the graph panel renders. The panel has two independent halves: the
+/// **selected node's** properties (`node`) and a **module's body** opened for
+/// editing (`editing`). Either can be absent; the modules list and the node
+/// list are always present. Cloned before the UI pass so the panel never
+/// borrows `App`.
 pub(crate) struct GraphInfo {
+    /// (id, name) of every node in the document — the reference-target picker.
+    pub(crate) nodes: Vec<(u64, String)>,
+    /// Every module in the project: id, name, and its knob names. Drives the
+    /// modules list, the link picker, and the override rows.
+    pub(crate) modules: Vec<ModuleInfo>,
+    /// The selected node's editable properties, if a node is selected.
+    pub(crate) node: Option<NodeView>,
+    /// The module whose body is open on the canvas, if one is being edited.
+    pub(crate) editing: Option<ModuleEdit>,
+}
+
+/// The selected node as the graph panel needs it.
+pub(crate) struct NodeView {
     pub(crate) node_id: NodeId,
     pub(crate) node_name: String,
     pub(crate) props: Vec<GraphProp>,
-    /// (id, name) of every node in the document.
-    pub(crate) nodes: Vec<(u64, String)>,
-    /// The selected node's parameter names and kinds, in display order.
+    /// The node's parameter names and kinds, in display order.
     pub(crate) params: Vec<(String, &'static str)>,
     /// Each script node's result at the current frame, addressed the same way
     /// an edit is: `(property, tree-path)`. Evaluated **here**, against the
@@ -78,10 +129,21 @@ pub(crate) struct GraphInfo {
     /// doc-less preview would report "no node named …" for a script that in
     /// fact resolves fine at render time.
     pub(crate) script_results: ScriptResults,
-    /// Every module in the project: id, name, and its knob names. Enough to
-    /// drive the link picker and the override rows without reaching into the
-    /// document from inside the UI pass.
-    pub(crate) modules: Vec<ModuleInfo>,
+}
+
+/// A module's body, opened on the canvas. Its knobs (`params`) are editable the
+/// same way a node's are, since the body reads them with `param("…")`.
+pub(crate) struct ModuleEdit {
+    pub(crate) id: ModuleId,
+    pub(crate) name: String,
+    pub(crate) params: Vec<(String, &'static str)>,
+    pub(crate) body: Expr,
+    /// Script previews for the body, keyed `(kind, path)` with a placeholder
+    /// kind (`ShapeSize`) so the address shape matches a property's. A body
+    /// script's `param("x")` previews as a fallback — the module's own scope
+    /// isn't pushed here — but resolves correctly at render time through the
+    /// link.
+    pub(crate) script_results: ScriptResults,
 }
 
 /// One module as the panel needs it.
@@ -92,45 +154,23 @@ pub(crate) struct ModuleInfo {
     pub(crate) params: Vec<String>,
 }
 
+/// The stand-in `PropKind` a module body's `(kind, path)` addresses use. A
+/// module body isn't a property, but the script-result map and the canvas were
+/// built around that key; a fixed placeholder keeps the address shape without
+/// pretending the body is `ShapeSize`.
+pub(crate) const MODULE_BODY_KIND: PropKind = PropKind::ShapeSize;
+
 impl GraphInfo {
     pub(crate) fn gather(
         doc: &Document,
         modules: &std::collections::BTreeMap<ModuleId, MModule>,
         selected: Option<NodeId>,
+        editing: Option<ModuleId>,
         frame: f64,
-    ) -> Option<GraphInfo> {
-        let id = selected?;
-        let node = doc.root.find(id)?;
-        let props: Vec<GraphProp> = PropKind::ALL
-            .iter()
-            .filter_map(|&kind| {
-                let p = prop_of(node, kind)?;
-                Some(GraphProp {
-                    kind,
-                    label: kind.label(),
-                    is_expr: p.is_expr(),
-                    expr: p.expr().cloned(),
-                    printed: p.expr().map(|e| e.to_string()),
-                })
-            })
-            .collect();
+    ) -> GraphInfo {
         let mut nodes = Vec::new();
         collect_nodes(&doc.root, &mut nodes);
-
-        let mut script_results = ScriptResults::new();
-        for prop in &props {
-            if let Some(expr) = &prop.expr {
-                let mut ctx = EvalCtx::new(doc, frame);
-                // In this node's context, so a script's `param("x")` previews
-                // the same value it resolves to at render time.
-                ctx.in_node(id, |ctx| {
-                    collect_scripts(expr, prop.kind, &mut Vec::new(), ctx, &mut script_results)
-                });
-            }
-        }
-        let params =
-            node.params.iter().map(|p| (p.name.clone(), p.value.kind_name())).collect();
-        let modules = modules
+        let module_infos = modules
             .iter()
             .map(|(id, m)| ModuleInfo {
                 id: *id,
@@ -138,15 +178,55 @@ impl GraphInfo {
                 params: m.params.iter().map(|p| p.name.clone()).collect(),
             })
             .collect();
-        Some(GraphInfo {
-            node_id: id,
-            modules,
-            node_name: node.name.clone(),
-            props,
-            nodes,
-            params,
-            script_results,
-        })
+
+        let node = selected.and_then(|id| doc.root.find(id)).map(|node| {
+            let props: Vec<GraphProp> = PropKind::ALL
+                .iter()
+                .filter_map(|&kind| {
+                    let p = prop_of(node, kind)?;
+                    Some(GraphProp {
+                        kind,
+                        label: kind.label(),
+                        is_expr: p.is_expr(),
+                        expr: p.expr().cloned(),
+                        printed: p.expr().map(|e| e.to_string()),
+                    })
+                })
+                .collect();
+            let mut script_results = ScriptResults::new();
+            for prop in &props {
+                if let Some(expr) = &prop.expr {
+                    let mut ctx = EvalCtx::new(doc, frame);
+                    // In this node's context, so a script's `param("x")` previews
+                    // the same value it resolves to at render time.
+                    ctx.in_node(node.id, |ctx| {
+                        collect_scripts(expr, prop.kind, &mut Vec::new(), ctx, &mut script_results)
+                    });
+                }
+            }
+            NodeView {
+                node_id: node.id,
+                node_name: node.name.clone(),
+                props,
+                params: node.params.iter().map(|p| (p.name.clone(), p.value.kind_name())).collect(),
+                script_results,
+            }
+        });
+
+        let editing = editing.and_then(|mid| modules.get(&mid).map(|m| (mid, m))).map(|(mid, m)| {
+            let mut script_results = ScriptResults::new();
+            let mut ctx = EvalCtx::new(doc, frame);
+            collect_scripts(&m.body, MODULE_BODY_KIND, &mut Vec::new(), &mut ctx, &mut script_results);
+            ModuleEdit {
+                id: mid,
+                name: m.name.clone(),
+                params: m.params.iter().map(|p| (p.name.clone(), p.value.kind_name())).collect(),
+                body: m.body.clone(),
+                script_results,
+            }
+        });
+
+        GraphInfo { nodes, modules: module_infos, node, editing }
     }
 }
 
@@ -191,21 +271,22 @@ pub(crate) enum GraphOp {
     /// Freeze an expression back to a constant.
     Bake(PropKind),
     /// Replace the node at `path` with a fresh node of `new` kind.
-    SetKind { kind: PropKind, path: Vec<usize>, new: ExprKind },
+    SetKind { target: GraphTarget, path: Vec<usize>, new: ExprKind },
     /// Set the literal at `path`.
-    SetLit { kind: PropKind, path: Vec<usize>, value: ExprValue },
+    SetLit { target: GraphTarget, path: Vec<usize>, value: ExprValue },
     /// Set the reference at `path`.
-    SetRef { kind: PropKind, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
+    SetRef { target: GraphTarget, path: Vec<usize>, node: NodeId, prop: PropPath, offset: f64 },
     /// Set the script source at `path`.
-    SetScript { kind: PropKind, path: Vec<usize>, src: String },
+    SetScript { target: GraphTarget, path: Vec<usize>, src: String },
     /// Set an oscillator's waveform at `path`.
-    SetWaveform { kind: PropKind, path: Vec<usize>, wave: Waveform },
-    /// Point a `param` node at a parameter of the node that owns the property.
-    SetParam { kind: PropKind, path: Vec<usize>, name: String },
-    /// Add a parameter to the selected node, seeded with a neutral value.
-    AddParam { name: String, kind: ParamKind },
-    /// Remove a parameter. Expressions reading it aren't rewritten — they warn.
-    RemoveParam { name: String },
+    SetWaveform { target: GraphTarget, path: Vec<usize>, wave: Waveform },
+    /// Point a `param` node at a knob of the target's owner (the node, or the
+    /// module whose body is being edited).
+    SetParam { target: GraphTarget, path: Vec<usize>, name: String },
+    /// Add a knob to a node or module, seeded with a neutral value.
+    AddParam { owner: ParamOwner, name: String, kind: ParamKind },
+    /// Remove a knob. Expressions reading it aren't rewritten — they warn.
+    RemoveParam { owner: ParamOwner, name: String },
     /// Lift this property's whole expression into a new project-wide module and
     /// leave a link in its place. How a module is *made*: you build the recipe
     /// once on a real property, then promote it.
@@ -213,9 +294,9 @@ pub(crate) enum GraphOp {
     /// Point this property at an existing module (promoting it if needed).
     LinkModule { kind: PropKind, module: ModuleId },
     /// Repoint an existing link at a different module.
-    SetModule { kind: PropKind, path: Vec<usize>, module: ModuleId },
+    SetModule { target: GraphTarget, path: Vec<usize>, module: ModuleId },
     /// Override one knob at a link site, or clear it back to inheriting.
-    SetOverride { kind: PropKind, path: Vec<usize>, name: String, value: Option<ExprValue> },
+    SetOverride { target: GraphTarget, path: Vec<usize>, name: String, value: Option<ExprValue> },
     RenameModule { module: ModuleId, name: String },
     /// Delete a module. Links to it aren't rewritten — they warn and fall back,
     /// exactly like any other dangling reference.
@@ -225,6 +306,10 @@ pub(crate) enum GraphOp {
 #[derive(Default)]
 pub(crate) struct GraphEdits {
     pub(crate) op: Option<GraphOp>,
+    /// Change which module's body the panel edits: `Some(Some(id))` opens one,
+    /// `Some(None)` closes the current one, `None` leaves it unchanged. View
+    /// state, so it rides beside the document ops rather than in one.
+    pub(crate) edit_module: Option<Option<ModuleId>>,
 }
 
 // Canvas geometry (logical points). A node box sits at (depth·COL_W, y) inside
@@ -329,25 +414,45 @@ pub(crate) fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
     out
 }
 
-/// The expression/node-graph panel: for the selected node, promote a property to
-/// an expression, edit its tree on a node canvas, or bake it back to a constant.
-pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, out: &mut GraphEdits) {
+/// The expression/node-graph panel. Two independent halves under a shared
+/// modules list: the selected node's properties, and — new in the graph-UI
+/// step — a module's *body* opened on the same canvas, so a module is edited in
+/// one place rather than only through the property it was extracted from.
+pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &GraphInfo, frame: f64, out: &mut GraphEdits) {
     ui.add_space(8.0);
     ui.heading("Graph");
-    let Some(info) = info else {
-        ui.weak("Select a node to drive its properties with expressions.");
-        return;
-    };
-    ui.weak(format!("Node: {}  ·  drag a node to arrange", info.node_name));
-    ui.separator();
-    let param_names = params_ui(ui, info, out);
-    ui.separator();
     modules_ui(ui, info, out);
     ui.separator();
+
+    // The module being edited sits above the node view: it's what you just
+    // opened, and it drives every link, so it reads as the more global thing.
+    if let Some(edit) = &info.editing {
+        module_edit_ui(ui, info, edit, frame, out);
+        ui.separator();
+    }
+
+    match &info.node {
+        Some(node) => node_view_ui(ui, info, node, frame, out),
+        // The placeholder only makes sense when nothing at all is open.
+        None if info.editing.is_none() => {
+            ui.weak("Select a node to drive its properties with expressions.");
+        }
+        None => {}
+    }
+}
+
+/// The selected node's half: its knobs, then each property's promote/link/bake
+/// controls and expression canvas.
+pub(crate) fn node_view_ui(ui: &mut egui::Ui, info: &GraphInfo, node: &NodeView, frame: f64, out: &mut GraphEdits) {
+    ui.weak(format!("Node: {}  ·  drag a node to arrange", node.node_name));
+    ui.separator();
+    let param_names = params_ui(ui, ParamOwner::Node(node.node_id), &node.params, out);
+    ui.separator();
     egui::ScrollArea::both()
+        .id_salt(("nodescroll", node.node_id.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for prop in &info.props {
+            for prop in &node.props {
                 ui.horizontal(|ui| {
                     ui.strong(prop.label);
                     if prop.is_expr {
@@ -393,18 +498,59 @@ pub(crate) fn graph_ui(ui: &mut egui::Ui, info: &Option<GraphInfo>, frame: f64, 
                     expr_canvas(
                         ui,
                         expr,
-                        info.node_id,
-                        prop.kind,
+                        GraphTarget::Prop(prop.kind),
                         frame,
                         &info.nodes,
                         &param_names,
-                        &info.script_results,
+                        &node.script_results,
                         &info.modules,
                         out,
                     );
                     ui.separator();
                 }
             }
+        });
+}
+
+/// A module body opened for editing: a header (name + close), the module's own
+/// knobs, and the body on the same node canvas every property uses. This is the
+/// editing surface a module lacked — before it, a module could only be *made*
+/// (by extracting a property) and its body edited nowhere.
+pub(crate) fn module_edit_ui(
+    ui: &mut egui::Ui,
+    info: &GraphInfo,
+    edit: &ModuleEdit,
+    frame: f64,
+    out: &mut GraphEdits,
+) {
+    ui.horizontal(|ui| {
+        ui.label(icon::text(icon::MODULE));
+        ui.strong(format!("Editing: {}", edit.name));
+        if icon::button(ui, icon::CLOSE, "Stop editing this module").clicked() {
+            out.edit_module = Some(None);
+        }
+    });
+    ui.weak("Its knobs, and the body every link drives.");
+    ui.separator();
+    // The module's own knobs — the tunables a link overrides, and what the
+    // body's `param("…")` nodes read.
+    let param_names = params_ui(ui, ParamOwner::Module(edit.id), &edit.params, out);
+    ui.separator();
+    egui::ScrollArea::both()
+        .id_salt(("modscroll", edit.id.0))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            expr_canvas(
+                ui,
+                &edit.body,
+                GraphTarget::Module(edit.id),
+                frame,
+                &info.nodes,
+                &param_names,
+                &edit.script_results,
+                &info.modules,
+                out,
+            );
         });
 }
 
@@ -423,8 +569,7 @@ type GraphPositions = std::collections::HashMap<Vec<usize>, egui::Vec2>;
 pub(crate) fn expr_canvas(
     ui: &mut egui::Ui,
     expr: &Expr,
-    node_id: NodeId,
-    kind: PropKind,
+    target: GraphTarget,
     frame: f64,
     nodes: &[(u64, String)],
     params: &[String],
@@ -434,9 +579,10 @@ pub(crate) fn expr_canvas(
 ) {
     let boxes = layout_expr(expr);
 
-    // Positions are remembered per (node, property) in egui memory; a box with
-    // no stored position falls back to its auto-layout slot (column × its y).
-    let mem_id = ui.id().with(("graphpos", node_id.0, kind.label()));
+    // Positions are remembered per target (node+property, or module body) in
+    // egui memory; a box with no stored position falls back to its auto-layout
+    // slot (column × its y).
+    let mem_id = ui.id().with(("graphpos", target));
     let mut positions: GraphPositions =
         ui.data(|d| d.get_temp::<GraphPositions>(mem_id)).unwrap_or_default();
     let pos_of = |b: &ExprBox, positions: &GraphPositions| {
@@ -478,7 +624,7 @@ pub(crate) fn expr_canvas(
     // the box moves it while the controls stay usable).
     for b in &boxes {
         let mut p = pos_of(b, &positions);
-        let drag_id = ui.id().with(("graphbox", node_id.0, kind.label(), b.path.as_slice()));
+        let drag_id = ui.id().with(("graphbox", target, b.path.as_slice()));
         let resp = ui.interact(rect_of(b, p, origin), drag_id, egui::Sense::drag());
         if resp.dragged() {
             p = (p + resp.drag_delta()).max(egui::vec2(0.0, 0.0));
@@ -501,7 +647,7 @@ pub(crate) fn expr_canvas(
         });
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
         expr_box(
-            &mut child, node, kind, frame, &b.path, slot_label, nodes, params, results,
+            &mut child, node, target, frame, &b.path, slot_label, nodes, params, results,
             modules, out,
         );
     }
@@ -516,7 +662,7 @@ pub(crate) fn expr_canvas(
 pub(crate) fn expr_box(
     ui: &mut egui::Ui,
     expr: &Expr,
-    kind: PropKind,
+    target: GraphTarget,
     frame: f64,
     path: &[usize],
     slot_label: Option<&str>,
@@ -530,33 +676,33 @@ pub(crate) fn expr_box(
         ui.small(label);
     }
     let cur = expr.kind();
-    egui::ComboBox::from_id_salt(("ek", kind.label(), path))
+    egui::ComboBox::from_id_salt(("ek", target, path))
         .width(60.0)
         .selected_text(cur.label())
         .show_ui(ui, |ui| {
             for k in ExprKind::ALL {
                 if ui.selectable_label(k == cur, k.label()).clicked() && k != cur {
-                    out.op = Some(GraphOp::SetKind { kind, path: path.to_vec(), new: k });
+                    out.op = Some(GraphOp::SetKind { target, path: path.to_vec(), new: k });
                 }
             }
         });
     match expr {
-        Expr::Lit(v) => lit_editor(ui, *v, kind, path, out),
+        Expr::Lit(v) => lit_editor(ui, *v, target, path, out),
         Expr::Ref { node, prop, time_offset } => {
-            ref_editor(ui, *node, *prop, *time_offset, kind, path, nodes, out)
+            ref_editor(ui, *node, *prop, *time_offset, target, path, nodes, out)
         }
-        Expr::Param { name, .. } => param_editor(ui, name, params, kind, path, out),
+        Expr::Param { name, .. } => param_editor(ui, name, params, target, path, out),
         Expr::Script(src) => {
-            let result = results.get(&(kind, path.to_vec()));
-            script_editor(ui, src, frame, result, kind, path, out)
+            let result = results.get(&(target.result_kind(), path.to_vec()));
+            script_editor(ui, src, frame, result, target, path, out)
         }
         Expr::Use { module, overrides } => {
-            use_editor(ui, *module, overrides, kind, path, modules, out)
+            use_editor(ui, *module, overrides, target, path, modules, out)
         }
         // A generator's knobs are wired-in child boxes; the only in-box control
         // is the oscillator's waveform picker.
         Expr::Gen(Generator::Oscillator { wave, .. }) => {
-            wave_editor(ui, *wave, kind, path, out)
+            wave_editor(ui, *wave, target, path, out)
         }
         _ => {}
     }
@@ -573,21 +719,21 @@ pub(crate) fn use_editor(
     ui: &mut egui::Ui,
     module: ModuleId,
     overrides: &[(String, Expr)],
-    kind: PropKind,
+    target: GraphTarget,
     path: &[usize],
     modules: &[ModuleInfo],
     out: &mut GraphEdits,
 ) {
     let current = modules.iter().find(|m| m.id == module);
     let label = current.map(|m| m.name.clone()).unwrap_or_else(|| format!("<missing {}>", module.0));
-    egui::ComboBox::from_id_salt(("usemod", kind.label(), path))
+    egui::ComboBox::from_id_salt(("usemod", target, path))
         .width(110.0)
         .selected_text(label)
         .show_ui(ui, |ui| {
             for m in modules {
                 if ui.selectable_label(m.id == module, &m.name).clicked() && m.id != module {
                     out.op =
-                        Some(GraphOp::SetModule { kind, path: path.to_vec(), module: m.id });
+                        Some(GraphOp::SetModule { target, path: path.to_vec(), module: m.id });
                 }
             }
         });
@@ -624,7 +770,7 @@ pub(crate) fn use_editor(
                     };
                     if changed {
                         out.op = Some(GraphOp::SetOverride {
-                            kind,
+                            target,
                             path: path.to_vec(),
                             name: name.clone(),
                             value: Some(value),
@@ -632,20 +778,22 @@ pub(crate) fn use_editor(
                     }
                     if ui.small_button("x").on_hover_text("Inherit from the module").clicked() {
                         out.op = Some(GraphOp::SetOverride {
-                            kind,
+                            target,
                             path: path.to_vec(),
                             name: name.clone(),
                             value: None,
                         });
                     }
                 }
-                // A non-literal override (an expression) is shown, not edited —
-                // editing it needs the graph canvas, which is the next step.
+                // A non-literal override (an expression) is shown, not edited:
+                // it would need its own nested canvas at the link site. The
+                // module *body* now has a canvas (open it from the modules
+                // list); an override sub-expression still doesn't.
                 Some((_, expr)) => {
                     ui.weak(expr.to_string());
                     if ui.small_button("x").clicked() {
                         out.op = Some(GraphOp::SetOverride {
-                            kind,
+                            target,
                             path: path.to_vec(),
                             name: name.clone(),
                             value: None,
@@ -659,7 +807,7 @@ pub(crate) fn use_editor(
                         .clicked()
                     {
                         out.op = Some(GraphOp::SetOverride {
-                            kind,
+                            target,
                             path: path.to_vec(),
                             name: name.clone(),
                             value: Some(ExprValue::Num(0.0)),
@@ -683,6 +831,7 @@ pub(crate) fn modules_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdi
         ui.weak("None yet — build a recipe on a property, then press -> module.");
         return;
     }
+    let open = info.editing.as_ref().map(|e| e.id);
     for m in &info.modules {
         ui.horizontal(|ui| {
             let mut name = m.name.clone();
@@ -691,6 +840,16 @@ pub(crate) fn modules_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdi
                 .changed()
             {
                 out.op = Some(GraphOp::RenameModule { module: m.id, name });
+            }
+            // Open (or, if it's already open, close) this module's body on the
+            // canvas — the editing surface a module now has.
+            let editing = open == Some(m.id);
+            let tip = if editing { "Stop editing this module" } else { "Edit this module's body" };
+            if icon::button(ui, icon::EXPR, tip).clicked() {
+                out.edit_module = Some((!editing).then_some(m.id));
+            }
+            if editing {
+                ui.weak("editing");
             }
             if icon::button(
                 ui,
@@ -709,36 +868,44 @@ pub(crate) fn modules_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdi
 pub(crate) fn wave_editor(
     ui: &mut egui::Ui,
     wave: Waveform,
-    kind: PropKind,
+    target: GraphTarget,
     path: &[usize],
     out: &mut GraphEdits,
 ) {
-    egui::ComboBox::from_id_salt(("wave", kind.label(), path))
+    egui::ComboBox::from_id_salt(("wave", target, path))
         .width(90.0)
         .selected_text(wave.label())
         .show_ui(ui, |ui| {
             for w in Waveform::ALL {
                 if ui.selectable_label(w == wave, w.label()).clicked() && w != wave {
-                    out.op = Some(GraphOp::SetWaveform { kind, path: path.to_vec(), wave: w });
+                    out.op = Some(GraphOp::SetWaveform { target, path: path.to_vec(), wave: w });
                 }
             }
         });
 }
 
-/// The selected node's parameters: what exists, plus add/remove. Returns the
+/// The knobs of a node or a module: what exists, plus add/remove. Returns the
 /// names, which the `param` nodes below use to populate their picker.
 ///
-/// Parameters live here rather than in the properties panel because they only
-/// mean anything to expressions — a knob nothing reads is noise in a list of
-/// real properties.
-pub(crate) fn params_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdits) -> Vec<String> {
-    let names: Vec<String> = info.params.iter().map(|(n, _)| n.clone()).collect();
+/// The same surface serves both owners — a node's `param("x")` and a module
+/// body's `param("x")` are read the same way — with `owner` deciding whose
+/// knobs are touched and salting the egui state so two owners' add-fields don't
+/// collide. Parameters live here rather than in the properties panel because
+/// they only mean anything to expressions — a knob nothing reads is noise in a
+/// list of real properties.
+pub(crate) fn params_ui(
+    ui: &mut egui::Ui,
+    owner: ParamOwner,
+    params: &[(String, &'static str)],
+    out: &mut GraphEdits,
+) -> Vec<String> {
+    let names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
     ui.horizontal_wrapped(|ui| {
         ui.strong("Parameters");
         // The new parameter's name is typed into egui memory, so the panel
         // stays a pure function of the document (the same rule as the canvas'
         // box positions).
-        let buf_id = egui::Id::new(("param_new", info.node_id.0));
+        let buf_id = egui::Id::new(("param_new", owner));
         let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id).unwrap_or_default());
         ui.add(
             egui::TextEdit::singleline(&mut buf).hint_text("new name").desired_width(90.0),
@@ -757,19 +924,19 @@ pub(crate) fn params_ui(ui: &mut egui::Ui, info: &GraphInfo, out: &mut GraphEdit
                 })
                 .clicked()
             {
-                out.op = Some(GraphOp::AddParam { name: buf.trim().to_string(), kind });
+                out.op = Some(GraphOp::AddParam { owner, name: buf.trim().to_string(), kind });
                 buf.clear();
             }
         }
         ui.data_mut(|d| d.insert_temp(buf_id, buf));
     });
-    if info.params.is_empty() {
+    if params.is_empty() {
         ui.weak("None. A parameter is a named knob expressions can read.");
     }
-    for (name, kind) in &info.params {
+    for (name, kind) in params {
         ui.horizontal(|ui| {
             if ui.small_button("x").on_hover_text("Remove").clicked() {
-                out.op = Some(GraphOp::RemoveParam { name: name.clone() });
+                out.op = Some(GraphOp::RemoveParam { owner, name: name.clone() });
             }
             ui.label(name);
             ui.weak(*kind);
@@ -785,7 +952,7 @@ pub(crate) fn param_editor(
     ui: &mut egui::Ui,
     name: &str,
     params: &[String],
-    kind: PropKind,
+    target: GraphTarget,
     path: &[usize],
     out: &mut GraphEdits,
 ) {
@@ -794,14 +961,14 @@ pub(crate) fn param_editor(
         ui.small("add one above");
         return;
     }
-    egui::ComboBox::from_id_salt(("pn", kind.label(), path))
+    egui::ComboBox::from_id_salt(("pn", target, path))
         .width(120.0)
         .selected_text(if name.is_empty() { "(pick)" } else { name })
         .show_ui(ui, |ui| {
             for p in params {
                 if ui.selectable_label(p == name, p).clicked() && p != name {
                     out.op = Some(GraphOp::SetParam {
-                        kind,
+                        target,
                         path: path.to_vec(),
                         name: p.clone(),
                     });
@@ -822,7 +989,7 @@ pub(crate) fn script_editor(
     src: &str,
     frame: f64,
     result: Option<&Result<String, String>>,
-    kind: PropKind,
+    target: GraphTarget,
     path: &[usize],
     out: &mut GraphEdits,
 ) {
@@ -836,7 +1003,7 @@ pub(crate) fn script_editor(
         )
         .on_hover_text(SCRIPT_HELP);
     if resp.changed() {
-        out.op = Some(GraphOp::SetScript { kind, path: path.to_vec(), src: text.clone() });
+        out.op = Some(GraphOp::SetScript { target, path: path.to_vec(), src: text.clone() });
     }
     // The result was computed in `GraphInfo::gather`, against the document, so
     // `value()`/`wiggle()` resolve here exactly as they do at render time.
@@ -889,8 +1056,8 @@ pub(crate) fn child_ref(expr: &Expr, slot: usize) -> Option<&Expr> {
     expr.child(slot)
 }
 
-pub(crate) fn lit_editor(ui: &mut egui::Ui, v: ExprValue, kind: PropKind, path: &[usize], out: &mut GraphEdits) {
-    let set = |value| Some(GraphOp::SetLit { kind, path: path.to_vec(), value });
+pub(crate) fn lit_editor(ui: &mut egui::Ui, v: ExprValue, target: GraphTarget, path: &[usize], out: &mut GraphEdits) {
+    let set = |value| Some(GraphOp::SetLit { target, path: path.to_vec(), value });
     match v {
         ExprValue::Num(n) => {
             let mut n = n;
@@ -921,7 +1088,7 @@ pub(crate) fn ref_editor(
     node: NodeId,
     prop: PropPath,
     offset: f64,
-    kind: PropKind,
+    target: GraphTarget,
     path: &[usize],
     nodes: &[(u64, String)],
     out: &mut GraphEdits,
@@ -932,7 +1099,7 @@ pub(crate) fn ref_editor(
         .find(|(id, _)| *id == node.0)
         .map(|(_, n)| n.clone())
         .unwrap_or_else(|| format!("#{}", node.0));
-    egui::ComboBox::from_id_salt(("rn", kind.label(), path))
+    egui::ComboBox::from_id_salt(("rn", target, path))
         .selected_text(cur_name)
         .show_ui(ui, |ui| {
             for (id, name) in nodes {
@@ -942,7 +1109,7 @@ pub(crate) fn ref_editor(
             }
         });
     let mut chosen_prop = prop;
-    egui::ComboBox::from_id_salt(("rp", kind.label(), path))
+    egui::ComboBox::from_id_salt(("rp", target, path))
         .width(80.0)
         .selected_text(prop_path_label(prop))
         .show_ui(ui, |ui| {
@@ -958,26 +1125,28 @@ pub(crate) fn ref_editor(
         .on_hover_text("Frame offset")
         .changed();
     if chosen_node != node || chosen_prop != prop || off_changed {
-        out.op = Some(GraphOp::SetRef { kind, path: path.to_vec(), node: chosen_node, prop: chosen_prop, offset: off });
+        out.op = Some(GraphOp::SetRef { target, path: path.to_vec(), node: chosen_node, prop: chosen_prop, offset: off });
     }
 }
 
-/// Apply a deferred graph-panel edit to `selected`'s property in `doc`. A free
-/// function (not an `App` method) so the whole promote/edit/bake flow is unit-
-/// testable against a plain `Document`, no window required.
-/// Apply one graph edit.
+/// Apply one deferred graph-panel edit. A free function (not an `App` method) so
+/// the whole promote/edit/bake/module flow is unit-testable against a plain
+/// project, no window required.
 ///
 /// Takes the whole project, not just the open comp: modules are project-wide,
-/// so extracting or relinking one reaches past the comp being edited.
+/// so extracting, relinking, or **editing a module body** reaches past the comp
+/// being edited. `selected` is optional because a module-body edit needs no
+/// node selection — the node-scoped ops (promote/bake/extract/link and any
+/// property-targeted tree edit) simply no-op without one.
 pub(crate) fn apply_graph_op(
     project: &mut MProject,
     comp: CompId,
-    selected: NodeId,
+    selected: Option<NodeId>,
     op: GraphOp,
     frame: i64,
 ) {
     let t = frame as f64;
-    // Every arm below edits the open comp; the module arms also touch the
+    // The node-scoped arms edit the open comp; the module arms touch the
     // registry, which is why this can't take a bare `&mut Comp`.
     macro_rules! doc {
         () => {
@@ -989,6 +1158,7 @@ pub(crate) fn apply_graph_op(
     }
     match op {
         GraphOp::Promote(kind) => {
+            let Some(selected) = selected else { return };
             // Promoting a constant/keyframed value only reads its own current
             // value, so a document-less context is enough.
             let mut ctx = EvalCtx::at(t);
@@ -999,6 +1169,7 @@ pub(crate) fn apply_graph_op(
             }
         }
         GraphOp::Bake(kind) => {
+            let Some(selected) = selected else { return };
             // Baking resolves the *expression*, which may reference other nodes —
             // so it needs the document. Resolve against a clone so the read
             // context doesn't alias the node being mutated.
@@ -1010,27 +1181,47 @@ pub(crate) fn apply_graph_op(
                 }
             }
         }
-        GraphOp::SetKind { kind, path, new } => {
-            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::seed(new));
+        GraphOp::SetKind { target, path, new } => {
+            edit_expr(project, comp, selected, target, &path, |e| *e = Expr::seed(new));
         }
-        GraphOp::SetLit { kind, path, value } => {
-            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::Lit(value));
+        GraphOp::SetLit { target, path, value } => {
+            edit_expr(project, comp, selected, target, &path, |e| *e = Expr::Lit(value));
         }
-        GraphOp::SetRef { kind, path, node, prop, offset } => {
-            edit_expr(doc!(), selected, kind, &path, |e| {
+        GraphOp::SetRef { target, path, node, prop, offset } => {
+            edit_expr(project, comp, selected, target, &path, |e| {
                 *e = Expr::Ref { node, prop, time_offset: offset }
             });
         }
-        GraphOp::AddParam { name, kind } => {
-            if let Some(node) = doc!().root.find_mut(selected) {
-                node.set_param(name, kind.seed());
+        GraphOp::AddParam { owner, name, kind } => match owner {
+            ParamOwner::Node(id) => {
+                if let Some(node) = doc!().root.find_mut(id) {
+                    node.set_param(name, kind.seed());
+                }
             }
-        }
+            ParamOwner::Module(m) => {
+                if let Some(m) = project.module_mut(m) {
+                    m.set_param(name, kind.seed());
+                }
+            }
+        },
+        GraphOp::RemoveParam { owner, name } => match owner {
+            ParamOwner::Node(id) => {
+                if let Some(node) = doc!().root.find_mut(id) {
+                    node.remove_param(&name);
+                }
+            }
+            ParamOwner::Module(m) => {
+                if let Some(m) = project.module_mut(m) {
+                    m.remove_param(&name);
+                }
+            }
+        },
 
         // Lift a property's whole recipe into a shared module, then link it back
         // in its place. The link starts with no overrides: it *is* the module,
         // so the frame is unchanged the instant you press the button.
         GraphOp::ExtractModule { kind } => {
+            let Some(selected) = selected else { return };
             let name = {
                 let doc = doc!();
                 let Some(node) = doc.root.find(selected) else { return };
@@ -1054,14 +1245,15 @@ pub(crate) fn apply_graph_op(
         // Point a property at an existing module, promoting it if it was still
         // a constant — otherwise linking would silently do nothing.
         GraphOp::LinkModule { kind, module } => {
+            let Some(selected) = selected else { return };
             if let Some(node) = doc!().root.find_mut(selected) {
                 if let Some(mut p) = prop_of_mut(node, kind) {
                     p.set_expr(Expr::Use { module, overrides: Vec::new() });
                 }
             }
         }
-        GraphOp::SetModule { kind, path, module } => {
-            edit_expr(doc!(), selected, kind, &path, |e| {
+        GraphOp::SetModule { target, path, module } => {
+            edit_expr(project, comp, selected, target, &path, |e| {
                 // Repointing keeps the overrides: knobs are matched by name, and
                 // any that the new module lacks warn rather than vanishing.
                 let overrides = match e {
@@ -1071,8 +1263,8 @@ pub(crate) fn apply_graph_op(
                 *e = Expr::Use { module, overrides };
             });
         }
-        GraphOp::SetOverride { kind, path, name, value } => {
-            edit_expr(doc!(), selected, kind, &path, |e| {
+        GraphOp::SetOverride { target, path, name, value } => {
+            edit_expr(project, comp, selected, target, &path, |e| {
                 if let Expr::Use { overrides, .. } = e {
                     overrides.retain(|(n, _)| n != &name);
                     // `None` means "inherit" — removing the entry *is* the
@@ -1091,20 +1283,17 @@ pub(crate) fn apply_graph_op(
         GraphOp::DeleteModule { module } => {
             project.modules.remove(&module);
         }
-        GraphOp::RemoveParam { name } => {
-            if let Some(node) = doc!().root.find_mut(selected) {
-                node.remove_param(&name);
-            }
+        GraphOp::SetParam { target, path, name } => {
+            edit_expr(project, comp, selected, target, &path, |e| {
+                *e = Expr::Param { node: None, name }
+            });
         }
-        GraphOp::SetParam { kind, path, name } => {
-            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::Param { node: None, name });
+        GraphOp::SetScript { target, path, src } => {
+            edit_expr(project, comp, selected, target, &path, |e| *e = Expr::Script(src));
         }
-        GraphOp::SetScript { kind, path, src } => {
-            edit_expr(doc!(), selected, kind, &path, |e| *e = Expr::Script(src));
-        }
-        GraphOp::SetWaveform { kind, path, wave } => {
+        GraphOp::SetWaveform { target, path, wave } => {
             // Only touches the waveform; the knobs are left as they are.
-            edit_expr(doc!(), selected, kind, &path, |e| {
+            edit_expr(project, comp, selected, target, &path, |e| {
                 if let Expr::Gen(Generator::Oscillator { wave: w, .. }) = e {
                     *w = wave;
                 }
@@ -1113,19 +1302,32 @@ pub(crate) fn apply_graph_op(
     }
 }
 
-/// Mutate the expression subtree at `path` on `selected`'s `kind` property.
-/// No-op if the property isn't an expression or the path is stale.
+/// Mutate the expression subtree at `path` on the [`GraphTarget`] — the selected
+/// node's `kind` property (in `comp`), or a project-wide module's body. No-op if
+/// the target isn't an expression, the selection is missing, or the path is
+/// stale. This is the one seam that makes the canvas target both.
 pub(crate) fn edit_expr(
-    doc: &mut Document,
-    selected: NodeId,
-    kind: PropKind,
+    project: &mut MProject,
+    comp: CompId,
+    selected: Option<NodeId>,
+    target: GraphTarget,
     path: &[usize],
     f: impl FnOnce(&mut Expr),
 ) {
-    if let Some(node) = doc.root.find_mut(selected) {
-        if let Some(mut p) = prop_of_mut(node, kind) {
-            if let Some(target) = p.expr_mut().and_then(|e| e.at_mut(path)) {
-                f(target);
+    match target {
+        GraphTarget::Prop(kind) => {
+            let Some(selected) = selected else { return };
+            let Some(c) = project.comp_mut(comp) else { return };
+            let Some(node) = c.root.find_mut(selected) else { return };
+            let Some(mut p) = prop_of_mut(node, kind) else { return };
+            if let Some(e) = p.expr_mut().and_then(|e| e.at_mut(path)) {
+                f(e);
+            }
+        }
+        GraphTarget::Module(m) => {
+            let Some(m) = project.module_mut(m) else { return };
+            if let Some(e) = m.body.at_mut(path) {
+                f(e);
             }
         }
     }

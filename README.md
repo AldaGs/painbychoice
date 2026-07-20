@@ -104,10 +104,16 @@ automatic retiming.
   that links itself warns and falls back rather than recursing. An override
   naming a knob the module lacks warns too — a silent no-op would be a typo trap.
 
-**The UI**, in the graph panel: a **Modules** list (rename / delete), a
-**`-> module`** button on any expression-driven property, and a **`link`**
+**The UI**, in the graph panel: a **Modules** list (rename / delete / **edit**),
+a **`-> module`** button on any expression-driven property, and a **`link`**
 picker on any property that isn't one yet. A link's box shows a module picker
 and one row per knob reading either `inherit` or the overridden value.
+
+The **edit** button is the graph-UI step (below): it opens the module's *body*
+on the same node canvas a property uses, plus the module's own knobs — see
+*Editing a module body* below. Before it, a module could be *made* (by
+extracting a property) but its body edited nowhere; you could only relink or
+tweak knobs at a call site.
 
 - **Extract is a no-op on the frame.** The recipe moves to the module and the
   property links it, so pressing `-> module` on work you care about is safe.
@@ -121,8 +127,48 @@ and one row per knob reading either `inherit` or the overridden value.
   The tests that predate projects go through an `apply_op` shim.
 
 - `ExprKind::Use` is deliberately **not** in `ExprKind::ALL`: that list is the
-  graph picker, and seeding a link needs a module picker, which belongs with the
-  Blender-standard graph UI step.
+  in-box kind picker, and seeding a link needs a *module* picker, not a bare
+  kind. A property links a module through `-> module` / `link`; a module body's
+  own boxes can't spawn a nested link from the kind menu (which keeps a module
+  from accidentally linking itself while you edit it). Repointing an existing
+  link still uses the module picker inside `use_editor`.
+
+### Editing a module body (the Blender-standard graph UI step)
+
+The next roadmap step past pre-comps, made concrete (2026-07-20). A module's
+**body** is now edited on the same node canvas a property is, so a module is
+authored in one place rather than only inherited from the property it was
+extracted with.
+
+The seam is a `GraphTarget`: every tree-editing op (`SetKind` / `SetLit` /
+`SetRef` / `SetScript` / `SetParam` / `SetWaveform` / `SetOverride` /
+`SetModule`) now carries `GraphTarget::Prop(kind)` **or**
+`GraphTarget::Module(id)` instead of a bare `PropKind`, and `edit_expr`
+resolves the tree root from it — the node's property, or `module.body`. The
+canvas, the box layout, the kind picker, and every in-box editor are byte-for-
+byte the same for both; only the address differs. That is what makes this cheap:
+the module body reuses the whole property-canvas machinery.
+
+- **No selection required.** A module body isn't any node's property, so
+  `apply_graph_op` takes `selected: Option<NodeId>`; the node-scoped ops
+  (promote/bake/extract/link and any `Prop`-targeted edit) no-op without one,
+  while module edits go through regardless. Which module is open is **view
+  state** (`App::editing_module`), reported as a `GraphEdits::edit_module`
+  intent and applied beside the document op, never in it — the same discipline
+  as the canvas' box positions.
+- **A module's knobs are editable too**, through the same parameters surface a
+  node has: `ParamOwner::{Node(id), Module(id)}` says whose knobs an add/remove
+  touches. A body full of `param("…")` nodes is useless without knobs to point
+  them at, so the two ship together; removing a knob leaves the body's
+  `param()` warning and falling back, like any dangling reference.
+- **Deleting the open module closes it** (the app clears `editing_module`), so
+  the panel can't keep editing a body that no longer exists.
+- **Left for later, deliberately:** a link's *override* can be a whole
+  sub-expression, but that's still shown-not-edited — it would want its own
+  nested canvas at the call site, which the body canvas doesn't provide. And a
+  module-body script's `param("x")` previews as a fallback (the module scope
+  isn't pushed for the preview) though it resolves correctly at render time
+  through the link.
 
 ### Icons (`live/src/icon.rs`)
 
@@ -586,13 +632,20 @@ order past #5* below (pre-comps first). The stages of each item:
      box's kind menu seeds it, and edits route through the same `GraphOp` /
      `apply_graph_op` path as every other node, so the whole flow is unit-tested.
 
-**Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps
-→ document-wide property graph → Blender-standard graph UI → the Nuke-style
-*image* graph. Pre-comps come before the big graph because a comp *is* a graph
-node, so building the graph first means rebuilding it; the image graph is last
-because it needs the raster compositor stage below, which isn't built. Note the
-distinction: today's graph is a **property** graph (values into properties);
-Nuke's is an **image** graph (operations on pixels). They're different machines.
+**Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps ✅
+→ document-wide property graph ✅ → Blender-standard graph UI (in progress) →
+the Nuke-style *image* graph. Pre-comps come before the big graph because a comp
+*is* a graph node, so building the graph first means rebuilding it; the image
+graph is last because it needs the raster compositor stage below, which isn't
+built. Note the distinction: today's graph is a **property** graph (values into
+properties); Nuke's is an **image** graph (operations on pixels). They're
+different machines.
+
+> **Graph-UI progress (2026-07-20):** module bodies now have a real editing
+> surface — you open a module from the graph panel and edit its body + knobs on
+> the same node canvas a property uses (see *Editing a module body* above). Still
+> open under this step: seeding a fresh `Use` link from the kind picker, and a
+> nested canvas for override sub-expressions at a call site.
 
 > Two riders on this order, both feeding the *reusable animation modules* feature
 > spec'd in the design section below: the **pre-comps** step also introduces the

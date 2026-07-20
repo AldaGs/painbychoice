@@ -521,12 +521,26 @@ impl Module {
     /// Add or replace a knob. Same uniqueness rule as a node's parameters: a
     /// duplicate would make `param("x")` ambiguous.
     pub fn with_param(mut self, name: impl Into<String>, value: ParamValue) -> Self {
+        self.set_param(name, value);
+        self
+    }
+
+    /// Add or replace a knob in place — the editing-surface counterpart to
+    /// [`Node::set_param`], since a module's body reads its knobs the same way.
+    pub fn set_param(&mut self, name: impl Into<String>, value: ParamValue) {
         let name = name.into();
         match self.params.iter_mut().find(|p| p.name == name) {
             Some(existing) => existing.value = value,
             None => self.params.push(Param { name, value }),
         }
-        self
+    }
+
+    /// Remove a knob by name, returning whether it was there. A body `param("x")`
+    /// left reading it warns and falls back, like any dangling reference.
+    pub fn remove_param(&mut self, name: &str) -> bool {
+        let before = self.params.len();
+        self.params.retain(|p| p.name != name);
+        before != self.params.len()
     }
 }
 
