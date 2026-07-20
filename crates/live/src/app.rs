@@ -77,14 +77,15 @@ pub(crate) struct App {
     /// like the panel split isn't part of the document. Re-clamped against the
     /// panel on every pass, so a stored width can't outlive a resize.
     pub(crate) dope_label_w: f32,
-    /// The comp's state from before an in-progress FPS drag: `(fps, root)`.
+    /// The comp's state from before an in-progress FPS drag: `(fps, root, selection)`.
     ///
     /// Retiming is lossy — keys land on whole frames — so applying it once per
     /// drag delta would run 60→24 as thirty-six successive roundings and shred
     /// dense keys on the way down. Every delta instead restores this snapshot
     /// and retimes from it, making the whole drag a single conversion off the
-    /// grid the user started on. `None` when no drag is in flight.
-    pub(crate) fps_drag: Option<(f64, MNode)>,
+    /// grid the user started on. The selection rides along for the same reason —
+    /// see `apply_fps_edit`. `None` when no drag is in flight.
+    pub(crate) fps_drag: Option<(f64, MNode, KeySelection)>,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -98,17 +99,49 @@ pub(crate) struct App {
 /// either direction a single conversion no matter what it travelled through.
 ///
 /// Typed edits carry no drag, and are applied directly.
-pub(crate) fn apply_fps_edit(doc: &mut Comp, drag: &mut Option<(f64, MNode)>, edits: &CompEdits) {
+///
+/// `selected_keys` is remapped alongside the document: keyframe selection is
+/// by index, and retiming can merge keys, so the selection has to be carried
+/// across the conversion or it starts pointing at the wrong keys. Like the
+/// retime itself, a drag remaps from the pre-drag state rather than from the
+/// previous delta, so the selection can't drift over a long drag either.
+pub(crate) fn apply_fps_edit(
+    doc: &mut Comp,
+    drag: &mut Option<(f64, MNode, KeySelection)>,
+    edits: &CompEdits,
+    selected: Option<NodeId>,
+    selected_keys: &mut KeySelection,
+) {
     // Snapshot first: egui reports a drag's start and its first delta together.
     if edits.fps_drag_started {
-        *drag = Some((doc.fps, doc.root.clone()));
+        *drag = Some((doc.fps, doc.root.clone(), selected_keys.clone()));
     }
     if let Some(fps) = edits.fps {
-        if let Some((base_fps, base_root)) = drag {
-            doc.root = base_root.clone();
-            doc.fps = *base_fps;
+        // Baseline for this conversion: the drag snapshot, or the live state
+        // for a typed edit. The selection is part of it for the same reason the
+        // tree is — remapping the *already-remapped* selection against the
+        // baseline tree reads an index from one numbering against another, so
+        // one merge at an intermediate rate would move it permanently.
+        let (base_fps, base_root, base_sel) = match drag.as_ref() {
+            Some((f, r, s)) => (*f, r.clone(), s.clone()),
+            None => (doc.fps, doc.root.clone(), selected_keys.clone()),
+        };
+        doc.root = base_root.clone();
+        doc.fps = base_fps;
+
+        let before_fps = doc.timebase().fps();
+        let ratio = if doc.set_fps(fps.max(1.0)) {
+            doc.timebase().fps() / before_fps
+        } else {
+            // Unchanged rate: still re-resolve, so the selection tracks the
+            // baseline rather than whatever the previous delta left behind.
+            1.0
+        };
+        if let Some(id) = selected {
+            if let (Some(before), Some(after)) = (base_root.find(id), doc.root.find(id)) {
+                *selected_keys = remap_selection(&base_sel, before, after, ratio);
+            }
         }
-        doc.set_fps(fps.max(1.0));
     }
     if edits.fps_drag_stopped {
         *drag = None;
@@ -1027,7 +1060,7 @@ impl App {
         let mut edits = PropEdits::default();
         let mut dope = DopeEdits::default();
         let mut tree_edits = TreeEdits::default();
-        let selected_keys = std::mem::take(&mut self.selected_keys);
+        let mut selected_keys = std::mem::take(&mut self.selected_keys);
         let selected_node = self.selected;
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         let mut comp = CompEdits::default();
@@ -1176,7 +1209,16 @@ impl App {
         if let Some(h) = comp.height {
             self.doc_mut().height = h.max(1.0);
         }
-        apply_fps_edit(self.project.comp_mut(self.current).expect("open comp"), &mut self.fps_drag, &comp);
+        // `selected_keys` is the local taken for the UI pass — `self.selected_keys`
+        // is empty until it's put back below, so the remap has to act on this one.
+        let selected_node_id = self.selected;
+        apply_fps_edit(
+            self.project.comp_mut(self.current).expect("open comp"),
+            &mut self.fps_drag,
+            &comp,
+            selected_node_id,
+            &mut selected_keys,
+        );
         if let Some(d) = comp.duration {
             self.doc_mut().duration = d.max(0.1);
         }

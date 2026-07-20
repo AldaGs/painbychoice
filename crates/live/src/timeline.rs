@@ -148,6 +148,45 @@ pub(crate) fn group_selection_by_prop(sel: &KeySelection) -> Vec<(PropKind, Vec<
     out
 }
 
+/// Carry a keyframe selection across a retime.
+///
+/// A [`KeyRef`] is an *index* into a track, not a frame, so anything that
+/// changes how many keys a track has invalidates it. Retiming does exactly
+/// that: keys land on whole frames, so two keys less than a frame apart on the
+/// new grid merge and every index after the merge shifts down. Left alone, the
+/// dopesheet would keep drawing a selection that quietly refers to different
+/// keys than the user picked — or, past the end, to none at all.
+///
+/// So the selection is re-resolved *through frames*: read each selected key's
+/// frame on `before`, scale it the way the retime did, and look up whichever
+/// key now sits there. Keys that merged collapse onto the survivor, which is
+/// the honest answer — the key the user selected no longer exists separately.
+pub(crate) fn remap_selection(
+    sel: &KeySelection,
+    before: &MNode,
+    after: &MNode,
+    ratio: f64,
+) -> KeySelection {
+    let mut out = KeySelection::new();
+    for &(kind, idx) in sel.iter() {
+        let Some(before_frames) = prop_of(before, kind).map(|p| p.key_frames()) else {
+            continue;
+        };
+        let Some(&frame) = before_frames.get(idx) else {
+            continue;
+        };
+        // The same rounding `Track::retime` applies, so the lookup below can be
+        // an exact match rather than a nearest-neighbour guess.
+        let target = (frame as f64 * ratio).round() as i64;
+        if let Some(after_frames) = prop_of(after, kind).map(|p| p.key_frames()) {
+            if let Some(new_idx) = after_frames.iter().position(|&f| f == target) {
+                out.insert((kind, new_idx));
+            }
+        }
+    }
+    out
+}
+
 /// One property's worth of copied keyframes. Two variants because `Value<T>` is
 /// generic and the transform's properties are either `Vec2` or `f64` — the enum
 /// is the type-erasure boundary, so paste can only ever put `Vec2` keys back on
@@ -488,6 +527,39 @@ pub(crate) fn edge_pan_intensity(x: f32, left: f32, right: f32, edge: f32) -> f3
     }
 }
 
+/// Allocate one row's label cell in the dopesheet's left column.
+///
+/// Every row — the ruler, the clip bar, each property — goes through this, so
+/// the column boundary is identical on all of them *by construction*. The rows
+/// used to allocate their own label areas with `allocate_ui_with_layout`, which
+/// grows past the size it is given when its contents don't fit: a wide button
+/// or a long name would push that one row's track right while its keyframes
+/// were still positioned from the ruler's axis, so the row silently disagreed
+/// with every other about where a frame is. `allocate_exact_size` cannot grow,
+/// which is the whole point of using it here.
+///
+/// Returns the cell for the caller to paint or place a widget in.
+pub(crate) fn label_cell(ui: &mut egui::Ui, w: f32, h: f32) -> egui::Rect {
+    ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover()).0
+}
+
+/// Draw a row's label text into its cell, clipped to the column so a long name
+/// is cut off at the splitter instead of bleeding over the keyframes.
+pub(crate) fn label_text(ui: &mut egui::Ui, cell: egui::Rect, text: &str, weak: bool) {
+    let color = if weak {
+        ui.style().visuals.weak_text_color()
+    } else {
+        ui.style().visuals.text_color()
+    };
+    ui.painter_at(cell).text(
+        egui::pos2(cell.left(), cell.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::TextStyle::Body.resolve(ui.style()),
+        color,
+    );
+}
+
 pub(crate) const DOPESHEET_H: f32 = 178.0;
 pub(crate) const RULER_H: f32 = 20.0;
 /// What one press of the zoom buttons multiplies the visible span by. Matches
@@ -564,13 +636,8 @@ pub(crate) fn dopesheet_ui(
     let mut axis = None;
     ui.horizontal(|ui| {
         ui.add_space(8.0);
-        ui.allocate_ui_with_layout(
-            egui::vec2(label_w, RULER_H),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.weak("Frame");
-            },
-        );
+        let cell = label_cell(ui, label_w, RULER_H);
+        label_text(ui, cell, "Frame", true);
         ui.add_space(SPLIT_W);
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width() - 8.0, RULER_H),
@@ -671,35 +738,42 @@ pub(crate) fn dopesheet_ui(
     if let Some(clip) = clip {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(label_w, ROW_H),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| match clip.timing {
-                    // No range yet: one click gives the layer one covering the
-                    // whole comp, which is exactly what it does today — so
-                    // enabling trimming never moves anything on screen.
-                    None => {
-                        if icon::button(ui, icon::TRIM, "Give this layer a time range")
-                            .clicked()
-                        {
-                            out.set_timing = Some(Some(LayerTiming::new(0, last_frame + 1)));
-                        }
+            // The cell is allocated at the shared column width like every other
+            // row; the button is *placed* inside it, so a wide button can't
+            // widen this row's column the way it could when the button drove
+            // the layout.
+            let cell = label_cell(ui, label_w, ROW_H);
+            let btn = egui::Rect::from_min_size(
+                cell.left_top(),
+                egui::vec2(cell.width().min(24.0), cell.height()),
+            );
+            match clip.timing {
+                // No range yet: one click gives the layer one covering the
+                // whole comp, which is exactly what it does today — so
+                // enabling trimming never moves anything on screen.
+                None => {
+                    if ui
+                        .put(btn, egui::Button::new(icon::text(icon::TRIM)))
+                        .on_hover_text("Give this layer a time range")
+                        .clicked()
+                    {
+                        out.set_timing = Some(Some(LayerTiming::new(0, last_frame + 1)));
                     }
-                    Some(_) => {
-                        if icon::button(
-                            ui,
-                            icon::CLOSE,
+                }
+                Some(_) => {
+                    if ui
+                        .put(btn, egui::Button::new(icon::text(icon::CLOSE)))
+                        .on_hover_text(
                             "Back to full comp.\n\
                              Drag an end to trim, the body to slide, \
                              alt+drag to slip (content moves, window stays).",
                         )
                         .clicked()
-                        {
-                            out.set_timing = Some(None);
-                        }
+                    {
+                        out.set_timing = Some(None);
                     }
-                },
-            );
+                }
+            }
 
             ui.add_space(SPLIT_W);
             let (track, resp) = ui.allocate_exact_size(
@@ -884,15 +958,8 @@ pub(crate) fn dopesheet_ui(
     for (row_idx, row) in rows.iter().enumerate() {
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(label_w, ROW_H),
-                egui::Layout::left_to_right(egui::Align::Center),
-                // Truncated, not wrapped: a long property name must never grow
-                // the row or bleed past the splitter into the track.
-                |ui| {
-                    ui.add(egui::Label::new(row.label).truncate());
-                },
-            );
+            let cell = label_cell(ui, label_w, ROW_H);
+            label_text(ui, cell, row.label, false);
 
             // The track: full remaining width, fixed height.
             ui.add_space(SPLIT_W);

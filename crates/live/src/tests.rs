@@ -1651,6 +1651,12 @@ fn rot_keys(comp: &motion_core::node::Comp) -> Vec<i64> {
     comp.root.children[0].transform.rotation_deg.key_frames()
 }
 
+/// `apply_fps_edit` with no node selected — the selection remap is exercised
+/// separately, by the tests that actually build one.
+fn fps_edit_apply(comp: &mut motion_core::node::Comp, drag: &mut Option<(f64, MNode, KeySelection)>, e: &CompEdits) {
+    crate::app::apply_fps_edit(comp, drag, e, None, &mut KeySelection::new());
+}
+
 fn fps_edit(fps: f64) -> CompEdits {
     CompEdits { fps: Some(fps), ..Default::default() }
 }
@@ -1664,15 +1670,15 @@ fn dragging_the_fps_spinner_retimes_on_every_delta() {
 
     let mut start = fps_edit(30.0);
     start.fps_drag_started = true;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &start);
+    fps_edit_apply(&mut comp, &mut drag, &start);
     assert_eq!(rot_keys(&comp), vec![0, 60], "the first delta already moved the key");
 
     // A later delta in the same drag, further down.
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(24.0));
+    fps_edit_apply(&mut comp, &mut drag, &fps_edit(24.0));
     assert_eq!(rot_keys(&comp), vec![0, 48], "2s is frame 48 @ 24fps");
 
     // And back up, past where the drag began — still measured off the start.
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(120.0));
+    fps_edit_apply(&mut comp, &mut drag, &fps_edit(120.0));
     assert_eq!(rot_keys(&comp), vec![0, 240], "2s is frame 240 @ 120fps");
 }
 
@@ -1692,17 +1698,17 @@ fn a_long_drag_does_not_compound_rounding() {
     let mut drag = None;
     let mut start = fps_edit(59.0);
     start.fps_drag_started = true;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &start);
+    fps_edit_apply(&mut comp, &mut drag, &start);
     // Sweep all the way down through every intermediate rate, then back up.
     for fps in (7..59).rev() {
-        crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(fps as f64));
+        fps_edit_apply(&mut comp, &mut drag, &fps_edit(fps as f64));
     }
     for fps in 8..=60 {
-        crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(fps as f64));
+        fps_edit_apply(&mut comp, &mut drag, &fps_edit(fps as f64));
     }
     let mut stop = fps_edit(60.0);
     stop.fps_drag_stopped = true;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &stop);
+    fps_edit_apply(&mut comp, &mut drag, &stop);
 
     assert_eq!(comp.fps, 60.0);
     assert_eq!(rot_keys(&comp), vec![0, 120, 121], "returning to 60fps restores every key");
@@ -1718,15 +1724,15 @@ fn a_second_drag_starts_from_the_committed_rate() {
 
     let mut first = fps_edit(24.0);
     first.fps_drag_started = true;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &first);
+    fps_edit_apply(&mut comp, &mut drag, &first);
     let mut stop = fps_edit(24.0);
     stop.fps_drag_stopped = true;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &stop);
+    fps_edit_apply(&mut comp, &mut drag, &stop);
     assert_eq!(rot_keys(&comp), vec![0, 48]);
 
     let mut second = fps_edit(48.0);
     second.fps_drag_started = true;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &second);
+    fps_edit_apply(&mut comp, &mut drag, &second);
     assert_eq!(rot_keys(&comp), vec![0, 96], "2s @ 48fps, measured from 24 not 60");
 }
 
@@ -1735,7 +1741,7 @@ fn a_second_drag_starts_from_the_committed_rate() {
 fn a_typed_fps_retimes_without_a_drag() {
     let mut comp = comp_at_fps(60.0, 120);
     let mut drag = None;
-    crate::app::apply_fps_edit(&mut comp, &mut drag, &fps_edit(24.0));
+    fps_edit_apply(&mut comp, &mut drag, &fps_edit(24.0));
     assert_eq!(rot_keys(&comp), vec![0, 48]);
     assert!(drag.is_none());
 }
@@ -1814,4 +1820,127 @@ fn a_fitting_label_width_is_left_alone() {
     let w = clamp_label_w(120.0, 800.0);
     assert_eq!(w, 120.0);
     assert_eq!(clamp_label_w(w, 800.0), w, "re-clamping is idempotent");
+}
+
+/// Retiming must carry the keyframe selection with it. A `KeyRef` is an index,
+/// so a merge shifts every index after it — left alone, the dopesheet would
+/// keep drawing a selection pointing at keys the user never picked.
+#[test]
+fn the_key_selection_survives_a_retime() {
+    use motion_core::value::{Keyframe, Track};
+    let mut comp = comp_at_fps(60.0, 120);
+    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(60, 30.0),
+        Keyframe::linear(120, 90.0),
+    ]));
+    let mut sel = KeySelection::new();
+    sel.insert((PropKind::Rotation, 2)); // the key at frame 120
+
+    let mut drag = None;
+    crate::app::apply_fps_edit(
+        &mut comp,
+        &mut drag,
+        &fps_edit(30.0),
+        Some(NodeId(1)),
+        &mut sel,
+    );
+
+    // 120 @ 60fps -> 60 @ 30fps, still the last of three keys.
+    assert_eq!(rot_keys(&comp), vec![0, 30, 60]);
+    assert_eq!(sel.iter().copied().collect::<Vec<_>>(), vec![(PropKind::Rotation, 2)]);
+}
+
+/// The case indices actually break on: two keys that merge. Everything after
+/// the merge shifts down one, and a selection on the *later* of the two must
+/// land on the survivor rather than on a stale index.
+#[test]
+fn a_selection_follows_keys_that_merge() {
+    use motion_core::value::{Keyframe, Track};
+    let mut comp = comp_at_fps(60.0, 120);
+    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(120, 45.0),
+        Keyframe::linear(121, 60.0),
+        Keyframe::linear(240, 90.0),
+    ]));
+    let mut sel = KeySelection::new();
+    sel.insert((PropKind::Rotation, 2)); // frame 121
+    sel.insert((PropKind::Rotation, 3)); // frame 240
+
+    let mut drag = None;
+    // A quarter-rate grid: 120 and 121 both land on 30, which is the merge.
+    // (At half rate they would not — 121 * 0.5 rounds up to 61, away from zero.)
+    crate::app::apply_fps_edit(
+        &mut comp,
+        &mut drag,
+        &fps_edit(15.0),
+        Some(NodeId(1)),
+        &mut sel,
+    );
+
+    // 120 and 121 both round to 30; 240 -> 60. Three keys survive.
+    assert_eq!(rot_keys(&comp), vec![0, 30, 60]);
+    assert_eq!(
+        sel.iter().copied().collect::<Vec<_>>(),
+        vec![(PropKind::Rotation, 1), (PropKind::Rotation, 2)],
+        "the merged key collapses onto the survivor, and 240 follows to its new index"
+    );
+}
+
+/// Over a drag the remap is measured from the pre-drag state, like the retime,
+/// so a long sweep can't walk the selection off its keys.
+#[test]
+fn the_selection_does_not_drift_over_a_drag() {
+    use motion_core::value::{Keyframe, Track};
+    let mut comp = comp_at_fps(60.0, 120);
+    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(120, 45.0),
+        Keyframe::linear(121, 60.0),
+    ]));
+    let mut sel = KeySelection::new();
+    sel.insert((PropKind::Rotation, 2));
+
+    let mut drag = None;
+    let mut start = fps_edit(59.0);
+    start.fps_drag_started = true;
+    crate::app::apply_fps_edit(&mut comp, &mut drag, &start, Some(NodeId(1)), &mut sel);
+    for fps in (7..59).rev() {
+        crate::app::apply_fps_edit(
+            &mut comp,
+            &mut drag,
+            &fps_edit(fps as f64),
+            Some(NodeId(1)),
+            &mut sel,
+        );
+    }
+    for fps in 8..=60 {
+        crate::app::apply_fps_edit(
+            &mut comp,
+            &mut drag,
+            &fps_edit(fps as f64),
+            Some(NodeId(1)),
+            &mut sel,
+        );
+    }
+    assert_eq!(rot_keys(&comp), vec![0, 120, 121], "every key came back");
+    assert_eq!(
+        sel.iter().copied().collect::<Vec<_>>(),
+        vec![(PropKind::Rotation, 2)],
+        "and the selection is still on the key it started on"
+    );
+}
+
+/// A selection on a property that isn't animated, or an index past the end,
+/// is dropped rather than panicking or resurrecting as some other key.
+#[test]
+fn a_stale_selection_entry_is_dropped() {
+    let comp = comp_at_fps(60.0, 120);
+    let node = &comp.root.children[0];
+    let mut sel = KeySelection::new();
+    sel.insert((PropKind::Rotation, 99)); // out of range
+    sel.insert((PropKind::Position, 0)); // not animated
+    let out = remap_selection(&sel, node, node, 1.0);
+    assert!(out.is_empty());
 }
