@@ -645,6 +645,66 @@ to the **same IR** (the EBN IR + dumb-printer discipline).
   and evaluator are in place for it to lower into. Swap behind the IR later if
   AE-JS compatibility (`boa`/v8) or Lua (`mlua`) is wanted.
 
+### Pre-comps + the layer time model — implementation plan (proposed)
+
+The next step past #5. Two intertwined-but-separable deliverables: a **per-layer
+time model** (cheap, foundational) and **nested comps** (the data-model change it
+unblocks). Grounding: today `Document = { width, height, fps, duration, root:
+Node }` is *one* composition; `Node` has **no time range** (every layer is live
+the whole comp); `evaluate(doc, frame)` walks the tree with a single **absolute**
+`EvalCtx.frame`. Note `resolve_target` already saves/restores `ctx.frame` to
+sample at a shifted time — the exact mechanism local time needs.
+
+**Three decisions (recommendations, not yet locked):**
+1. **Multi-comp model — registry + instances** (recommended) over inline nesting.
+   `Document` becomes a project of comps keyed by `CompId`; a layer can be a
+   `Precomp(CompId)` *instance*. Only this gives **reuse** (one comp placed
+   twice) and sets up the shared-module/override story; inline nesting is less
+   code but can't instance. ("A comp *is* a graph node," as the agreed order
+   says.)
+2. **Keyframes stored in local frames** (recommended) — a layer's own keys and
+   expressions are authored relative to its `start`, so two subtitles with
+   different in-points play the *same* local keyframes at different comp times.
+   This is what makes "one animation, retimed per clip" fall out for free.
+3. **v1 precomp compositing = "vector paste-through"** — geometry composes
+   correctly (fold the precomp layer's xf/opacity into its items), but **no**
+   isolated rasterization / blend modes / 2D-vs-3D collapse (those need the
+   compositor stage, which is later). Correct for subtitles; a known limit.
+
+**Staged build:**
+- **Stage 1 — layer time model** (`core` + minimal timeline UI; safe first PR,
+  shippable alone). `Node` gains `#[serde(default)] timing: Option<LayerTiming>`
+  (`{ start, in_, out }` in frames; `None` = today's behaviour). Add
+  `EvalCtx.comp_frame` (global) beside `frame` (now the current layer's *local*
+  frame); `walk` computes `local = comp_frame − start`, skips drawing outside
+  `[in, out)`, and sets `ctx.frame` for the subtree via the existing
+  save/restore. Serde `default` covers migration (no `migrate()` change);
+  trim/slip eval + round-trip tests. UI: in/out clip bars in the timeline (lean
+  on the existing `ClipTrack`/`tracks` scaffold), drag to trim/slide.
+- **Stage 2 — local-time expression sources** (small, rides on Stage 1).
+  `Expr::LocalTime / InPoint / OutPoint` + a `t01` convenience
+  (`clamp((frame−in)/(out−in), 0, 1)`), and `inPoint`/`outPoint`/`localTime` in
+  the Rhai scope. Now "ease in over the first N frames, hold, ease out over the
+  last N" is **one** expression that auto-fits any layer — the subtitle payoff,
+  before pre-comps even exist. Fully unit-testable.
+- **Stage 3 — multi-comp data model** (the big/risky one; minimal UI).
+  `Project { comps: Map<CompId, Comp>, root: CompId }`, `Comp = { size, fps,
+  duration, root: Node }`; a `Precomp(CompId)` layer kind;
+  `evaluate(project, comp_id, frame)` recurses into a precomp at the layer's
+  local frame and folds in xf/opacity. **Comp-level cycle guard** (A→B→A → warn
+  + skip, mirroring the expr guard). **`.pbc` migration**: wrap today's single
+  `root` as the one comp and reconcile with the existing `Project { document,
+  layout }` wrapper; old files still load. Cross-comp references stay out of
+  scope for v1.
+- **Stage 4 — pre-comp UI.** Comp switcher in the comp bar; "pre-compose
+  selection" (move selected layers into a new comp, replace with an instance —
+  the core AE workflow); open/close a comp; precomp layer in the layers panel.
+
+**Blast radius to record before saved multi-comp docs exist** (same discipline
+as the 2.5D note): the `Document`→`Project` shape, the `evaluate` signature,
+hit-testing/selection, the `.pbc` loader, and every live-app assumption of a
+single `doc`. All cheap now, expensive once multi-comp docs are in the wild.
+
 ### Reusable animation modules — shared, auto-retimed, overridable
 
 *The target user story* (recorded so the pieces below have a home): drop a video
