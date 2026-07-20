@@ -104,10 +104,16 @@ automatic retiming.
   that links itself warns and falls back rather than recursing. An override
   naming a knob the module lacks warns too — a silent no-op would be a typo trap.
 
-**The UI**, in the graph panel: a **Modules** list (rename / delete), a
-**`-> module`** button on any expression-driven property, and a **`link`**
+**The UI**, in the graph panel: a **Modules** list (rename / delete / **edit**),
+a **`-> module`** button on any expression-driven property, and a **`link`**
 picker on any property that isn't one yet. A link's box shows a module picker
 and one row per knob reading either `inherit` or the overridden value.
+
+The **edit** button is the graph-UI step (below): it opens the module's *body*
+on the same node canvas a property uses, plus the module's own knobs — see
+*Editing a module body* below. Before it, a module could be *made* (by
+extracting a property) but its body edited nowhere; you could only relink or
+tweak knobs at a call site.
 
 - **Extract is a no-op on the frame.** The recipe moves to the module and the
   property links it, so pressing `-> module` on work you care about is safe.
@@ -121,8 +127,48 @@ and one row per knob reading either `inherit` or the overridden value.
   The tests that predate projects go through an `apply_op` shim.
 
 - `ExprKind::Use` is deliberately **not** in `ExprKind::ALL`: that list is the
-  graph picker, and seeding a link needs a module picker, which belongs with the
-  Blender-standard graph UI step.
+  in-box kind picker, and seeding a link needs a *module* picker, not a bare
+  kind. A property links a module through `-> module` / `link`; a module body's
+  own boxes can't spawn a nested link from the kind menu (which keeps a module
+  from accidentally linking itself while you edit it). Repointing an existing
+  link still uses the module picker inside `use_editor`.
+
+### Editing a module body (the Blender-standard graph UI step)
+
+The next roadmap step past pre-comps, made concrete (2026-07-20). A module's
+**body** is now edited on the same node canvas a property is, so a module is
+authored in one place rather than only inherited from the property it was
+extracted with.
+
+The seam is a `GraphTarget`: every tree-editing op (`SetKind` / `SetLit` /
+`SetRef` / `SetScript` / `SetParam` / `SetWaveform` / `SetOverride` /
+`SetModule`) now carries `GraphTarget::Prop(kind)` **or**
+`GraphTarget::Module(id)` instead of a bare `PropKind`, and `edit_expr`
+resolves the tree root from it — the node's property, or `module.body`. The
+canvas, the box layout, the kind picker, and every in-box editor are byte-for-
+byte the same for both; only the address differs. That is what makes this cheap:
+the module body reuses the whole property-canvas machinery.
+
+- **No selection required.** A module body isn't any node's property, so
+  `apply_graph_op` takes `selected: Option<NodeId>`; the node-scoped ops
+  (promote/bake/extract/link and any `Prop`-targeted edit) no-op without one,
+  while module edits go through regardless. Which module is open is **view
+  state** (`App::editing_module`), reported as a `GraphEdits::edit_module`
+  intent and applied beside the document op, never in it — the same discipline
+  as the canvas' box positions.
+- **A module's knobs are editable too**, through the same parameters surface a
+  node has: `ParamOwner::{Node(id), Module(id)}` says whose knobs an add/remove
+  touches. A body full of `param("…")` nodes is useless without knobs to point
+  them at, so the two ship together; removing a knob leaves the body's
+  `param()` warning and falling back, like any dangling reference.
+- **Deleting the open module closes it** (the app clears `editing_module`), so
+  the panel can't keep editing a body that no longer exists.
+- **Left for later, deliberately:** a link's *override* can be a whole
+  sub-expression, but that's still shown-not-edited — it would want its own
+  nested canvas at the call site, which the body canvas doesn't provide. And a
+  module-body script's `param("x")` previews as a fallback (the module scope
+  isn't pushed for the preview) though it resolves correctly at render time
+  through the link.
 
 ### Icons (`live/src/icon.rs`)
 
@@ -152,6 +198,36 @@ worth in wall-clock time. Changing fps therefore re-times the document without
 drifting keyframes off their frames — the same thing After Effects does.
 Integer frames also killed two float-epsilon fudges (key matching, and
 neighbour clamping when dragging).
+
+### The work area (2026-07-20)
+
+AE's work area: a comp-level **preview** range that bounds the playback loop.
+The deliberate distinction it turns on — recorded back when the layer time model
+landed — is **view state vs document state**: the work area bounds *playback*,
+so it changes nothing the renderer sees and is never saved with the `.pbc`;
+per-layer in/out points change *evaluation*, so they are. `App::work_area:
+Option<WorkArea>` sits beside `view` and resets the same way, when a comp opens.
+
+- **The loop is the only thing confined.** `raw_time()` folds the wall clock
+  into the work-area span *while playing* (`wrap_into` over `loop_bounds_secs`);
+  **while paused** the playhead sits exactly where it was placed. So scrubbing
+  and `←/→` still reach the whole comp — you can park on a frame outside the
+  band to inspect it — and only *looping* stays inside. Restart (`R` / the
+  button) returns to the work-area start, not always frame 0.
+- **Set with `B`/`N` at the playhead** (AE's keys): `B` the start, `N` the end.
+  The end is **exclusive** (like a layer clip's `[in, out)`), so `N` at frame F
+  keeps F as the last previewed frame. The first press seeds the other edge from
+  the comp extent, so one keystroke makes a valid range.
+- **The math is pure and tested.** `loop_bounds` (work area clamped into the
+  comp, `hi > lo` always — the span can't invert or empty), `wrap_into` (the
+  cyclic fold, holding at `lo` on a collapsed span), and `with_work_start` /
+  `with_work_end` (the edge-seeding) are free functions in `timeline.rs`, unit-
+  tested without a window; `App`'s methods are thin wrappers. The ruler band is
+  drawn from `loop_bounds` on the same `Axis` the playhead uses, so they can't
+  drift.
+- **Ephemeral, by choice.** It could persist with the layout later, but AE-style
+  per-comp preview state is genuinely session-scoped; keeping it out of the
+  `.pbc` avoids a format change for something you re-set constantly.
 
 ### `live/` module layout
 
@@ -212,6 +288,13 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   `hh:mm:ss.ff` plus `[frame/last]`. Playback runs off the wall clock but
   *quantizes* to the frame grid, so changing FPS visibly changes the playback
   cadence.
+- **Work area** (AE's) — a comp-level **preview range** shown as a translucent
+  band on the ruler. `B` sets its start at the playhead, `N` its end; **playback
+  loops within it** and Restart returns to its start. It's **view state** — it
+  bounds the loop, never evaluation — so it isn't saved with the document and
+  resets when a comp opens. Scrubbing and frame-stepping still reach the whole
+  comp (only *looping* is confined), so you can inspect a frame outside the band
+  while paused. See *The work area* below.
 - **Layers** (left) — scene tree; select, reorder (▲/▼), add Rect/Ellipse/Group,
   delete (✕), Save…/Load… (`.pbc` JSON via serde — document *and* panel layout).
 - **Properties** (right) — resolved values for the selection; drag or click-type
@@ -586,13 +669,20 @@ order past #5* below (pre-comps first). The stages of each item:
      box's kind menu seeds it, and edits route through the same `GraphOp` /
      `apply_graph_op` path as every other node, so the whole flow is unit-tested.
 
-**Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps
-→ document-wide property graph → Blender-standard graph UI → the Nuke-style
-*image* graph. Pre-comps come before the big graph because a comp *is* a graph
-node, so building the graph first means rebuilding it; the image graph is last
-because it needs the raster compositor stage below, which isn't built. Note the
-distinction: today's graph is a **property** graph (values into properties);
-Nuke's is an **image** graph (operations on pixels). They're different machines.
+**Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps ✅
+→ document-wide property graph ✅ → Blender-standard graph UI (in progress) →
+the Nuke-style *image* graph. Pre-comps come before the big graph because a comp
+*is* a graph node, so building the graph first means rebuilding it; the image
+graph is last because it needs the raster compositor stage below, which isn't
+built. Note the distinction: today's graph is a **property** graph (values into
+properties); Nuke's is an **image** graph (operations on pixels). They're
+different machines.
+
+> **Graph-UI progress (2026-07-20):** module bodies now have a real editing
+> surface — you open a module from the graph panel and edit its body + knobs on
+> the same node canvas a property uses (see *Editing a module body* above). Still
+> open under this step: seeding a fresh `Use` link from the kind picker, and a
+> nested canvas for override sub-expressions at a call site.
 
 > Two riders on this order, both feeding the *reusable animation modules* feature
 > spec'd in the design section below: the **pre-comps** step also introduces the
@@ -801,9 +891,15 @@ sample at a shifted time — the exact mechanism local time needs.
   - Slip's only feedback is the local-0 marker inside the bar (the bar itself
     doesn't move), so when `start` slips out of the visible clip the marker
     becomes a `<`/`>` pinned to the edge it went past rather than vanishing.
-  - Not to be confused with **AE's work area**, which PBC doesn't have: that is
-    a comp-level *preview/render* range (view state), while these are per-layer
-    in/out points that change evaluation (document state).
+  - Not to be confused with **AE's work area** (now built — see *The work area*
+    below): that is a comp-level *preview* range (view state), while these are
+    per-layer in/out points that change evaluation (document state).
+  - **Out-of-bounds is allowed, by decision (2026-07-20):** `drag_clip` has no
+    upper clamp against the comp's duration, so a layer's `out` can extend past
+    the comp end — a layer **may outlive the comp**, as in AE. It's harmless
+    (eval is half-open `[in, out)` and the comp only renders `[0, duration)`, so
+    the overhang never draws) and keeps `drag_clip` a pure function of the clip.
+    Pinned by a test so a future clamp can't slip in unnoticed.
   - **Known limit, deliberate:** local time is `comp_frame − start`, so a timed
     layer nested under another timed layer reads *comp* time, not its parent's
     local time. Nested time is a comp-level concern — Stage 3's business.

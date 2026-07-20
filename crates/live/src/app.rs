@@ -65,6 +65,14 @@ pub(crate) struct App {
     pub(crate) canvas_rect: Option<kurbo::Rect>,
     /// Next unused node id, for shapes created in-app.
     pub(crate) next_id: u64,
+    /// The module whose body is open on the graph canvas, if any. View state —
+    /// which module you're editing isn't part of the document. A delete clears
+    /// it (see the graph-op apply) so it can't dangle.
+    pub(crate) editing_module: Option<ModuleId>,
+    /// AE's work area: a comp-level *preview* range that bounds the playback
+    /// loop. View state, like `view` — reset when a comp opens, never saved with
+    /// the document. `None` = the whole comp. Set with `B`/`N` at the playhead.
+    pub(crate) work_area: Option<WorkArea>,
 }
 
 /// The largest node id in a subtree, for seeding the id counter.
@@ -121,23 +129,63 @@ impl App {
             comp_name_buf: String::new(),
             canvas_rect: None,
             next_id,
+            editing_module: None,
+            work_area: None,
+        }
+    }
+
+    /// The playback loop's frame bounds `[lo, hi)` — the work area clamped into
+    /// the comp, or the whole comp.
+    pub(crate) fn loop_bounds_frames(&self) -> (i64, i64) {
+        loop_bounds(self.work_area, self.doc().duration_frames())
+    }
+
+    /// The same bounds in seconds, for the wall-clock playback loop. The
+    /// no-work-area case returns the comp's exact `duration` (not a frame
+    /// round-trip) so playback timing is byte-for-byte what it was before work
+    /// areas existed.
+    fn loop_bounds_secs(&self) -> (f64, f64) {
+        match self.work_area {
+            None => (0.0, self.doc().duration),
+            Some(_) => {
+                let tb = self.doc().timebase();
+                let (lo, hi) = self.loop_bounds_frames();
+                (tb.frames_to_seconds(lo as f64), tb.frames_to_seconds(hi as f64))
+            }
         }
     }
 
     /// Current looped position on the wall clock, in seconds. Continuous — this
     /// is the clock, not the frame grid. Use `current_frame` / `current_time`
     /// for anything that evaluates or displays.
+    ///
+    /// **While playing**, the wall clock folds into the work-area span, so a
+    /// preview loops within it. **While paused**, the playhead sits exactly
+    /// where it was placed (wrapped only at the comp bounds) — so you can still
+    /// scrub *outside* the work area to inspect a frame, the way AE lets you.
     pub(crate) fn raw_time(&self) -> f64 {
-        let raw = if self.playing {
-            self.anchor.elapsed().as_secs_f64()
+        if self.playing {
+            let (lo, hi) = self.loop_bounds_secs();
+            wrap_into(self.anchor.elapsed().as_secs_f64(), lo, hi)
+        } else if self.doc().duration > 0.0 {
+            self.paused_t.rem_euclid(self.doc().duration)
         } else {
             self.paused_t
-        };
-        if self.doc().duration > 0.0 {
-            raw.rem_euclid(self.doc().duration)
-        } else {
-            raw
         }
+    }
+
+    /// Set the work area's start (`B`) or end (`N`) at `frame`. Thin wrappers
+    /// over the pure `with_work_*` (which own the seeding + clamping, so it's
+    /// unit-tested); a degenerate range is re-clamped by `loop_bounds` at read
+    /// time, so the loop span can never invert.
+    pub(crate) fn set_work_start(&mut self, frame: i64) {
+        let total = self.doc().duration_frames();
+        self.work_area = Some(with_work_start(self.work_area, frame, total));
+    }
+
+    pub(crate) fn set_work_end(&mut self, frame: i64) {
+        let total = self.doc().duration_frames();
+        self.work_area = Some(with_work_end(self.work_area, frame, total));
     }
 
     /// The frame the playhead currently sits on.
@@ -298,7 +346,19 @@ impl ApplicationHandler for App {
                         self.playing = false;
                         self.seek_frame(self.current_frame() - 1);
                     }
-                    Key::Character(ref s) if s == "r" || s == "R" => self.seek_frame(0),
+                    Key::Character(ref s) if s == "r" || s == "R" => {
+                        // Restart the *preview*: to the work-area start, not
+                        // always frame 0.
+                        self.seek_frame(self.loop_bounds_frames().0);
+                    }
+                    // AE's work-area keys: B sets the start at the playhead, N
+                    // the end. View state — nothing in the document changes.
+                    Key::Character(ref s) if s == "b" || s == "B" => {
+                        self.set_work_start(self.current_frame());
+                    }
+                    Key::Character(ref s) if s == "n" || s == "N" => {
+                        self.set_work_end(self.current_frame());
+                    }
                     Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
                         self.delete_selected_keys();
                     }
@@ -684,6 +744,8 @@ impl App {
             (max_id(&comp.root) + 1, comp.duration_frames(), comp.name.clone());
         self.next_id = next_id;
         self.view = TimelineView::full(frames);
+        // The work area is per-comp view state; a fresh open starts with none.
+        self.work_area = None;
         self.comp_name_buf = name;
         self.selected = None;
         self.selected_keys.clear();
@@ -785,6 +847,8 @@ impl App {
         let open = project.root_comp();
         self.next_id = max_id(&open.root) + 1;
         self.view = TimelineView::full(open.duration_frames());
+        // The work area is view state, not saved with the document.
+        self.work_area = None;
         self.project = project;
         self.current = self.project.root;
         self.selected = None;
@@ -873,9 +937,15 @@ impl App {
         let clip = sel_node
             .filter(|n| Some(n.id) != Some(self.doc().root.id))
             .map(|n| ClipInfo { timing: n.timing });
-        // Snapshot for the graph panel (clones the selected node's expressions).
-        let graph_info =
-            GraphInfo::gather(self.doc(), &self.project.modules, self.selected, t);
+        // Snapshot for the graph panel (clones the selected node's expressions
+        // and the module body being edited, if any).
+        let graph_info = GraphInfo::gather(
+            self.doc(),
+            &self.project.modules,
+            self.selected,
+            self.editing_module,
+            t,
+        );
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -904,6 +974,7 @@ impl App {
         let duration = self.doc().duration;
         let timebase = self.doc().timebase();
         let view = self.view;
+        let work_area = self.work_area;
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
@@ -974,6 +1045,7 @@ impl App {
                         view,
                         &selected_keys,
                         clip,
+                        work_area,
                         &mut dope,
                     ),
                     Editor::Properties => {
@@ -986,12 +1058,25 @@ impl App {
                 &mut dock_cmd,
             );
         });
-        // Apply a graph edit (promote/bake/tree change) after the UI pass.
+        // Open/close a module for editing (view state) before applying any op,
+        // so a delete-then-nothing leaves the panel in a sane place.
+        if let Some(change) = graph_edits.edit_module.take() {
+            self.editing_module = change;
+            window.request_redraw();
+        }
+        // Apply a graph edit (promote/bake/tree change, or a module-body edit)
+        // after the UI pass. Node-scoped ops no-op without a selection; module
+        // ops don't need one, so this runs regardless.
         if let Some(op) = graph_edits.op.take() {
-            if let Some(id) = self.selected {
-                apply_graph_op(&mut self.project, self.current, id, op, frame);
-                window.request_redraw();
+            // A module delete must also close it if it was the one open, or the
+            // panel would keep editing a body that no longer exists.
+            if let GraphOp::DeleteModule { module } = &op {
+                if self.editing_module == Some(*module) {
+                    self.editing_module = None;
+                }
             }
+            apply_graph_op(&mut self.project, self.current, self.selected, op, frame);
+            window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area
         // header asked to. Doing it here (not mid-pass) keeps the panels and
@@ -1108,7 +1193,9 @@ impl App {
             self.toggle_play();
         }
         if transport.restart {
-            self.seek_frame(0);
+            // Restart the preview at the work-area start (frame 0 when there's
+            // no work area), matching the R key.
+            self.seek_frame(self.loop_bounds_frames().0);
         }
         if let Some(nf) = transport.scrub_to.or(dope.seek_to) {
             self.playing = false;

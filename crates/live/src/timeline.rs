@@ -217,6 +217,14 @@ pub(crate) fn clip_grab_at(px: f32, left: f32, right: f32, handle_w: f32, alt: b
 /// Apply a drag of `delta` frames to `t`, given what the drag grabbed. Trims
 /// clamp against each other (a clip can't be shorter than one frame) and `in_`
 /// clamps at 0; sliding can't push the clip before frame 0 either.
+///
+/// **Deliberately comp-agnostic** (decided 2026-07-20): there is *no* upper
+/// clamp against the comp's duration, so a layer's `out` may extend past the
+/// comp end — a layer **may outlive the comp**, as in AE. It costs nothing
+/// (evaluation is half-open `[in, out)` and the comp only renders `[0,
+/// duration)`, so the overhang simply never draws) and keeps this a pure
+/// function of the clip, needing no duration threaded in. If a hard clamp is
+/// ever wanted, it belongs at the call site with the comp in hand, not here.
 pub(crate) fn drag_clip(t: LayerTiming, grab: ClipGrab, delta: i64) -> LayerTiming {
     match grab {
         ClipGrab::TrimIn => LayerTiming { in_: (t.in_ + delta).clamp(0, t.out - 1), ..t },
@@ -258,6 +266,67 @@ impl TimelineView {
         let start = self.start.clamp(0.0, (total - visible).max(0.0));
         Self { start, visible }
     }
+}
+
+/// AE's **work area**: a comp-level preview range in frames, half-open
+/// `[start, end)`. This is **view state** — it bounds *playback looping*, never
+/// evaluation — so it's deliberately not saved with the document (unlike a
+/// layer's in/out, which is document state that changes the frame). `None` on
+/// `App` means the whole comp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkArea {
+    pub(crate) start: i64,
+    /// Exclusive — the last previewed frame is `end - 1`, matching the layer
+    /// clip's half-open window so "the frame at the end" isn't double-counted.
+    pub(crate) end: i64,
+}
+
+/// The playback loop's frame bounds `[lo, hi)`: the work area clamped into the
+/// comp, or the whole comp when there's none. Pure, so the clamping is
+/// unit-tested rather than only exercised by playing. `hi > lo` always, so the
+/// span is never empty.
+pub(crate) fn loop_bounds(work_area: Option<WorkArea>, total_frames: i64) -> (i64, i64) {
+    let total = total_frames.max(1);
+    match work_area {
+        Some(wa) => {
+            let lo = wa.start.clamp(0, total - 1);
+            let hi = wa.end.clamp(lo + 1, total);
+            (lo, hi)
+        }
+        None => (0, total),
+    }
+}
+
+/// Fold an absolute playback time `raw` into a loop span `[lo, hi)` (any unit,
+/// here seconds). This is what makes playback cycle within the work area; a
+/// span that collapsed to zero holds at `lo` rather than dividing by it.
+pub(crate) fn wrap_into(raw: f64, lo: f64, hi: f64) -> f64 {
+    let span = hi - lo;
+    if span > 0.0 {
+        lo + (raw - lo).rem_euclid(span)
+    } else {
+        lo
+    }
+}
+
+/// The work area after setting its **start** at `frame` (AE's `B`). The other
+/// edge is seeded from the comp extent on the first press, so one keystroke
+/// makes a valid range. Pure, so the seeding is unit-tested. `loop_bounds`
+/// re-clamps at read time, so a start dragged past the end still can't invert
+/// the loop.
+pub(crate) fn with_work_start(current: Option<WorkArea>, frame: i64, total_frames: i64) -> WorkArea {
+    let total = total_frames.max(1);
+    let end = current.map_or(total, |w| w.end);
+    WorkArea { start: frame.clamp(0, total - 1), end }
+}
+
+/// The work area after setting its **end** at `frame` (AE's `N`). The end is
+/// exclusive, so `frame` stays the last previewed frame; the start is seeded
+/// from 0 on the first press.
+pub(crate) fn with_work_end(current: Option<WorkArea>, frame: i64, total_frames: i64) -> WorkArea {
+    let total = total_frames.max(1);
+    let start = current.map_or(0, |w| w.start);
+    WorkArea { start, end: (frame + 1).clamp(1, total) }
 }
 
 /// Maps frames to pixels across one track's inset width. Built once from the
@@ -343,6 +412,7 @@ pub(crate) const EDGE_PAN_W: f32 = 36.0;
 /// Bottom dopesheet: one row per animated property, keyframes drawn as diamonds
 /// along a shared time axis with a playhead line. Click a row's track to seek;
 /// click a diamond to select it (Delete removes); drag a diamond to move it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dopesheet_ui(
     ui: &mut egui::Ui,
     rows: &[DopeRow],
@@ -352,6 +422,7 @@ pub(crate) fn dopesheet_ui(
     view: TimelineView,
     selected_keys: &KeySelection,
     clip: Option<ClipInfo>,
+    work_area: Option<WorkArea>,
     out: &mut DopeEdits,
 ) {
     ui.add_space(4.0);
@@ -360,7 +431,7 @@ pub(crate) fn dopesheet_ui(
         ui.strong("Timeline");
         ui.weak(
             "— ctrl+click or drag a box to multi-select, drag to move them \
-             together, ctrl+C/V copies, Del removes",
+             together, ctrl+C/V copies, Del removes, B/N set the preview range",
         );
     });
     ui.separator();
@@ -393,6 +464,30 @@ pub(crate) fn dopesheet_ui(
         axis = Some(a);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+
+        // Work-area band: a translucent strip over the previewed range, with a
+        // brighter tick at each edge. Drawn under the ticks/playhead so it reads
+        // as a background wash, not a foreground marker. Only when one is set —
+        // no work area means "the whole comp", which needs no band.
+        if let Some(wa) = work_area {
+            let (lo, hi) = loop_bounds(Some(wa), last_frame + 1);
+            let (x0, x1) = (a.frame_to_x(lo as f64), a.frame_to_x(hi as f64));
+            let band = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.top()),
+                egui::pos2(x1, rect.bottom()),
+            )
+            .intersect(rect);
+            painter.rect_filled(band, 0.0, egui::Color32::from_rgba_unmultiplied(80, 150, 235, 46));
+            let edge = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 245));
+            for x in [x0, x1] {
+                if rect.x_range().contains(x) {
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        edge,
+                    );
+                }
+            }
+        }
 
         // Ticks. Minor ticks appear only once frames are far enough
         // apart to be legible as individual frames.
