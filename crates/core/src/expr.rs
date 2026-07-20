@@ -234,6 +234,10 @@ pub enum Expr {
     /// a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`). A leaf: it
     /// pulls its inputs from `frame`, not from wired-in child nodes.
     Script(String),
+    /// The layer's own clock: local frame, in/out point, or normalized progress.
+    /// A leaf, like a literal, but one whose value depends on *which layer* is
+    /// resolving — which is what lets one expression fit itself to any clip.
+    Time(TimeSource),
     /// A procedural generator — a typed-knob motion primitive (oscillator, noise,
     /// ramp, bounce) that computes a number from the frame, without a script. Its
     /// knobs are themselves `Expr`s (children in the graph), so a knob can be a
@@ -241,6 +245,54 @@ pub enum Expr {
     /// after parameters. Always resolves to a `Num`; feed it through `Mul` to
     /// broadcast onto a vec/colour property.
     Gen(Generator),
+}
+
+/// Which reading of the current layer's clock an [`Expr::Time`] takes.
+///
+/// **Everything here is in layer-local frames**, not comp frames — the same
+/// domain the layer's keyframes are authored in (see [`crate::node::LayerTiming`]).
+/// So `InPoint` is where the layer becomes visible *relative to its own frame
+/// 0*, and an expression written against these reads identically on two clips
+/// with different in-points. That is the whole point: one animation, auto-fitted.
+///
+/// A layer with no timing has local time = comp time, so it reads `In = 0` and
+/// `Out = ` the comp duration — an untimed layer behaves as if it were one clip
+/// spanning the composition, which keeps `T01` meaningful everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeSource {
+    /// The current local frame — `frame`, but explicit about whose clock it is.
+    Local,
+    /// First local frame the layer draws on.
+    In,
+    /// First local frame it no longer draws on (exclusive).
+    Out,
+    /// Progress through the layer, `0` at the in-point and `1` at the out-point,
+    /// clamped outside. The piece that makes "ease over the first/last N frames"
+    /// fit any clip length without touching a keyframe.
+    T01,
+}
+
+impl TimeSource {
+    /// The name a picker shows and a printed expression reads as. Matches the
+    /// identifier a Rhai script uses for the same reading, so the graph and the
+    /// script spellings are one vocabulary.
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeSource::Local => "localTime",
+            TimeSource::In => "inPoint",
+            TimeSource::Out => "outPoint",
+            TimeSource::T01 => "t01",
+        }
+    }
+
+    pub fn kind(self) -> ExprKind {
+        match self {
+            TimeSource::Local => ExprKind::LocalTime,
+            TimeSource::In => ExprKind::InPoint,
+            TimeSource::Out => ExprKind::OutPoint,
+            TimeSource::T01 => ExprKind::T01,
+        }
+    }
 }
 
 /// A periodic waveform for [`Generator::Oscillator`]. Sampled over a phase in
@@ -488,6 +540,7 @@ impl Expr {
             Expr::Neg(..) => ExprKind::Neg,
             Expr::Param { .. } => ExprKind::Param,
             Expr::Script(_) => ExprKind::Script,
+            Expr::Time(t) => t.kind(),
             Expr::Gen(g) => g.kind(),
         }
     }
@@ -509,6 +562,10 @@ impl Expr {
             ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
             ExprKind::Param => Expr::Param { node: None, name: String::new() },
             ExprKind::Script => Expr::Script(String::new()),
+            ExprKind::LocalTime => Expr::Time(TimeSource::Local),
+            ExprKind::InPoint => Expr::Time(TimeSource::In),
+            ExprKind::OutPoint => Expr::Time(TimeSource::Out),
+            ExprKind::T01 => Expr::Time(TimeSource::T01),
             ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {
                 Expr::Gen(Generator::seed(kind))
             }
@@ -522,7 +579,11 @@ impl Expr {
             Expr::Add(..) | Expr::Mul(..) => 2,
             Expr::Neg(..) => 1,
             Expr::Gen(g) => g.arity(),
-            Expr::Lit(_) | Expr::Ref { .. } | Expr::Param { .. } | Expr::Script(_) => 0,
+            Expr::Lit(_)
+            | Expr::Ref { .. }
+            | Expr::Param { .. }
+            | Expr::Script(_)
+            | Expr::Time(_) => 0,
         }
     }
 
@@ -588,6 +649,10 @@ pub enum ExprKind {
     Neg,
     Param,
     Script,
+    LocalTime,
+    InPoint,
+    OutPoint,
+    T01,
     Oscillator,
     Noise,
     Ramp,
@@ -596,7 +661,7 @@ pub enum ExprKind {
 
 impl ExprKind {
     /// Every kind, in picker order — the generators grouped after the primitives.
-    pub const ALL: [ExprKind; 11] = [
+    pub const ALL: [ExprKind; 15] = [
         ExprKind::Lit,
         ExprKind::Ref,
         ExprKind::Add,
@@ -604,6 +669,10 @@ impl ExprKind {
         ExprKind::Neg,
         ExprKind::Param,
         ExprKind::Script,
+        ExprKind::LocalTime,
+        ExprKind::InPoint,
+        ExprKind::OutPoint,
+        ExprKind::T01,
         ExprKind::Oscillator,
         ExprKind::Noise,
         ExprKind::Ramp,
@@ -619,6 +688,10 @@ impl ExprKind {
             ExprKind::Neg => "neg",
             ExprKind::Param => "param",
             ExprKind::Script => "script",
+            ExprKind::LocalTime => "localTime",
+            ExprKind::InPoint => "inPoint",
+            ExprKind::OutPoint => "outPoint",
+            ExprKind::T01 => "t01",
             ExprKind::Oscillator => "osc",
             ExprKind::Noise => "noise",
             ExprKind::Ramp => "ramp",
@@ -661,6 +734,7 @@ impl fmt::Display for Expr {
             Expr::Param { node: None, name } => write!(f, "param({name})"),
             Expr::Param { node: Some(n), name } => write!(f, "param(#{}, {name})", n.0),
             Expr::Script(src) => write!(f, "{{ {src} }}"),
+            Expr::Time(t) => f.write_str(t.label()),
             Expr::Gen(g) => write!(f, "{g}"),
         }
     }
@@ -893,11 +967,20 @@ pub fn eval_script(src: &str, frame: f64) -> Result<ExprValue, String> {
 /// value so a bad script never breaks the frame.
 pub fn eval_script_ctx(src: &str, ctx: &mut EvalCtx<'_>) -> Result<ExprValue, String> {
     let frame = ctx.frame;
+    // Read the layer clock before parking the context — the same four readings
+    // `Expr::Time` exposes, under the same names, so a script and a graph node
+    // are two spellings of one vocabulary.
+    let (in_point, out_point) = ctx.local_window();
+    let t01 = ctx.time_source(TimeSource::T01);
     let _parked = bridge::enter(ctx);
     SCRIPT_ENGINE.with(|engine| {
         let mut scope = rhai::Scope::new();
         scope.push_constant("frame", frame);
         scope.push_constant("time", frame);
+        scope.push_constant("localTime", frame);
+        scope.push_constant("inPoint", in_point);
+        scope.push_constant("outPoint", out_point);
+        scope.push_constant("t01", t01);
         let out: rhai::Dynamic =
             engine.eval_with_scope(&mut scope, src).map_err(|e| e.to_string())?;
         dynamic_to_expr_value(&out)
@@ -974,6 +1057,11 @@ pub struct EvalCtx<'a> {
     /// timing. Layer-local time is derived from this; expressions that want
     /// comp time (and the timeline UI) read it directly.
     pub comp_frame: f64,
+    /// The timing of the layer currently resolving, so [`Expr::Time`] can read
+    /// its in/out points. `None` = the layer has no range, which reads as a
+    /// clip spanning the whole composition. Saved and restored by `walk`
+    /// alongside `frame`, for the same reason.
+    pub timing: Option<crate::node::LayerTiming>,
     /// The document, for cross-property references. `None` for a context that
     /// only samples constants/keyframes (a value with no expressions) — a
     /// `Ref` then resolves to its neutral fallback.
@@ -992,6 +1080,7 @@ impl<'a> EvalCtx<'a> {
         Self {
             frame,
             comp_frame: frame,
+            timing: None,
             doc: Some(doc),
             cache: ResolveCache::default(),
             warnings: Vec::new(),
@@ -1006,10 +1095,43 @@ impl<'a> EvalCtx<'a> {
         Self {
             frame,
             comp_frame: frame,
+            timing: None,
             doc: None,
             cache: ResolveCache::default(),
             warnings: Vec::new(),
             current: None,
+        }
+    }
+
+    /// The current layer's `[in, out)` window **in local frames** — the domain
+    /// its keyframes and expressions are authored in.
+    ///
+    /// A layer with no timing falls back to `[0, comp duration)`: local time is
+    /// comp time for it, so it reads as one clip spanning the composition and
+    /// `t01` stays meaningful. With no document either (a bare `EvalCtx::at`),
+    /// the window is empty and `t01` is 0 — there is nothing to be a fraction of.
+    pub fn local_window(&self) -> (f64, f64) {
+        match self.timing {
+            Some(t) => ((t.in_ - t.start) as f64, (t.out - t.start) as f64),
+            None => (0.0, self.doc.map_or(0.0, |d| d.duration_frames() as f64)),
+        }
+    }
+
+    /// Read one of the layer-clock sources. `T01` clamps, and a zero-length
+    /// window reads 0 rather than dividing by zero.
+    pub fn time_source(&self, which: TimeSource) -> f64 {
+        let (in_, out) = self.local_window();
+        match which {
+            TimeSource::Local => self.frame,
+            TimeSource::In => in_,
+            TimeSource::Out => out,
+            TimeSource::T01 => {
+                if out <= in_ {
+                    0.0
+                } else {
+                    ((self.frame - in_) / (out - in_)).clamp(0.0, 1.0)
+                }
+            }
         }
     }
 
@@ -1241,6 +1363,8 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
                 ExprValue::Num(0.0)
             }
         },
+        // Like a generator, the layer clock is always a scalar.
+        Expr::Time(which) => ExprValue::Num(ctx.time_source(*which)),
         // A generator always produces a scalar; a vec/colour property broadcasts
         // it through the same `Num` edge a literal number would.
         Expr::Gen(g) => ExprValue::Num(g.eval(ctx)),
@@ -1364,6 +1488,21 @@ mod tests {
         assert!(matches!(back, Value::Expr(Expr::Ref { .. })));
     }
 
+    /// A layer-clock leaf has to survive a `.pbc` round-trip like any other
+    /// expression — it's a saved document's contents, not just a runtime value.
+    #[test]
+    fn a_time_source_round_trips_through_json() {
+        for src in [TimeSource::Local, TimeSource::In, TimeSource::Out, TimeSource::T01] {
+            let v: Value<f64> = Value::expr(Expr::Time(src));
+            let json = serde_json::to_string(&v).unwrap();
+            let back: Value<f64> = serde_json::from_str(&json).unwrap();
+            match back {
+                Value::Expr(Expr::Time(got)) => assert_eq!(got, src),
+                other => panic!("{src:?} came back as {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn seed_matches_its_kind_and_arity() {
         for k in ExprKind::ALL {
@@ -1372,7 +1511,15 @@ mod tests {
             let expected = match k {
                 ExprKind::Add | ExprKind::Mul => 2,
                 ExprKind::Neg => 1,
-                ExprKind::Lit | ExprKind::Ref | ExprKind::Param | ExprKind::Script => 0,
+                // Leaves: a literal, a lookup, or a reading of the layer clock.
+                ExprKind::Lit
+                | ExprKind::Ref
+                | ExprKind::Param
+                | ExprKind::Script
+                | ExprKind::LocalTime
+                | ExprKind::InPoint
+                | ExprKind::OutPoint
+                | ExprKind::T01 => 0,
                 // Generators carry their own knob count — assert it's non-empty
                 // and matches the labels, checked in full elsewhere.
                 ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {

@@ -747,7 +747,26 @@ sample at a shifted time — the exact mechanism local time needs.
   save/restore. Serde `default` covers migration (no `migrate()` change);
   trim/slip eval + round-trip tests. UI: in/out clip bars in the timeline (lean
   on the existing `ClipTrack`/`tracks` scaffold), drag to trim/slide.
-- **Stage 2 — local-time expression sources** (small, rides on Stage 1).
+- ~~**Stage 2 — local-time expression sources**~~ ✅ Done (2026-07-19).
+  `Expr::Time(TimeSource)` — `Local` / `In` / `Out` / `T01` — plus `localTime`,
+  `inPoint`, `outPoint` and `t01` in the Rhai scope. One vocabulary, two
+  spellings: `TimeSource::label()` is the identifier a script uses, so a graph
+  node and a script name the same reading the same way.
+  - **Everything is in layer-*local* frames**, matching the domain keyframes are
+    authored in — so `inPoint` is the in-point relative to the layer's own frame
+    0, and an expression reads identically on two clips with different
+    in-points. (AE's `inPoint` is comp-time; local is the coherent choice here
+    because Stage 1 made keyframes local.)
+  - An **untimed layer reads the comp as its window** (`in = 0`,
+    `out = duration_frames`), so `t01` is meaningful before anything is trimmed
+    rather than degenerating to 0.
+  - `EvalCtx.timing` carries the current layer's window, saved/restored by
+    `walk` beside `frame` — so a nested layer reads its own clock, not an
+    ancestor's.
+  - Proven by the test that motivated the feature: two clips of *different
+    lengths* share one expression (`opacity = t01`) and each fades across its
+    own duration, with no keyframes and nothing clip-specific in the expression.
+- The plan as written: **local-time expression sources** (small, rides on Stage 1).
   `Expr::LocalTime / InPoint / OutPoint` + a `t01` convenience
   (`clamp((frame−in)/(out−in), 0, 1)`), and `inPoint`/`outPoint`/`localTime` in
   the Rhai scope. Now "ease in over the first N frames, hold, ease out over the

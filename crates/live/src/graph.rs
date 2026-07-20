@@ -210,6 +210,8 @@ pub(crate) fn box_height(expr: &Expr, labeled: bool) -> f32 {
         Expr::Lit(_) => 50.0,
         Expr::Gen(Generator::Oscillator { .. }) => 56.0,
         Expr::Gen(_) => 30.0,
+        // A layer-clock leaf has no controls at all — it *is* its kind picker.
+        Expr::Time(_) => 30.0,
         Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
     };
     base + if labeled { GRAPH_LABEL_H } else { 0.0 }
@@ -646,6 +648,9 @@ Rhai. Return a number, or an array: [x, y] or [r, g, b(, a)].
 
 In scope:
   frame, time          the current frame
+  localTime            …in this layer's own time
+  inPoint, outPoint    this layer's local in/out
+  t01                  0 at in, 1 at out (clamped)
   value(\"node\", \"prop\")            another node's property
   value_at(\"node\", \"prop\", frame)  …at another frame
   wiggle(freq, amp)               smooth noise, deterministic

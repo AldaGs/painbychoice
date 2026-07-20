@@ -60,8 +60,12 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, 
     // restored around the whole subtree (the same mechanism `resolve_target`
     // uses for off-time sampling) so a sibling can't inherit the shift.
     let prev_frame = ctx.frame;
+    let prev_timing = ctx.timing;
     if let Some(timing) = &node.timing {
         ctx.frame = timing.local_frame(ctx.comp_frame);
+        // Also publish the window, so `Expr::Time` (in/out/t01) reads *this*
+        // layer's clock rather than an ancestor's.
+        ctx.timing = Some(*timing);
     }
 
     // Everything resolved below belongs to this node, so a warning raised deep
@@ -106,6 +110,7 @@ fn walk(node: &Node, parent_xf: Affine, parent_opacity: f64, ctx: &mut EvalCtx, 
     }
 
     ctx.frame = prev_frame;
+    ctx.timing = prev_timing;
 }
 
 #[cfg(test)]
@@ -394,6 +399,95 @@ mod tests {
         };
         assert!((x(1) - 60.0).abs() < 1e-6, "shifted layer at local 6");
         assert!((x(2) - 120.0).abs() < 1e-6, "sibling still at comp frame 12");
+    }
+
+    /// **The Stage 2 payoff.** Two clips of *different lengths* share one
+    /// expression — opacity = `t01` — and each fades across its own duration.
+    /// No keyframes, and nothing about the expression mentions either clip.
+    #[test]
+    fn one_expression_fits_itself_to_each_clips_length() {
+        use crate::expr::{Expr, TimeSource};
+        use crate::node::LayerTiming;
+        let clip = |id: u64, in_: i64, out: i64| {
+            Node::shape(
+                id,
+                "clip",
+                Shape::Rect {
+                    size: Value::constant(Vec2::new(10.0, 10.0)),
+                    radius: Value::constant(0.0),
+                },
+            )
+            .with_timing(LayerTiming::new(in_, out))
+            .with_transform(Transform {
+                opacity: Value::expr(Expr::Time(TimeSource::T01)),
+                ..Transform::default()
+            })
+        };
+        // A short clip and a long one, starting at different comp frames.
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(clip(1, 0, 10)).with_child(clip(2, 100, 200)),
+        );
+
+        let opacity_of = |frame: f64, id: u64| {
+            evaluate(&doc, frame).items.iter().find(|i| i.source == NodeId(id)).unwrap().opacity
+        };
+        // Halfway through each clip — 5 frames into one, 50 into the other —
+        // both are at 0.5, because each measures against its own length.
+        assert!((opacity_of(5.0, 1) - 0.5).abs() < 1e-9, "short clip midpoint");
+        assert!((opacity_of(150.0, 2) - 0.5).abs() < 1e-9, "long clip midpoint");
+        // And each starts at 0.
+        assert!(opacity_of(0.0, 1).abs() < 1e-9);
+        assert!(opacity_of(100.0, 2).abs() < 1e-9);
+    }
+
+    /// The same thing through the Rhai scope rather than the IR — the two
+    /// spellings have to agree, since they're one vocabulary.
+    #[test]
+    fn a_script_reads_the_same_layer_clock() {
+        use crate::expr::Expr;
+        use crate::node::LayerTiming;
+        let square = Node::shape(
+            1,
+            "s",
+            Shape::Rect { size: Value::constant(Vec2::new(10.0, 10.0)), radius: Value::constant(0.0) },
+        )
+        .with_timing(LayerTiming::new(20, 60))
+        .with_transform(Transform {
+            // Local in/out are 0/40 here, so this reads (localTime + in + out).
+            opacity: Value::expr(Expr::Script("(localTime + inPoint + outPoint) / 100.0".into())),
+            ..Transform::default()
+        });
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square));
+
+        // Comp frame 30 → local 10, inPoint 0, outPoint 40 → 50/100.
+        let scene = evaluate(&doc, 30.0);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        assert!((scene.items[0].opacity - 0.5).abs() < 1e-9, "{}", scene.items[0].opacity);
+    }
+
+    /// An untimed layer still has a meaningful clock: it reads as one clip
+    /// spanning the composition, so `t01` works before any trimming exists.
+    #[test]
+    fn an_untimed_layer_reads_the_comp_as_its_window() {
+        use crate::expr::{Expr, TimeSource};
+        let square = Node::shape(
+            1,
+            "s",
+            Shape::Rect { size: Value::constant(Vec2::new(10.0, 10.0)), radius: Value::constant(0.0) },
+        )
+        .with_transform(Transform {
+            opacity: Value::expr(Expr::Time(TimeSource::T01)),
+            ..Transform::default()
+        });
+        let mut doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square));
+        doc.fps = 10.0;
+        doc.duration = 10.0; // 100 frames
+        assert_eq!(doc.duration_frames(), 100);
+
+        assert!((evaluate(&doc, 50.0).items[0].opacity - 0.5).abs() < 1e-9);
+        assert!((evaluate(&doc, 100.0).items[0].opacity - 1.0).abs() < 1e-9);
     }
 
     /// Serde `default` *is* the migration: a `.pbc` written before layer timing
