@@ -84,6 +84,8 @@ fn eval_comp(
     // Each comp gets its own resolve context: its cache and name lookups are
     // scoped to its own tree, which is exactly what "a comp is a boundary" means.
     let mut ctx = EvalCtx::new(comp, frame);
+    // Modules are project-wide: the same definition resolves from any comp.
+    ctx.modules = Some(&project.modules);
     stack.push(id);
     walk(&comp.root, xf, opacity, &mut ctx, Some(project), stack, scene);
     stack.pop();
@@ -818,6 +820,191 @@ mod tests {
             "{:?}",
             scene.warnings
         );
+    }
+
+
+    // --- Shared animation modules (the document-wide property graph) ---
+
+    /// **The story this feature exists for.** Three "subtitles" of different
+    /// lengths and in-points all link *one* module for their fade. Each plays it
+    /// fitted to its own clip, because the module's body reads `t01` and `t01`
+    /// is whichever layer is resolving.
+    #[test]
+    fn one_module_drives_many_layers_each_fitted_to_its_own_clip() {
+        use crate::expr::{Expr, TimeSource};
+        use crate::node::{LayerTiming, Module, Project};
+
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "root")));
+        let comp_id = project.root;
+        // The module: opacity = t01. One definition, mentioning no layer.
+        let fade = project.add_module(Module::new("fade", Expr::Time(TimeSource::T01)));
+
+        let subtitle = |id: u64, in_: i64, out: i64| {
+            dot(id).with_timing(LayerTiming::new(in_, out)).with_transform(Transform {
+                opacity: Value::expr(Expr::Use { module: fade, overrides: Vec::new() }),
+                ..Transform::default()
+            })
+        };
+        let root = &mut project.comp_mut(comp_id).unwrap().root;
+        root.children.push(subtitle(1, 0, 10));
+        root.children.push(subtitle(2, 100, 200));
+        root.children.push(subtitle(3, 300, 340));
+
+        let opacity_at = |frame: f64, id: u64| {
+            evaluate_comp(&project, comp_id, frame)
+                .items
+                .iter()
+                .find(|i| i.source == NodeId(id))
+                .map(|i| i.opacity)
+        };
+        // Halfway through each clip - 5, 50 and 20 frames in - all read 0.5.
+        assert!((opacity_at(5.0, 1).unwrap() - 0.5).abs() < 1e-9);
+        assert!((opacity_at(150.0, 2).unwrap() - 0.5).abs() < 1e-9);
+        assert!((opacity_at(320.0, 3).unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    /// Editing the module in one place changes every link - the point of a
+    /// module over copied expressions.
+    #[test]
+    fn editing_a_module_changes_every_link() {
+        use crate::expr::{Expr, ExprValue};
+        use crate::node::{Module, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "root")));
+        let comp_id = project.root;
+        let m = project.add_module(Module::new("dim", Expr::Lit(ExprValue::Num(0.2))));
+        for id in 1..=3 {
+            project.comp_mut(comp_id).unwrap().root.children.push(
+                dot(id).with_transform(Transform {
+                    opacity: Value::expr(Expr::Use { module: m, overrides: Vec::new() }),
+                    ..Transform::default()
+                }),
+            );
+        }
+        let opacities = |p: &Project| {
+            evaluate_comp(p, comp_id, 0.0).items.iter().map(|i| i.opacity).collect::<Vec<_>>()
+        };
+        assert!(opacities(&project).iter().all(|o| (o - 0.2).abs() < 1e-9));
+
+        // One edit, at the definition site.
+        project.module_mut(m).unwrap().body = Expr::Lit(ExprValue::Num(0.9));
+        assert!(opacities(&project).iter().all(|o| (o - 0.9).abs() < 1e-9), "all three followed");
+    }
+
+    /// **Override is a layering, not a fork**: an overridden knob wins, and every
+    /// knob left alone still inherits the module's default, so one diverging
+    /// instance does not detach from the shared definition.
+    #[test]
+    fn an_override_replaces_one_knob_and_inherits_the_rest() {
+        use crate::expr::{Expr, ExprValue};
+        use crate::node::{Module, ParamValue, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "root")));
+        let comp_id = project.root;
+        // opacity = level * scale, both knobs.
+        let m = project.add_module(
+            Module::new(
+                "two-knobs",
+                Expr::Mul(
+                    Box::new(Expr::Param { node: None, name: "level".into() }),
+                    Box::new(Expr::Param { node: None, name: "scale".into() }),
+                ),
+            )
+            .with_param("level", ParamValue::Num(Value::constant(0.5)))
+            .with_param("scale", ParamValue::Num(Value::constant(1.0))),
+        );
+        let link = |id: u64, overrides: Vec<(String, Expr)>| {
+            dot(id).with_transform(Transform {
+                opacity: Value::expr(Expr::Use { module: m, overrides }),
+                ..Transform::default()
+            })
+        };
+        let root = &mut project.comp_mut(comp_id).unwrap().root;
+        root.children.push(link(1, Vec::new()));
+        root.children.push(link(2, vec![("scale".into(), Expr::Lit(ExprValue::Num(0.5)))]));
+
+        let scene = evaluate_comp(&project, comp_id, 0.0);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        let op = |id: u64| scene.items.iter().find(|i| i.source == NodeId(id)).unwrap().opacity;
+        assert!((op(1) - 0.5).abs() < 1e-9, "inherits both defaults");
+        // Overrode `scale` only; `level` still comes from the module.
+        assert!((op(2) - 0.25).abs() < 1e-9, "0.5 inherited x 0.5 override");
+
+        // And the definition still reaches the overridden instance.
+        project.module_mut(m).unwrap().params[0].value = ParamValue::Num(Value::constant(1.0));
+        let scene = evaluate_comp(&project, comp_id, 0.0);
+        let op = |id: u64| scene.items.iter().find(|i| i.source == NodeId(id)).unwrap().opacity;
+        assert!((op(2) - 0.5).abs() < 1e-9, "override layered over the new default");
+    }
+
+    /// A module that links itself warns and falls back, exactly as a property
+    /// cycle and a comp cycle do.
+    #[test]
+    fn a_module_that_links_itself_warns() {
+        use crate::expr::{Expr, ExprValue};
+        use crate::node::{Module, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "root")));
+        let comp_id = project.root;
+        let m = project.add_module(Module::new("loop", Expr::Lit(ExprValue::Num(1.0))));
+        project.module_mut(m).unwrap().body = Expr::Use { module: m, overrides: Vec::new() };
+        project.comp_mut(comp_id).unwrap().root.children.push(dot(1).with_transform(Transform {
+            opacity: Value::expr(Expr::Use { module: m, overrides: Vec::new() }),
+            ..Transform::default()
+        }));
+
+        let scene = evaluate_comp(&project, comp_id, 0.0);
+        assert!(
+            scene.warnings.iter().any(|(_, msg)| msg.contains("links itself")),
+            "{:?}",
+            scene.warnings
+        );
+    }
+
+    /// Typos are worth surfacing: an override naming a knob the module does not
+    /// have would otherwise silently do nothing.
+    #[test]
+    fn overriding_an_unknown_knob_warns() {
+        use crate::expr::{Expr, ExprValue};
+        use crate::node::{Module, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "root")));
+        let comp_id = project.root;
+        let m = project.add_module(Module::new("plain", Expr::Lit(ExprValue::Num(1.0))));
+        project.comp_mut(comp_id).unwrap().root.children.push(dot(1).with_transform(Transform {
+            opacity: Value::expr(Expr::Use {
+                module: m,
+                overrides: vec![("typo".into(), Expr::Lit(ExprValue::Num(0.0)))],
+            }),
+            ..Transform::default()
+        }));
+        let scene = evaluate_comp(&project, comp_id, 0.0);
+        assert!(
+            scene.warnings.iter().any(|(_, msg)| msg.contains("no parameter")),
+            "{:?}",
+            scene.warnings
+        );
+    }
+
+    /// A module link round-trips through `.pbc`, overrides included.
+    #[test]
+    fn a_project_with_modules_round_trips() {
+        use crate::expr::{Expr, ExprValue, TimeSource};
+        use crate::node::{Module, ParamValue, Project};
+        let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "root")));
+        let m = project.add_module(
+            Module::new("fade", Expr::Time(TimeSource::T01))
+                .with_param("amount", ParamValue::Num(Value::constant(0.5))),
+        );
+        let root_id = project.root;
+        project.comp_mut(root_id).unwrap().root.children.push(dot(1).with_transform(Transform {
+            opacity: Value::expr(Expr::Use {
+                module: m,
+                overrides: vec![("amount".into(), Expr::Lit(ExprValue::Num(0.25)))],
+            }),
+            ..Transform::default()
+        }));
+        let back: Project =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(back.modules.len(), 1);
+        assert_eq!(back.module(m).unwrap().name, "fade");
+        assert_eq!(back.module(m).unwrap().params.len(), 1);
     }
 
     /// Serde `default` *is* the migration: a `.pbc` written before layer timing

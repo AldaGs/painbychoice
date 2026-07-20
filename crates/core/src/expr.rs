@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::node::{Document, NodeId, Shape};
+use crate::node::{Document, Module, ModuleId, NodeId, Shape};
 use crate::value::Color;
 
 /// A value flowing through an expression, before it's converted back to a
@@ -234,6 +234,21 @@ pub enum Expr {
     /// a number (→ `Num`) or a 2/3/4-element array (→ `Vec2`/`Color`). A leaf: it
     /// pulls its inputs from `frame`, not from wired-in child nodes.
     Script(String),
+    /// Link a shared [`crate::node::Module`], optionally overriding its knobs.
+    ///
+    /// **Override is a layering, not a fork**: an override supplies one knob,
+    /// and every knob left out inherits the module's default — the same shape as
+    /// `Value`'s const→keyframe→expr layering.
+    ///
+    /// Overrides are evaluated **in the linking property's own scope**, before
+    /// the module body runs. That is what lets a link pass `t01` or one of its
+    /// own node's params into a shared module, and it keeps the module body a
+    /// pure function of its knobs.
+    Use {
+        module: ModuleId,
+        #[serde(default)]
+        overrides: Vec<(String, Expr)>,
+    },
     /// The layer's own clock: local frame, in/out point, or normalized progress.
     /// A leaf, like a literal, but one whose value depends on *which layer* is
     /// resolving — which is what lets one expression fit itself to any clip.
@@ -540,6 +555,7 @@ impl Expr {
             Expr::Neg(..) => ExprKind::Neg,
             Expr::Param { .. } => ExprKind::Param,
             Expr::Script(_) => ExprKind::Script,
+            Expr::Use { .. } => ExprKind::Use,
             Expr::Time(t) => t.kind(),
             Expr::Gen(g) => g.kind(),
         }
@@ -561,6 +577,7 @@ impl Expr {
             ExprKind::Mul => Expr::Mul(Box::new(Expr::num(1.0)), Box::new(Expr::num(1.0))),
             ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
             ExprKind::Param => Expr::Param { node: None, name: String::new() },
+            ExprKind::Use => Expr::Use { module: ModuleId(0), overrides: Vec::new() },
             ExprKind::Script => Expr::Script(String::new()),
             ExprKind::LocalTime => Expr::Time(TimeSource::Local),
             ExprKind::InPoint => Expr::Time(TimeSource::In),
@@ -583,6 +600,7 @@ impl Expr {
             | Expr::Ref { .. }
             | Expr::Param { .. }
             | Expr::Script(_)
+            | Expr::Use { .. }
             | Expr::Time(_) => 0,
         }
     }
@@ -649,6 +667,10 @@ pub enum ExprKind {
     Neg,
     Param,
     Script,
+    /// A link to a shared module. Deliberately **not** in [`ExprKind::ALL`]:
+    /// that list is the graph picker, and seeding a link needs a module to point
+    /// at, which wants a picker of its own (the Blender-standard graph UI step).
+    Use,
     LocalTime,
     InPoint,
     OutPoint,
@@ -688,6 +710,7 @@ impl ExprKind {
             ExprKind::Neg => "neg",
             ExprKind::Param => "param",
             ExprKind::Script => "script",
+            ExprKind::Use => "use",
             ExprKind::LocalTime => "localTime",
             ExprKind::InPoint => "inPoint",
             ExprKind::OutPoint => "outPoint",
@@ -734,6 +757,13 @@ impl fmt::Display for Expr {
             Expr::Param { node: None, name } => write!(f, "param({name})"),
             Expr::Param { node: Some(n), name } => write!(f, "param(#{}, {name})", n.0),
             Expr::Script(src) => write!(f, "{{ {src} }}"),
+            Expr::Use { module, overrides } => {
+                write!(f, "use(#{}", module.0)?;
+                for (name, value) in overrides {
+                    write!(f, ", {name}: {value}")?;
+                }
+                write!(f, ")")
+            }
             Expr::Time(t) => f.write_str(t.label()),
             Expr::Gen(g) => write!(f, "{g}"),
         }
@@ -1057,6 +1087,17 @@ pub struct EvalCtx<'a> {
     /// timing. Layer-local time is derived from this; expressions that want
     /// comp time (and the timeline UI) read it directly.
     pub comp_frame: f64,
+    /// Project-wide modules, if this evaluation has a project behind it. `None`
+    /// for a bare single-comp evaluate, where a link warns like a precomp does.
+    pub modules: Option<&'a std::collections::BTreeMap<ModuleId, Module>>,
+    /// Modules currently being resolved further up, so a module that links
+    /// itself warns instead of recursing forever — the same discipline as the
+    /// property cycle guard and the comp one.
+    module_stack: Vec<ModuleId>,
+    /// The knob values of the module invocation being resolved, if any. A
+    /// `param("x")` inside a module body reads this rather than any node's
+    /// parameters — which is what makes a module a closed, reusable thing.
+    module_scope: Vec<Vec<(String, ExprValue)>>,
     /// The timing of the layer currently resolving, so [`Expr::Time`] can read
     /// its in/out points. `None` = the layer has no range, which reads as a
     /// clip spanning the whole composition. Saved and restored by `walk`
@@ -1081,6 +1122,9 @@ impl<'a> EvalCtx<'a> {
             frame,
             comp_frame: frame,
             timing: None,
+            modules: None,
+            module_stack: Vec::new(),
+            module_scope: Vec::new(),
             doc: Some(doc),
             cache: ResolveCache::default(),
             warnings: Vec::new(),
@@ -1096,6 +1140,9 @@ impl<'a> EvalCtx<'a> {
             frame,
             comp_frame: frame,
             timing: None,
+            modules: None,
+            module_stack: Vec::new(),
+            module_scope: Vec::new(),
             doc: None,
             cache: ResolveCache::default(),
             warnings: Vec::new(),
@@ -1336,6 +1383,20 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
         // A parameter reads off its owning node — `None` meaning "the node
         // being resolved", which `walk` and `resolve_target` keep current.
         Expr::Param { node, name } => {
+            // Inside a module body, `param("x")` means *the module's* knob. An
+            // explicit node still wins, so a module can deliberately reach a
+            // named node, but the bare form stays closed over the module.
+            if node.is_none() {
+                if let Some(scope) = ctx.module_scope.last() {
+                    return match scope.iter().find(|(n, _)| n == name) {
+                        Some((_, v)) => *v,
+                        None => {
+                            ctx.warn_here(format!("module has no parameter named '{name}'"));
+                            ExprValue::Num(0.0)
+                        }
+                    };
+                }
+            }
             let owner = node.or(ctx.current);
             let Some(owner) = owner else {
                 ctx.warn_here(format!("param '{name}' has no owning node"));
@@ -1363,6 +1424,10 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
                 ExprValue::Num(0.0)
             }
         },
+        // Linking a shared module. Overrides are evaluated *here*, in the
+        // linking property's own scope, so a link can feed the module its own
+        // `t01` or node params; the body then sees plain knob values.
+        Expr::Use { module, overrides } => eval_use(*module, overrides, ctx),
         // Like a generator, the layer clock is always a scalar.
         Expr::Time(which) => ExprValue::Num(ctx.time_source(*which)),
         // A generator always produces a scalar; a vec/colour property broadcasts
@@ -1511,8 +1576,10 @@ mod tests {
             let expected = match k {
                 ExprKind::Add | ExprKind::Mul => 2,
                 ExprKind::Neg => 1,
-                // Leaves: a literal, a lookup, or a reading of the layer clock.
-                ExprKind::Lit
+                // Leaves: a literal, a lookup, a module link, or a reading of
+                // the layer clock.
+                ExprKind::Use
+                | ExprKind::Lit
                 | ExprKind::Ref
                 | ExprKind::Param
                 | ExprKind::Script
@@ -2101,4 +2168,50 @@ mod tests {
         assert!((before - on).abs() < 1e-2, "{before} → {on}");
         assert!((after - on).abs() < 1e-2, "{on} → {after}");
     }
+}
+
+/// Resolve an [`Expr::Use`]: bind the module's knobs, then evaluate its body.
+///
+/// Binding is the override layering made concrete — an explicitly overridden
+/// knob wins, anything else falls back to the module's own default. Both are
+/// resolved in the **caller's** scope (before the module's scope is pushed), so
+/// a default that reads `t01` retimes to the linking layer just as an override
+/// that does would.
+fn eval_use(module: ModuleId, overrides: &[(String, Expr)], ctx: &mut EvalCtx) -> ExprValue {
+    let Some(modules) = ctx.modules else {
+        ctx.warn_here("a module link needs a project to resolve".to_string());
+        return ExprValue::Num(0.0);
+    };
+    let Some(def) = modules.get(&module).cloned() else {
+        ctx.warn_here(format!("module {} no longer exists", module.0));
+        return ExprValue::Num(0.0);
+    };
+    if ctx.module_stack.contains(&module) {
+        ctx.warn_here(format!("module '{}' links itself; not expanded", def.name));
+        return ExprValue::Num(0.0);
+    }
+
+    // Knobs first, in the caller's scope.
+    let mut scope: Vec<(String, ExprValue)> = Vec::with_capacity(def.params.len());
+    for param in &def.params {
+        let value = match overrides.iter().find(|(n, _)| *n == param.name) {
+            Some((_, expr)) => eval_expr(expr, ctx),
+            None => param.value.resolve(ctx),
+        };
+        scope.push((param.name.clone(), value));
+    }
+    // An override naming a knob the module doesn't have is a typo that would
+    // otherwise silently do nothing.
+    for (name, _) in overrides {
+        if !def.params.iter().any(|p| &p.name == name) {
+            ctx.warn_here(format!("module '{}' has no parameter '{name}' to override", def.name));
+        }
+    }
+
+    ctx.module_stack.push(module);
+    ctx.module_scope.push(scope);
+    let out = eval_expr(&def.body, ctx);
+    ctx.module_scope.pop();
+    ctx.module_stack.pop();
+    out
 }

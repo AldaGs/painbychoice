@@ -486,6 +486,50 @@ impl Comp {
 /// before projects existed still deserializes into exactly this shape.
 pub type Document = Comp;
 
+/// Identifies a shared animation module within a [`Project`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ModuleId(pub u64);
+
+/// A **named driver stored once for the whole project** that many properties
+/// link to — edit it once, every link updates.
+///
+/// This is the promotion of a pattern the expression graph already supported by
+/// convention (park the animation on a "controller" node and `Ref` it) into a
+/// first-class object. What it adds over that convention is a real definition
+/// site, per-link overrides, and — because the body reads `t01`/`localTime` —
+/// automatic retiming to whichever layer resolves it.
+///
+/// A module is deliberately just an [`crate::expr::Expr`] plus its knobs: the
+/// procedural generators are the ready-made bodies, and nothing new is needed in
+/// the evaluator beyond the link itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Module {
+    pub name: String,
+    /// The tunables a link may override. A knob left unset at the link site
+    /// falls back to the default here — override is a *layering*, not a fork.
+    pub params: Vec<Param>,
+    /// The graph fragment. Reads its knobs with `param("…")`, which resolve
+    /// against the module's own scope rather than any node's.
+    pub body: crate::expr::Expr,
+}
+
+impl Module {
+    pub fn new(name: impl Into<String>, body: crate::expr::Expr) -> Self {
+        Self { name: name.into(), params: Vec::new(), body }
+    }
+
+    /// Add or replace a knob. Same uniqueness rule as a node's parameters: a
+    /// duplicate would make `param("x")` ambiguous.
+    pub fn with_param(mut self, name: impl Into<String>, value: ParamValue) -> Self {
+        let name = name.into();
+        match self.params.iter_mut().find(|p| p.name == name) {
+            Some(existing) => existing.value = value,
+            None => self.params.push(Param { name, value }),
+        }
+        self
+    }
+}
+
 /// Identifies a composition within a [`Project`]. Stable across edits — a
 /// precomp layer stores one, so renaming or reordering comps can't break an
 /// instance.
@@ -505,6 +549,11 @@ pub struct Project {
     pub comps: std::collections::BTreeMap<CompId, Comp>,
     /// The comp a fresh open shows — the "main" one.
     pub root: CompId,
+    /// Shared animation modules, addressable from any comp — this is the
+    /// "document-wide" part of the property graph. `#[serde(default)]` so a
+    /// `.pbc` written before modules existed still loads.
+    #[serde(default)]
+    pub modules: std::collections::BTreeMap<ModuleId, Module>,
 }
 
 impl Project {
@@ -512,7 +561,11 @@ impl Project {
     /// migration: a pre-project document loads as one comp, which becomes root.
     pub fn single(comp: Comp) -> Self {
         let root = CompId(0);
-        Self { comps: [(root, comp)].into_iter().collect(), root }
+        Self {
+            comps: [(root, comp)].into_iter().collect(),
+            root,
+            modules: Default::default(),
+        }
     }
 
     pub fn comp(&self, id: CompId) -> Option<&Comp> {
@@ -532,6 +585,21 @@ impl Project {
     pub fn insert(&mut self, comp: Comp) -> CompId {
         let id = CompId(self.comps.keys().map(|c| c.0).max().map_or(0, |m| m + 1));
         self.comps.insert(id, comp);
+        id
+    }
+
+    pub fn module(&self, id: ModuleId) -> Option<&Module> {
+        self.modules.get(&id)
+    }
+
+    pub fn module_mut(&mut self, id: ModuleId) -> Option<&mut Module> {
+        self.modules.get_mut(&id)
+    }
+
+    /// Add a module under a fresh id.
+    pub fn add_module(&mut self, module: Module) -> ModuleId {
+        let id = ModuleId(self.modules.keys().map(|m| m.0).max().map_or(0, |m| m + 1));
+        self.modules.insert(id, module);
         id
     }
 

@@ -73,6 +73,41 @@ No authoring UI yet — expressions are built in code or a hand-edited `.pbc`
 (`Value::Expr` serializes like any other value). The node-graph panel that lets
 you *build* them is the next #5 step.
 
+### Shared animation modules (`Module` + `Expr::Use`)
+
+The document-wide property graph, made concrete (2026-07-19). Core only so far —
+**no UI yet**, so modules are reachable from code and a hand-edited `.pbc`.
+
+A `Module { name, params, body }` lives on the `Project`, not a node: one
+definition, addressable from every comp. A property links it with
+`Expr::Use { module, overrides }`. Editing the definition edits every link.
+
+This is less "new engine" than promoting a pattern the expression graph already
+supported by convention (park the animation on a controller node and `Ref` it)
+into a first-class object with a real definition site, per-link overrides, and
+automatic retiming.
+
+- **Overrides are call-by-value, evaluated in the caller's scope**, before the
+  module's scope is pushed. That is what lets a link feed the module its own
+  `t01` or a node param, and it keeps the body a pure function of its knobs.
+  A module body has no state to read back, so laziness would buy nothing and
+  cost a borrow-checker fight over storing `&Expr` in the context.
+- **Override is a layering, not a fork.** A link stores *only* the knobs it wants
+  different; the rest inherit, so a later edit to the module still reaches an
+  overridden instance. Same shape as `Value`'s const→keyframe→expr layering.
+- **`param("x")` inside a body means the module's knob**, not the owning node's —
+  a module is closed over its own scope, which is what makes it reusable. An
+  explicit `Param { node: Some(id) }` still reaches that node deliberately.
+- **Retiming is free**: a body reading `t01`/`localTime` reads *whichever layer
+  is resolving*, so one module fits itself to every clip. That is the subtitle
+  story, and it is a unit test.
+- **Third cycle guard, same discipline** as the property and comp ones: a module
+  that links itself warns and falls back rather than recursing. An override
+  naming a knob the module lacks warns too — a silent no-op would be a typo trap.
+- `ExprKind::Use` is deliberately **not** in `ExprKind::ALL`: that list is the
+  graph picker, and seeding a link needs a module picker, which belongs with the
+  Blender-standard graph UI step.
+
 ### Frames are the native time domain
 
 `core` thinks in **frames, not seconds**. `Keyframe.frame` is an `i64`, and

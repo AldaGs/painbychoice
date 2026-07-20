@@ -212,6 +212,9 @@ pub(crate) fn box_height(expr: &Expr, labeled: bool) -> f32 {
         Expr::Gen(_) => 30.0,
         // A layer-clock leaf has no controls at all — it *is* its kind picker.
         Expr::Time(_) => 30.0,
+        // A module link shows which module it points at; its overrides get an
+        // editor with the module picker, in the graph-UI step.
+        Expr::Use { .. } => 50.0,
         Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
     };
     base + if labeled { GRAPH_LABEL_H } else { 0.0 }
