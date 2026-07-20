@@ -1535,6 +1535,10 @@ enum ClipGrab {
     /// The body: moves all three together, so the clip plays the same content
     /// at a different comp time.
     Slide,
+    /// Alt+drag anywhere on the bar: moves `start` only, so the window stays put
+    /// and the content shifts *underneath* it — the clip shows an earlier or
+    /// later part of its own animation. AE spells this the same way.
+    Slip,
 }
 
 /// Decide what a press at `px` grabbed, given the clip bar's **painted** edges.
@@ -1546,7 +1550,14 @@ enum ClipGrab {
 /// Nearest edge wins when the handles overlap, which they do on a short clip or
 /// one zoomed out to a few pixels wide. Testing `in_` first instead would let it
 /// always claim the press, leaving the right edge of a narrow clip untrimmable.
-fn clip_grab_at(px: f32, left: f32, right: f32, handle_w: f32) -> ClipGrab {
+/// `alt` short-circuits to a slip: held, the whole bar slips regardless of where
+/// the press landed. Trimming an edge *while* slipping isn't a coherent gesture
+/// — slip is about the content behind a fixed window — so alt wins outright
+/// rather than combining with the edge handles.
+fn clip_grab_at(px: f32, left: f32, right: f32, handle_w: f32, alt: bool) -> ClipGrab {
+    if alt {
+        return ClipGrab::Slip;
+    }
     let (dl, dr) = ((px - left).abs(), (px - right).abs());
     if dl.min(dr) > handle_w {
         ClipGrab::Slide
@@ -1568,6 +1579,12 @@ fn drag_clip(t: LayerTiming, grab: ClipGrab, delta: i64) -> LayerTiming {
             let d = delta.max(-t.in_);
             LayerTiming { start: t.start + d, in_: t.in_ + d, out: t.out + d }
         }
+        // Deliberately unclamped: `start` is where local frame 0 sits, and a
+        // layer is free to show any part of its own timeline — including
+        // negative local frames, which a track holds at its first key. AE
+        // clamps slip to the bounds of the source footage; we have no footage,
+        // so there is nothing to run out of.
+        ClipGrab::Slip => LayerTiming { start: t.start + delta, ..t },
     }
 }
 
@@ -1810,7 +1827,15 @@ fn dopesheet_ui(
                         }
                     }
                     Some(_) => {
-                        if ui.small_button("Clip ×").on_hover_text("Back to full comp").clicked() {
+                        if ui
+                            .small_button("Clip ×")
+                            .on_hover_text(
+                                "Back to full comp.\n\
+                                 Drag an end to trim, the body to slide, \
+                                 alt+drag to slip (content moves, window stays).",
+                            )
+                            .clicked()
+                        {
                             out.set_timing = Some(None);
                         }
                     }
@@ -1856,14 +1881,37 @@ fn dopesheet_ui(
                     egui::Stroke::new(1.0, accent),
                     egui::StrokeKind::Inside,
                 );
-                // Where local frame 0 sits: the slip marker. Only meaningful
-                // when it's inside the visible window of the clip.
+                // Where local frame 0 sits: the slip marker, and the only
+                // feedback a slip gives — the bar itself doesn't move, so
+                // without this the gesture would look like nothing happening.
                 let sx = axis.frame_to_x(timing.start as f64);
                 if sx > bar.left() && sx < bar.right() {
                     painter.line_segment(
                         [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
                     );
+                } else {
+                    // Slipped out of view: pin an arrow to the edge it went
+                    // past, so "local 0 is off that way" stays legible instead
+                    // of the marker just vanishing.
+                    let (x, text) = if sx <= bar.left() {
+                        (bar.left() + 3.0, "<")
+                    } else {
+                        (bar.right() - 3.0, ">")
+                    };
+                    if bar.width() > 10.0 {
+                        painter.text(
+                            egui::pos2(x, bar.center().y),
+                            if sx <= bar.left() {
+                                egui::Align2::LEFT_CENTER
+                            } else {
+                                egui::Align2::RIGHT_CENTER
+                            },
+                            text,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_gray(170),
+                        );
+                    }
                 }
             }
 
@@ -1888,7 +1936,8 @@ fn dopesheet_ui(
                 // body, so every trim read as a slide. The marquee below uses
                 // the same input for the same reason.
                 if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-                    let grab = clip_grab_at(p.x, grab_l, grab_r, HANDLE_W);
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    let grab = clip_grab_at(p.x, grab_l, grab_r, HANDLE_W, alt);
                     let anchor = axis.x_to_frame(p.x);
                     ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
                 }
@@ -4248,17 +4297,42 @@ mod tests {
     #[test]
     fn the_right_handle_is_grabbable_when_the_clip_runs_past_the_view() {
         // Bar painted from 100 to 500, clamped at the track's right edge.
-        assert_eq!(clip_grab_at(499.0, 100.0, 500.0, 6.0), ClipGrab::TrimOut);
-        assert_eq!(clip_grab_at(101.0, 100.0, 500.0, 6.0), ClipGrab::TrimIn);
-        assert_eq!(clip_grab_at(300.0, 100.0, 500.0, 6.0), ClipGrab::Slide);
+        assert_eq!(clip_grab_at(499.0, 100.0, 500.0, 6.0, false), ClipGrab::TrimOut);
+        assert_eq!(clip_grab_at(101.0, 100.0, 500.0, 6.0, false), ClipGrab::TrimIn);
+        assert_eq!(clip_grab_at(300.0, 100.0, 500.0, 6.0, false), ClipGrab::Slide);
     }
 
     /// Handles overlap on a clip only a few pixels wide. The nearer edge has to
     /// win, or the right one can never be grabbed.
     #[test]
     fn a_narrow_clip_splits_its_overlapping_handles_by_nearest_edge() {
-        assert_eq!(clip_grab_at(100.5, 100.0, 104.0, 6.0), ClipGrab::TrimIn);
-        assert_eq!(clip_grab_at(103.5, 100.0, 104.0, 6.0), ClipGrab::TrimOut);
+        assert_eq!(clip_grab_at(100.5, 100.0, 104.0, 6.0, false), ClipGrab::TrimIn);
+        assert_eq!(clip_grab_at(103.5, 100.0, 104.0, 6.0, false), ClipGrab::TrimOut);
+    }
+
+    /// Alt wins over the edge handles: slipping from a point that would
+    /// otherwise trim is still a slip, since trim-while-slipping isn't a
+    /// coherent gesture.
+    #[test]
+    fn alt_slips_from_anywhere_on_the_bar() {
+        assert_eq!(clip_grab_at(300.0, 100.0, 500.0, 6.0, true), ClipGrab::Slip);
+        assert_eq!(clip_grab_at(100.0, 100.0, 500.0, 6.0, true), ClipGrab::Slip);
+        assert_eq!(clip_grab_at(500.0, 100.0, 500.0, 6.0, true), ClipGrab::Slip);
+    }
+
+    /// Slip moves the content under a fixed window: `start` shifts, `in_`/`out`
+    /// don't, so the clip plays a different part of its own animation in the
+    /// same slot. Unclamped in both directions — there's no source footage to
+    /// run past, and a negative local frame just holds the first key.
+    #[test]
+    fn slipping_moves_only_the_start() {
+        let t = LayerTiming { start: 10, in_: 10, out: 30 };
+        let later = drag_clip(t, ClipGrab::Slip, 6);
+        assert_eq!((later.start, later.in_, later.out), (16, 10, 30));
+        let earlier = drag_clip(t, ClipGrab::Slip, -40);
+        assert_eq!((earlier.start, earlier.in_, earlier.out), (-30, 10, 30));
+        // The window is untouched, so the clip occupies exactly the same frames.
+        assert_eq!(later.len(), t.len());
     }
 
     /// Trimming an edge moves only that edge: the content keeps its place in

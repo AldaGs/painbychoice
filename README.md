@@ -695,8 +695,16 @@ sample at a shifted time — the exact mechanism local time needs.
     can't see is an edge you can't grab. Nearest edge wins where the two
     handles overlap, or a clip a few pixels wide can never be trimmed shorter.
   - `start` is deliberately separate from `in_`: trim moves an edge only, slide
-    moves all three, and slip (moving `start` alone) shifts the content under a
-    fixed window. Only slide and trim have UI so far.
+    moves all three, and **slip** (alt+drag, as in AE) moves `start` alone so
+    the content shifts under a fixed window. Slip is unclamped in both
+    directions — AE clamps it to the source footage's bounds, but there is no
+    footage here, and a negative local frame simply holds the track's first key.
+  - Slip's only feedback is the local-0 marker inside the bar (the bar itself
+    doesn't move), so when `start` slips out of the visible clip the marker
+    becomes a `<`/`>` pinned to the edge it went past rather than vanishing.
+  - Not to be confused with **AE's work area**, which PBC doesn't have: that is
+    a comp-level *preview/render* range (view state), while these are per-layer
+    in/out points that change evaluation (document state).
   - **Known limit, deliberate:** local time is `comp_frame − start`, so a timed
     layer nested under another timed layer reads *comp* time, not its parent's
     local time. Nested time is a comp-level concern — Stage 3's business.
