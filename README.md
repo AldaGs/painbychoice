@@ -725,6 +725,40 @@ different machines.
 > open under this step: seeding a fresh `Use` link from the kind picker, and a
 > nested canvas for override sub-expressions at a call site.
 
+> **Timeline UX + fps retiming (2026-07-20, user-verified):** changing a comp's
+> fps now **re-grids** the animation instead of leaving keys on stale frame
+> numbers — a key at frame 120 @ 60fps (two seconds in) lands on frame 48 @ 24fps.
+> `Comp::set_fps` is the only supported way to write the rate on a comp with
+> content (a plain `fps =` shifts every key in seconds); it walks the tree
+> rescaling every frame position by `new_fps/old_fps`, `LayerTiming` included.
+> The conversion rounds to whole frames, so it's lossy — keys under a frame apart
+> merge, first one wins. The fps **drag** applies as a *single* retime off a
+> pre-drag snapshot (`App::fps_drag`), not one rounding per delta, or a slow drag
+> would shred dense keys passing through every intermediate rate. The keyframe
+> **selection rides along**: a `KeyRef` is a track index, and a merge shifts
+> indices, so `remap_selection` re-resolves the selection through frames across
+> the retime (snapshotted in the drag too, so a long drag can't walk it off its
+> keys). Per-delta cost is a tree clone + retime — measured ~1.3 ms at 100k keys
+> in release, linear, only a concern near 500k.
+>
+> Dopesheet + transport got a Blender-style pass: the label/track split is now
+> **two resizable columns** sharing one full-height splitter, with every row's
+> label cell allocated at the identical width via `allocate_exact_size` (the old
+> `allocate_ui_with_layout` grew a row whose button/name didn't fit, desyncing
+> its track from the ruler axis). The timeline header gained **zoom in / out /
+> fit** buttons (anchored at the playhead; the wheel and the buttons share
+> `zoomed()`). The transport is `|◀ ◀◀ ▶ ▶▶ ▶|` — jump to range start, prev/next
+> keyframe (disabled when there's none), play/pause, jump to range end — plus
+> numeric **Start/End** fields over the existing work area. The old blue playhead
+> slider is **gone**: it mapped `0..=last_frame` while the ruler maps the visible
+> window, so once zoomed it landed the playhead somewhere other than where you
+> dropped it.
+>
+> Icons are a real font now (`live/src/icon.rs`, Tabler subsetted to the named
+> codepoints — regenerate the subset when adding a glyph, see `assets/NOTICE.md`),
+> so the old "egui renders ◆◇ as tofu, paint your own" gotcha is retired for
+> anything drawn through `icon::`.
+
 > Two riders on this order, both feeding the *reusable animation modules* feature
 > spec'd in the design section below: the **pre-comps** step also introduces the
 > **per-layer in/out time model** (a pre-comp is a layer with a time range) and
