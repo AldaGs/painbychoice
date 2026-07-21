@@ -371,16 +371,18 @@ above, so it has a panel row, a stopwatch, a dopesheet row, retiming, easing and
 copy/paste for free. It was already addressable from expressions
 (`PropPath::Anchor`) but had no UI — an odd asymmetry, now closed.
 
-**The selection box** is the union of the selected layer's *subtree* bounds, so
-selecting a group boxes what it contains; a group has no geometry of its own, so
-unioning only its own items would give an empty rect for exactly the layers
-whose extent is least obvious. Bounds come from each item's path through its
-world transform, giving the axis-aligned box of the rotated shape rather than a
-rotated rectangle — "how much room does this take up". It is drawn with corner
-ticks and is deliberately **not grabbable**: resizing by a bbox corner would
-fight the scale handles, which already own that gesture. A layer that draws
-nothing gets no box, rather than a zero-size rect at the origin that would look
-like a bug.
+**The selection box is one box per drawable item** in the selection's subtree,
+not a single rect around the lot. A union tells you only the group's extent,
+which is the least informative thing about it; per-item shows what the group
+contains and where each piece sits. For a plain single-shape layer — the common
+case — the two are identical, so nothing is lost.
+
+Bounds come from each item's path through its world transform, giving the
+axis-aligned box of the rotated shape rather than a rotated rectangle — "how
+much room does this take up". They are drawn with corner ticks and are
+deliberately **not grabbable**: resizing by a bbox corner would fight the scale
+handles, which already own that gesture. A layer that draws nothing gets no box
+at all, rather than a zero-size rect at the origin that would look like a bug.
 
 Note this is computed in `live` from the evaluated scene. Bounding-box *snapping*
 would want it in `core` beside `Scene::places` instead, so sibling bounds are

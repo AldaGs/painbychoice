@@ -613,18 +613,19 @@ pub(crate) struct SnapCtx<'a> {
     pub(crate) enabled: bool,
 }
 
-/// The selected layer's bounding box in **composition** space, or `None` when
-/// it draws nothing on this frame.
+/// One bounding box per drawable item in the selection's subtree, in
+/// **composition** space. Empty when the selection draws nothing.
 ///
-/// The union over the whole *subtree*, because selecting a group should box
-/// what the group contains — a group has no geometry of its own, so boxing only
-/// its own items would give an empty rect for exactly the layers whose extent
-/// is least obvious.
+/// Per item rather than one union around the whole subtree: a union tells you
+/// only the extent of the group, which is the least informative thing about it.
+/// Boxing each item shows what the group actually contains and where each piece
+/// sits — and for a plain single-shape layer the two are identical anyway, so
+/// nothing is lost in the common case.
 ///
 /// Bounds are taken from each item's path through its world transform, so a
 /// rotated layer yields the axis-aligned box of the rotated shape (what you
 /// want for "how much room does this take up"), not a rotated rectangle.
-pub(crate) fn selection_bounds(scene: &MScene, root: &MNode) -> Option<kurbo::Rect> {
+pub(crate) fn selection_boxes(scene: &MScene, root: &MNode) -> Vec<kurbo::Rect> {
     let mut ids = Vec::new();
     collect_ids(root, &mut ids);
     scene
@@ -632,7 +633,7 @@ pub(crate) fn selection_bounds(scene: &MScene, root: &MNode) -> Option<kurbo::Re
         .iter()
         .filter(|i| ids.contains(&i.source))
         .map(|i| (i.transform * i.path.clone()).bounding_box())
-        .reduce(|a, b| a.union(b))
+        .collect()
 }
 
 fn collect_ids(node: &MNode, out: &mut Vec<NodeId>) {

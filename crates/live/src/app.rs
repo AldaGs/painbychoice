@@ -1310,9 +1310,10 @@ impl App {
                 .map(|place| GizmoTarget::new(id.0, place.world, info)),
             _ => None,
         };
-        // The selection's extent, unioned over its subtree so a group boxes
-        // what it contains. Comp space, projected at paint time like the path.
-        let sel_bounds = sel_node.and_then(|n| selection_bounds(&scene, n));
+        // One box per drawable item in the selection's subtree — a group shows
+        // its pieces, not just its extent. Comp space, projected at paint time
+        // like the motion path.
+        let sel_boxes = sel_node.map(|n| selection_boxes(&scene, n)).unwrap_or_default();
         let rows = sel_node.map(dope_rows).unwrap_or_default();
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -1534,8 +1535,11 @@ impl App {
                         }
                         // The selection box sits with the aids: it measures,
                         // it isn't grabbed.
-                        if let (Some(b), Some(rect)) = (sel_bounds, canvas_pts) {
-                            draw_bounds(&ui.painter_at(rect), b, fit, ppp);
+                        if let Some(rect) = canvas_pts {
+                            let painter = ui.painter_at(rect);
+                            for b in &sel_boxes {
+                                draw_bounds(&painter, *b, fit, ppp);
+                            }
                         }
                         // Path next, gizmo last: the gizmo is what you grab, so
                         // it must never be obscured by the trajectory.

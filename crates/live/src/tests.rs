@@ -2841,11 +2841,11 @@ fn an_anchor_drag_on_a_flattened_layer_is_inert() {
     assert!(r.anchor.x.is_finite() && r.anchor.y.is_finite());
 }
 
-/// Selecting a group boxes what the group *contains*. A group has no geometry
-/// of its own, so unioning only its own items would give nothing for exactly
-/// the layers whose extent is least obvious.
+/// Selecting a group boxes **each item** in it, not one rect around the lot. A
+/// union would tell you only the group's extent, which is the least
+/// informative thing about it; per-item shows where the pieces actually are.
 #[test]
-fn the_selection_box_covers_a_groups_whole_subtree() {
+fn the_selection_boxes_cover_each_item_in_a_group() {
     let mut a = MNode::group(1, "a");
     a.shape = Some(MShape::Rect {
         size: Value::constant(Vec2::new(100.0, 100.0)),
@@ -2868,20 +2868,46 @@ fn the_selection_box_covers_a_groups_whole_subtree() {
     let scene = evaluate_comp(&project, project.root, 0.0);
     let root = project.comps[&project.root].root.find(NodeId(3)).unwrap();
 
-    let b = selection_bounds(&scene, root).expect("the group has drawable children");
-    // Two 100-wide squares centred at x=0 and x=200: -50 .. 250.
-    assert!((b.x0 - -50.0).abs() < 0.5, "x0 {}", b.x0);
-    assert!((b.x1 - 250.0).abs() < 0.5, "x1 {}", b.x1);
-    assert!((b.y0 - -50.0).abs() < 0.5, "y0 {}", b.y0);
-    assert!((b.y1 - 50.0).abs() < 0.5, "y1 {}", b.y1);
+    let boxes = selection_boxes(&scene, root);
+    assert_eq!(boxes.len(), 2, "one box per drawable item, not one union");
+    // Each is its own 100-wide square, centred at x=0 and x=200 — crucially
+    // *not* the -50..250 union those two would collapse into.
+    assert!((boxes[0].x0 - -50.0).abs() < 0.5, "{:?}", boxes[0]);
+    assert!((boxes[0].x1 - 50.0).abs() < 0.5, "{:?}", boxes[0]);
+    assert!((boxes[1].x0 - 150.0).abs() < 0.5, "{:?}", boxes[1]);
+    assert!((boxes[1].x1 - 250.0).abs() < 0.5, "{:?}", boxes[1]);
+    for r in &boxes {
+        assert!((r.width() - 100.0).abs() < 0.5 && (r.height() - 100.0).abs() < 0.5);
+    }
 }
 
-/// A layer that draws nothing has no box — better than a zero-size rect at the
-/// origin, which would look like a bug.
+/// A plain single-shape layer is the common case, and there per-item and a
+/// union are the same thing — exactly one box.
+#[test]
+fn a_single_shape_layer_gets_exactly_one_box() {
+    let mut a = MNode::group(1, "a");
+    a.shape = Some(MShape::Rect {
+        size: Value::constant(Vec2::new(80.0, 40.0)),
+        radius: Value::constant(0.0),
+    });
+    a.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+    let comp = Comp::new(500.0, 500.0, MNode::group(0, "root").with_child(a));
+    let project = MProject::single(comp);
+    let scene = evaluate_comp(&project, project.root, 0.0);
+    let root = project.comps[&project.root].root.find(NodeId(1)).unwrap();
+
+    let boxes = selection_boxes(&scene, root);
+    assert_eq!(boxes.len(), 1);
+    assert!((boxes[0].width() - 80.0).abs() < 0.5, "{:?}", boxes[0]);
+    assert!((boxes[0].height() - 40.0).abs() < 0.5, "{:?}", boxes[0]);
+}
+
+/// A layer that draws nothing gets no boxes at all — better than a zero-size
+/// rect at the origin, which would look like a bug.
 #[test]
 fn a_layer_that_draws_nothing_has_no_selection_box() {
     let (project, node, comp) = moving_project();
     let scene = evaluate_comp(&project, comp, 0.0);
     let root = project.comps[&comp].root.find(node).unwrap();
-    assert!(selection_bounds(&scene, root).is_none());
+    assert!(selection_boxes(&scene, root).is_empty());
 }
