@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::expr::ExprValue;
 use crate::value::Color;
 
 /// The type a node socket (port) carries. Determines what may connect to what,
@@ -111,7 +112,11 @@ impl SocketType {
 /// be baked into the binary. The registry is the seam a plugin registers
 /// through, so everything reachable from a descriptor has to be constructible
 /// without compile-time knowledge.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is deliberately *not* derived: the `default` value carries an
+/// `ExprValue`, which holds `f64`s and so is only `PartialEq`. A socket is
+/// descriptor metadata, never a map key, so `PartialEq` is all it needs.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Socket {
     /// Addresses this port in a wire. Unique among a descriptor's inputs (and,
     /// separately, its outputs) — [`crate::registry::NodeDescriptor`] enforces
@@ -120,11 +125,29 @@ pub struct Socket {
     /// What the canvas prints beside the dot.
     pub label: String,
     pub ty: SocketType,
+    /// The literal an **input** feeds when nothing is wired to it — a node's
+    /// resting value, and where lowering reads an unwired knob's default (so a
+    /// fresh `osc` already oscillates rather than sitting at zero). `None` on
+    /// outputs, and on inputs that must be wired (geometry / layer / matte,
+    /// which have no scalar literal).
+    pub default: Option<ExprValue>,
 }
 
 impl Socket {
+    /// A socket with no input default (an output, or an input that must be
+    /// wired).
     pub fn new(id: impl Into<String>, label: impl Into<String>, ty: SocketType) -> Self {
-        Self { id: id.into(), label: label.into(), ty }
+        Self { id: id.into(), label: label.into(), ty, default: None }
+    }
+
+    /// An input socket whose unwired value is `default`.
+    pub fn with_default(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        ty: SocketType,
+        default: ExprValue,
+    ) -> Self {
+        Self { id: id.into(), label: label.into(), ty, default: Some(default) }
     }
 }
 

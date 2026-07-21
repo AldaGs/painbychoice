@@ -45,6 +45,25 @@ pub struct GraphNode {
     /// Shown instead of the descriptor label when set — a user-renamed node.
     #[serde(default)]
     pub title: Option<String>,
+    /// Literal overrides for this node's scalar sockets, keyed by socket id — the
+    /// value an unwired input feeds, or a `value` node's constant. **Sparse**: an
+    /// absent entry means "use the descriptor's default", so lowering never needs
+    /// the map to be pre-filled and a fresh node carries none. Editing a socket's
+    /// field writes here.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, crate::expr::ExprValue>,
+}
+
+impl GraphNode {
+    /// The literal set on socket `id`, if the user has overridden it.
+    pub fn value(&self, id: &str) -> Option<crate::expr::ExprValue> {
+        self.values.get(id).copied()
+    }
+
+    /// Override socket `id`'s literal (an unwired input, or a `value` constant).
+    pub fn set_value(&mut self, id: impl Into<String>, v: crate::expr::ExprValue) {
+        self.values.insert(id.into(), v);
+    }
 }
 
 /// Names one socket on one node: the addressing a wire endpoint uses. The socket
@@ -131,7 +150,13 @@ impl NodeGraph {
     pub fn add_node(&mut self, kind: impl Into<String>, pos: Vec2) -> GraphNodeId {
         let id = GraphNodeId(self.next_id);
         self.next_id += 1;
-        self.nodes.push(GraphNode { id, kind: kind.into(), pos, title: None });
+        self.nodes.push(GraphNode {
+            id,
+            kind: kind.into(),
+            pos,
+            title: None,
+            values: std::collections::BTreeMap::new(),
+        });
         id
     }
 

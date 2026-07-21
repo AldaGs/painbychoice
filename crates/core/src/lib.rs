@@ -13,6 +13,7 @@ pub mod demo;
 pub mod eval;
 pub mod expr;
 pub mod graph;
+pub mod lower;
 pub mod node;
 pub mod registry;
 pub mod socket;
@@ -32,6 +33,7 @@ pub use node::{
 pub use graph::{
     ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
 };
+pub use lower::lower_output;
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };

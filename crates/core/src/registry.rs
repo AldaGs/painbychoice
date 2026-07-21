@@ -81,7 +81,10 @@ impl NodeCategory {
 ///
 /// Owned fields throughout, because a plugin builds one of these at runtime
 /// through the exact same API a built-in uses.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq`: a socket's `default` carries an `ExprValue` (holds `f64`s), so a
+/// descriptor is only `PartialEq`. It's never a map key, so that's enough.
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeDescriptor {
     /// The registry key and how a graph node names its type. Built-ins mirror
     /// the IR they will lower to (`"rect"`, `"add"`, `"osc"`); a plugin uses a
@@ -106,9 +109,24 @@ impl NodeDescriptor {
         }
     }
 
-    /// Add an input socket (builder form).
+    /// Add an input socket with no unwired default — one that must be wired
+    /// (geometry / layer / matte), or whose neutral is left to lowering.
     pub fn input(mut self, id: impl Into<String>, label: impl Into<String>, ty: SocketType) -> Self {
         self.inputs.push(Socket::new(id, label, ty));
+        self
+    }
+
+    /// Add an input socket whose unwired value is `default` — the resting value
+    /// lowering reads when nothing feeds the socket (a generator knob's default,
+    /// a math operand's identity).
+    pub fn input_def(
+        mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        ty: SocketType,
+        default: crate::expr::ExprValue,
+    ) -> Self {
+        self.inputs.push(Socket::with_default(id, label, ty, default));
         self
     }
 
@@ -243,6 +261,9 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
     // are always socket types.
     use NodeCategory as Cat;
     use SocketType::*;
+    // Unwired input defaults (math operands, generator knobs) mirror the IR's
+    // own seed values, so lowering a fresh node reproduces `Expr::seed`.
+    let num = crate::expr::ExprValue::Num;
     vec![
         // ── Geometry: a shape's params are inputs; it outputs its geometry and
         //    echoes its resolved params so math can chain off them. ───────────
@@ -261,15 +282,15 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .output("geometry", "Geometry", Geometry),
         // ── Math: an input (or two) and a result. ────────────────────────────
         NodeDescriptor::new("add", Cat::Math, "Add")
-            .input("a", "A", Number)
-            .input("b", "B", Number)
+            .input_def("a", "A", Number, num(0.0))
+            .input_def("b", "B", Number, num(0.0))
             .output("result", "Result", Number),
         NodeDescriptor::new("mul", Cat::Math, "Multiply")
-            .input("a", "A", Number)
-            .input("b", "B", Number)
+            .input_def("a", "A", Number, num(1.0))
+            .input_def("b", "B", Number, num(1.0))
             .output("result", "Result", Number),
         NodeDescriptor::new("neg", Cat::Math, "Negate")
-            .input("a", "A", Number)
+            .input_def("a", "A", Number, num(0.0))
             .output("result", "Result", Number),
         // ── Inputs: leaves that read a value in. ─────────────────────────────
         NodeDescriptor::new("value", Cat::Input, "Value").output("value", "Value", Number),
@@ -281,26 +302,26 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
         NodeDescriptor::new("t01", Cat::Input, "Progress (t01)").output("value", "Value", Number),
         // ── Generators: typed-knob motion primitives (knob names match the IR).
         NodeDescriptor::new("osc", Cat::Generator, "Oscillator")
-            .input("freq", "Freq", Number)
-            .input("amp", "Amp", Number)
-            .input("phase", "Phase", Number)
-            .input("offset", "Offset", Number)
+            .input_def("freq", "Freq", Number, num(0.1))
+            .input_def("amp", "Amp", Number, num(1.0))
+            .input_def("phase", "Phase", Number, num(0.0))
+            .input_def("offset", "Offset", Number, num(0.0))
             .output("value", "Value", Number),
         NodeDescriptor::new("noise", Cat::Generator, "Noise")
-            .input("freq", "Freq", Number)
-            .input("amp", "Amp", Number)
-            .input("seed", "Seed", Number)
+            .input_def("freq", "Freq", Number, num(0.1))
+            .input_def("amp", "Amp", Number, num(1.0))
+            .input_def("seed", "Seed", Number, num(0.0))
             .output("value", "Value", Number),
         NodeDescriptor::new("ramp", Cat::Generator, "Ramp")
-            .input("from", "From", Number)
-            .input("to", "To", Number)
-            .input("start", "Start", Time)
-            .input("end", "End", Time)
+            .input_def("from", "From", Number, num(0.0))
+            .input_def("to", "To", Number, num(1.0))
+            .input_def("start", "Start", Time, num(0.0))
+            .input_def("end", "End", Time, num(30.0))
             .output("value", "Value", Number),
         NodeDescriptor::new("bounce", Cat::Generator, "Bounce")
-            .input("amp", "Amp", Number)
-            .input("freq", "Freq", Number)
-            .input("decay", "Decay", Number)
+            .input_def("amp", "Amp", Number, num(1.0))
+            .input_def("freq", "Freq", Number, num(0.1))
+            .input_def("decay", "Decay", Number, num(0.05))
             .output("value", "Value", Number),
         // ── Module reuse. ────────────────────────────────────────────────────
         NodeDescriptor::new("use", Cat::Module, "Module").output("value", "Value", Number),
