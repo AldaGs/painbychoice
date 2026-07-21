@@ -33,6 +33,10 @@ pub(crate) struct NodeInfo {
     pub(crate) pos: (f64, f64),
     pub(crate) rot: f64,
     pub(crate) scale: (f64, f64),
+    /// Not shown in the panel, but the on-canvas gizmo needs it: it is the
+    /// pivot the layer rotates and scales about, and it sits inside the local
+    /// matrix, so reconstructing that matrix without it lands elsewhere.
+    pub(crate) anchor: (f64, f64),
     pub(crate) opacity: f64,
     pub(crate) fill: Option<[f32; 3]>,
     /// Parametric geometry, `None` for a group or a hand-drawn `Path`.
@@ -75,12 +79,14 @@ impl NodeInfo {
         let tr = &node.transform;
         let pos = tr.position.resolve(ctx);
         let scale = tr.scale.resolve(ctx);
+        let anchor = tr.anchor.resolve(ctx);
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
             pos: (pos.x, pos.y),
             rot: tr.rotation_deg.resolve(ctx),
             scale: (scale.x, scale.y),
+            anchor: (anchor.x, anchor.y),
             opacity: tr.opacity.resolve(ctx),
             fill: node.fill.as_ref().map(|f| {
                 let c = f.resolve(ctx);

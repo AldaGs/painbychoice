@@ -60,6 +60,18 @@ impl Editor {
     pub(crate) fn is_swappable(self) -> bool {
         SWAPPABLE.contains(&self)
     }
+
+    /// Whether [`show_dock`] should wrap this leaf in a fill-and-scroll region
+    /// so its content can't resize the panel it lives in. See the note on
+    /// `show_dock` for why that matters.
+    ///
+    /// Excluded: **Graph** runs its own `ScrollArea::both` (nesting two would
+    /// fight over the scroll delta); **Canvas** must measure an exact rect for
+    /// the vello target; **Comp** and **Transport** are single fixed-height
+    /// bars in non-resizable panels, so they have nothing to overflow.
+    pub(crate) fn scroll_wrapped(self) -> bool {
+        matches!(self, Editor::Layers | Editor::Properties | Editor::Dopesheet)
+    }
 }
 
 /// Which edge of an area a split pins its first child to.
@@ -410,7 +422,21 @@ pub(crate) fn show_dock(
             if editor.is_swappable() {
                 area_header(ui, *editor, path, cmd);
             }
-            draw(*editor, ui);
+            if editor.scroll_wrapped() {
+                // Vertical only: the dopesheet maps frames across the panel's
+                // *width*, so a horizontal scroll would desync every track from
+                // the ruler. `auto_shrink` off in both directions — a short list
+                // must still fill the area, or the panel shrinks to fit it and
+                // we're back to the same bug from the other side.
+                // No `id_salt`: the enclosing panel `Ui` already carries the
+                // split's unique id, so two areas showing the same editor still
+                // get distinct scroll states.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| draw(*editor, ui));
+            } else {
+                draw(*editor, ui);
+            }
         }
         Dock::Split { side, size, resizable, first, second } => {
             let id = egui::Id::new(("dock", *next_id));
@@ -433,6 +459,21 @@ pub(crate) fn show_dock(
             });
             // Read the size back so the tree — not egui's private panel memory —
             // stays the source of truth for what the layout currently is.
+            //
+            // **This rect is content-driven**, and that is a trap. egui returns
+            // the panel's *inner response* rect, which grows (and shrinks) to
+            // whatever the content allocated, clamped only at `max_size` — and
+            // it stores that same rect as the panel's `PanelState`, so the next
+            // frame starts from it. A leaf whose content changes height
+            // therefore resizes its own panel and shoves every other leaf
+            // around, including the canvas.
+            //
+            // That is exactly what selecting a layer used to do: the dopesheet
+            // grows a row per animatable property, so each select/deselect
+            // resized the timeline and moved the preview under the pointer.
+            // The invariant that keeps this honest is `Editor::scroll_wrapped`
+            // — every leaf must either fill its area exactly or scroll inside
+            // it, never allocate past it.
             let r = resp.response.rect;
             *size = match side {
                 DockSide::Left | DockSide::Right => r.width(),
@@ -502,6 +543,8 @@ pub(crate) struct CompEdits {
     /// The FPS drag ended this frame — the rate is settled, drop the snapshot.
     pub(crate) fps_drag_stopped: bool,
     pub(crate) duration: Option<f64>,
+    /// A new composition background colour, as egui's `[f32; 3]`.
+    pub(crate) bg: Option<[f32; 3]>,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -535,6 +578,7 @@ pub(crate) fn comp_ui(
     height: f64,
     fps: f64,
     duration: f64,
+    bg: MColor,
     out: &mut CompEdits,
     presets: &[String],
     name_buf: &mut String,
@@ -630,6 +674,20 @@ pub(crate) fn comp_ui(
             .changed()
         {
             out.duration = Some(dur);
+        }
+        ui.separator();
+
+        // Composition background. A per-comp setting rather than a theme
+        // constant: it is what the frame renders against, so it belongs to the
+        // document and is saved with it.
+        ui.label("BG");
+        let mut rgb = [bg.r as f32, bg.g as f32, bg.b as f32];
+        if ui
+            .color_edit_button_rgb(&mut rgb)
+            .on_hover_text("Composition background")
+            .changed()
+        {
+            out.bg = Some(rgb);
         }
         ui.separator();
 

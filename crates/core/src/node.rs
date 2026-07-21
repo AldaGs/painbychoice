@@ -485,10 +485,22 @@ pub struct Comp {
     pub height: f64,
     pub fps: f64,
     pub duration: f64,
+    /// The colour painted inside the comp bounds, behind every layer. A user
+    /// setting, not a constant — `#[serde(default)]` so pre-bg `.pbc` files
+    /// load with [`Comp::DEFAULT_BG`] rather than transparent.
+    #[serde(default = "Comp::default_bg")]
+    pub bg: Color,
     pub root: Node,
 }
 
 impl Comp {
+    /// The out-of-the-box composition background (#5d677e).
+    pub const DEFAULT_BG: Color = Color::rgb(0.364_706, 0.403_922, 0.494_118);
+
+    fn default_bg() -> Color {
+        Self::DEFAULT_BG
+    }
+
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
             name: String::new(),
@@ -496,6 +508,7 @@ impl Comp {
             height,
             fps: 60.0,
             duration: 5.0,
+            bg: Self::DEFAULT_BG,
             root,
         }
     }
@@ -720,6 +733,23 @@ mod tests {
 
     fn key_frames(comp: &Comp) -> Vec<i64> {
         comp.root.children[0].transform.rotation_deg.key_frames()
+    }
+
+    /// The comp background is a setting, so it round-trips — and a `.pbc`
+    /// written before the setting existed must land on the default rather than
+    /// failing to parse or rendering the frame transparent.
+    #[test]
+    fn a_comp_without_a_background_loads_the_default_one() {
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root"));
+        comp.bg = Color::rgb(1.0, 0.0, 0.0);
+        let json = serde_json::to_string(&comp).unwrap();
+        let back: Comp = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bg, Color::rgb(1.0, 0.0, 0.0));
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("bg");
+        let old: Comp = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.bg, Comp::DEFAULT_BG);
     }
 
     #[test]

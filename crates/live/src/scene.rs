@@ -75,13 +75,20 @@ pub(crate) fn to_peniko(c: MColor, opacity: f64) -> Color {
 /// global transform that fits the composition into the window. The composition
 /// bounds are drawn first (so the editable frame is visible), then the shapes,
 /// then the selection outline on top.
-pub(crate) fn to_vello(scene: &MScene, fit: Affine, comp: (f64, f64), selected: Option<NodeId>) -> VScene {
+pub(crate) fn to_vello(
+    scene: &MScene,
+    fit: Affine,
+    comp: (f64, f64),
+    bg: MColor,
+    selected: Option<NodeId>,
+) -> VScene {
     let mut vs = VScene::new();
 
-    // Composition frame: a slightly lighter fill plus a border, so the comp
-    // bounds stand out from the letterbox and resolution changes are visible.
+    // Composition frame: the comp's own background colour plus a border, so the
+    // comp bounds stand out from the letterbox and resolution changes are
+    // visible. The fill is a per-comp user setting (`Comp::bg`), not a constant.
     let comp_rect = kurbo::Rect::new(0.0, 0.0, comp.0, comp.1);
-    vs.fill(Fill::NonZero, fit, Color::new([0.14, 0.15, 0.18, 1.0]), None, &comp_rect);
+    vs.fill(Fill::NonZero, fit, to_peniko(bg, 1.0), None, &comp_rect);
     let scale = fit.as_coeffs()[0].abs().max(1e-6);
     vs.stroke(
         &KurboStroke::new(1.5 / scale),

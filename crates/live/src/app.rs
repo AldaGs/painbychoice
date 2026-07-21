@@ -92,6 +92,21 @@ pub(crate) struct App {
     /// grid the user started on. The selection rides along for the same reason —
     /// see `apply_fps_edit`. `None` when no drag is in flight.
     pub(crate) fps_drag: Option<(f64, MNode, KeySelection)>,
+    /// The on-canvas transform gizmo's live drag, if one is in flight. Like
+    /// `fps_drag` this holds the pre-drag values so every delta resolves off
+    /// the state the grab started from — see `gizmo::resolve_drag`.
+    pub(crate) gizmo_drag: Option<GizmoDrag>,
+    /// Whether last frame's UI pass found a gizmo handle under the pointer (or
+    /// had a drag in flight). Gates canvas click-picking: without it, pressing
+    /// a handle *also* runs the picker, which hits empty canvas out at the end
+    /// of an arrow and deselects the very layer you were about to transform.
+    ///
+    /// It has to be our own flag because `is_pointer_over_egui` — the check the
+    /// rest of the winit handler uses — is area-based, not widget-based, and
+    /// stays `false` everywhere inside the canvas hole no matter what we draw
+    /// there. One frame stale, like `over_ui` itself, which is fine: the
+    /// pointer must hover a handle before it can press one.
+    pub(crate) gizmo_hot: bool,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -189,6 +204,7 @@ impl App {
                 // or the first frame draws tofu where every icon should be.
                 let ctx = egui::Context::default();
                 icon::install(&ctx);
+                theme::install(&ctx);
                 ctx
             },
             egui_state: None,
@@ -214,6 +230,8 @@ impl App {
             work_area: None,
             dope_label_w: 80.0,
             fps_drag: None,
+            gizmo_drag: None,
+            gizmo_hot: false,
         }
     }
 
@@ -465,8 +483,11 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
 
+            // `!self.gizmo_hot` is what keeps a handle click from doubling as a
+            // deselect — see the field's docs for why `over_ui` can't cover it.
             WindowEvent::MouseInput { state, button, .. }
                 if !over_ui
+                    && !self.gizmo_hot
                     && state == ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
@@ -1063,7 +1084,8 @@ impl App {
             }
         }
 
-        self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), self.selected);
+        let bg = self.doc().bg;
+        self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, self.selected);
 
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
@@ -1071,6 +1093,18 @@ impl App {
         // Pass the doc so an expression-driven property resolves against the
         // scene (a doc-less context would show its fallback instead).
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, self.doc(), t));
+        // The gizmo needs the selected layer's *world* matrix, which only the
+        // evaluated scene knows (it is the whole parent chain multiplied out).
+        // A selected group with no drawable geometry produces no scene item, so
+        // it simply gets no gizmo rather than one at the wrong place.
+        let gizmo_target = match (self.selected, &sel_info) {
+            (Some(id), Some(info)) => scene
+                .items
+                .iter()
+                .find(|i| i.source == id)
+                .map(|i| GizmoTarget::new(id.0, i.transform, info)),
+            _ => None,
+        };
         let rows = sel_node.map(dope_rows).unwrap_or_default();
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -1115,6 +1149,7 @@ impl App {
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
         let duration = self.doc().duration;
+        let comp_bg = self.doc().bg;
         let timebase = self.doc().timebase();
         let view = self.view;
         let work_area = self.work_area;
@@ -1122,6 +1157,12 @@ impl App {
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
+        // Moved out of `self` for the UI pass and put back after it, like the
+        // keyframe selection — the closure must not borrow `App`.
+        let mut gizmo_drag = self.gizmo_drag.take();
+        // Recomputed every frame: with no selection there is no gizmo, so the
+        // flag must fall back to false rather than latch on from a stale frame.
+        let mut gizmo_hot = false;
         let mut dope = DopeEdits::default();
         let mut tree_edits = TreeEdits::default();
         let mut selected_keys = std::mem::take(&mut self.selected_keys);
@@ -1172,6 +1213,7 @@ impl App {
                         doc_h,
                         doc_fps,
                         duration,
+                        comp_bg,
                         &mut comp,
                         &preset_names,
                         &mut preset_name_buf,
@@ -1230,6 +1272,13 @@ impl App {
                             full.max,
                         );
                         canvas_toolbar(ui, bar, zoom_pct, is_fit, &mut canvas_edits);
+                        // The gizmo paints over the frame and reports into the
+                        // ordinary property edits, so a handle drag auto-keys
+                        // exactly like a DragValue drag does.
+                        if let (Some(t), Some(rect)) = (&gizmo_target, canvas_pts) {
+                            gizmo_hot =
+                                gizmo_ui(ui, rect, t, fit, ppp, &mut gizmo_drag, &mut edits);
+                        }
                     }
                 },
                 &mut dock_cmd,
@@ -1422,7 +1471,16 @@ impl App {
 
         // Apply property edits + keyframe drags to the selected node, then
         // re-evaluate so the change is visible on this very frame.
+        self.gizmo_drag = gizmo_drag;
+        self.gizmo_hot = gizmo_hot;
         let mut dirty = self.apply_edits(frame, &edits);
+        // Applied here rather than with the other comp settings above so it can
+        // mark the scene dirty — the backdrop is baked into `vscene`, which is
+        // only rebuilt when something says it changed.
+        if let Some(rgb) = comp.bg {
+            self.doc_mut().bg = rgb_color(rgb);
+            dirty = true;
+        }
         if let Some(delta) = dope.move_by {
             dirty |= self.move_selected_keys(delta);
         }
@@ -1477,7 +1535,8 @@ impl App {
         }
         if dirty {
             let scene = evaluate_comp(&self.project, self.current, t);
-            self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), self.selected);
+            let bg = self.doc().bg;
+            self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, self.selected);
         }
 
         self.egui_state
@@ -1511,7 +1570,8 @@ impl App {
                 &self.vscene,
                 &surface.target_view,
                 &vello::RenderParams {
-                    base_color: Color::new([0.08, 0.09, 0.11, 1.0]),
+                    // The preview letterbox — the area around the comp frame.
+                    base_color: theme::PREVIEW_BACKDROP,
                     width: surface.config.width,
                     height: surface.config.height,
                     antialiasing_method: AaConfig::Area,

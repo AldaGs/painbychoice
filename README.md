@@ -256,6 +256,66 @@ state**, like `view` and `work_area`, reset to Fit when a comp opens.
   pass (the same defer-then-apply discipline as every other panel). Built to hold
   more preview tools later.
 
+### The transform gizmo (2026-07-20)
+
+`live/src/gizmo.rs`. On-canvas move / rotate / scale handles for the selected
+layer. Two decisions carry the design:
+
+- **Painted with egui, not vello.** egui's pass runs *after* the vello render in
+  `App::redraw`, so a plain `ui.painter()` lands on top of the frame — no
+  compositing work, and `ui.interact` supplies hover and drag for free.
+- **It emits ordinary `PropEdits`.** A handle drag fills in `pos_x`/`rot`/
+  `scale_x`/… — the same struct the properties panel's DragValues fill in — so
+  it goes through `apply_edits` and **auto-keys exactly like typing the number
+  does**. There is no second write path into the document that could disagree
+  with the first.
+
+The arithmetic lives in `resolve_drag`, which is pure (no egui, no `App`) and
+therefore unit-tested without a window, the same way `apply_fps_edit` is. It
+resolves every delta against a **pre-drag snapshot** (`GizmoDrag`) rather than
+stacking on the previous frame — re-deriving from a moving base accumulates
+error, and with an auto-keying property that error gets baked into a keyframe.
+
+Three gotchas worth keeping:
+
+- **The pivot is `position`, not `anchor`.** `Transform::resolve` builds
+  `translate(position) · rotate · scale · translate(-anchor)`, so the anchor
+  point *maps to* `position` in parent space. Rotation and scale hang off there.
+- **The parent matrix is recovered, not looked up.** `GizmoTarget::new` computes
+  `parent = world · local⁻¹` from the scene item's world matrix. That is why
+  `anchor` had to join `NodeInfo`: leave it out of `local` and the recovered
+  parent is wrong, so the gizmo tracks the cursor at an offset. A zero scale
+  makes `local` singular, so the recovery substitutes a scale of 1 (an
+  approximation, but it beats handles at NaN).
+- **It must never claim the whole canvas.** `is_pointer_over_egui` is what tells
+  the winit handler to skip click-picking, so `gizmo_ui` calls `ui.interact` on a
+  small rect **around the pointer**, and only while a handle is under it or a
+  drag is live. A canvas-wide interactive rect would make the preview unclickable
+  everywhere the gizmo is shown.
+
+Handle sizes are constants in **logical points**, not comp units, so the gizmo
+stays the same size on screen at every zoom — a gizmo that scaled with the comp
+would vanish exactly when you zoomed out to grab it.
+
+### Colours
+
+Three surfaces, deliberately distinct, and they live in three different places
+for a reason:
+
+| Surface | Value | Where it lives |
+| --- | --- | --- |
+| UI chrome (panels, headers, widgets) | `#2d2d2d` | `theme::UI_BASE` → `egui::Visuals` |
+| Preview backdrop (the letterbox) | `#23262d` | `theme::PREVIEW_BACKDROP`, vello's `base_color` |
+| Composition area (inside the frame) | `#5d677e` **default** | `Comp::bg` — **document data** |
+
+The backdrop is vello's, not egui's, because the canvas is a GPU hole with no
+egui behind it. The composition colour is a **per-comp setting** rather than a
+theme constant: it is what the frame renders against, so it belongs to the
+document and is saved with it (`#[serde(default)]`, so pre-`bg` `.pbc` files load
+on the default rather than rendering transparent). Edit it in the composition bar
+under **BG**. Widget states are `shade()` offsets from `UI_BASE`, so re-tinting
+the editor is one constant.
+
 ### `live/` module layout
 
 `main.rs` grew to ~5,100 lines and was split by concern (2026-07-19). It was a
@@ -306,8 +366,10 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
 
 ## What works today (live editor)
 
-- **Composition bar** (top) — editable Size (W×H), FPS, Duration. Drives canvas
-  fit, playback, frame step, timeline. Comp bounds drawn with a fill + border.
+- **Composition bar** (top) — editable Size (W×H), FPS, Duration, **BG**. Drives
+  canvas fit, playback, frame step, timeline. Comp bounds drawn with a fill +
+  border, the fill being `Comp::bg` — a per-comp **setting** saved in the `.pbc`
+  (default `#5d677e`), not a theme constant. See *Colours* below.
 - **Canvas** — vello rasterizes `evaluate(doc, t)` each frame; click a shape to
   select (front-most, via `NodeId` provenance). Selection gets a yellow outline.
   **Zoomable + pannable**: scroll zooms about the cursor, middle-drag pans, and a
@@ -315,6 +377,12 @@ replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
   (25/50/100/200/400/800%). **Fit** (the default) frames the comp in the canvas
   area with a 20px gap from the surrounding panels, and re-fits as they resize.
   See *The preview camera* below.
+- **Transform gizmo** — the selected layer gets on-canvas handles: a centre
+  square (free move), an X/Y arrow each (move along the *layer's* own axis), a
+  box at the end of each axis (scale that axis), a corner box (uniform scale),
+  and a ring (rotate). Everything pivots on the **anchor point**. The handles are
+  a fixed size in screen points, so they stay grabbable at any zoom. See
+  *The transform gizmo* below.
 - **Transport** — Play/Pause (Space), Restart (R), ←/→ frame step, scrubbable
   playhead (an integer slider, so it can only land on frames). Readout is
   `hh:mm:ss.ff` plus `[frame/last]`. Playback runs off the wall clock but
@@ -552,6 +620,28 @@ Two rules keep this safe:
   `max_rect`. Measuring the canvas leaf with `max_rect` fit the comp to the whole
   window and floated the zoom strip in the window corner; use
   `available_rect_before_wrap()` for the leftover central region.
+- **An egui panel's returned rect is content-driven, and it persists.**
+  `Panel::show` hands back the *inner response* rect, which grew (or shrank) to
+  whatever the content allocated — clamped only at `max_size` — and egui stores
+  that same rect as the panel's `PanelState`, so the next frame starts from it.
+  A leaf whose content changes height therefore resizes its own panel and shoves
+  every other leaf around, canvas included. This is why selecting a layer used to
+  resize the whole window: the dopesheet grows a row per animatable property, so
+  every select/deselect moved the preview. The invariant that fixes it is
+  `Editor::scroll_wrapped` — **every leaf must either fill its area exactly or
+  scroll inside it, never allocate past it** — enforced by a test. Note the
+  scroll wrapper is `ScrollArea::vertical` with `auto_shrink([false; 2])`:
+  horizontal scrolling would desync the dopesheet tracks from the ruler (frames
+  map across the panel's *width*), and letting it auto-shrink reintroduces the
+  same bug from the other side.
+- **`is_pointer_over_egui` is area-based, not widget-based.** It asks which
+  *layer* is under the pointer, and for the background layer whether the point
+  falls outside the root `Ui`'s available rect. So it is `false` everywhere in
+  the canvas hole **no matter what you draw or `ui.interact` there** — an
+  interactive rect inside the hole does not make egui "want" the pointer. Any
+  canvas-space widget that must not double as a canvas click therefore needs its
+  own flag; the gizmo uses `App::gizmo_hot`. Getting this wrong is silent: the
+  widget works, and the click *also* falls through to the picker.
 - **Redraw is event-driven** (`ControlFlow::Wait`). Anything that must keep
   animating while the pointer is held still (edge auto-pan) needs an explicit
   `ctx.request_repaint()`, or it stops the moment input stops.
@@ -719,11 +809,44 @@ built. Note the distinction: today's graph is a **property** graph (values into
 properties); Nuke's is an **image** graph (operations on pixels). They're
 different machines.
 
+**Canvas gizmos + grids (added 2026-07-20).** Not part of the agreed sequence
+above — it came in sideways as a preview-panel need. The **transform gizmo is
+done** (see *The transform gizmo*). Still open, in this order:
+
+1. **Grid + rulers + guides** — a comp-space grid at a configurable spacing,
+   rulers on the preview edges, draggable guides. Decided: this is **per-comp
+   state saved in the `.pbc`**, alongside `Comp::bg`, not session-only view
+   state — same reasoning, it describes the composition rather than the window.
+2. **Snapping** — drags snap to the grid, guides, comp edges/centre, and other
+   layers' bounds. Depends on (1), and on the gizmo for the drag path.
+3. **Anchor-point handle + selection bbox** — the gizmo pivots on the anchor but
+   can't yet *move* it, and there is no bounding box drawn.
+
 > **Graph-UI progress (2026-07-20):** module bodies now have a real editing
 > surface — you open a module from the graph panel and edit its body + knobs on
-> the same node canvas a property uses (see *Editing a module body* above). Still
-> open under this step: seeding a fresh `Use` link from the kind picker, and a
-> nested canvas for override sub-expressions at a call site.
+> the same node canvas a property uses (see *Editing a module body* above).
+> **Seeding a fresh `Use` link from the kind picker is now done:** since a bare
+> `ExprKind` can't name a module, the box's kind combo lists the project's
+> modules below the primitives (`ExprKind::ALL`), and choosing one emits a
+> `SetModule` op — which repoints an existing link *or* replaces any other kind
+> with a fresh `use <module>` (no overrides). No core change: `Use` stays out of
+> `ExprKind::ALL`, and `Expr::seed(Use)`'s placeholder module is never reached by
+> the picker.
+>
+> **Override sub-expressions are now editable on the canvas** (the last open
+> graph-UI item). A link's overrides became **first-class children** of the
+> `Expr::Use` node — `arity`/`child`/`at`/`at_mut` treat `overrides[i]` as slot
+> `i` — so the existing canvas lays each override out as a wired box with its own
+> kind picker, and edits route through the ordinary `GraphOp`s (path = the link's
+> path + the child slot). An override can therefore be a literal, a `ref`, a
+> `param`, a script — anything, not just a literal. The `use_editor` row shrank to
+> the two-state toggle: **override** seeds a literal `0` child to build from,
+> **inherit** (the `x`) drops it so the knob follows the module again; the value
+> itself is edited in the child box, labelled with the knob name (derived in the
+> canvas, since override names are dynamic and core's `slot_label` is `&'static`).
+> `eval_use` is unchanged — it still reads overrides by name — so this is a walk
+> change, not a semantics change. With that, the Blender-standard graph UI step is
+> complete.
 
 > **Timeline UX + fps retiming (2026-07-20, user-verified):** changing a comp's
 > fps now **re-grids** the animation instead of leaving keys on stale frame

@@ -2076,3 +2076,144 @@ fn a_stale_selection_entry_is_dropped() {
     let out = remap_selection(&sel, node, node, 1.0);
     assert!(out.is_empty());
 }
+
+// --- Transform gizmo -------------------------------------------------------
+
+/// A drag snapshot, positioned so the pivot is at the origin unless a test
+/// says otherwise. Every gizmo test resolves against one of these rather than
+/// through egui, because `resolve_drag` is deliberately free of it.
+fn drag_at(handle: GizmoHandle, rot: f64, grab: (f64, f64)) -> GizmoDrag {
+    GizmoDrag {
+        handle,
+        node: 1,
+        start_pos: Vec2::new(0.0, 0.0),
+        start_rot: rot,
+        start_scale: (1.0, 1.0),
+        grab_parent: Point::new(grab.0, grab.1),
+    }
+}
+
+/// The centre handle moves the layer by exactly the pointer's parent-space
+/// delta — no scaling, no rotation folded in.
+#[test]
+fn the_centre_handle_tracks_the_pointer_one_to_one() {
+    let d = drag_at(GizmoHandle::Move, 30.0, (10.0, 10.0));
+    let (pos, rot, scale) = resolve_drag(&d, Point::new(35.0, -5.0));
+    assert_eq!((pos.x, pos.y), (25.0, -15.0));
+    assert_eq!(rot, 30.0, "a move must not touch rotation");
+    assert_eq!(scale, (1.0, 1.0));
+}
+
+/// An axis arrow constrains the move to the *layer's* axis, not the parent's:
+/// at 90° the layer's X points along parent +Y, so a purely vertical drag
+/// moves the full distance and a horizontal one moves nothing.
+#[test]
+fn an_axis_arrow_projects_the_drag_onto_the_rotated_axis() {
+    let d = drag_at(GizmoHandle::MoveAxis(GizmoAxis::X), 90.0, (0.0, 0.0));
+    let (pos, ..) = resolve_drag(&d, Point::new(0.0, 40.0));
+    assert!((pos.x - 0.0).abs() < 1e-9, "no movement across the axis");
+    assert!((pos.y - 40.0).abs() < 1e-9, "the whole drag lands along it");
+
+    let (pos, ..) = resolve_drag(&d, Point::new(40.0, 0.0));
+    assert!(pos.hypot() < 1e-9, "a drag square to the axis moves nothing");
+}
+
+/// The ring adds the angle the pointer sweeps about the pivot, and leaves
+/// position and scale alone.
+#[test]
+fn the_ring_adds_the_swept_angle() {
+    let d = drag_at(GizmoHandle::Rotate, 10.0, (100.0, 0.0));
+    // Straight out on +X, swung to +Y: a quarter turn.
+    let (pos, rot, scale) = resolve_drag(&d, Point::new(0.0, 100.0));
+    assert!((rot - 100.0).abs() < 1e-6, "10° + 90°, got {rot}");
+    assert_eq!((pos.x, pos.y), (0.0, 0.0));
+    assert_eq!(scale, (1.0, 1.0));
+}
+
+/// Scale handles are a *ratio* of distances from the pivot, so halving the
+/// grab distance halves the scale — and the axis handle touches one axis only.
+#[test]
+fn scale_handles_use_the_distance_ratio_from_the_pivot() {
+    let d = drag_at(GizmoHandle::ScaleUniform, 0.0, (50.0, 0.0));
+    let (_, _, scale) = resolve_drag(&d, Point::new(100.0, 0.0));
+    assert_eq!(scale, (2.0, 2.0));
+
+    let d = drag_at(GizmoHandle::ScaleAxis(GizmoAxis::Y), 0.0, (0.0, 40.0));
+    let (_, _, scale) = resolve_drag(&d, Point::new(0.0, 20.0));
+    assert!((scale.1 - 0.5).abs() < 1e-9, "Y halved, got {}", scale.1);
+    assert_eq!(scale.0, 1.0, "X untouched");
+}
+
+/// A rotate or scale grab that lands *on* the pivot has no radius to measure
+/// from. It must hold the values rather than divide by zero and emit NaN into
+/// the document.
+#[test]
+fn a_grab_on_the_pivot_is_inert_rather_than_nan() {
+    for handle in [GizmoHandle::Rotate, GizmoHandle::ScaleUniform] {
+        let d = drag_at(handle, 0.0, (0.0, 0.0));
+        let (pos, rot, scale) = resolve_drag(&d, Point::new(30.0, 30.0));
+        assert!(pos.hypot().is_finite() && rot.is_finite());
+        assert_eq!(scale, (1.0, 1.0), "{handle:?} held its scale");
+        assert_eq!(rot, 0.0, "{handle:?} held its rotation");
+    }
+}
+
+/// The gizmo recovers the *parent* transform by dividing the layer's own local
+/// matrix back out of its world matrix. If that arithmetic is off, the handles
+/// draw somewhere other than where the layer's pivot actually is — so check it
+/// against a nested layer with a non-trivial anchor.
+#[test]
+fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
+    let parent = Affine::translate((300.0, 40.0)) * Affine::rotate(0.4) * Affine::scale(2.0);
+    let mut info = NodeInfo::resolve(
+        &MNode::group(1, "layer"),
+        &Comp::new(100.0, 100.0, MNode::group(0, "root")),
+        0.0,
+    );
+    info.pos = (25.0, -60.0);
+    info.rot = 33.0;
+    info.scale = (1.5, 0.5);
+    info.anchor = (12.0, 7.0);
+
+    let local = Affine::translate(Vec2::new(info.pos.0, info.pos.1))
+        * Affine::rotate(info.rot.to_radians())
+        * Affine::scale_non_uniform(info.scale.0, info.scale.1)
+        * Affine::translate(Vec2::new(-info.anchor.0, -info.anchor.1));
+    let world = parent * local;
+
+    let t = GizmoTarget::new(1, world, &info);
+    // The recovered parent must map `position` to wherever the world matrix
+    // puts the anchor point — that is the definition of the pivot.
+    let via_parent = t.parent * Point::new(info.pos.0, info.pos.1);
+    let via_world = world * Point::new(info.anchor.0, info.anchor.1);
+    assert!(
+        (via_parent - via_world).hypot() < 1e-6,
+        "pivot drifted: {via_parent:?} vs {via_world:?}"
+    );
+}
+
+/// Every content leaf must either scroll inside its area or fill it exactly —
+/// never allocate past it. egui hands `show_dock` a **content-driven** panel
+/// rect and persists it as the panel's own size, so a leaf that overflows
+/// resizes its panel and shoves every other leaf around. That is what made
+/// selecting a layer resize the whole window: the dopesheet grows a row per
+/// animatable property.
+///
+/// Graph is the one exemption — it runs its own `ScrollArea::both`.
+#[test]
+fn every_content_leaf_is_kept_from_resizing_its_own_panel() {
+    for editor in SWAPPABLE {
+        let wrapped = editor.scroll_wrapped();
+        if editor == Editor::Graph {
+            assert!(!wrapped, "Graph scrolls itself; nesting a second area fights it");
+        } else {
+            assert!(wrapped, "{editor:?} would resize its panel as its content changes");
+        }
+    }
+    // The structural leaves must stay unwrapped: the canvas measures an exact
+    // rect for the vello target, and a scroll area would both offset and
+    // (with a scrollbar) narrow it.
+    assert!(!Editor::Canvas.scroll_wrapped(), "the canvas rect must stay exact");
+    assert!(!Editor::Comp.scroll_wrapped());
+    assert!(!Editor::Transport.scroll_wrapped());
+}

@@ -42,17 +42,20 @@ use winit::window::{Window, WindowId};
 // below) so no module needs its own import bookkeeping.
 mod app;
 mod dock;
+mod gizmo;
 mod graph;
 mod icon;
 mod layers;
 mod props;
 mod scene;
+mod theme;
 mod timeline;
 #[cfg(test)]
 mod tests;
 
 use app::*;
 use dock::*;
+use gizmo::*;
 use graph::*;
 use layers::*;
 use props::*;
