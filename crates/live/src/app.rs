@@ -382,6 +382,31 @@ impl App {
         }
     }
 
+    /// Raise a scene property's expression onto the node canvas and bind it back
+    /// — the **property-graph fold**. Reads the property's current `Expr`, raises
+    /// it into the project graph as nodes, and adds a driver from the raised
+    /// output to the same property, so the recipe is now edited on the canvas and
+    /// still drives the layer. A no-op if the property isn't expression-driven —
+    /// promote it first (the old panel's `= fx`).
+    pub(crate) fn import_property(&mut self, target: NodeId, prop: PropPath) {
+        let kind = PropKind::from_path(prop);
+        let expr = self
+            .project
+            .comp(self.current)
+            .and_then(|c| c.root.find(target))
+            .and_then(|n| prop_of(n, kind).and_then(|p| p.expr().cloned()));
+        let Some(expr) = expr else {
+            eprintln!("import: that property isn't expression-driven — promote it first");
+            return;
+        };
+        // Raise (mutates the graph) using the registry — disjoint fields, so both
+        // borrows coexist. Place the root clear of the usual spawn corner.
+        let at = kurbo::Vec2::new(360.0, 40.0);
+        let output = motion_core::raise(&mut self.project.graph, &self.node_registry, &expr, at);
+        self.project.bindings.push(Binding { output, target, prop });
+        self.recompile_graph();
+    }
+
     /// Recompile every driver: lower its graph output to an `Expr` and set the
     /// target property to `Value::Expr`, so `evaluate` runs it. Lowering is
     /// frame-independent (it builds the recipe, doesn't sample it), so this needn't
@@ -1842,6 +1867,12 @@ impl App {
         }
         if ng_changed && !self.project.bindings.is_empty() {
             self.recompile_graph();
+            window.request_redraw();
+        }
+        // Import raises + binds + recompiles on its own, so it's handled apart
+        // from the `ng_changed` recompile above.
+        if let Some((target, prop)) = ng_edits.import.take() {
+            self.import_property(target, prop);
             window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area

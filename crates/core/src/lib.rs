@@ -15,6 +15,7 @@ pub mod expr;
 pub mod graph;
 pub mod lower;
 pub mod node;
+pub mod raise;
 pub mod registry;
 pub mod socket;
 pub mod text;
@@ -34,6 +35,7 @@ pub use graph::{
     Binding, ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
 };
 pub use lower::lower_output;
+pub use raise::raise;
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };

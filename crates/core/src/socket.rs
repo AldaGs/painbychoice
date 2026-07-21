@@ -79,6 +79,16 @@ impl SocketType {
         }
     }
 
+    /// Whether an output of `self` may feed an input of `other`. Equal types
+    /// always connect; additionally **`Time` and `Number` are interchangeable**,
+    /// because a layer-clock reading *is* a number (`localTime` into a `mul`, a
+    /// literal frame into a ramp's `start`). Everything else must match exactly —
+    /// a `Vector` can't feed a `Number`.
+    pub fn feeds(self, other: SocketType) -> bool {
+        use SocketType::{Number, Time};
+        self == other || matches!((self, other), (Time, Number) | (Number, Time))
+    }
+
     /// The colour of this type's socket dot — the whole point of a *typed* port
     /// being that you can read a graph's dataflow at a glance. Hues follow
     /// Blender's convention where there's an equivalent (grey number, purple

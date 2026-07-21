@@ -62,6 +62,10 @@ pub(crate) enum BindingOp {
 pub(crate) struct NgEdits {
     pub(crate) op: Option<NgOp>,
     pub(crate) binding: Option<BindingOp>,
+    /// Raise a scene layer's property expression onto the canvas (the fold): the
+    /// panel names `(layer, property)`, `App` reads its `Expr`, raises it, and
+    /// binds the result back so editing the nodes drives the property.
+    pub(crate) import: Option<(NodeId, PropPath)>,
 }
 
 /// A core [`motion_core::Color`] as an egui colour. Socket dots and header tints
@@ -134,6 +138,8 @@ pub(crate) fn nodegraph_ui(
     });
     ui.separator();
     drivers_ui(ui, graph, reg, layers, bindings, out);
+    ui.separator();
+    import_ui(ui, layers, out);
     ui.separator();
     inspector_ui(ui, graph, reg, layers, out);
     ui.separator();
@@ -256,6 +262,57 @@ fn drivers_ui(
                 });
         });
     }
+}
+
+/// The **Import** row — the fold's front door: pull an expression-driven
+/// property onto the canvas as nodes. Picks a layer + property; `App` raises that
+/// property's `Expr` into the graph and binds it back, so the recipe you built in
+/// the old per-property editor becomes editable here. The pending pick lives in
+/// egui memory (view state), like the driver combos.
+fn import_ui(ui: &mut egui::Ui, layers: &[(u64, String)], out: &mut NgEdits) {
+    if layers.is_empty() {
+        return;
+    }
+    let mem = egui::Id::new("ng_import_sel");
+    let mut sel: (u64, PropPath) =
+        ui.ctx().data(|d| d.get_temp(mem)).unwrap_or((layers[0].0, PropPath::Rotation));
+    ui.horizontal(|ui| {
+        ui.strong("Import");
+        let cur_layer = layers
+            .iter()
+            .find(|(i, _)| *i == sel.0)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| format!("#{}", sel.0));
+        egui::ComboBox::from_id_salt("imp_layer").width(90.0).selected_text(cur_layer).show_ui(
+            ui,
+            |ui| {
+                for (i, n) in layers {
+                    if ui.selectable_label(*i == sel.0, n).clicked() {
+                        sel.0 = *i;
+                    }
+                }
+            },
+        );
+        egui::ComboBox::from_id_salt("imp_prop").width(80.0).selected_text(prop_path_label(sel.1)).show_ui(
+            ui,
+            |ui| {
+                for p in PROP_PATHS {
+                    if ui.selectable_label(p == sel.1, prop_path_label(p)).clicked() {
+                        sel.1 = p;
+                    }
+                }
+            },
+        );
+        if ui
+            .button("→ nodes")
+            .on_hover_text("Raise this property's expression onto the canvas")
+            .clicked()
+        {
+            out.import = Some((NodeId(sel.0), sel.1));
+        }
+    });
+    ui.weak("Pulls an expression-driven property onto the graph as nodes.");
+    ui.ctx().data_mut(|d| d.insert_temp(mem, sel));
 }
 
 /// The inspector for the selected node: drag editors for its `value` constant

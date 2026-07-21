@@ -1773,8 +1773,16 @@ files load with an empty graph; load re-syncs the driven properties. **`ref` /
 None, .. }` (so it reads whichever layer a driver points at), and
 `localTime`/`inPoint`/`outPoint`/`t01` to `Expr::Time`. The inspector gained a
 ref target picker (layer / property / frame offset) and a param name field.
-Still ahead in (3): `use` (module link — its overrides are wired children) and
-shape/geometry lowering, then the property-graph fold. (4) The compositor stage — the real gate for effects/mattes/masks.
+**The property-graph fold is underway**: `raise` (`core/src/raise.rs`) is the
+inverse of `lower` — it lays an existing property `Expr` out as nodes + wires and
+returns the output endpoint, so `lower(raise(e)) == e` on the lowerable subset
+(tested). The Nodes panel's **Import** row pulls an expression-driven property
+onto the canvas (`App::import_property` raises its `Expr` and binds the result
+back), so a recipe built in the old per-property editor becomes editable on the
+unified canvas — two views of one substrate. (A small type-system consequence:
+`SocketType::feeds` lets a `Time` output feed a `Number` input, since a layer
+clock reads as a number.) Still ahead: retiring the old `Editor::Graph` panel
+once the canvas covers `script`/`use`, plus `use`/shape lowering. (4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.

@@ -233,7 +233,7 @@ impl NodeGraph {
         // Both endpoints' nodes and kinds must resolve.
         let from_ty = self.output_type(reg, &from)?;
         let to_ty = self.input_type(reg, &to)?;
-        if from_ty != to_ty {
+        if !from_ty.feeds(to_ty) {
             return Err(ConnectError::TypeMismatch { from: from_ty, to: to_ty });
         }
         // A wire from an output back to a node it (transitively) feeds would
@@ -326,7 +326,7 @@ impl NodeGraph {
             let out_ty = self.output_type(reg, &edge.from);
             let in_ty = self.input_type(reg, &edge.to);
             match (out_ty, in_ty) {
-                (Ok(a), Ok(b)) if a != b => {
+                (Ok(a), Ok(b)) if !a.feeds(b) => {
                     out.push(GraphError::TypeMismatch { edge: edge.clone(), from: a, to: b });
                 }
                 (Ok(_), Ok(_)) => {}
