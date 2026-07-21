@@ -690,9 +690,6 @@ fn only_content_areas_carry_a_header() {
     assert!(Editor::Properties.is_swappable());
     assert!(Editor::Dopesheet.is_swappable());
     assert!(Editor::NodeGraph.is_swappable());
-    // The retired expression panel is not offerable — nothing may create a new
-    // leaf of it, even though a saved layout can still name one.
-    assert!(!Editor::Graph.is_swappable());
     assert!(!Editor::Canvas.is_swappable());
     assert!(!Editor::Comp.is_swappable());
     assert!(!Editor::Transport.is_swappable());
@@ -1430,12 +1427,12 @@ fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
 /// selecting a layer resize the whole window: the dopesheet grows a row per
 /// animatable property.
 ///
-/// Graph is the one exemption — it runs its own `ScrollArea::both`.
+/// The node graph is the one exemption — it runs its own `ScrollArea::both`.
 #[test]
 fn every_content_leaf_is_kept_from_resizing_its_own_panel() {
     for editor in SWAPPABLE {
         let wrapped = editor.scroll_wrapped();
-        if editor == Editor::Graph || editor == Editor::NodeGraph {
+        if editor == Editor::NodeGraph {
             assert!(!wrapped, "{editor:?} scrolls itself; nesting a second area fights it");
         } else {
             assert!(wrapped, "{editor:?} would resize its panel as its content changes");

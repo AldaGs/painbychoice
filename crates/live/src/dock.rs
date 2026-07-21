@@ -25,18 +25,6 @@ pub(crate) enum Editor {
     Properties,
     Transport,
     Dopesheet,
-    /// **Retired.** The old per-property expression editor, replaced entirely by
-    /// [`Editor::NodeGraph`] once the node canvas covered everything it did
-    /// (module authoring and body scope, link overrides, oscillator waveforms,
-    /// exposed knobs, and the script live result).
-    ///
-    /// The variant stays because it is **document data**: a `.pbc` saved while
-    /// an area showed this panel names it in the stored layout, and an unknown
-    /// variant is a hard serde error — it would fail the whole file, not just
-    /// the layout. [`Dock::migrate_retired`] rewrites such a leaf to
-    /// `NodeGraph` on load; nothing can produce a new one, since it isn't in
-    /// [`SWAPPABLE`].
-    Graph,
     /// The composition node-graph editor: a Blender-style canvas of typed nodes
     /// wired output→input, drawn from the `NodeRegistry`. It runs its own scroll
     /// area and isn't in the default layout — summon it with the area-header
@@ -65,9 +53,6 @@ impl Editor {
             Editor::Properties => "Properties",
             Editor::Transport => "Transport",
             Editor::Dopesheet => "Dopesheet",
-            // Retired — see `Editor::Graph`. Labelled as what it becomes, since
-            // the only way to see one is a saved layout mid-migration.
-            Editor::Graph => "Nodes",
             Editor::NodeGraph => "Nodes",
         }
     }
@@ -81,7 +66,7 @@ impl Editor {
     /// so its content can't resize the panel it lives in. See the note on
     /// `show_dock` for why that matters.
     ///
-    /// Excluded: **Graph** and **NodeGraph** run their own `ScrollArea::both`
+    /// Excluded: **NodeGraph** runs its own `ScrollArea::both`
     /// (nesting two would fight over the scroll delta); **Canvas** must measure an exact rect for
     /// the vello target; **Comp** and **Transport** are single fixed-height
     /// bars in non-resizable panels, so they have nothing to overflow.
@@ -328,27 +313,6 @@ impl Dock {
     /// the default: exactly one canvas — the single vello target and the tree's
     /// innermost leaf — plus the two headerless toolbars, which no picker can
     /// re-add if a bad layout dropped them.
-    /// Rewrite any leaf showing a **retired** editor to its replacement.
-    ///
-    /// Run on every loaded layout, before [`Self::is_valid`]. A saved `.pbc`
-    /// can name a panel that no longer exists — the layout is document data,
-    /// and the code that wrote it is gone — so retiring a panel has to migrate
-    /// its leaves rather than strand or discard the whole arrangement the user
-    /// built. Today that's `Graph` → `NodeGraph`, the panel that replaced it.
-    pub(crate) fn migrate_retired(&mut self) {
-        match self {
-            Dock::Leaf(e) => {
-                if *e == Editor::Graph {
-                    *e = Editor::NodeGraph;
-                }
-            }
-            Dock::Split { first, second, .. } => {
-                first.migrate_retired();
-                second.migrate_retired();
-            }
-        }
-    }
-
     pub(crate) fn is_valid(&self) -> bool {
         fn tally(d: &Dock, canvas: &mut u32, comp: &mut u32, transport: &mut u32) {
             match d {

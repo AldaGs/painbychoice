@@ -1676,20 +1676,11 @@ impl App {
         self.presets = builtin_presets();
         let restored = match layout {
             Some(l) => {
-                self.presets.extend(l.user_presets.into_iter().filter_map(|mut p| {
-                    p.dock.migrate_retired();
-                    p.dock.is_valid().then_some(p)
-                }));
+                self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
                 l.dock
             }
             None => None,
         };
-        // A saved layout may name a retired panel; rewrite those leaves before
-        // validating, so an old file keeps the arrangement it had.
-        let restored = restored.map(|mut d| {
-            d.migrate_retired();
-            d
-        });
         self.dock = match restored {
             Some(d) if d.is_valid() => d,
             Some(_) => {
@@ -2077,9 +2068,7 @@ impl App {
                             &FontList { all: font_families, recent: recent_fonts },
                         )
                     }
-                    // `Graph` is the retired expression panel; a layout mid-migration
-                    // can still name it, so it shows its replacement.
-                    Editor::Graph | Editor::NodeGraph => nodegraph_ui(
+                    Editor::NodeGraph => nodegraph_ui(
                         ui,
                         node_graph,
                         &node_ctx,

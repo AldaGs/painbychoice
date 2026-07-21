@@ -1890,12 +1890,13 @@ capability was consciously dropped:** `ExtractModule`, which lifted a property's
 expression into a new module in one click — with module scope and Import both on
 the canvas, it was a shortcut, not a capability.
 
-Two things worth knowing about the retirement. **The `Editor::Graph` enum variant
-stays**, excluded from `SWAPPABLE` so nothing can create one: the dock layout is
-*document data*, and an unknown variant is a hard serde error that would fail an
-entire `.pbc`, not just its layout. `Dock::migrate_retired()` rewrites such a
-leaf to `NodeGraph` on load, so a file saved with the old panel docked keeps the
-arrangement it had. **29 tests went with the panel** — the ones covering its box
+One thing worth knowing about the retirement. The `Editor::Graph` enum variant
+was briefly kept for loadability — the dock layout is *document data*, and an
+unknown serde variant is a hard error that fails an entire `.pbc` rather than
+just its layout — with a `migrate_retired()` pass rewriting such leaves. **That
+shim is gone**: no `.pbc` predating the retirement exists, so it was
+back-compat for a population of zero. If a save file ever does need to outlive a
+panel, that is the shape the migration takes. **29 tests went with the panel** — the ones covering its box
 geometry (`layout_expr`, `box_height`) were genuinely dead, but the ones covering
 *semantics* that merely moved (module rename/delete, body edits reaching every
 link, overrides surviving a re-point) are re-pinned against the node path that
