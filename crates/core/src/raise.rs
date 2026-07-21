@@ -19,6 +19,8 @@ use kurbo::Vec2;
 
 use crate::expr::{Expr, ExprValue, Generator, TimeSource};
 use crate::graph::{Endpoint, GraphCtx, NodeGraph};
+use crate::node::Shape;
+use crate::value::Value;
 
 /// Column width and row height for the auto-layout — children sit one column to
 /// the left of their parent (output flows left→right), stacked down the rows.
@@ -186,6 +188,164 @@ fn raise_generator(
         let _ = graph.connect(ctx, e, Endpoint::new(id, socket));
     }
     (Endpoint::new(id, "value"), center)
+}
+
+/// Why a [`Shape`] can't be raised onto the canvas.
+///
+/// Both arms are refusals rather than best-effort conversions, on purpose: a
+/// raised shape is *bound* straight away, so anything lost in translation would
+/// be lost from the document a moment later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RaiseShapeError {
+    /// This param is a keyframe track. A graph-authored param lowers to
+    /// `Value::Expr` (see [`crate::lower::lower_geometry`]), so binding the
+    /// raised shape would *replace* the track — the animation would simply be
+    /// gone. Bake it to a constant first, the same rule the property fold
+    /// follows when it asks you to promote before importing.
+    ///
+    /// Carries the socket's human label so the caller can name it.
+    Keyframed(&'static str),
+    /// A hand-drawn [`Shape::Path`] has no node form — its geometry isn't
+    /// parametric, which is the same reason it has no `ShapeSize`.
+    Unsupported,
+}
+
+impl std::fmt::Display for RaiseShapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RaiseShapeError::Keyframed(what) => write!(
+                f,
+                "'{what}' is keyframed. Bake it to a constant first — a \
+                 graph-authored param is an expression and would replace the track."
+            ),
+            RaiseShapeError::Unsupported => {
+                f.write_str("a hand-drawn path has no node form — its geometry isn't parametric")
+            }
+        }
+    }
+}
+
+/// Raise a [`Shape`] into `graph` as a shape node with its params filled in, and
+/// return the `geometry` output that reproduces it — ready to bind to a layer.
+///
+/// **The inverse of [`crate::lower::lower_geometry`]**, and tested as one:
+/// lowering the returned endpoint reproduces the shape. That is the geometry
+/// counterpart of the `lower(raise(e)) == e` guarantee the `Expr` fold gives,
+/// and it's what lets a shape made with the toolbar be pulled onto the canvas
+/// and keep editing instead of having to be rebuilt as nodes.
+///
+/// Each param is filled by what its `Value` *is*: a constant becomes the socket's
+/// stored literal, an expression is raised through [`raise`] and wired in, and a
+/// keyframe track is refused (see [`RaiseShapeError::Keyframed`]).
+pub fn raise_geometry(
+    graph: &mut NodeGraph,
+    ctx: &GraphCtx,
+    shape: &Shape,
+    at: Vec2,
+) -> Result<Endpoint, RaiseShapeError> {
+    // Check every param *before* touching the graph: a refusal must leave no
+    // orphaned nodes behind, and the checks are cheap.
+    let params: Vec<(&str, &'static str, ShapeParam<'_>)> = match shape {
+        Shape::Path(_) => return Err(RaiseShapeError::Unsupported),
+        Shape::Rect { size, radius } => vec![
+            ("size", "Size", ShapeParam::Vec2(size)),
+            ("radius", "Radius", ShapeParam::Num(radius)),
+        ],
+        Shape::Ellipse { size } => vec![("size", "Size", ShapeParam::Vec2(size))],
+        Shape::Text { content, size, .. } => vec![
+            ("content", "Content", ShapeParam::Str(content)),
+            ("size", "Font Size", ShapeParam::Num(size)),
+        ],
+    };
+    for (_, label, p) in &params {
+        if p.is_keyframed() {
+            return Err(RaiseShapeError::Keyframed(label));
+        }
+    }
+
+    let kind = match shape {
+        Shape::Rect { .. } => "rect",
+        Shape::Ellipse { .. } => "ellipse",
+        Shape::Text { .. } => "text",
+        Shape::Path(_) => unreachable!("refused above"),
+    };
+    // Expression params are raised into the column to the left, sharing one row
+    // cursor so two raised subtrees can't land on top of each other — the same
+    // layout discipline `raise_rec` uses for a generator's knobs.
+    let mut cursor_y = at.y;
+    let mut wired = Vec::new();
+    let mut literals = Vec::new();
+    for (socket, _, p) in &params {
+        match p.source() {
+            ParamSource::Const(v) => literals.push((*socket, v)),
+            ParamSource::Expr(e) => {
+                let (ep, _) = raise_rec(graph, ctx, e, at.x - COL, &mut cursor_y);
+                wired.push((*socket, ep));
+            }
+        }
+    }
+    let id = graph.add_node(kind, Vec2::new(at.x, at.y));
+    {
+        let node = graph.node_mut(id).unwrap();
+        for (socket, v) in literals {
+            node.set_value(socket, v);
+        }
+        // Text's non-value half: `family` names a system font (a lookup key, not
+        // a value) and align/wrap select a shaping mode, so none of them is a
+        // socket. `lower_geometry` reads them straight back out of here.
+        if let Shape::Text { family, align, max_width, .. } = shape {
+            node.config.text.family = family.clone();
+            node.config.text.align = *align;
+            node.config.text.max_width = *max_width;
+        }
+    }
+    for (socket, ep) in wired {
+        let _ = graph.connect(ctx, ep, Endpoint::new(id, socket));
+    }
+    Ok(Endpoint::new(id, "geometry"))
+}
+
+/// A shape param, type-erased just far enough to ask the two questions
+/// `raise_geometry` has: is it a track, and if not, is it a constant or an
+/// expression? Mirrors the `PropRef` trick in the editor, minus the ops.
+enum ShapeParam<'a> {
+    Num(&'a Value<f64>),
+    Vec2(&'a Value<Vec2>),
+    Str(&'a Value<String>),
+}
+
+/// What a param will become on the canvas.
+enum ParamSource<'a> {
+    Const(ExprValue),
+    Expr(&'a Expr),
+}
+
+impl ShapeParam<'_> {
+    fn is_keyframed(&self) -> bool {
+        match self {
+            ShapeParam::Num(v) => matches!(v, Value::Keyframed(_)),
+            ShapeParam::Vec2(v) => matches!(v, Value::Keyframed(_)),
+            ShapeParam::Str(v) => matches!(v, Value::Keyframed(_)),
+        }
+    }
+
+    /// Only called after [`Self::is_keyframed`] has cleared every param, so the
+    /// track arm is unreachable — it falls back to the type's neutral rather
+    /// than panicking, keeping raising total the way lowering is.
+    fn source(&self) -> ParamSource<'_> {
+        use crate::expr::ToExpr;
+        match self {
+            ShapeParam::Num(Value::Const(v)) => ParamSource::Const(v.to_expr()),
+            ShapeParam::Vec2(Value::Const(v)) => ParamSource::Const(v.to_expr()),
+            ShapeParam::Str(Value::Const(v)) => ParamSource::Const(v.to_expr()),
+            ShapeParam::Num(Value::Expr(e))
+            | ShapeParam::Vec2(Value::Expr(e))
+            | ShapeParam::Str(Value::Expr(e)) => ParamSource::Expr(e),
+            ShapeParam::Num(_) => ParamSource::Const(ExprValue::Num(0.0)),
+            ShapeParam::Vec2(_) => ParamSource::Const(ExprValue::Vec2(Vec2::ZERO)),
+            ShapeParam::Str(_) => ParamSource::Const(ExprValue::Str(String::new())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +521,128 @@ mod tests {
         // its default — a copy would stop retiming in the caller's scope.
         let Expr::Use { overrides, .. } = &back else { panic!("{back:?}") };
         assert_eq!(overrides.len(), 1, "only the touched knob is overridden");
+    }
+
+    // ── Geometry fold ────────────────────────────────────────────────────────
+
+    use crate::lower::lower_geometry;
+    use crate::node::Shape;
+    use crate::value::{Keyframe, Track, Value};
+
+    /// The geometry counterpart of `round_trips`: raising a shape onto the
+    /// canvas and lowering it back must reproduce it. Compares the *resolved*
+    /// params, since lowering deliberately turns every param into an `Expr`
+    /// (that's what makes a graph-authored shape animate) — so the recipes
+    /// differ by construction while the values must not.
+    fn shape_round_trips(shape: Shape) -> Shape {
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let ep = raise_geometry(&mut g, ctx, &shape, Vec2::ZERO).expect("should raise");
+        assert_eq!(ep.socket, "geometry", "a raised shape hands back its geometry");
+        lower_geometry(&g, ctx, &ep).expect("a raised shape must lower back")
+    }
+
+    #[test]
+    fn a_rect_round_trips_through_the_canvas() {
+        let back = shape_round_trips(Shape::Rect {
+            size: Value::constant(Vec2::new(320.0, 180.0)),
+            radius: Value::constant(12.0),
+        });
+        let Shape::Rect { size, radius } = &back else { panic!("{back:?}") };
+        let ctx = &mut crate::expr::EvalCtx::at(0.0);
+        assert_eq!(size.resolve(ctx), Vec2::new(320.0, 180.0));
+        assert_eq!(radius.resolve(ctx), 12.0);
+    }
+
+    #[test]
+    fn an_ellipse_round_trips_through_the_canvas() {
+        let back =
+            shape_round_trips(Shape::Ellipse { size: Value::constant(Vec2::new(64.0, 48.0)) });
+        let Shape::Ellipse { size } = &back else { panic!("{back:?}") };
+        assert_eq!(size.resolve(&mut crate::expr::EvalCtx::at(0.0)), Vec2::new(64.0, 48.0));
+    }
+
+    /// Text carries the most across: a string param *and* three non-value
+    /// fields that ride in `NodeConfig::text` rather than on sockets.
+    #[test]
+    fn text_round_trips_including_its_typography() {
+        let back = shape_round_trips(Shape::Text {
+            content: Value::constant("Chapter One".to_string()),
+            family: "Georgia".into(),
+            size: Value::constant(72.0),
+            align: crate::text::TextAlign::Center,
+            max_width: Some(400.0),
+        });
+        let Shape::Text { content, family, size, align, max_width } = &back else {
+            panic!("{back:?}")
+        };
+        let ctx = &mut crate::expr::EvalCtx::at(0.0);
+        assert_eq!(content.resolve(ctx), "Chapter One");
+        assert_eq!(size.resolve(ctx), 72.0);
+        assert_eq!(family, "Georgia");
+        assert_eq!(*align, crate::text::TextAlign::Center);
+        assert_eq!(*max_width, Some(400.0));
+    }
+
+    /// An expression param isn't flattened to its current value — it comes
+    /// across as a *wired subtree*, which is the whole point of pulling a shape
+    /// onto the canvas: you can keep editing the recipe.
+    #[test]
+    fn an_expression_param_raises_as_wired_nodes() {
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let shape = Shape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::expr(Expr::Mul(
+                Box::new(Expr::Lit(ExprValue::Num(2.0))),
+                Box::new(Expr::Time(TimeSource::T01)),
+            )),
+        };
+        let ep = raise_geometry(&mut g, ctx, &shape, Vec2::ZERO).unwrap();
+        // The rect, plus the mul and its two leaves.
+        assert_eq!(g.nodes.len(), 4, "the expression came across as nodes, not a literal");
+        let back = lower_geometry(&g, ctx, &ep).unwrap();
+        let Shape::Rect { radius, .. } = &back else { panic!("{back:?}") };
+        assert_eq!(radius.expr_ref().unwrap().to_string(), "(2 * t01)");
+    }
+
+    /// The refusal that keeps the fold lossless. Binding a raised shape makes
+    /// every param an expression, so a track would simply be replaced — and the
+    /// error names which param, because "something is keyframed" is unactionable
+    /// on a shape with several.
+    #[test]
+    fn a_keyframed_param_is_refused_by_name() {
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let shape = Shape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::Keyframed(Track::new(vec![
+                Keyframe::linear(0, 0.0),
+                Keyframe::linear(24, 40.0),
+            ])),
+        };
+        assert_eq!(
+            raise_geometry(&mut g, ctx, &shape, Vec2::ZERO),
+            Err(RaiseShapeError::Keyframed("Radius"))
+        );
+        // And it refused *before* touching the graph — a rejected raise must
+        // not leave half a shape behind.
+        assert!(g.nodes.is_empty(), "a refusal left orphaned nodes");
+    }
+
+    /// A hand-drawn path has no parametric form, so there is nothing to raise.
+    #[test]
+    fn a_hand_drawn_path_cannot_be_raised() {
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        assert_eq!(
+            raise_geometry(&mut g, ctx, &Shape::Path(kurbo::BezPath::new()), Vec2::ZERO),
+            Err(RaiseShapeError::Unsupported)
+        );
+        assert!(g.nodes.is_empty());
     }
 }

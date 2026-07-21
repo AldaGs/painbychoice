@@ -1118,6 +1118,53 @@ Shaping contexts (parley's `FontContext`/`LayoutContext`) are `thread_local` and
 reused, like `expr.rs`'s script engine — enumerating system fonts is far too
 expensive to redo per frame.
 
+### The geometry fold, both directions
+
+Added 2026-07-21. The graph could already *author* geometry — `lower_geometry`
+compiles a shape node's `geometry` output into a whole `Shape`, and a
+`ShapeBinding` makes a layer's shape be that output. What it couldn't do was
+bring geometry into or out of itself: a binding needed a layer that already
+existed, and an existing `Shape` couldn't be pulled onto the canvas. Both ends
+are now closed, so the node canvas is a place you can work rather than a panel
+that decorates layers made elsewhere.
+
+- **Create layer** (on any node with a `geometry` output) adds a layer whose
+  shape *is* that output and binds the two. The shape is lowered immediately
+  rather than left for the next recompile, so the layer is correct the instant
+  it appears instead of flashing a placeholder. It parents at the **root**, not
+  under the layers-panel selection — a graph-created layer shouldn't inherit
+  whatever happens to be selected in a panel that had nothing to do with the
+  click. `App::new_layer_look` / `push_layer` are shared with the toolbar's
+  `add_node`, so the two kinds of layer are indistinguishable.
+- **Import ▸ Shape** is `raise_geometry` (`core/src/raise.rs`), the inverse of
+  `lower_geometry` and tested as one: lowering a raised shape reproduces it, the
+  geometry counterpart of `lower(raise(e)) == e`. Each param is filled by what
+  its `Value` *is* — a constant becomes the socket's stored literal, an
+  expression is raised through the existing `raise` and **wired in** (so you can
+  keep editing the recipe, which is the point), and a keyframe track is refused.
+- **Refusing a keyframed param is the design, not a limitation.** A raised shape
+  is bound straight away, and a graph-authored param lowers to `Value::Expr` —
+  so going ahead would *replace* the track and the animation would simply be
+  gone. `RaiseShapeError::Keyframed` names the offending param so "bake Radius
+  first" is actionable; "something is keyframed" wouldn't be, on a shape with
+  several. Same discipline as the property fold asking you to promote first.
+  The check runs **before** any node is built, so a refusal can't leave orphans.
+- **The refusal needed somewhere to be read.** `App::import_property` had been
+  reporting failure with `eprintln!` since it was written — invisible to anyone
+  running a GUI, which makes a refusal indistinguishable from a dead button.
+  `App::ng_status` (view state, not saved) now carries one line into the Nodes
+  panel in the usual warning amber, cleared by the next successful graph edit so
+  a stale complaint can't outlive what it was about.
+- The document work sits in **free functions** (`create_layer_from_geometry`,
+  `import_shape`) with the `App` methods as thin wrappers over id allocation,
+  selection, and status — the same split `compile_drivers` follows, and the
+  reason both directions are unit-tested without a window.
+
+This deliberately stops short of nodes-*being*-the-scene. The layer tree is
+still the structural spine; the graph authors and drives it. Making a node's
+existence create a layer is the composition-graph step, still gated behind the
+compositor.
+
 ### The string value type
 
 Added 2026-07-21. `ExprValue` gained a fourth kind, `Str(String)`, so text is a
@@ -1958,9 +2005,7 @@ geometry (`layout_expr`, `box_height`) were genuinely dead, but the ones coverin
 *semantics* that merely moved (module rename/delete, body edits reaching every
 link, overrides surviving a re-point) are re-pinned against the node path that
 owns them now.
-Also still ahead: raising a `Shape` back onto the canvas (`lower_geometry`'s
-inverse — the Import row only handles properties). (4) The compositor stage —
-the real gate for effects/mattes/masks.
+(4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.

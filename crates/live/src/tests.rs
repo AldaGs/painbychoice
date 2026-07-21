@@ -2882,3 +2882,125 @@ fn repointing_a_link_keeps_overrides_that_still_apply() {
     assert_eq!(overrides.len(), 1, "only knobs the new module has: {overrides:?}");
     assert_eq!(overrides[0].0, "amp");
 }
+
+// ── The geometry fold, both directions ──────────────────────────────────────
+
+/// Creating a layer *from* the graph — the thing that makes the node canvas a
+/// place you can work rather than a panel that decorates layers you made by
+/// hand. Before this the Add button greyed out until a layer already existed.
+#[test]
+fn a_geometry_node_can_create_the_layer_it_drives() {
+    let (mut project, comp, _) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let rect = project.graph.add_node("rect", Vec2::ZERO);
+    project.graph.node_mut(rect).unwrap().set_value("radius", ExprValue::Num(7.0));
+    let before = project.comp(comp).unwrap().root.children.len();
+
+    let seed = LayerSeed {
+        id: 42,
+        transform: Transform::default(),
+        fill: MColor::rgb(1.0, 0.0, 0.0),
+    };
+    let node = create_layer_from_geometry(
+        &mut project,
+        &reg,
+        Endpoint::new(rect, "geometry"),
+        seed,
+    )
+    .expect("a rect's geometry should make a layer");
+
+    // Named after the node, and carrying the node's shape already — the layer
+    // is correct before any recompile rather than flashing a placeholder.
+    assert_eq!(node.name, "Rectangle 42");
+    let Some(MShape::Rect { radius, .. }) = &node.shape else { panic!("{:?}", node.shape) };
+    assert_eq!(radius.resolve(&mut EvalCtx::at(0.0)), 7.0);
+    // Exactly one binding, pointing at the new layer.
+    assert_eq!(project.shape_bindings.len(), 1);
+    assert_eq!(project.shape_bindings[0].target, NodeId(42));
+    // The free fn builds the layer but doesn't parent it — that's the caller's
+    // job, so the tree is untouched here.
+    assert_eq!(project.comp(comp).unwrap().root.children.len(), before);
+}
+
+/// A non-geometry output can't make a layer. The button only offers geometry
+/// outputs, so this is the guard behind that, not a reachable path.
+#[test]
+fn a_value_output_cannot_create_a_layer() {
+    let (mut project, _, _) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let v = project.graph.add_node("value", Vec2::ZERO);
+    let seed =
+        LayerSeed { id: 9, transform: Transform::default(), fill: MColor::rgb(0.0, 0.0, 0.0) };
+    assert!(create_layer_from_geometry(&mut project, &reg, Endpoint::new(v, "value"), seed)
+        .is_none());
+    assert!(project.shape_bindings.is_empty(), "a refused create left a binding behind");
+}
+
+/// The other direction: a shape made with the toolbar comes *onto* the canvas
+/// as nodes and keeps driving its layer, so you can carry on editing it there
+/// instead of rebuilding it by hand.
+#[test]
+fn a_hand_made_shape_imports_onto_the_canvas_and_still_drives_its_layer() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    // Give the layer a real shape first — the fixture's layer is a bare group.
+    project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().shape =
+        Some(MShape::Rect {
+            size: Value::constant(Vec2::new(120.0, 80.0)),
+            radius: Value::constant(5.0),
+        });
+
+    import_shape(&mut project, &reg, comp, target).expect("a const rect should import");
+
+    assert_eq!(project.graph.nodes.len(), 1, "one rect node came across");
+    assert_eq!(project.shape_bindings.len(), 1);
+    // Recompiling reproduces the shape it was raised from — the round trip is
+    // lossless, which is what makes importing safe to do to a live layer.
+    compile_drivers(&mut project, &reg, comp);
+    let node = project.comp(comp).unwrap().root.find(target).unwrap();
+    let Some(MShape::Rect { size, radius }) = &node.shape else { panic!("{:?}", node.shape) };
+    let ctx = &mut EvalCtx::at(0.0);
+    assert_eq!(size.resolve(ctx), Vec2::new(120.0, 80.0));
+    assert_eq!(radius.resolve(ctx), 5.0);
+    // And it's the graph driving it now, not the original constants.
+    assert!(radius.is_expr(), "the imported shape is graph-authored");
+}
+
+/// The refusal that keeps the fold lossless, end to end: importing a shape with
+/// a keyframed param must change **nothing**. Binding makes every param an
+/// expression, so going ahead would silently delete the track.
+#[test]
+fn importing_a_keyframed_shape_changes_nothing() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().shape =
+        Some(MShape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::Keyframed(motion_core::Track::new(vec![
+                motion_core::Keyframe::linear(0, 0.0),
+                motion_core::Keyframe::linear(24, 40.0),
+            ])),
+        });
+
+    let err = import_shape(&mut project, &reg, comp, target).unwrap_err();
+    assert!(err.contains("Radius"), "the message must name the param: {err}");
+    assert!(err.contains("Bake"), "and say what to do about it: {err}");
+
+    // Nothing moved: no nodes, no binding, and the track is still a track.
+    assert!(project.graph.nodes.is_empty(), "a refused import left nodes behind");
+    assert!(project.shape_bindings.is_empty(), "a refused import left a binding behind");
+    let node = project.comp(comp).unwrap().root.find(target).unwrap();
+    let Some(MShape::Rect { radius, .. }) = &node.shape else { panic!("{:?}", node.shape) };
+    assert!(radius.is_animated(), "the keyframe track survived the refusal");
+}
+
+/// A group has no shape, so there is nothing to import — reported rather than
+/// silently doing nothing.
+#[test]
+fn importing_a_group_reports_that_it_has_no_shape() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let err = import_shape(&mut project, &reg, comp, target).unwrap_err();
+    assert!(err.contains("no shape"), "{err}");
+    assert!(project.graph.nodes.is_empty());
+}

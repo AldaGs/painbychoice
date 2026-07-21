@@ -242,6 +242,14 @@ pub(crate) struct NgEdits {
     /// panel names `(layer, property)`, `App` reads its `Expr`, raises it, and
     /// binds the result back so editing the nodes drives the property.
     pub(crate) import: Option<(NodeId, PropPath)>,
+    /// Raise a scene layer's *shape* onto the canvas and bind it back — the
+    /// geometry half of the same fold. Names only the layer; the property combo
+    /// beside it is irrelevant to a shape.
+    pub(crate) import_shape: Option<NodeId>,
+    /// Create a **new layer** whose shape is this geometry output. The one
+    /// action that makes something exist from the graph rather than binding to
+    /// a layer the tree already had.
+    pub(crate) create_layer: Option<Endpoint>,
 }
 
 /// A core [`motion_core::Color`] as an egui colour. Socket dots and header tints
@@ -323,6 +331,7 @@ pub(crate) fn nodegraph_ui(
     knobs: &[KnobInfo],
     module_output: Option<&Endpoint>,
     script_preview: Option<&Result<String, String>>,
+    status: Option<&str>,
     out: &mut NgEdits,
 ) {
     ui.add_space(6.0);
@@ -342,6 +351,12 @@ pub(crate) fn nodegraph_ui(
             shape_drivers_ui(ui, graph, ctx, layers, shape_bindings, out);
             ui.separator();
             import_ui(ui, layers, out);
+            // Right under Import, because that's where a refusal most often
+            // comes from. Amber, not red: the action didn't happen, but nothing
+            // is broken — the same hue the comp bar's warning count uses.
+            if let Some(msg) = status {
+                ui.colored_label(crate::props::WARN_COLOR, format!("{} {msg}", icon::WARNING));
+            }
             ui.separator();
             layer_knobs_ui(ui, layers, out);
         }
@@ -922,8 +937,20 @@ fn import_ui(ui: &mut egui::Ui, layers: &[LayerInfo], out: &mut NgEdits) {
         {
             out.import = Some((NodeId(sel.0), sel.1));
         }
+        // The geometry half. Acts on the layer alone — a shape isn't one of the
+        // properties in the combo beside it.
+        if ui
+            .button(format!("{} Shape", icon::SHAPE))
+            .on_hover_text(
+                "Raise this layer's shape onto the canvas as nodes, and bind it back.
+                 Refused if a shape param is keyframed — bake it first.",
+            )
+            .clicked()
+        {
+            out.import_shape = Some(NodeId(sel.0));
+        }
     });
-    ui.weak("Pulls an expression-driven property onto the graph as nodes.");
+    ui.weak("Pulls an expression-driven property, or a whole shape, onto the graph as nodes.");
     ui.ctx().data_mut(|d| d.insert_temp(mem, sel));
 }
 
@@ -947,7 +974,26 @@ fn inspector_ui(
         ui.weak("Select a node (click its header) to edit its values.");
         return;
     };
-    ui.strong(format!("Values — {}", node.title.clone().unwrap_or_else(|| desc.label.clone())));
+    ui.horizontal(|ui| {
+        ui.strong(format!(
+            "Values — {}",
+            node.title.clone().unwrap_or_else(|| desc.label.clone())
+        ));
+        // A shape node can *become* a layer. Offered here rather than in the
+        // Geometry section because it acts on the node you have selected, and
+        // because that section's Add button means the other thing: bind to a
+        // layer that already exists.
+        if desc.outputs.iter().any(|s| s.ty == SocketType::Geometry)
+            && ui
+                .button(format!("{} Create layer", icon::ADD))
+                .on_hover_text(
+                    "Add a new layer to this composition whose shape is this node's geometry.",
+                )
+                .clicked()
+        {
+            out.create_layer = Some(Endpoint::new(node.id, "geometry"));
+        }
+    });
     // A `ref` reads another layer's property; a `param` reads the driven layer's
     // own knob. Both carry addressing rather than a socket value.
     if node.kind == "ref" {

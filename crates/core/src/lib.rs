@@ -36,7 +36,7 @@ pub use graph::{
     ShapeBinding, TextConfig,
 };
 pub use lower::{compile_modules, lower_geometry, lower_output};
-pub use raise::raise;
+pub use raise::{raise, raise_geometry, RaiseShapeError};
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };

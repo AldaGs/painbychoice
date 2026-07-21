@@ -164,6 +164,14 @@ pub(crate) struct App {
     /// body. View state (which scope you're looking at), not document data, so
     /// it isn't saved: reopening a file starts at the project scope.
     pub(crate) ng_scope: NgScope,
+    /// The Nodes panel's one-line message — why the last action was refused.
+    ///
+    /// View state, so it isn't saved. It exists because the panel's refusals
+    /// used to go to `eprintln!`, which nobody running a GUI ever sees: a
+    /// refusal you can't read is indistinguishable from a button that does
+    /// nothing. Cleared by the next successful graph edit so a stale complaint
+    /// can't outlive the thing it was complaining about.
+    pub(crate) ng_status: Option<String>,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -278,6 +286,76 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
     }
 }
 
+/// The look a freshly created layer gets, decided by `App` (it owns the id
+/// counter and the comp's dimensions) and handed to the window-free layer
+/// builders below.
+pub(crate) struct LayerSeed {
+    pub(crate) id: u64,
+    pub(crate) transform: Transform,
+    pub(crate) fill: MColor,
+}
+
+/// Build a layer whose shape is `output`'s geometry, and bind the two.
+///
+/// The shape is lowered here rather than left for the next recompile, so the
+/// layer is correct the instant it appears instead of flashing a placeholder.
+/// `None` when the endpoint isn't a shape node's `geometry` — the button only
+/// offers geometry outputs, so that's a guard rather than a path.
+///
+/// Free-standing (like [`compile_drivers`]) so the document work is testable
+/// without a window; the caller parents and selects the returned node.
+pub(crate) fn create_layer_from_geometry(
+    project: &mut MProject,
+    reg: &NodeRegistry,
+    output: Endpoint,
+    seed: LayerSeed,
+) -> Option<MNode> {
+    let ctx = GraphCtx::new(reg, &project.modules);
+    let shape = lower_geometry(&project.graph, &ctx, &output)?;
+    // Named after the node, so the layers panel and the canvas agree on what
+    // this thing is called.
+    let name = project
+        .graph
+        .node(output.node)
+        .map(|n| {
+            n.title.clone().unwrap_or_else(|| {
+                ctx.descriptor_for(n).map(|d| d.label.clone()).unwrap_or_else(|| n.kind.clone())
+            })
+        })
+        .unwrap_or_else(|| "Shape".to_string());
+    let node = MNode::shape(seed.id, format!("{name} {}", seed.id), shape)
+        .with_fill(seed.fill)
+        .with_transform(seed.transform);
+    project.shape_bindings.push(ShapeBinding { output, target: NodeId(seed.id) });
+    Some(node)
+}
+
+/// Raise `target`'s shape onto the canvas and bind it back. `Err` carries the
+/// message for the Nodes panel's status line.
+///
+/// Refuses rather than converting a keyframed param: binding makes every param
+/// an expression, so a track would simply be replaced. A refusal leaves the
+/// project **completely untouched** — `raise_geometry` checks before it builds.
+pub(crate) fn import_shape(
+    project: &mut MProject,
+    reg: &NodeRegistry,
+    comp: CompId,
+    target: NodeId,
+) -> Result<(), String> {
+    let shape = project
+        .comp(comp)
+        .and_then(|c| c.root.find(target))
+        .and_then(|n| n.shape.clone())
+        .ok_or_else(|| "that layer has no shape (a group has none).".to_string())?;
+    // Placed clear of the usual spawn corner, like `import_property`.
+    let at = Vec2::new(360.0, 40.0);
+    let ctx = GraphCtx::new(reg, &project.modules);
+    let output = motion_core::raise_geometry(&mut project.graph, &ctx, &shape, at)
+        .map_err(|e| e.to_string())?;
+    project.shape_bindings.push(ShapeBinding { output, target });
+    Ok(())
+}
+
 /// The graph the Nodes panel is editing, by scope — the project's own, or one
 /// module's body. `None` when the scope names a module that's since been
 /// deleted, in which case the caller does nothing rather than editing the wrong
@@ -371,6 +449,7 @@ impl App {
             aids_hot: false,
             node_registry: NodeRegistry::with_builtins(),
             ng_scope: NgScope::Project,
+            ng_status: None,
         }
     }
 
@@ -379,6 +458,9 @@ impl App {
     /// function. A connection is validated against the registry inside
     /// [`NodeGraph::connect`]; a rejected drop simply doesn't wire.
     pub(crate) fn apply_ng_op(&mut self, op: NgOp) {
+        // Any successful edit retires the last refusal: it was about the graph
+        // as it stood, and the graph just moved.
+        self.ng_status = None;
         // `connect` needs a descriptor context (a `use` node's sockets come
         // from the module it links), and in *module* scope the graph being
         // edited lives inside the very map the context reads. A snapshot breaks
@@ -549,7 +631,10 @@ impl App {
             .and_then(|c| c.root.find(target))
             .and_then(|n| prop_of(n, kind).and_then(|p| p.expr().cloned()));
         let Some(expr) = expr else {
-            eprintln!("import: that property isn't expression-driven — promote it first");
+            self.ng_status = Some(format!(
+                "{} isn't expression-driven — promote it first (= fx).",
+                prop_path_label(prop)
+            ));
             return;
         };
         // Raise (mutates the graph) using the registry — disjoint fields, so both
@@ -1472,18 +1557,19 @@ impl App {
         true
     }
 
-    /// Create a new shape/group, parent it under the selected node (or the
-    /// root), select it, and return `true` (the doc changed).
-    pub(crate) fn add_node(&mut self, kind: NewShape) -> bool {
+    /// Reserve the next layer id and the look a new layer gets: centred in the
+    /// comp, and the next colour off a rotating palette so successive shapes
+    /// are visually distinct.
+    ///
+    /// Split out of [`Self::add_node`] so a layer created **from the node
+    /// graph** is indistinguishable from one created with the toolbar — the
+    /// alternative was a second, drifting copy of the seeding rules.
+    fn new_layer_look(&mut self) -> (u64, Transform, MColor) {
         let id = self.next_id;
         self.next_id += 1;
-
         let center = Vec2::new(self.doc().width / 2.0, self.doc().height / 2.0);
-        let at_center = Transform {
-            position: Value::constant(center),
-            ..Transform::default()
-        };
-        // A rotating palette so new shapes are visually distinct.
+        let at_center =
+            Transform { position: Value::constant(center), ..Transform::default() };
         let palette = [
             MColor::rgb(0.90, 0.25, 0.25),
             MColor::rgb(0.25, 0.65, 0.95),
@@ -1491,7 +1577,32 @@ impl App {
             MColor::rgb(0.95, 0.75, 0.20),
             MColor::rgb(0.70, 0.45, 0.90),
         ];
-        let fill = palette[(id as usize) % palette.len()];
+        (id, at_center, palette[(id as usize) % palette.len()])
+    }
+
+    /// Parent `node` under `parent` (or the root), then select it.
+    ///
+    /// `parent: None` means the root outright — *not* "fall back to the
+    /// selection". A graph-created layer takes that path deliberately: it
+    /// shouldn't inherit whatever happens to be selected over in the layers
+    /// panel, which has nothing to do with the node you clicked.
+    fn push_layer(&mut self, node: MNode, parent: Option<NodeId>) -> NodeId {
+        let id = node.id;
+        let parent = parent.filter(|pid| self.doc().root.find(*pid).is_some());
+        let dest = match parent {
+            Some(pid) => self.doc_mut().root.find_mut(pid).unwrap(),
+            None => &mut self.doc_mut().root,
+        };
+        dest.children.push(node);
+        self.selected = Some(id);
+        self.selected_keys.clear();
+        id
+    }
+
+    /// Create a new shape/group, parent it under the selected node (or the
+    /// root), select it, and return `true` (the doc changed).
+    pub(crate) fn add_node(&mut self, kind: NewShape) -> bool {
+        let (id, at_center, fill) = self.new_layer_look();
 
         let node = match kind {
             NewShape::Rect => MNode::shape(
@@ -1530,16 +1641,47 @@ impl App {
         };
 
         // Parent under the selected node if it still exists, else the root.
-        let target = self.selected.filter(|sid| self.doc().root.find(*sid).is_some());
-        let parent = match target {
-            Some(sid) => self.doc_mut().root.find_mut(sid).unwrap(),
-            None => &mut self.doc_mut().root,
-        };
-        parent.children.push(node);
-
-        self.selected = Some(NodeId(id));
-        self.selected_keys.clear();
+        self.push_layer(node, self.selected);
         true
+    }
+
+    /// Create a layer whose shape **is** a graph geometry output — the other
+    /// half of the geometry fold, and the thing that lets the node canvas bring
+    /// something into existence rather than only decorate a layer you already
+    /// made by hand.
+    ///
+    /// The `App` half: allocate the id and the look, then hand off to the
+    /// window-free [`create_layer_from_geometry`] so the actual document work is
+    /// testable, the same split [`compile_drivers`] follows.
+    pub(crate) fn create_layer_from_geometry(&mut self, output: Endpoint) {
+        let (id, at_center, fill) = self.new_layer_look();
+        let seed = LayerSeed { id, transform: at_center, fill };
+        match create_layer_from_geometry(&mut self.project, &self.node_registry, output, seed) {
+            Some(node) => {
+                self.push_layer(node, None);
+                self.ng_status = None;
+                self.recompile_graph();
+            }
+            None => {
+                self.ng_status = Some("that output isn't a shape node's geometry.".into())
+            }
+        }
+    }
+
+    /// Raise a layer's [`Shape`] onto the node canvas and bind it back — the
+    /// geometry twin of [`Self::import_property`].
+    ///
+    /// Refuses rather than converting when a param is keyframed: binding makes
+    /// every param an expression, so a track would be replaced. See
+    /// [`motion_core::RaiseShapeError`].
+    pub(crate) fn import_shape(&mut self, target: NodeId) {
+        match import_shape(&mut self.project, &self.node_registry, self.current, target) {
+            Ok(()) => {
+                self.ng_status = None;
+                self.recompile_graph();
+            }
+            Err(msg) => self.ng_status = Some(msg),
+        }
     }
 
     /// Open a different composition for editing.
@@ -1973,6 +2115,9 @@ impl App {
         // one module's body. A scope pointing at a deleted module falls back to
         // the project graph rather than blanking the panel.
         let ng_scope = self.ng_scope;
+        // Borrowed as a `&str` beside `dock`, like the font list — disjoint
+        // fields, so no clone.
+        let ng_status = self.ng_status.as_deref();
         let node_graph =
             scoped_graph(&self.project, ng_scope).unwrap_or(&self.project.graph);
         // The panel resolves each node's descriptor per placed node (a `use`
@@ -2081,6 +2226,7 @@ impl App {
                         &ng_knobs,
                         ng_module_output.as_ref(),
                         ng_script_preview.as_ref(),
+                        ng_status,
                         &mut ng_edits,
                     ),
                     // vello paints the frame here; egui only measures the hole
@@ -2238,6 +2384,16 @@ impl App {
         // from the `ng_changed` recompile above.
         if let Some((target, prop)) = ng_edits.import.take() {
             self.import_property(target, prop);
+            window.request_redraw();
+        }
+        // The geometry fold, both directions. Like `import`, each raises/binds
+        // and recompiles itself, so neither rides the `ng_changed` path above.
+        if let Some(target) = ng_edits.import_shape.take() {
+            self.import_shape(target);
+            window.request_redraw();
+        }
+        if let Some(output) = ng_edits.create_layer.take() {
+            self.create_layer_from_geometry(output);
             window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area
