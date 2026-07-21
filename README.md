@@ -340,6 +340,52 @@ click-picking on it (`App::aids_hot`) — `is_pointer_over_egui` is area-based a
 stays false inside the canvas hole, so an interactive overlay there cannot
 suppress picking on its own. See the gotcha of that name below.
 
+### The anchor handle and the selection box (2026-07-21)
+
+The gizmo grew a **ring just outside its centre**, drawn as a circle crossed by
+four ticks: drag it to move the layer's anchor. It sits between the free-move
+square and everything else, and is hit-tested before the arrows — which pass
+straight through that radius — because it is the smaller, more specific target.
+
+**Dragging it moves the pivot without moving the layer**, which is After
+Effects' Pan Behind tool. That takes two coordinated edits, not one. The layer
+draws at `pos + R·S·(q − anchor)` for each local point `q`, so holding that
+fixed while the pivot follows the pointer by `delta` needs:
+
+    pos'    = pos + delta
+    anchor' = anchor + (R·S)⁻¹ · delta
+
+Emitting one without the other is the classic version of this bug: move only
+the anchor and the artwork jumps; move only the position and the pivot doesn't
+end up where you dropped it. A test checks a *rotated, non-uniformly scaled*
+layer, since that is where a naive `anchor += delta` looks right on a plain
+layer and is visibly wrong on a real one. A collapsed scale makes `R·S`
+singular, so that case holds rather than writing infinities into the document.
+
+Editing **Anchor in the properties panel deliberately does not compensate** —
+there you are asking to re-origin the layer, and it should move. Which behaviour
+you get is which control you reached for, matching AE.
+
+The anchor is now a full animatable property: `PropKind::Anchor` per the recipe
+above, so it has a panel row, a stopwatch, a dopesheet row, retiming, easing and
+copy/paste for free. It was already addressable from expressions
+(`PropPath::Anchor`) but had no UI — an odd asymmetry, now closed.
+
+**The selection box** is the union of the selected layer's *subtree* bounds, so
+selecting a group boxes what it contains; a group has no geometry of its own, so
+unioning only its own items would give an empty rect for exactly the layers
+whose extent is least obvious. Bounds come from each item's path through its
+world transform, giving the axis-aligned box of the rotated shape rather than a
+rotated rectangle — "how much room does this take up". It is drawn with corner
+ticks and is deliberately **not grabbable**: resizing by a bbox corner would
+fight the scale handles, which already own that gesture. A layer that draws
+nothing gets no box, rather than a zero-size rect at the origin that would look
+like a bug.
+
+Note this is computed in `live` from the evaluated scene. Bounding-box *snapping*
+would want it in `core` beside `Scene::places` instead, so sibling bounds are
+available without a second pass.
+
 ### Snapping (2026-07-21)
 
 A gizmo **move** snaps to the composition edges and centre, to visible guides,
@@ -1043,8 +1089,8 @@ done** (see *The transform gizmo*). Still open, in this order:
 2. ~~**Snapping**~~ ✅ Done for the pivot — see *Snapping*. Still open: snapping
    a layer's **bounding-box edges** and to *other layers'* bounds, which needs
    per-frame bounds for the dragged layer and a candidate set from its siblings.
-3. **Anchor-point handle + selection bbox** — the gizmo pivots on the anchor but
-   can't yet *move* it, and there is no bounding box drawn.
+3. ~~**Anchor-point handle + selection bbox**~~ ✅ Done — see *The anchor handle
+   and the selection box*.
 4. **Onion skinning** — ghosts of the rendered layer at ±N frames, tinted by
    direction (past warm, future cool). This is the answer for every property a
    motion path *can't* show; see *The motion path*. Will want the same caching

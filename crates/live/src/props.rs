@@ -33,9 +33,9 @@ pub(crate) struct NodeInfo {
     pub(crate) pos: (f64, f64),
     pub(crate) rot: f64,
     pub(crate) scale: (f64, f64),
-    /// Not shown in the panel, but the on-canvas gizmo needs it: it is the
-    /// pivot the layer rotates and scales about, and it sits inside the local
-    /// matrix, so reconstructing that matrix without it lands elsewhere.
+    /// The pivot the layer rotates and scales about. It sits inside the local
+    /// matrix, so the gizmo needs it to reconstruct that matrix — and it is an
+    /// animatable property in its own right, with a row and a stopwatch.
     pub(crate) anchor: (f64, f64),
     pub(crate) opacity: f64,
     pub(crate) fill: Option<[f32; 3]>,
@@ -45,6 +45,7 @@ pub(crate) struct NodeInfo {
     pub(crate) radius: Option<f64>,
     /// Stroke color + width, `None` when the node has no stroke.
     pub(crate) stroke: Option<([f32; 3], f64)>,
+    pub(crate) anchor_anim: bool,
     pub(crate) pos_anim: bool,
     pub(crate) rot_anim: bool,
     pub(crate) scale_anim: bool,
@@ -214,6 +215,7 @@ impl NodeInfo {
                 let c = s.color.resolve(ctx);
                 ([c.r as f32, c.g as f32, c.b as f32], s.width.resolve(ctx))
             }),
+            anchor_anim: tr.anchor.is_animated(),
             pos_anim: tr.position.is_animated(),
             rot_anim: tr.rotation_deg.is_animated(),
             scale_anim: tr.scale.is_animated(),
@@ -246,6 +248,8 @@ impl NodeInfo {
 /// new value the user dialed in; `None` means untouched.
 #[derive(Default)]
 pub(crate) struct PropEdits {
+    pub(crate) anchor_x: Option<f64>,
+    pub(crate) anchor_y: Option<f64>,
     pub(crate) pos_x: Option<f64>,
     pub(crate) pos_y: Option<f64>,
     pub(crate) rot: Option<f64>,
@@ -412,6 +416,26 @@ pub(crate) fn properties_ui(
         ui.label("Node id");
         ui.monospace(n.id.to_string());
         ui.label("");
+        ui.end_row();
+
+        // Anchor (x, y) — the pivot rotation and scale turn about. Editing it
+        // *here* moves the layer, because position is measured from it; the
+        // canvas handle instead compensates position so the layer stays put.
+        // Both are wanted, and which you get is which one you reached for.
+        ui.label("Anchor");
+        ui.horizontal(|ui| {
+            let mut x = n.anchor.0;
+            let mut y = n.anchor.1;
+            if ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed() {
+                edits.anchor_x = Some(x);
+            }
+            if ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed() {
+                edits.anchor_y = Some(y);
+            }
+        });
+        if key_button(ui, n.anchor_anim) {
+            edits.key.insert(PropKind::Anchor);
+        }
         ui.end_row();
 
         // Position (x, y). DragValue gives both interactions: drag to
@@ -696,6 +720,7 @@ pub(crate) fn properties_ui(
 /// `group_selection_by_prop`). Transform first, then paint, then geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PropKind {
+    Anchor,
     Position,
     Rotation,
     Scale,
@@ -710,7 +735,8 @@ pub(crate) enum PropKind {
 
 impl PropKind {
     /// Every property that can be animated, in row order.
-    pub(crate) const ALL: [PropKind; 10] = [
+    pub(crate) const ALL: [PropKind; 11] = [
+        PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
         PropKind::Scale,
@@ -725,6 +751,7 @@ impl PropKind {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            PropKind::Anchor => "Anchor",
             PropKind::Position => "Position",
             PropKind::Rotation => "Rotation",
             PropKind::Scale => "Scale",
@@ -863,6 +890,7 @@ impl PropRefMut<'_> {
 pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
     let tr = &node.transform;
     Some(match kind {
+        PropKind::Anchor => PropRef::Vec2(&tr.anchor),
         PropKind::Position => PropRef::Vec2(&tr.position),
         PropKind::Rotation => PropRef::Num(&tr.rotation_deg),
         PropKind::Scale => PropRef::Vec2(&tr.scale),
@@ -890,6 +918,7 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
 pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut<'_>> {
     let tr = &mut node.transform;
     Some(match kind {
+        PropKind::Anchor => PropRefMut::Vec2(&mut tr.anchor),
         PropKind::Position => PropRefMut::Vec2(&mut tr.position),
         PropKind::Rotation => PropRefMut::Num(&mut tr.rotation_deg),
         PropKind::Scale => PropRefMut::Vec2(&mut tr.scale),

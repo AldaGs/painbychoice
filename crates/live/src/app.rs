@@ -682,6 +682,12 @@ impl App {
         let tr = &mut node.transform;
         let mut changed = false;
 
+        if e.anchor_x.is_some() || e.anchor_y.is_some() {
+            let cur = tr.anchor.resolve(&mut ctx);
+            let v = Vec2::new(e.anchor_x.unwrap_or(cur.x), e.anchor_y.unwrap_or(cur.y));
+            tr.anchor.set_at(frame, v);
+            changed = true;
+        }
         if e.pos_x.is_some() || e.pos_y.is_some() {
             let cur = tr.position.resolve(&mut ctx);
             let v = Vec2::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y));
@@ -1304,6 +1310,9 @@ impl App {
                 .map(|place| GizmoTarget::new(id.0, place.world, info)),
             _ => None,
         };
+        // The selection's extent, unioned over its subtree so a group boxes
+        // what it contains. Comp space, projected at paint time like the path.
+        let sel_bounds = sel_node.and_then(|n| selection_bounds(&scene, n));
         let rows = sel_node.map(dope_rows).unwrap_or_default();
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -1522,6 +1531,11 @@ impl App {
                                 &mut guide_drag,
                                 &mut aid_edits,
                             );
+                        }
+                        // The selection box sits with the aids: it measures,
+                        // it isn't grabbed.
+                        if let (Some(b), Some(rect)) = (sel_bounds, canvas_pts) {
+                            draw_bounds(&ui.painter_at(rect), b, fit, ppp);
                         }
                         // Path next, gizmo last: the gizmo is what you grab, so
                         // it must never be obscured by the trajectory.

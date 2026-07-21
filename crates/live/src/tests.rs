@@ -2089,6 +2089,7 @@ fn drag_at(handle: GizmoHandle, rot: f64, grab: (f64, f64)) -> GizmoDrag {
         start_pos: Vec2::new(0.0, 0.0),
         start_rot: rot,
         start_scale: (1.0, 1.0),
+        start_anchor: Vec2::ZERO,
         grab_parent: Point::new(grab.0, grab.1),
     }
 }
@@ -2098,7 +2099,7 @@ fn drag_at(handle: GizmoHandle, rot: f64, grab: (f64, f64)) -> GizmoDrag {
 #[test]
 fn the_centre_handle_tracks_the_pointer_one_to_one() {
     let d = drag_at(GizmoHandle::Move, 30.0, (10.0, 10.0));
-    let (pos, rot, scale) = resolve_drag(&d, Point::new(35.0, -5.0));
+    let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(35.0, -5.0));
     assert_eq!((pos.x, pos.y), (25.0, -15.0));
     assert_eq!(rot, 30.0, "a move must not touch rotation");
     assert_eq!(scale, (1.0, 1.0));
@@ -2110,11 +2111,11 @@ fn the_centre_handle_tracks_the_pointer_one_to_one() {
 #[test]
 fn an_axis_arrow_projects_the_drag_onto_the_rotated_axis() {
     let d = drag_at(GizmoHandle::MoveAxis(GizmoAxis::X), 90.0, (0.0, 0.0));
-    let (pos, ..) = resolve_drag(&d, Point::new(0.0, 40.0));
+    let pos = resolve_drag(&d, Point::new(0.0, 40.0)).pos;
     assert!((pos.x - 0.0).abs() < 1e-9, "no movement across the axis");
     assert!((pos.y - 40.0).abs() < 1e-9, "the whole drag lands along it");
 
-    let (pos, ..) = resolve_drag(&d, Point::new(40.0, 0.0));
+    let pos = resolve_drag(&d, Point::new(40.0, 0.0)).pos;
     assert!(pos.hypot() < 1e-9, "a drag square to the axis moves nothing");
 }
 
@@ -2124,7 +2125,7 @@ fn an_axis_arrow_projects_the_drag_onto_the_rotated_axis() {
 fn the_ring_adds_the_swept_angle() {
     let d = drag_at(GizmoHandle::Rotate, 10.0, (100.0, 0.0));
     // Straight out on +X, swung to +Y: a quarter turn.
-    let (pos, rot, scale) = resolve_drag(&d, Point::new(0.0, 100.0));
+    let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(0.0, 100.0));
     assert!((rot - 100.0).abs() < 1e-6, "10° + 90°, got {rot}");
     assert_eq!((pos.x, pos.y), (0.0, 0.0));
     assert_eq!(scale, (1.0, 1.0));
@@ -2135,11 +2136,11 @@ fn the_ring_adds_the_swept_angle() {
 #[test]
 fn scale_handles_use_the_distance_ratio_from_the_pivot() {
     let d = drag_at(GizmoHandle::ScaleUniform, 0.0, (50.0, 0.0));
-    let (_, _, scale) = resolve_drag(&d, Point::new(100.0, 0.0));
+    let scale = resolve_drag(&d, Point::new(100.0, 0.0)).scale;
     assert_eq!(scale, (2.0, 2.0));
 
     let d = drag_at(GizmoHandle::ScaleAxis(GizmoAxis::Y), 0.0, (0.0, 40.0));
-    let (_, _, scale) = resolve_drag(&d, Point::new(0.0, 20.0));
+    let scale = resolve_drag(&d, Point::new(0.0, 20.0)).scale;
     assert!((scale.1 - 0.5).abs() < 1e-9, "Y halved, got {}", scale.1);
     assert_eq!(scale.0, 1.0, "X untouched");
 }
@@ -2151,7 +2152,7 @@ fn scale_handles_use_the_distance_ratio_from_the_pivot() {
 fn a_grab_on_the_pivot_is_inert_rather_than_nan() {
     for handle in [GizmoHandle::Rotate, GizmoHandle::ScaleUniform] {
         let d = drag_at(handle, 0.0, (0.0, 0.0));
-        let (pos, rot, scale) = resolve_drag(&d, Point::new(30.0, 30.0));
+        let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(30.0, 30.0));
         assert!(pos.hypot().is_finite() && rot.is_finite());
         assert_eq!(scale, (1.0, 1.0), "{handle:?} held its scale");
         assert_eq!(rot, 0.0, "{handle:?} held its rotation");
@@ -2664,6 +2665,7 @@ fn an_axis_constrained_drag_only_snaps_along_its_axis() {
         pos: Vec2::new(0.0, 0.0),
         rot_deg: 0.0,
         scale: (1.0, 1.0),
+        anchor: Vec2::ZERO,
     };
     // A vertical guide at x=300 and a horizontal one at y=300: an unconstrained
     // move near their crossing would be pulled on both axes.
@@ -2685,6 +2687,7 @@ fn an_axis_constrained_drag_only_snaps_along_its_axis() {
         start_pos: at,
         start_rot: 0.0,
         start_scale: (1.0, 1.0),
+        start_anchor: Vec2::ZERO,
         grab_parent: Point::new(302.0, 302.0),
     };
     let (pos, snap) = snap_move(&target, &free, at, ctx, fit, 1.0);
@@ -2718,6 +2721,7 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
         pos: Vec2::ZERO,
         rot_deg: 0.0,
         scale: (1.0, 1.0),
+        anchor: Vec2::ZERO,
     };
     let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
     let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: true };
@@ -2730,6 +2734,7 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
         start_pos: at,
         start_rot: 0.0,
         start_scale: (1.0, 1.0),
+        start_anchor: Vec2::ZERO,
         grab_parent: Point::new(101.0, 200.0),
     };
     let (pos, snap) = snap_move(&target, &drag, at, ctx, Affine::IDENTITY, 1.0);
@@ -2752,6 +2757,7 @@ fn the_bypass_modifier_defeats_every_snap_target() {
         pos: Vec2::ZERO,
         rot_deg: 0.0,
         scale: (1.0, 1.0),
+        anchor: Vec2::ZERO,
     };
     let aids = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
     let at = Vec2::new(301.0, 2.0);
@@ -2761,10 +2767,121 @@ fn the_bypass_modifier_defeats_every_snap_target() {
         start_pos: at,
         start_rot: 0.0,
         start_scale: (1.0, 1.0),
+        start_anchor: Vec2::ZERO,
         grab_parent: Point::new(301.0, 2.0),
     };
     let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: false };
     let (pos, snap) = snap_move(&target, &drag, at, ctx, Affine::IDENTITY, 1.0);
     assert_eq!(pos, at, "the drag lands exactly where the pointer put it");
     assert_eq!(snap, Snap::default(), "and nothing is drawn as snapped");
+}
+
+// --- Anchor handle + selection bounds --------------------------------------
+
+/// Dragging the anchor handle moves the pivot to the pointer **without moving
+/// the layer**: position is compensated so every drawn point stays put. Moving
+/// only the anchor makes the artwork jump; moving only the position leaves the
+/// pivot behind. Both halves, together, or neither.
+#[test]
+fn dragging_the_anchor_moves_the_pivot_but_not_the_artwork() {
+    // A rotated, non-uniformly scaled layer — the case where a naive
+    // "anchor += delta" is visibly wrong.
+    let (rot, scale) = (90.0, (2.0, 4.0));
+    let d = GizmoDrag {
+        handle: GizmoHandle::Anchor,
+        node: 1,
+        start_pos: Vec2::new(100.0, 50.0),
+        start_rot: rot,
+        start_scale: scale,
+        start_anchor: Vec2::new(7.0, -3.0),
+        grab_parent: Point::new(100.0, 50.0),
+    };
+    let delta = Vec2::new(20.0, -12.0);
+    let r = resolve_drag(&d, Point::new(100.0 + delta.x, 50.0 + delta.y));
+
+    // The pivot follows the pointer exactly.
+    assert!((r.pos - (d.start_pos + delta)).hypot() < 1e-9, "pivot: {:?}", r.pos);
+
+    // And the layer doesn't move: check a local point maps to the same place
+    // before and after, through the real local matrix.
+    let local = |pos: Vec2, anchor: Vec2| {
+        Affine::translate(pos)
+            * Affine::rotate(rot.to_radians())
+            * Affine::scale_non_uniform(scale.0, scale.1)
+            * Affine::translate(-anchor)
+    };
+    let before = local(d.start_pos, d.start_anchor);
+    let after = local(r.pos, r.anchor);
+    for q in [Point::ZERO, Point::new(50.0, 0.0), Point::new(-13.0, 29.0)] {
+        assert!(
+            ((before * q) - (after * q)).hypot() < 1e-9,
+            "{q:?} moved: {:?} -> {:?}",
+            before * q,
+            after * q
+        );
+    }
+}
+
+/// A collapsed scale makes the compensation matrix singular. Inverting it would
+/// put infinities into the document, so the drag holds instead.
+#[test]
+fn an_anchor_drag_on_a_flattened_layer_is_inert() {
+    let d = GizmoDrag {
+        handle: GizmoHandle::Anchor,
+        node: 1,
+        start_pos: Vec2::new(10.0, 10.0),
+        start_rot: 0.0,
+        start_scale: (0.0, 1.0),
+        start_anchor: Vec2::ZERO,
+        grab_parent: Point::new(10.0, 10.0),
+    };
+    let r = resolve_drag(&d, Point::new(60.0, 60.0));
+    assert_eq!(r.pos, d.start_pos);
+    assert_eq!(r.anchor, d.start_anchor);
+    assert!(r.anchor.x.is_finite() && r.anchor.y.is_finite());
+}
+
+/// Selecting a group boxes what the group *contains*. A group has no geometry
+/// of its own, so unioning only its own items would give nothing for exactly
+/// the layers whose extent is least obvious.
+#[test]
+fn the_selection_box_covers_a_groups_whole_subtree() {
+    let mut a = MNode::group(1, "a");
+    a.shape = Some(MShape::Rect {
+        size: Value::constant(Vec2::new(100.0, 100.0)),
+        radius: Value::constant(0.0),
+    });
+    a.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+    a.transform.position = Value::constant(Vec2::new(0.0, 0.0));
+
+    let mut b = MNode::group(2, "b");
+    b.shape = Some(MShape::Rect {
+        size: Value::constant(Vec2::new(100.0, 100.0)),
+        radius: Value::constant(0.0),
+    });
+    b.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+    b.transform.position = Value::constant(Vec2::new(200.0, 0.0));
+
+    let group = MNode::group(3, "group").with_child(a).with_child(b);
+    let comp = Comp::new(1000.0, 1000.0, MNode::group(0, "root").with_child(group));
+    let project = MProject::single(comp);
+    let scene = evaluate_comp(&project, project.root, 0.0);
+    let root = project.comps[&project.root].root.find(NodeId(3)).unwrap();
+
+    let b = selection_bounds(&scene, root).expect("the group has drawable children");
+    // Two 100-wide squares centred at x=0 and x=200: -50 .. 250.
+    assert!((b.x0 - -50.0).abs() < 0.5, "x0 {}", b.x0);
+    assert!((b.x1 - 250.0).abs() < 0.5, "x1 {}", b.x1);
+    assert!((b.y0 - -50.0).abs() < 0.5, "y0 {}", b.y0);
+    assert!((b.y1 - 50.0).abs() < 0.5, "y1 {}", b.y1);
+}
+
+/// A layer that draws nothing has no box — better than a zero-size rect at the
+/// origin, which would look like a bug.
+#[test]
+fn a_layer_that_draws_nothing_has_no_selection_box() {
+    let (project, node, comp) = moving_project();
+    let scene = evaluate_comp(&project, comp, 0.0);
+    let root = project.comps[&comp].root.find(node).unwrap();
+    assert!(selection_bounds(&scene, root).is_none());
 }

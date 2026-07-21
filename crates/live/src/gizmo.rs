@@ -33,6 +33,9 @@ pub(crate) enum GizmoHandle {
     ScaleAxis(GizmoAxis),
     /// The corner box: scale both axes together, preserving aspect.
     ScaleUniform,
+    /// The ring just outside the centre: move the **anchor** without moving the
+    /// layer. Position is compensated to cancel it out — see `resolve_drag`.
+    Anchor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +58,7 @@ pub(crate) struct GizmoDrag {
     pub(crate) start_pos: Vec2,
     pub(crate) start_rot: f64,
     pub(crate) start_scale: (f64, f64),
+    pub(crate) start_anchor: Vec2,
     /// Where the pointer grabbed, in **parent** space.
     pub(crate) grab_parent: Point,
 }
@@ -70,6 +74,8 @@ pub(crate) struct GizmoTarget {
     pub(crate) pos: Vec2,
     pub(crate) rot_deg: f64,
     pub(crate) scale: (f64, f64),
+    /// Needed to *recover* `parent`, and now to drag the anchor itself.
+    pub(crate) anchor: Vec2,
 }
 
 impl GizmoTarget {
@@ -107,6 +113,7 @@ impl GizmoTarget {
             pos,
             rot_deg: info.rot,
             scale: info.scale,
+            anchor,
         }
     }
 
@@ -136,7 +143,12 @@ const ARROW_LEN: f32 = 62.0;
 const ARROW_HEAD: f32 = 11.0;
 const SCALE_BOX_AT: f32 = 78.0;
 const BOX_HALF: f32 = 5.0;
-const CENTRE_HALF: f32 = 6.0;
+const CENTRE_HALF: f32 = 5.0;
+/// Radius of the anchor ring, and how far either side of it counts as a grab.
+/// It sits just outside the centre square so the two never fight, and inside
+/// everything else so it can't be confused with the rotation ring.
+const ANCHOR_R: f32 = 12.0;
+const ANCHOR_GRAB: f32 = 4.5;
 const RING_R: f32 = 96.0;
 /// How close (in points) the pointer must be to the ring to grab it.
 const RING_GRAB: f32 = 7.0;
@@ -226,8 +238,13 @@ fn dist_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
 /// the centre square wins over the arrows that pass through it, and the arrows
 /// win over the ring.
 fn hit(l: &Layout, p: egui::Pos2) -> Option<GizmoHandle> {
-    if (p - l.origin).length() <= CENTRE_HALF + 3.0 {
+    if (p - l.origin).length() <= CENTRE_HALF + 2.0 {
         return Some(GizmoHandle::Move);
+    }
+    // Before the arrows, which pass straight through this radius on their way
+    // out — the ring is the smaller, more specific target, so it wins here.
+    if ((p - l.origin).length() - ANCHOR_R).abs() <= ANCHOR_GRAB {
+        return Some(GizmoHandle::Anchor);
     }
     if (p - l.corner()).length() <= BOX_HALF + 3.0 {
         return Some(GizmoHandle::ScaleUniform);
@@ -292,6 +309,18 @@ fn paint(painter: &egui::Painter, l: &Layout, hot: Option<GizmoHandle>) {
         egui::StrokeKind::Middle,
     );
 
+    // The anchor ring, drawn as AE draws an anchor: a circle crossed by four
+    // ticks, so it reads as a pivot rather than another scale handle.
+    let ac = col(GizmoHandle::Anchor, CENTRE_COL);
+    painter.circle_stroke(l.origin, ANCHOR_R, egui::Stroke::new(1.3, ac));
+    for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        let d = egui::vec2(dx, dy);
+        painter.line_segment(
+            [l.origin + d * (ANCHOR_R - 3.0), l.origin + d * (ANCHOR_R + 3.0)],
+            egui::Stroke::new(1.3, ac),
+        );
+    }
+
     // Anchor / free-move square last, on top of everything.
     let mc = col(GizmoHandle::Move, CENTRE_COL);
     painter.rect_filled(
@@ -301,14 +330,27 @@ fn paint(painter: &egui::Painter, l: &Layout, hot: Option<GizmoHandle>) {
     );
 }
 
-/// Resolve one frame of a drag into transform values, given where the pointer
-/// is now in parent space. Pure — no egui, no `App` — so the arithmetic is
-/// unit-testable without a window, like `apply_fps_edit`.
-///
-/// Returns `(pos, rot_deg, scale)`; only the fields the handle owns differ from
-/// the drag's starting values.
-pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> (Vec2, f64, (f64, f64)) {
-    let (pos, rot, scale) = (drag.start_pos, drag.start_rot, drag.start_scale);
+/// What one frame of a drag resolves to. Only the fields the dragged handle
+/// owns differ from the values the drag started with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Resolved {
+    pub(crate) pos: Vec2,
+    pub(crate) rot: f64,
+    pub(crate) scale: (f64, f64),
+    pub(crate) anchor: Vec2,
+}
+
+/// Resolve one frame of a drag, given where the pointer is now in parent space.
+/// Pure — no egui, no `App` — so the arithmetic is unit-testable without a
+/// window, like `apply_fps_edit`.
+pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> Resolved {
+    let base = Resolved {
+        pos: drag.start_pos,
+        rot: drag.start_rot,
+        scale: drag.start_scale,
+        anchor: drag.start_anchor,
+    };
+    let (pos, rot, scale) = (base.pos, base.rot, base.scale);
     let delta = now_parent - drag.grab_parent;
     let origin = Point::new(pos.x, pos.y);
 
@@ -317,40 +359,65 @@ pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> (Vec2, f64, (
     let grab_r = (drag.grab_parent - origin).hypot();
 
     match drag.handle {
-        GizmoHandle::Move => (pos + delta, rot, scale),
+        GizmoHandle::Move => Resolved { pos: pos + delta, ..base },
         GizmoHandle::MoveAxis(axis) => {
             let a = axis_of(rot, axis);
             let along = delta.x * a.x + delta.y * a.y;
-            (pos + a * along, rot, scale)
+            Resolved { pos: pos + a * along, ..base }
         }
         GizmoHandle::Rotate => {
             if grab_r < 1e-6 {
-                return (pos, rot, scale);
+                return base;
             }
             let a0 = (drag.grab_parent - origin).atan2();
             let a1 = (now_parent - origin).atan2();
-            (pos, rot + (a1 - a0).to_degrees(), scale)
+            Resolved { rot: rot + (a1 - a0).to_degrees(), ..base }
         }
         GizmoHandle::ScaleAxis(axis) => {
             let a = axis_of(rot, axis);
             let d0 = (drag.grab_parent - origin).dot(a);
             let d1 = (now_parent - origin).dot(a);
             if d0.abs() < 1e-6 {
-                return (pos, rot, scale);
+                return base;
             }
             let f = d1 / d0;
             let s = match axis {
                 GizmoAxis::X => (scale.0 * f, scale.1),
                 GizmoAxis::Y => (scale.0, scale.1 * f),
             };
-            (pos, rot, s)
+            Resolved { scale: s, ..base }
         }
         GizmoHandle::ScaleUniform => {
             if grab_r < 1e-6 {
-                return (pos, rot, scale);
+                return base;
             }
             let f = (now_parent - origin).hypot() / grab_r;
-            (pos, rot, (scale.0 * f, scale.1 * f))
+            Resolved { scale: (scale.0 * f, scale.1 * f), ..base }
+        }
+        // Move the pivot *without moving the layer* — After Effects' Pan Behind
+        // tool. The layer is drawn at `pos + R·S·(q - anchor)` for each local
+        // point `q`, so holding that fixed while the pivot follows the pointer
+        // by `delta` needs both halves:
+        //
+        //     pos'    = pos + delta
+        //     anchor' = anchor + (R·S)⁻¹ · delta
+        //
+        // Compensating only one of them is the classic version of this bug:
+        // move just the anchor and the artwork jumps; move just the position
+        // and the pivot doesn't go where you dropped it. Editing Anchor in the
+        // properties panel deliberately does *not* compensate — there you are
+        // asking to re-origin the layer, and it should move.
+        GizmoHandle::Anchor => {
+            let rs = Affine::rotate(rot.to_radians())
+                * Affine::scale_non_uniform(scale.0, scale.1);
+            // A collapsed scale makes `R·S` singular and its inverse infinite.
+            // Nothing sensible can be computed, so hold rather than emit NaN
+            // into the document.
+            if scale.0.abs() < 1e-9 || scale.1.abs() < 1e-9 {
+                return base;
+            }
+            let d = rs.inverse() * Point::new(delta.x, delta.y) - Point::ZERO;
+            Resolved { pos: pos + delta, anchor: base.anchor + d, ..base }
         }
     }
 }
@@ -433,6 +500,7 @@ pub(crate) fn gizmo_ui(
                     start_pos: target.pos,
                     start_rot: target.rot_deg,
                     start_scale: target.scale,
+                    start_anchor: target.anchor,
                     grab_parent: to_parent(target, fit, ppp, p),
                 });
             }
@@ -444,7 +512,8 @@ pub(crate) fn gizmo_ui(
 
     let mut snap = Snap::default();
     if let (Some(d), Some(p)) = (*drag, pointer) {
-        let (mut pos, rot, scale) = resolve_drag(&d, to_parent(target, fit, ppp, p));
+        let r = resolve_drag(&d, to_parent(target, fit, ppp, p));
+        let (mut pos, rot, scale, anchor) = (r.pos, r.rot, r.scale, r.anchor);
         // Snapping applies to moves only. Rotating or scaling *to* a guide is a
         // different question with a different answer (an angle, not a point),
         // and pretending a position snap covers it would just make the handles
@@ -463,6 +532,14 @@ pub(crate) fn gizmo_ui(
             GizmoHandle::ScaleAxis(_) | GizmoHandle::ScaleUniform => {
                 out.scale_x = Some(scale.0);
                 out.scale_y = Some(scale.1);
+            }
+            // Both halves, always together — see `resolve_drag`. Emitting one
+            // without the other is what makes the artwork jump.
+            GizmoHandle::Anchor => {
+                out.anchor_x = Some(anchor.x);
+                out.anchor_y = Some(anchor.y);
+                out.pos_x = Some(pos.x);
+                out.pos_y = Some(pos.y);
             }
         }
     }
@@ -534,4 +611,67 @@ pub(crate) struct SnapCtx<'a> {
     /// Cleared while the bypass modifier is held, so precise placement is
     /// always one key away rather than a trip to a toggle.
     pub(crate) enabled: bool,
+}
+
+/// The selected layer's bounding box in **composition** space, or `None` when
+/// it draws nothing on this frame.
+///
+/// The union over the whole *subtree*, because selecting a group should box
+/// what the group contains — a group has no geometry of its own, so boxing only
+/// its own items would give an empty rect for exactly the layers whose extent
+/// is least obvious.
+///
+/// Bounds are taken from each item's path through its world transform, so a
+/// rotated layer yields the axis-aligned box of the rotated shape (what you
+/// want for "how much room does this take up"), not a rotated rectangle.
+pub(crate) fn selection_bounds(scene: &MScene, root: &MNode) -> Option<kurbo::Rect> {
+    let mut ids = Vec::new();
+    collect_ids(root, &mut ids);
+    scene
+        .items
+        .iter()
+        .filter(|i| ids.contains(&i.source))
+        .map(|i| (i.transform * i.path.clone()).bounding_box())
+        .reduce(|a, b| a.union(b))
+}
+
+fn collect_ids(node: &MNode, out: &mut Vec<NodeId>) {
+    out.push(node.id);
+    for c in &node.children {
+        collect_ids(c, out);
+    }
+}
+
+const BBOX_COL: egui::Color32 = egui::Color32::from_rgba_premultiplied(210, 215, 230, 150);
+
+/// Draw the selection's bounding box: a thin rectangle with corner ticks, so it
+/// reads as a measurement rather than as another draggable frame. It is
+/// deliberately *not* grabbable — resizing by bbox corner would fight the scale
+/// handles, which already own that gesture.
+pub(crate) fn draw_bounds(
+    painter: &egui::Painter,
+    bounds: kurbo::Rect,
+    fit: Affine,
+    ppp: f64,
+) {
+    let a = fit * Point::new(bounds.x0, bounds.y0);
+    let b = fit * Point::new(bounds.x1, bounds.y1);
+    let r = egui::Rect::from_min_max(
+        egui::pos2((a.x.min(b.x) / ppp) as f32, (a.y.min(b.y) / ppp) as f32),
+        egui::pos2((a.x.max(b.x) / ppp) as f32, (a.y.max(b.y) / ppp) as f32),
+    );
+    let stroke = egui::Stroke::new(1.0, BBOX_COL);
+    painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
+
+    // Corner ticks, clamped so they never overlap on a tiny selection.
+    let t = (r.width().min(r.height()) * 0.25).clamp(2.0, 10.0);
+    for (c, sx, sy) in [
+        (r.left_top(), 1.0, 1.0),
+        (r.right_top(), -1.0, 1.0),
+        (r.left_bottom(), 1.0, -1.0),
+        (r.right_bottom(), -1.0, -1.0),
+    ] {
+        painter.line_segment([c, c + egui::vec2(t * sx, 0.0)], egui::Stroke::new(1.6, BBOX_COL));
+        painter.line_segment([c, c + egui::vec2(0.0, t * sy)], egui::Stroke::new(1.6, BBOX_COL));
+    }
 }
