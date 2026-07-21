@@ -2552,6 +2552,12 @@ fn the_guide_grab_band_follows_the_screen_not_the_composition() {
 
 // --- Snapping --------------------------------------------------------------
 
+/// Snap a bare pivot with no bounds and no sibling layers — the shape the
+/// original pivot-only tests were written against.
+fn snap_pivot(p: Point, aids: &ViewAids, comp: (f64, f64), tol: f64) -> Snap {
+    snap_point(p, None, SnapWorld { aids, comp, others: &[] }, tol)
+}
+
 fn aids_with(grid: bool, guides: Vec<Guide>) -> ViewAids {
     ViewAids {
         grid: Grid { visible: grid, spacing: 100.0, subdivisions: 4 },
@@ -2569,16 +2575,16 @@ fn the_comp_edges_and_centre_always_snap() {
     let aids = aids_with(false, Vec::new());
     let comp = (1920.0, 1080.0);
 
-    let s = snap_point(Point::new(4.0, 540.0 - 3.0), &aids, comp, 8.0);
+    let s = snap_pivot(Point::new(4.0, 540.0 - 3.0), &aids, comp, 8.0);
     assert_eq!(s.x.map(|a| a.target), Some(0.0), "left edge");
     assert_eq!(s.y.map(|a| a.target), Some(540.0), "vertical centre");
 
-    let s = snap_point(Point::new(1918.0, 1078.0), &aids, comp, 8.0);
+    let s = snap_pivot(Point::new(1918.0, 1078.0), &aids, comp, 8.0);
     assert_eq!(s.x.map(|a| a.target), Some(1920.0), "right edge");
     assert_eq!(s.y.map(|a| a.target), Some(1080.0), "bottom edge");
 
     // Well away from anything: no pull at all.
-    let s = snap_point(Point::new(700.0, 300.0), &aids, comp, 8.0);
+    let s = snap_pivot(Point::new(700.0, 300.0), &aids, comp, 8.0);
     assert_eq!(s, Snap::default());
 }
 
@@ -2587,7 +2593,7 @@ fn the_comp_edges_and_centre_always_snap() {
 #[test]
 fn the_two_axes_snap_independently() {
     let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
-    let s = snap_point(Point::new(302.0, 777.0), &aids, (1920.0, 1080.0), 8.0);
+    let s = snap_pivot(Point::new(302.0, 777.0), &aids, (1920.0, 1080.0), 8.0);
     assert_eq!(s.x.map(|a| a.target), Some(300.0));
     assert!(s.y.is_none(), "y had nothing near it and must stay free");
     assert_eq!(s.offset(), Vec2::new(-2.0, 0.0));
@@ -2601,17 +2607,17 @@ fn hidden_aids_do_not_snap() {
     let at = Point::new(402.0, 402.0);
 
     let shown = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 400.0 }]);
-    assert!(snap_point(at, &shown, comp, 8.0).x.is_some(), "shown guide pulls");
+    assert!(snap_pivot(at, &shown, comp, 8.0).x.is_some(), "shown guide pulls");
 
     let mut hidden = shown.clone();
     hidden.guides.visible = false;
     hidden.grid.visible = false;
-    assert_eq!(snap_point(at, &hidden, comp, 8.0), Snap::default());
+    assert_eq!(snap_pivot(at, &hidden, comp, 8.0), Snap::default());
 
     // And the master switch beats everything, including the comp edges.
     let mut off = shown.clone();
     off.snap = false;
-    assert_eq!(snap_point(Point::new(2.0, 2.0), &off, comp, 8.0), Snap::default());
+    assert_eq!(snap_pivot(Point::new(2.0, 2.0), &off, comp, 8.0), Snap::default());
 }
 
 /// Grid snapping computes the nearest multiple rather than enumerating lines,
@@ -2622,11 +2628,11 @@ fn the_grid_snaps_to_the_nearest_line_at_any_distance() {
     let comp = (100_000.0, 100_000.0);
 
     // 100px majors: a long way out, still exact.
-    let s = snap_point(Point::new(49_998.0, 3.0), &aids, comp, 8.0);
+    let s = snap_pivot(Point::new(49_998.0, 3.0), &aids, comp, 8.0);
     assert_eq!(s.x.map(|a| a.target), Some(50_000.0));
 
     // 4 subdivisions of 100 = minor lines every 25.
-    let s = snap_point(Point::new(74.0, 5_000.0), &aids, comp, 8.0);
+    let s = snap_pivot(Point::new(74.0, 5_000.0), &aids, comp, 8.0);
     assert_eq!(s.x.map(|a| a.target), Some(75.0), "nearest minor line");
 }
 
@@ -2635,7 +2641,7 @@ fn the_grid_snaps_to_the_nearest_line_at_any_distance() {
 #[test]
 fn the_nearest_snap_target_wins() {
     let aids = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 103.0 }]);
-    let s = snap_point(Point::new(102.0, 500.0), &aids, (1920.0, 1080.0), 8.0);
+    let s = snap_pivot(Point::new(102.0, 500.0), &aids, (1920.0, 1080.0), 8.0);
     assert_eq!(s.x.map(|a| a.target), Some(103.0), "the guide is 1 away, the grid 2");
 }
 
@@ -2677,7 +2683,13 @@ fn an_axis_constrained_drag_only_snaps_along_its_axis() {
             Guide { axis: GuideAxis::Horizontal, at: 300.0 },
         ],
     );
-    let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: true };
+    let ctx = SnapCtx {
+        aids: &aids,
+        comp: (1920.0, 1080.0),
+        bounds: None,
+        others: &[],
+        enabled: true,
+    };
     let fit = Affine::IDENTITY;
     let at = Vec2::new(302.0, 302.0);
 
@@ -2725,7 +2737,13 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
         anchor: Vec2::ZERO,
     };
     let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
-    let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: true };
+    let ctx = SnapCtx {
+        aids: &aids,
+        comp: (1920.0, 1080.0),
+        bounds: None,
+        others: &[],
+        enabled: true,
+    };
 
     // Parent-space x=101 maps to comp 100 + 2*101 = 302, two from the guide.
     let at = Vec2::new(101.0, 200.0);
@@ -2771,7 +2789,13 @@ fn the_bypass_modifier_defeats_every_snap_target() {
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(301.0, 2.0),
     };
-    let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: false };
+    let ctx = SnapCtx {
+        aids: &aids,
+        comp: (1920.0, 1080.0),
+        bounds: None,
+        others: &[],
+        enabled: false,
+    };
     let (pos, snap) = snap_move(&target, &drag, at, ctx, Affine::IDENTITY, 1.0);
     assert_eq!(pos, at, "the drag lands exactly where the pointer put it");
     assert_eq!(snap, Snap::default(), "and nothing is drawn as snapped");
@@ -3036,4 +3060,169 @@ fn a_ghost_keeps_some_of_its_own_colour() {
     // Zero blend is a no-op; full blend is the tint.
     assert_eq!(tinted(own, tint, 0.0).g, 1.0);
     assert_eq!(tinted(own, tint, 1.0).r, 1.0);
+}
+
+// --- Bounding-box snapping -------------------------------------------------
+
+/// A layer's **edge** can land on a guide, not just its pivot. This is the
+/// whole point of bbox snapping: the pivot usually sits in the middle of the
+/// artwork, so pivot-only snapping puts the *centre* on the margin when what
+/// you asked for was the edge flush against it.
+#[test]
+fn a_layers_edge_snaps_to_a_guide_not_just_its_pivot() {
+    let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
+    let comp = (1920.0, 1080.0);
+    // A 100-wide layer centred at x=352: its left edge is at 302, two from the
+    // guide, while the pivot is 52 away and far out of tolerance.
+    let bounds = kurbo::Rect::new(302.0, 0.0, 402.0, 100.0);
+    let pivot = Point::new(352.0, 50.0);
+
+    let world = SnapWorld { aids: &aids, comp, others: &[] };
+    let s = snap_point(pivot, Some(bounds), world, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(300.0), "the left edge caught it");
+    assert_eq!(s.offset(), Vec2::new(-2.0, 0.0), "and only by the edge's gap");
+
+    // Without bounds the same drag is out of range entirely.
+    assert!(snap_pivot(pivot, &aids, comp, 8.0).x.is_none());
+}
+
+/// Edges align against *other layers*, which is what makes "line this up with
+/// that" work without dropping a guide first.
+#[test]
+fn a_layer_snaps_to_another_layers_edge() {
+    let aids = aids_with(false, Vec::new());
+    let comp = (1920.0, 1080.0);
+    let other = kurbo::Rect::new(800.0, 0.0, 900.0, 100.0);
+
+    // Dragged layer's right edge is at 797, three short of the other's left.
+    let bounds = kurbo::Rect::new(697.0, 0.0, 797.0, 100.0);
+    let world = SnapWorld { aids: &aids, comp, others: std::slice::from_ref(&other) };
+    let s = snap_point(Point::new(747.0, 50.0), Some(bounds), world, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(800.0));
+
+    // With no siblings offered, nothing pulls it.
+    let alone = SnapWorld { aids: &aids, comp, others: &[] };
+    assert!(snap_point(Point::new(747.0, 50.0), Some(bounds), alone, 8.0).x.is_none());
+}
+
+/// Centres align to centres, so two layers can be lined up on their middles
+/// rather than their edges.
+#[test]
+fn layer_centres_align_to_each_other() {
+    let aids = aids_with(false, Vec::new());
+    let comp = (4000.0, 4000.0);
+    // A sibling spanning 1000..1200, so its centre is 1100.
+    let other = kurbo::Rect::new(1000.0, 0.0, 1200.0, 50.0);
+    // Dragged layer spans 1057..1097 — centre 1077, twenty-three short. Its
+    // edges are far from anything, so only the centre can be the match.
+    let bounds = kurbo::Rect::new(1057.0, 500.0, 1097.0, 540.0);
+    let world = SnapWorld { aids: &aids, comp, others: std::slice::from_ref(&other) };
+    let s = snap_point(Point::new(1077.0, 520.0), Some(bounds), world, 25.0);
+    assert_eq!(s.x.map(|a| a.target), Some(1100.0), "centre to centre");
+}
+
+/// The smallest correction wins across *every* source/target pair — an edge two
+/// away must beat a pivot five away, or the snap feels arbitrary.
+#[test]
+fn the_smallest_correction_wins_across_edges_and_pivot() {
+    let aids = aids_with(
+        false,
+        vec![
+            Guide { axis: GuideAxis::Vertical, at: 500.0 },
+            Guide { axis: GuideAxis::Vertical, at: 447.0 },
+        ],
+    );
+    let comp = (1920.0, 1080.0);
+    // Pivot at 505 is 5 from the guide at 500; the left edge at 445 is 2 from
+    // the guide at 447. The edge should win.
+    let bounds = kurbo::Rect::new(445.0, 0.0, 565.0, 80.0);
+    let world = SnapWorld { aids: &aids, comp, others: &[] };
+    let s = snap_point(Point::new(505.0, 40.0), Some(bounds), world, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(447.0));
+    assert_eq!(s.offset(), Vec2::new(2.0, 0.0));
+}
+
+/// A layer that draws nothing has no edges, so it falls back to pivot-only
+/// snapping rather than snapping to a degenerate box at the origin.
+#[test]
+fn a_layer_with_no_geometry_snaps_only_its_pivot() {
+    let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
+    let comp = (1920.0, 1080.0);
+    let world = SnapWorld { aids: &aids, comp, others: &[] };
+
+    assert!(snap_point(Point::new(303.0, 500.0), None, world, 8.0).x.is_some());
+    assert!(snap_point(Point::new(600.0, 500.0), None, world, 8.0).x.is_none());
+}
+
+/// `Scene::places` reports every node's extent, unioned over its subtree, so a
+/// group's bounds cover its children even though the group draws nothing
+/// itself. Snapping reads sibling bounds straight from here, which is why it
+/// has to be right for containers and not just for shapes.
+#[test]
+fn a_groups_bounds_cover_its_children() {
+    let mut a = MNode::group(1, "a");
+    a.shape = Some(MShape::Rect {
+        size: Value::constant(Vec2::new(100.0, 100.0)),
+        radius: Value::constant(0.0),
+    });
+    a.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+
+    let mut b = MNode::group(2, "b");
+    b.shape = Some(MShape::Rect {
+        size: Value::constant(Vec2::new(100.0, 100.0)),
+        radius: Value::constant(0.0),
+    });
+    b.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+    b.transform.position = Value::constant(Vec2::new(200.0, 0.0));
+
+    let group = MNode::group(3, "group").with_child(a).with_child(b);
+    let comp = Comp::new(1000.0, 1000.0, MNode::group(0, "root").with_child(group));
+    let project = MProject::single(comp);
+    let scene = evaluate_comp(&project, project.root, 0.0);
+
+    let g = scene.place(NodeId(3)).expect("the group has a place");
+    let bounds = g.bounds.expect("and, through its children, an extent");
+    assert!((bounds.x0 - -50.0).abs() < 0.5, "x0 {}", bounds.x0);
+    assert!((bounds.x1 - 250.0).abs() < 0.5, "x1 {}", bounds.x1);
+
+    // Its own children still report their own, narrower boxes.
+    let child = scene.place(NodeId(1)).and_then(|p| p.bounds).expect("child bounds");
+    assert!((child.x1 - 50.0).abs() < 0.5, "the child is not widened by its sibling");
+}
+
+/// A node that draws nothing anywhere in its subtree has no extent at all —
+/// better than a zero-size box at the origin, which would act as a phantom snap
+/// target sitting in the corner of every composition.
+#[test]
+fn a_subtree_that_draws_nothing_has_no_extent() {
+    let (project, node, comp) = moving_project();
+    let scene = evaluate_comp(&project, comp, 0.0);
+    assert!(scene.place(node).expect("still has a place").bounds.is_none());
+}
+
+/// A dragged layer must not be offered its own ancestors as snap targets. A
+/// group's extent is the union of its children's, so an ancestor's box contains
+/// the dragged layer and moves with it — snapping to one pins the drag against
+/// a target that runs away from it. The root is an ancestor of everything, so
+/// excluding ancestors excludes it for free.
+#[test]
+fn a_drag_is_never_offered_its_own_subtree_or_ancestors() {
+    let leaf = MNode::group(3, "leaf");
+    let inner = MNode::group(2, "inner").with_child(leaf);
+    let sibling = MNode::group(4, "sibling");
+    let root = MNode::group(0, "root").with_child(inner).with_child(sibling);
+
+    let excluded = snap_excluded(&root, NodeId(2));
+    for id in [NodeId(0), NodeId(2), NodeId(3)] {
+        assert!(excluded.contains(&id), "{id:?} must be excluded");
+    }
+    assert!(!excluded.contains(&NodeId(4)), "a sibling is a legitimate target");
+
+    // Dragging the leaf excludes it and both containers, but still not the
+    // sibling branch.
+    let excluded = snap_excluded(&root, NodeId(3));
+    for id in [NodeId(0), NodeId(2), NodeId(3)] {
+        assert!(excluded.contains(&id), "{id:?} must be excluded");
+    }
+    assert!(!excluded.contains(&NodeId(4)));
 }

@@ -577,7 +577,15 @@ pub(crate) fn snap_move(
         return (pos, Snap::default());
     }
     let pivot = target.parent * Point::new(pos.x, pos.y);
-    let snap = snap_point(pivot, ctx.aids, ctx.comp, snap_tolerance(fit, ppp));
+    // The cached bounds describe the layer where the *scene* last put it, which
+    // during a drag is a frame behind. A move is a pure translation, so shifting
+    // them by how far the pivot has travelled is exact — and far cheaper than
+    // re-evaluating the comp for every drag frame just to re-measure a box.
+    let here = target.parent * Point::new(target.pos.x, target.pos.y);
+    let shift = pivot - here;
+    let bounds = ctx.bounds.map(|b| b + shift);
+    let world = SnapWorld { aids: ctx.aids, comp: ctx.comp, others: ctx.others };
+    let snap = snap_point(pivot, bounds, world, snap_tolerance(fit, ppp));
     let mut offset = snap.offset();
     if offset == Vec2::ZERO {
         return (pos, snap);
@@ -608,6 +616,12 @@ pub(crate) fn snap_move(
 pub(crate) struct SnapCtx<'a> {
     pub(crate) aids: &'a ViewAids,
     pub(crate) comp: (f64, f64),
+    /// The dragged layer's extent, as the scene last evaluated it. Translated
+    /// to the proposed position before use — a move only translates, so that is
+    /// exact and avoids re-evaluating the comp per drag frame.
+    pub(crate) bounds: Option<kurbo::Rect>,
+    /// Every other layer's extent, so edges can align against siblings.
+    pub(crate) others: &'a [kurbo::Rect],
     /// Cleared while the bypass modifier is held, so precise placement is
     /// always one key away rather than a trip to a toggle.
     pub(crate) enabled: bool,
@@ -634,6 +648,33 @@ pub(crate) fn selection_boxes(scene: &MScene, root: &MNode) -> Vec<kurbo::Rect> 
         .filter(|i| ids.contains(&i.source))
         .map(|i| (i.transform * i.path.clone()).bounding_box())
         .collect()
+}
+
+/// Ids that must not be offered as snap targets while `target` is dragged:
+/// everything in its own subtree, plus every **ancestor** up to the root.
+///
+/// The ancestors matter and are easy to miss. A group's extent is the union of
+/// its children's, so any ancestor's box *contains* the dragged layer and moves
+/// with it — offering those edges would let a layer snap to a box it is itself
+/// defining, which pins the drag against a target that runs away from it. The
+/// root is an ancestor of everything, so this excludes it for free.
+pub(crate) fn snap_excluded(root: &MNode, target: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    fn walk(node: &MNode, target: NodeId, out: &mut Vec<NodeId>) -> bool {
+        if node.id == target {
+            collect_ids(node, out);
+            return true;
+        }
+        for c in &node.children {
+            if walk(c, target, out) {
+                out.push(node.id);
+                return true;
+            }
+        }
+        false
+    }
+    walk(root, target, &mut out);
+    out
 }
 
 fn collect_ids(node: &MNode, out: &mut Vec<NodeId>) {

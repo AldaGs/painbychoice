@@ -1355,6 +1355,20 @@ impl App {
         // its pieces, not just its extent. Comp space, projected at paint time
         // like the motion path.
         let sel_boxes = sel_node.map(|n| selection_boxes(&scene, n)).unwrap_or_default();
+        // Snap candidates: the dragged layer's own extent, and every *other*
+        // node's. Both come straight from `Scene::places`, so they agree with
+        // what the walk actually did rather than being re-derived here.
+        let sel_extent = self.selected.and_then(|id| scene.place(id).and_then(|p| p.bounds));
+        let excluded: Vec<NodeId> = self
+            .selected
+            .map(|id| snap_excluded(&self.doc().root, id))
+            .unwrap_or_default();
+        let other_extents: Vec<kurbo::Rect> = scene
+            .places
+            .iter()
+            .filter(|(id, _)| !excluded.contains(id))
+            .filter_map(|(_, p)| p.bounds)
+            .collect();
         let rows = sel_node.map(dope_rows).unwrap_or_default();
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -1607,6 +1621,8 @@ impl App {
                                     SnapCtx {
                                         aids: &aids,
                                         comp: (doc_w, doc_h),
+                                        bounds: sel_extent,
+                                        others: &other_extents,
                                         enabled: !snap_bypass,
                                     },
                                     &mut gizmo_drag,

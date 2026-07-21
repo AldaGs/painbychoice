@@ -2,7 +2,7 @@
 //! time is just calling this with a different `t`; nothing is cached or baked,
 //! which is what makes the whole thing non-linear and non-destructive.
 
-use kurbo::{Affine, BezPath};
+use kurbo::{Affine, BezPath, Shape as _};
 
 use crate::expr::EvalCtx;
 use crate::node::{CompId, Document, Node, NodeId, Project};
@@ -58,6 +58,20 @@ pub struct Placement {
     /// scales about. An overlay drawn anywhere else sits away from where the
     /// layer visibly turns.
     pub pivot: kurbo::Point,
+    /// The node's extent in composition space: its own geometry unioned with
+    /// every descendant's. `None` when nothing in the subtree draws.
+    ///
+    /// Filled in *after* the children are walked, because a group has no
+    /// geometry of its own and its extent is entirely its contents'. Computing
+    /// it here rather than outside is what makes it available for **every**
+    /// node — an editor wanting to snap one layer's edge against its siblings'
+    /// needs all of their bounds from the same pass, not a second walk per
+    /// candidate.
+    ///
+    /// Axis-aligned in comp space, so a rotated layer reports the box of the
+    /// rotated shape rather than a rotated box. That is the right answer for
+    /// "how much room does this take up", which is what alignment needs.
+    pub bounds: Option<kurbo::Rect>,
 }
 
 impl Scene {
@@ -143,13 +157,13 @@ fn walk(
     project: Option<&Project>,
     stack: &mut Vec<CompId>,
     scene: &mut Scene,
-) {
+) -> Option<kurbo::Rect> {
     // A trimmed layer outside its window contributes nothing — and neither do
     // its children, which live in its time. Checked before anything resolves,
     // so a hidden layer costs nothing.
     if let Some(timing) = &node.timing {
         if !timing.is_live(ctx.comp_frame) {
-            return;
+            return None;
         }
     }
 
@@ -172,12 +186,20 @@ fn walk(
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
 
-    // Recorded for every node, drawable or not — see `Scene::places`.
+    // Recorded for every node, drawable or not — see `Scene::places`. `bounds`
+    // can't be known yet (a group's extent is its children's), so the slot is
+    // remembered and filled once they've been walked.
     let anchor = node.transform.anchor.resolve(ctx);
+    let place_at = scene.places.len();
     scene.places.push((
         node.id,
-        Placement { world: xf, pivot: xf * kurbo::Point::new(anchor.x, anchor.y) },
+        Placement {
+            world: xf,
+            pivot: xf * kurbo::Point::new(anchor.x, anchor.y),
+            bounds: None,
+        },
     ));
+    let mut bounds: Option<kurbo::Rect> = None;
 
     if let Some(shape) = &node.shape {
         let path = shape.to_path(ctx);
@@ -194,6 +216,7 @@ fn walk(
                 .warnings
                 .push((node.id, "transform resolved to a non-finite value".into()));
         } else {
+            bounds = Some((xf * path.clone()).bounding_box());
             scene.items.push(RenderItem {
                 source: node.id,
                 transform: xf,
@@ -241,11 +264,17 @@ fn walk(
     ctx.exit_node(prev_node);
 
     for child in &node.children {
-        walk(child, xf, opacity, ctx, project, stack, scene);
+        let child_bounds = walk(child, xf, opacity, ctx, project, stack, scene);
+        bounds = match (bounds, child_bounds) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (a, b) => a.or(b),
+        };
     }
+    scene.places[place_at].1.bounds = bounds;
 
     ctx.frame = prev_frame;
     ctx.timing = prev_timing;
+    bounds
 }
 
 #[cfg(test)]

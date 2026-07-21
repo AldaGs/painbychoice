@@ -425,9 +425,30 @@ Moves only: rotating or scaling *to* a guide is a different question with a
 different answer (an angle, not a point), and pretending a position snap covers
 it would just make those handles stick for no visible reason.
 
-Not yet: snapping a layer's **bounding-box edges** rather than its pivot. That
-is what you want for laying out a title against a margin, and it needs per-frame
-bounds for the dragged layer plus a candidate set from its siblings.
+**Edges and centres snap, not only the pivot** (2026-07-21). Pivot-only is the
+common half-measure and it cannot lay a title flush against a margin: the pivot
+usually sits in the middle of the artwork, so "on the guide" puts the *centre*
+there rather than the edge. Each axis now considers the pivot, both edges and
+the centre as sources, and takes the smallest correction over every
+source/target pair.
+
+Sibling layers are targets too, so "line this up with that" works without
+dropping a guide first. Their extents come from `Placement::bounds`, filled by
+the same walk that produces everything else — which is why bounds live in `core`
+rather than being re-derived per candidate in the editor.
+
+Two subtleties:
+
+- **A layer is never offered its own ancestors.** A group's extent is the union
+  of its children's, so any ancestor's box *contains* the dragged layer and
+  moves with it; snapping to one pins the drag against a target that runs away
+  from it. The root is an ancestor of everything, so excluding ancestors
+  excludes it for free. `snap_excluded` does subtree + ancestors in one walk.
+- **The dragged layer's bounds are translated, not re-measured.** The cached
+  extent describes where the *scene* last put the layer, a frame behind during a
+  drag. A move is a pure translation, so shifting the box by how far the pivot
+  travelled is exact — and far cheaper than re-evaluating the comp every drag
+  frame just to re-measure a rectangle.
 
 ### Onion skins (2026-07-21)
 
@@ -535,6 +556,12 @@ Three properties are load-bearing:
   which is what lets the motion path break its polyline instead of drawing a
   line to the origin, and what stops the gizmo lingering over an off-screen
   layer.
+- `bounds` is the subtree's extent, **filled after the children are walked**,
+  because a group has no geometry of its own. It is `None` when nothing in the
+  subtree draws — better than a zero-size box, which would act as a phantom snap
+  target sitting in every composition's corner. Having it here rather than in
+  the editor is what lets snapping read *every* sibling's extent from one pass
+  instead of walking per candidate.
 
 ### Colours
 
@@ -1134,17 +1161,15 @@ done** (see *The transform gizmo*). Still open, in this order:
 
 1. ~~**Grid + rulers + guides**~~ ✅ Done — see *Grid, rulers and guides*.
    Per-comp state saved in the `.pbc`, alongside `Comp::bg`.
-2. ~~**Snapping**~~ ✅ Done for the pivot — see *Snapping*. Still open: snapping
-   a layer's **bounding-box edges** and to *other layers'* bounds, which needs
-   per-frame bounds for the dragged layer and a candidate set from its siblings.
+2. ~~**Snapping**~~ ✅ Done, pivot *and* bounding-box edges/centres, including
+   against other layers — see *Snapping*.
 3. ~~**Anchor-point handle + selection bbox**~~ ✅ Done — see *The anchor handle
    and the selection box*.
 4. ~~**Onion skinning**~~ ✅ Done — see *Onion skins*.
 
-That completes the canvas-gizmos track as agreed. What remains from it is
-**bounding-box snapping** (edges, and to other layers' bounds), which wants the
-bounds computed in `core` beside `Scene::places` so sibling bounds come out of
-the same pass.
+That completes the canvas-gizmos track as agreed — grid, rulers, guides,
+snapping (pivot and bounding box), the anchor handle, selection boxes, the
+motion path and onion skins are all in.
 
 > **Graph-UI progress (2026-07-20):** module bodies now have a real editing
 > surface — you open a module from the graph panel and edit its body + knobs on

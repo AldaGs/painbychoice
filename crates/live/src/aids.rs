@@ -474,50 +474,97 @@ impl Snap {
     }
 }
 
-/// The nearest snap coordinate to `v` on one axis, within `tol`.
+/// What a drag can snap *to*, gathered once per drag frame.
+#[derive(Clone, Copy)]
+pub(crate) struct SnapWorld<'a> {
+    pub(crate) aids: &'a ViewAids,
+    pub(crate) comp: (f64, f64),
+    /// Other layers' extents in composition space. Their edges and centres are
+    /// targets, which is what makes "line this up with that" work without
+    /// dropping a guide first.
+    pub(crate) others: &'a [kurbo::Rect],
+}
+
+/// Coordinates on one axis that a drag can be pulled *from*: its pivot, and —
+/// when the layer draws something — its two edges and its centre.
+///
+/// Snapping only the pivot is the common half-measure, and it can't align a
+/// title flush to a margin: the pivot is usually somewhere in the middle of the
+/// artwork, so "on the guide" puts the *centre* there, not the edge.
+fn sources(pivot: f64, bounds: Option<(f64, f64)>) -> Vec<f64> {
+    let mut v = vec![pivot];
+    if let Some((lo, hi)) = bounds {
+        v.push(lo);
+        v.push((lo + hi) / 2.0);
+        v.push(hi);
+    }
+    v
+}
+
+/// The best snap on one axis: the smallest correction over every (source,
+/// target) pair within `tol`.
 ///
 /// `extent` is the composition's size along this axis, `guides` the guide
-/// coordinates that cross it. Grid lines are *not* enumerated — the nearest
-/// multiple is computed directly, so a 1px grid on a huge comp costs the same
-/// as a 500px one instead of building a million candidates.
+/// coordinates crossing it, `others` the other layers' spans. Grid lines are
+/// *not* enumerated — the nearest multiple is computed per source, so a 1px
+/// grid on a huge comp costs what a 500px one does instead of building a
+/// million candidates.
 fn snap_axis(
-    v: f64,
+    sources: &[f64],
     extent: f64,
     guides: &[f64],
+    others: &[(f64, f64)],
     grid: Option<&Grid>,
     tol: f64,
 ) -> Option<SnapAxis> {
     let mut best: Option<SnapAxis> = None;
-    let mut consider = |target: f64| {
-        let offset = target - v;
-        if offset.abs() <= tol && best.is_none_or(|b| offset.abs() < b.offset.abs()) {
-            best = Some(SnapAxis { offset, target });
+    for &v in sources {
+        let mut consider = |target: f64| {
+            let offset = target - v;
+            if offset.abs() <= tol && best.is_none_or(|b| offset.abs() < b.offset.abs()) {
+                best = Some(SnapAxis { offset, target });
+            }
+        };
+
+        // The composition's own edges and centre, always live: they exist
+        // whether or not any aid is switched on, and are what you align to most.
+        consider(0.0);
+        consider(extent / 2.0);
+        consider(extent);
+
+        for g in guides {
+            consider(*g);
         }
-    };
-
-    // The composition's own edges and centre, always live: they exist whether
-    // or not any aid is switched on, and are what you align to most.
-    consider(0.0);
-    consider(extent / 2.0);
-    consider(extent);
-
-    for g in guides {
-        consider(*g);
-    }
-
-    if let Some(grid) = grid.filter(|g| g.visible) {
-        for step in [Some(grid.step()), grid.minor_step()].into_iter().flatten() {
-            consider((v / step).round() * step);
+        for (lo, hi) in others {
+            consider(*lo);
+            consider((*lo + *hi) / 2.0);
+            consider(*hi);
+        }
+        if let Some(grid) = grid.filter(|g| g.visible) {
+            for step in [Some(grid.step()), grid.minor_step()].into_iter().flatten() {
+                consider((v / step).round() * step);
+            }
         }
     }
     best
 }
 
-/// Snap a point in **composition space** to whatever aids are currently armed.
+/// Snap a dragged layer in **composition space** to whatever aids are armed.
+///
+/// `pivot` is where the layer's anchor would land; `bounds` its extent there,
+/// or `None` if it draws nothing. Both axes are decided independently, because
+/// a drag can perfectly well land its left edge on a guide while its Y stays
+/// exactly where the pointer put it.
 ///
 /// `tol` is in composition units — convert from [`SNAP_PX`] with
 /// [`snap_tolerance`] so the feel stays constant across zoom levels.
-pub(crate) fn snap_point(p: Point, aids: &ViewAids, comp: (f64, f64), tol: f64) -> Snap {
+pub(crate) fn snap_point(
+    pivot: Point,
+    bounds: Option<kurbo::Rect>,
+    world: SnapWorld<'_>,
+    tol: f64,
+) -> Snap {
+    let aids = world.aids;
     if !aids.snap {
         return Snap::default();
     }
@@ -532,9 +579,27 @@ pub(crate) fn snap_point(p: Point, aids: &ViewAids, comp: (f64, f64), tol: f64) 
             }
         }
     }
+    let ox: Vec<(f64, f64)> = world.others.iter().map(|r| (r.x0, r.x1)).collect();
+    let oy: Vec<(f64, f64)> = world.others.iter().map(|r| (r.y0, r.y1)).collect();
+    let grid = Some(&aids.grid);
+
     Snap {
-        x: snap_axis(p.x, comp.0, &vs, Some(&aids.grid), tol),
-        y: snap_axis(p.y, comp.1, &hs, Some(&aids.grid), tol),
+        x: snap_axis(
+            &sources(pivot.x, bounds.map(|b| (b.x0, b.x1))),
+            world.comp.0,
+            &vs,
+            &ox,
+            grid,
+            tol,
+        ),
+        y: snap_axis(
+            &sources(pivot.y, bounds.map(|b| (b.y0, b.y1))),
+            world.comp.1,
+            &hs,
+            &oy,
+            grid,
+            tol,
+        ),
     }
 }
 
