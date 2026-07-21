@@ -547,6 +547,8 @@ pub(crate) struct CompEdits {
     pub(crate) bg: Option<[f32; 3]>,
     /// A new passepartout strength, 0.0–1.0.
     pub(crate) passepartout: Option<f64>,
+    /// A new motion-path half-window, in frames.
+    pub(crate) motion_path_range: Option<i64>,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -582,6 +584,7 @@ pub(crate) fn comp_ui(
     duration: f64,
     bg: MColor,
     passepartout: f64,
+    motion_path_range: i64,
     out: &mut CompEdits,
     presets: &[String],
     name_buf: &mut String,
@@ -708,6 +711,24 @@ pub(crate) fn comp_ui(
             .changed()
         {
             out.passepartout = Some(pct / 100.0);
+        }
+
+        // How far either side of the playhead the motion path reaches. Each
+        // frame in the window costs a scene evaluation whenever the document
+        // changes, so this is a real cost dial, not just a clutter dial.
+        ui.label("Path");
+        let mut range = motion_path_range;
+        if ui
+            .add(
+                egui::DragValue::new(&mut range)
+                    .speed(1.0)
+                    .range(0..=MAX_RANGE)
+                    .suffix(" f"),
+            )
+            .on_hover_text("Motion path: frames sampled either side of the playhead")
+            .changed()
+        {
+            out.motion_path_range = Some(range);
         }
         ui.separator();
 

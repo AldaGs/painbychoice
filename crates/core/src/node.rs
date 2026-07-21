@@ -529,6 +529,10 @@ pub struct Comp {
     /// is off, `1.0` is opaque black. Preview-only: it never reaches a render.
     #[serde(default = "Comp::default_passepartout")]
     pub passepartout: f64,
+    /// How many frames either side of the playhead the preview's motion path
+    /// covers. Preview-only, like `passepartout`.
+    #[serde(default = "Comp::default_motion_path_range")]
+    pub motion_path_range: i64,
     pub root: Node,
 }
 
@@ -549,6 +553,14 @@ impl Comp {
         Self::DEFAULT_PASSEPARTOUT
     }
 
+    /// Two seconds either side at 30fps, one at 60 — enough to read the shape
+    /// of a move without burying the frame in dots.
+    pub const DEFAULT_MOTION_PATH_RANGE: i64 = 60;
+
+    fn default_motion_path_range() -> i64 {
+        Self::DEFAULT_MOTION_PATH_RANGE
+    }
+
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
             name: String::new(),
@@ -558,6 +570,7 @@ impl Comp {
             duration: 5.0,
             bg: Self::DEFAULT_BG,
             passepartout: Self::DEFAULT_PASSEPARTOUT,
+            motion_path_range: Self::DEFAULT_MOTION_PATH_RANGE,
             root,
         }
     }

@@ -297,6 +297,61 @@ Handle sizes are constants in **logical points**, not comp units, so the gizmo
 stays the same size on screen at every zoom — a gizmo that scaled with the comp
 would vanish exactly when you zoomed out to grab it.
 
+### The motion path (2026-07-20)
+
+`live/src/motionpath.rs`. An animated layer's pivot trajectory, drawn on the
+preview as a curve with a dot per frame — dot *spacing* is the reading, since
+bunched dots are slow and spread dots are fast, which a bare curve can't show.
+Keyframed samples draw as larger squares, the current frame gets a ring.
+
+**Only position gets one, and that is a design decision, not a gap.** Position
+*is* a spatial curve: it lives in the same space as the canvas, so drawing it
+shows the data rather than a visualisation invented for it. Nothing else on a
+layer has that property — a "rotation path" would be a made-up mapping, and
+value-over-time for every other property is already better served by the
+dopesheet and the graph editor. The whole-layer equivalent for everything else
+is **onion skinning** (ghost the rendered layer at ±N frames), which covers
+rotation, scale, opacity, fill, shape params and text in one feature instead of
+one visualisation per property. Not built yet.
+
+Each sample is a full `evaluate_comp`, and the point is read out of the scene's
+new pivot table. That is not the cheap way — the cheap way walks the ancestor
+transforms directly — but it is the only way the path cannot disagree with the
+canvas: parent chains, expressions, pre-comp instancing and `LayerTiming`'s
+local-frame shift all bend where a layer actually is, and re-deriving that
+outside `eval.rs` would be a second implementation of its walk, silently
+drifting from the first. Same reasoning as the gizmo emitting ordinary
+`PropEdits` rather than writing the document itself.
+
+**The cost is real and the cache is what makes it affordable.** A ±60 window is
+121 scene evaluations, so the path rebuilds only when its key changes —
+selection, frame window, or `App::doc_rev`, a counter bumped on every document
+change. It *does* rebuild on every frame of a gizmo drag, since each delta bumps
+the revision. That is the case to watch on a heavy comp and the first thing to
+optimise if it ever feels slow. `Comp::motion_path_range` (default 60, capped at
+`MAX_RANGE`) is therefore a cost dial as much as a clutter dial.
+
+Display-only for now: dragging a keyframe along the path needs per-key
+hit-testing and a spatial-tangent story, and wants the path proven correct first.
+
+### `Scene::pivots` — why a node's place is separate from its drawing
+
+`eval.rs`'s walk records every live node's anchor point in comp space, alongside
+the draw list. A node need not draw anything — a group or a null has no shape
+and so no `RenderItem` — but it still has a place, and it is exactly the sort of
+layer you parent things to and animate. Editor overlays need that place.
+
+Two properties are load-bearing:
+
+- It is the **anchor**, not the local origin. `local` maps the anchor point to
+  `position` by construction, so this is the point the layer rotates and scales
+  about, and the point the gizmo centres on. An overlay drawn anywhere else sits
+  away from where the layer visibly turns.
+- A node outside its time window is **absent, not zeroed**. The walk returns
+  before reaching it, so "the layer isn't here on this frame" is expressible —
+  which is what lets the motion path break its polyline instead of drawing a
+  line to the origin.
+
 ### Colours
 
 Three surfaces, deliberately distinct, and they live in three different places
@@ -889,6 +944,12 @@ done** (see *The transform gizmo*). Still open, in this order:
    layers' bounds. Depends on (1), and on the gizmo for the drag path.
 3. **Anchor-point handle + selection bbox** — the gizmo pivots on the anchor but
    can't yet *move* it, and there is no bounding box drawn.
+4. **Onion skinning** — ghosts of the rendered layer at ±N frames, tinted by
+   direction (past warm, future cool). This is the answer for every property a
+   motion path *can't* show; see *The motion path*. Will want the same caching
+   discipline, and is strictly more expensive (each ghost is a whole scene).
+
+The **motion path** from this track is done — see *The motion path* below.
 
 > **Graph-UI progress (2026-07-20):** module bodies now have a real editing
 > surface — you open a module from the graph panel and edit its body + knobs on

@@ -2316,3 +2316,108 @@ fn a_comp_larger_than_the_canvas_does_not_invert_the_passepartout() {
         );
     }
 }
+
+// --- Motion path -----------------------------------------------------------
+
+/// A project with one layer moving from (0,0) at frame 0 to (100,200) at 100.
+fn moving_project() -> (MProject, NodeId, CompId) {
+    use motion_core::value::{Keyframe, Track};
+    // `set_at` overwrites a constant rather than promoting it, so build the
+    // track directly — the same idiom `comp_at_fps` uses.
+    let mut layer = MNode::group(1, "mover");
+    layer.transform.position = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+        Keyframe::linear(100, Vec2::new(100.0, 200.0)),
+    ]));
+    // Deliberately a bare group with no shape: a null/group draws nothing and
+    // so has no `RenderItem`, and it is exactly the sort of layer you animate
+    // and want a path for.
+    let comp = Comp::new(640.0, 480.0, MNode::group(0, "root").with_child(layer));
+    let project = MProject::single(comp);
+    let root = project.root;
+    (project, NodeId(1), root)
+}
+
+/// The path samples the window around the playhead, one point per frame, and
+/// its endpoints match the keyframed positions.
+#[test]
+fn the_motion_path_samples_a_window_around_the_playhead() {
+    let (project, node, comp) = moving_project();
+    let mut path = MotionPath::default();
+    assert!(path.cache(&project, comp, node, 50, 10, 0), "first build");
+
+    assert_eq!(path.points.len(), 21, "±10 frames inclusive");
+    assert_eq!(path.first_frame, 40);
+    // Frame 50 is halfway along a linear move.
+    let mid = path.points[10].expect("the layer exists at the playhead");
+    assert!((mid.x - 50.0).abs() < 1e-6, "x at frame 50: {}", mid.x);
+    assert!((mid.y - 100.0).abs() < 1e-6, "y at frame 50: {}", mid.y);
+}
+
+/// The window clamps to the composition — it must not sample negative frames
+/// or run past the end, which would either panic or invent trajectory.
+#[test]
+fn the_motion_path_window_clamps_to_the_comp() {
+    let (project, node, comp) = moving_project();
+    let mut path = MotionPath::default();
+    path.cache(&project, comp, node, 0, 60, 0);
+    assert_eq!(path.first_frame, 0, "never samples before frame 0");
+    assert!(
+        path.points.len() <= 61,
+        "half the window is clipped away, got {}",
+        path.points.len()
+    );
+}
+
+/// The cache is the whole reason this is affordable: each sample is a full
+/// scene evaluation, so an unchanged key must not rebuild, and a document
+/// revision must.
+#[test]
+fn the_motion_path_rebuilds_only_when_its_key_changes() {
+    let (project, node, comp) = moving_project();
+    let mut path = MotionPath::default();
+
+    assert!(path.cache(&project, comp, node, 50, 10, 0), "first build");
+    assert!(!path.cache(&project, comp, node, 50, 10, 0), "identical key reuses");
+    assert!(path.cache(&project, comp, node, 51, 10, 0), "playhead moved");
+    assert!(path.cache(&project, comp, node, 51, 20, 0), "range changed");
+    assert!(path.cache(&project, comp, node, 51, 20, 1), "document changed");
+    assert!(!path.cache(&project, comp, node, 51, 20, 1), "and settles again");
+}
+
+/// Keyframed samples are flagged so they can be drawn larger, and only those
+/// inside the window are listed.
+#[test]
+fn the_motion_path_flags_its_keyframes() {
+    let (project, node, comp) = moving_project();
+    let mut path = MotionPath::default();
+
+    path.cache(&project, comp, node, 0, 10, 0);
+    assert_eq!(path.keys, vec![0], "frame 0's key, at index 0");
+
+    // A window containing neither key.
+    path.cache(&project, comp, node, 50, 10, 0);
+    assert!(path.keys.is_empty(), "no key between frames 40 and 60");
+}
+
+/// `segments` breaks the polyline wherever the layer doesn't exist, rather
+/// than drawing a straight line across the gap to somewhere it never was. A
+/// lone visible point is not a segment — there is nothing to connect it to.
+#[test]
+fn the_motion_path_breaks_where_the_layer_is_absent() {
+    let mut path = MotionPath::default();
+    path.points = vec![
+        Some(Point::new(0.0, 0.0)),
+        Some(Point::new(1.0, 1.0)),
+        None,
+        Some(Point::new(5.0, 5.0)),
+        Some(Point::new(6.0, 6.0)),
+        Some(Point::new(7.0, 7.0)),
+        None,
+        Some(Point::new(9.0, 9.0)),
+    ];
+    let segs = path.segments();
+    assert_eq!(segs.len(), 2, "two runs, and the lone tail point is dropped");
+    assert_eq!(segs[0].len(), 2);
+    assert_eq!(segs[1].len(), 3);
+}

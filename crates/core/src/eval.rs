@@ -27,6 +27,27 @@ pub struct RenderItem {
 pub struct Scene {
     pub items: Vec<RenderItem>,
     pub warnings: Vec<(NodeId, String)>,
+    /// Every *live* node's pivot — its anchor point in composition space —
+    /// recorded as the walk passes through it.
+    ///
+    /// Separate from `items` because a node need not draw anything: a group or
+    /// a null has no shape and so no [`RenderItem`], but it still has a place,
+    /// and editor overlays (the motion path) need that place. Reading it here
+    /// rather than re-deriving the parent chain outside is what keeps those
+    /// overlays from drifting away from what the walk actually did with
+    /// `LayerTiming`, pre-comps and expression-driven transforms.
+    ///
+    /// Nodes outside their time window are absent, not zeroed — the walk
+    /// returns before reaching them, which is exactly the "layer isn't here on
+    /// this frame" signal a path needs to break itself on.
+    pub pivots: Vec<(NodeId, kurbo::Point)>,
+}
+
+impl Scene {
+    /// Where `node`'s anchor sits in composition space, if it was live.
+    pub fn pivot(&self, node: NodeId) -> Option<kurbo::Point> {
+        self.pivots.iter().find(|(id, _)| *id == node).map(|(_, p)| *p)
+    }
 }
 
 /// Evaluate a document at `frame` into a flat `Scene`.
@@ -129,6 +150,12 @@ fn walk(
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
 
+    // `local_xf` maps the anchor point to `position` by construction, so this
+    // is the point the layer rotates and scales about — and the point an
+    // on-canvas gizmo centres on. Recorded for every node, drawable or not.
+    let anchor = node.transform.anchor.resolve(ctx);
+    scene.pivots.push((node.id, xf * kurbo::Point::new(anchor.x, anchor.y)));
+
     if let Some(shape) = &node.shape {
         let path = shape.to_path(ctx);
         let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
@@ -204,6 +231,62 @@ mod tests {
     use crate::node::{Node, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
+
+    /// A group draws nothing, so it produces no `RenderItem` — but it is
+    /// exactly the sort of layer you parent things to and animate, so it must
+    /// still report a pivot. This is what lets the editor draw a motion path
+    /// for a null.
+    #[test]
+    fn a_group_has_no_render_item_but_still_has_a_pivot() {
+        let mut group = Node::group(1, "null");
+        group.transform.position = Value::constant(Vec2::new(30.0, 40.0));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(group));
+
+        let scene = evaluate(&doc, 0.0);
+        assert!(scene.items.is_empty(), "a bare group renders nothing");
+        assert_eq!(scene.pivot(NodeId(1)), Some(kurbo::Point::new(30.0, 40.0)));
+    }
+
+    /// The pivot is the *anchor* in comp space, not the local origin, and it
+    /// composes through the parent chain. Anything else and an overlay drawn
+    /// at the pivot would sit away from where the layer turns.
+    #[test]
+    fn a_pivot_is_the_anchor_through_the_whole_parent_chain() {
+        let mut child = Node::group(2, "child");
+        child.transform.position = Value::constant(Vec2::new(10.0, 0.0));
+        child.transform.anchor = Value::constant(Vec2::new(5.0, 5.0));
+
+        let mut parent = Node::group(1, "parent");
+        parent.transform.position = Value::constant(Vec2::new(100.0, 100.0));
+        let doc = Document::new(
+            500.0,
+            500.0,
+            Node::group(0, "root").with_child(parent.with_child(child)),
+        );
+
+        let scene = evaluate(&doc, 0.0);
+        // local maps anchor -> position, so the child's pivot is its position
+        // in the parent's space, offset by the parent's own position.
+        assert_eq!(scene.pivot(NodeId(2)), Some(kurbo::Point::new(110.0, 100.0)));
+        assert_eq!(scene.pivot(NodeId(1)), Some(kurbo::Point::new(100.0, 100.0)));
+    }
+
+    /// A layer outside its time window is absent from the pivot table rather
+    /// than reported at the origin — "the layer isn't here on this frame" is
+    /// the signal the motion path breaks its polyline on, and a zero would
+    /// draw a line to the corner instead.
+    #[test]
+    fn a_trimmed_layer_has_no_pivot_outside_its_window() {
+        use crate::node::LayerTiming;
+        let mut layer = Node::group(1, "clip");
+        layer.transform.position = Value::constant(Vec2::new(20.0, 20.0));
+        layer.timing = Some(LayerTiming { start: 0, in_: 10, out: 20 });
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(layer));
+
+        assert_eq!(evaluate(&doc, 15.0).pivot(NodeId(1)), Some(kurbo::Point::new(20.0, 20.0)));
+        assert_eq!(evaluate(&doc, 5.0).pivot(NodeId(1)), None, "before its in-point");
+        assert_eq!(evaluate(&doc, 25.0).pivot(NodeId(1)), None, "after its out-point");
+    }
 
     /// The canonical smoke test: a keyframed square whose position animates.
     /// Halfway between its two keys the evaluated render item's transform must

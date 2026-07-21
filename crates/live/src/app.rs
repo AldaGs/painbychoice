@@ -142,6 +142,13 @@ pub(crate) struct App {
     /// there. One frame stale, like `over_ui` itself, which is fine: the
     /// pointer must hover a handle before it can press one.
     pub(crate) gizmo_hot: bool,
+    /// The selected layer's sampled trajectory, rebuilt only when `doc_rev`,
+    /// the selection or the frame window moves — each sample is a full scene
+    /// evaluation, so this must never be recomputed per UI frame.
+    pub(crate) motion_path: MotionPath,
+    /// Bumped whenever the document changes. The motion-path cache keys off it;
+    /// without it the path would keep drawing the pre-edit trajectory.
+    pub(crate) doc_rev: u64,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -272,6 +279,8 @@ impl App {
             fps_drag: None,
             gizmo_drag: None,
             gizmo_hot: false,
+            motion_path: MotionPath::default(),
+            doc_rev: 0,
         }
     }
 
@@ -1197,6 +1206,29 @@ impl App {
         self.vscene =
             to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, pp, canvas, self.selected);
 
+        // Motion path: only for a layer whose *position* is actually animated —
+        // a constant position has no trajectory, and drawing one dot under the
+        // gizmo would be noise. Cached, so this is a no-op on most frames.
+        //
+        // Runs *before* `sel_node` is bound: that binding holds an immutable
+        // borrow of `self` for the rest of the frame, and caching needs `&mut`.
+        let path_frame = self.current_frame();
+        let pos_animated = self
+            .selected
+            .and_then(|id| self.doc().root.find(id))
+            .is_some_and(|n| n.transform.position.is_animated());
+        match (pos_animated, self.selected) {
+            (true, Some(id)) => {
+                let range = self.doc().motion_path_range;
+                let rev = self.doc_rev;
+                self.motion_path.cache(&self.project, self.current, id, path_frame, range, rev);
+            }
+            _ => self.motion_path.clear(),
+        }
+        // Cloned for the UI closure, which must not borrow `self`.
+        let motion_path = self.motion_path.clone();
+        let path_now = (path_frame - motion_path.first_frame).try_into().ok();
+
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
         let sel_node = self.selected.and_then(|id| self.doc().root.find(id));
@@ -1261,6 +1293,7 @@ impl App {
         let duration = self.doc().duration;
         let comp_bg = self.doc().bg;
         let comp_pp = self.doc().passepartout;
+        let comp_path_range = self.doc().motion_path_range;
         let timebase = self.doc().timebase();
         let view = self.view;
         let work_area = self.work_area;
@@ -1330,6 +1363,7 @@ impl App {
                         duration,
                         comp_bg,
                         comp_pp,
+                        comp_path_range,
                         &mut comp,
                         &preset_names,
                         &mut preset_name_buf,
@@ -1395,6 +1429,17 @@ impl App {
                             full.max,
                         );
                         canvas_toolbar(ui, bar, zoom_pct, is_fit, &mut canvas_edits);
+                        // Path first, gizmo second: the gizmo is what you grab,
+                        // so it must never be obscured by the trajectory.
+                        if let Some(rect) = canvas_pts {
+                            motionpath::draw(
+                                &ui.painter_at(rect),
+                                &motion_path,
+                                fit,
+                                ppp,
+                                path_now,
+                            );
+                        }
                         // The gizmo paints over the frame and reports into the
                         // ordinary property edits, so a handle drag auto-keys
                         // exactly like a DragValue drag does.
@@ -1620,6 +1665,10 @@ impl App {
             self.doc_mut().passepartout = pp.clamp(0.0, 1.0);
             dirty = true;
         }
+        if let Some(r) = comp.motion_path_range {
+            self.doc_mut().motion_path_range = r.clamp(0, MAX_RANGE);
+            dirty = true;
+        }
         if let Some(delta) = dope.move_by {
             dirty |= self.move_selected_keys(delta);
         }
@@ -1673,6 +1722,8 @@ impl App {
             dirty |= self.load();
         }
         if dirty {
+            // Every document change invalidates the motion-path cache.
+            self.doc_rev = self.doc_rev.wrapping_add(1);
             // Re-derive the preview rather than reusing the one from the top of
             // the frame: an edit may have just changed the node it applies to,
             // and a font being hovered must survive an unrelated change.
