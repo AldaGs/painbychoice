@@ -296,6 +296,8 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
         NodeDescriptor::new("value", Cat::Input, "Value").output("value", "Value", Number),
         NodeDescriptor::new("ref", Cat::Input, "Reference").output("value", "Value", Number),
         NodeDescriptor::new("param", Cat::Input, "Parameter").output("value", "Value", Number),
+        // A leaf holding Rhai source — pulls from `frame`, not wired inputs.
+        NodeDescriptor::new("script", Cat::Input, "Script").output("value", "Value", Number),
         NodeDescriptor::new("localTime", Cat::Input, "Local Time").output("time", "Time", Time),
         NodeDescriptor::new("inPoint", Cat::Input, "In Point").output("time", "Time", Time),
         NodeDescriptor::new("outPoint", Cat::Input, "Out Point").output("time", "Time", Time),

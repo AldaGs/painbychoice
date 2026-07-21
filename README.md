@@ -1781,8 +1781,13 @@ onto the canvas (`App::import_property` raises its `Expr` and binds the result
 back), so a recipe built in the old per-property editor becomes editable on the
 unified canvas — two views of one substrate. (A small type-system consequence:
 `SocketType::feeds` lets a `Time` output feed a `Number` input, since a layer
-clock reads as a number.) Still ahead: retiring the old `Editor::Graph` panel
-once the canvas covers `script`/`use`, plus `use`/shape lowering. (4) The compositor stage — the real gate for effects/mattes/masks.
+clock reads as a number.) **`script` and `use` node kinds now exist**, so the
+canvas covers what the old per-property editor does: `script` is a Rhai leaf
+(`config.script` → `Expr::Script`, edited in the inspector), `use` links a shared
+module (`config.module` → `Expr::Use`, picked from the project's modules) — both
+raise/lower round-trip (a plain `use`; module *overrides* aren't yet editable on
+this canvas, so a `use` with overrides links at the module's defaults). Still
+ahead: shape/geometry lowering, then retiring the old `Editor::Graph` panel. (4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.

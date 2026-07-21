@@ -16,7 +16,7 @@
 
 use kurbo::Vec2;
 
-use crate::expr::{Expr, ExprValue, Generator, TimeSource};
+use crate::expr::{Expr, Generator, TimeSource};
 use crate::graph::{Endpoint, NodeGraph};
 use crate::registry::NodeRegistry;
 
@@ -84,11 +84,17 @@ fn raise_rec(
             (Endpoint::new(id, "result"), cy)
         }
         Expr::Gen(g) => raise_generator(graph, reg, g, x, cursor_y),
-        // No node kind for these yet — a placeholder keeps raising total (never a
-        // panic), and it's visible so the loss is obvious rather than silent.
-        Expr::Script(_) | Expr::Use { .. } => {
-            let (id, y) = leaf(graph, "value");
-            graph.node_mut(id).unwrap().set_value("value", ExprValue::Num(0.0));
+        Expr::Script(src) => {
+            let (id, y) = leaf(graph, "script");
+            graph.node_mut(id).unwrap().config.script = src.clone();
+            (Endpoint::new(id, "value"), y)
+        }
+        // A module link. The canvas can't yet edit overrides, so they're dropped
+        // here — a `use` with overrides doesn't round-trip losslessly (it links
+        // the module at its defaults). A plain `use` round-trips exactly.
+        Expr::Use { module, .. } => {
+            let (id, y) = leaf(graph, "use");
+            graph.node_mut(id).unwrap().config.module = Some(*module);
             (Endpoint::new(id, "value"), y)
         }
     }
@@ -158,9 +164,9 @@ fn raise_generator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::{PropPath, Waveform};
+    use crate::expr::{ExprValue, PropPath, Waveform};
     use crate::lower::lower_output;
-    use crate::node::NodeId;
+    use crate::node::{ModuleId, NodeId};
 
     fn reg() -> NodeRegistry {
         NodeRegistry::with_builtins()
@@ -213,6 +219,23 @@ mod tests {
             Box::new(Expr::Time(TimeSource::Local)),
             Box::new(Expr::Lit(ExprValue::Num(4.0))),
         );
+        round_trips(expr);
+    }
+
+    /// A script leaf, wired into math, round-trips its source intact.
+    #[test]
+    fn a_script_round_trips() {
+        let expr = Expr::Add(
+            Box::new(Expr::Script("frame * 2.0".into())),
+            Box::new(Expr::Lit(ExprValue::Num(1.0))),
+        );
+        round_trips(expr);
+    }
+
+    /// A plain module link (no overrides) round-trips to the same `Use`.
+    #[test]
+    fn a_plain_module_link_round_trips() {
+        let expr = Expr::Use { module: ModuleId(3), overrides: Vec::new() };
         round_trips(expr);
     }
 }

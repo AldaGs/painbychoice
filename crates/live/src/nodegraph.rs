@@ -46,6 +46,10 @@ pub(crate) enum NgOp {
     SetRef { id: GraphNodeId, target: Option<(NodeId, PropPath, f64)> },
     /// Set a `param` node's knob name.
     SetParam { id: GraphNodeId, name: String },
+    /// Set a `script` node's Rhai source.
+    SetScript { id: GraphNodeId, src: String },
+    /// Set a `use` node's linked module.
+    SetModule { id: GraphNodeId, module: Option<ModuleId> },
 }
 
 /// One deferred edit to the driver list ([`motion_core::Binding`]). Separate
@@ -122,11 +126,13 @@ fn wire(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, color: egui::
 
 /// The panel. Palette + drivers + a selected-node inspector, then the graph on a
 /// scrollable canvas.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn nodegraph_ui(
     ui: &mut egui::Ui,
     graph: &NodeGraph,
     reg: &NodeRegistry,
     layers: &[(u64, String)],
+    modules: &[(ModuleId, String)],
     bindings: &[Binding],
     out: &mut NgEdits,
 ) {
@@ -141,7 +147,7 @@ pub(crate) fn nodegraph_ui(
     ui.separator();
     import_ui(ui, layers, out);
     ui.separator();
-    inspector_ui(ui, graph, reg, layers, out);
+    inspector_ui(ui, graph, reg, layers, modules, out);
     ui.separator();
     if graph.nodes.is_empty() {
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
@@ -323,6 +329,7 @@ fn inspector_ui(
     graph: &NodeGraph,
     reg: &NodeRegistry,
     layers: &[(u64, String)],
+    modules: &[(ModuleId, String)],
     out: &mut NgEdits,
 ) {
     let sel = read_selection(ui.ctx());
@@ -349,6 +356,45 @@ fn inspector_ui(
         {
             out.op = Some(NgOp::SetParam { id: node.id, name });
         }
+        return;
+    }
+    if node.kind == "script" {
+        let mut src = node.config.script.clone();
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut src)
+                    .hint_text("frame * 2.0")
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .font(egui::TextStyle::Monospace),
+            )
+            .on_hover_text(SCRIPT_HELP)
+            .changed()
+        {
+            out.op = Some(NgOp::SetScript { id: node.id, src });
+        }
+        return;
+    }
+    if node.kind == "use" {
+        if modules.is_empty() {
+            ui.weak("No modules yet. Make one in the Graph panel (→ module).");
+            return;
+        }
+        let cur = node
+            .config
+            .module
+            .and_then(|m| modules.iter().find(|(id, _)| *id == m))
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| "(pick)".into());
+        egui::ComboBox::from_id_salt(("use_mod", node.id.0)).selected_text(cur).show_ui(ui, |ui| {
+            for (m, name) in modules {
+                let picked = node.config.module == Some(*m);
+                if ui.selectable_label(picked, name).clicked() && !picked {
+                    out.op = Some(NgOp::SetModule { id: node.id, module: Some(*m) });
+                }
+            }
+        });
+        ui.weak("Links a shared module (runs at its defaults).");
         return;
     }
     let mut num_field = |ui: &mut egui::Ui, socket: &str, label: &str, cur: f64| {

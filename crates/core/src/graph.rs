@@ -20,7 +20,7 @@ use kurbo::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::expr::PropPath;
-use crate::node::NodeId;
+use crate::node::{ModuleId, NodeId};
 use crate::registry::NodeRegistry;
 
 /// Stable identity for a node *within a graph* — distinct from a scene
@@ -75,6 +75,15 @@ pub struct NodeConfig {
     /// points the graph at — the layer's *own* exposed knob.
     #[serde(default)]
     pub param: String,
+    /// A `script` node's Rhai source. Empty until written; lowers to neutral
+    /// while empty so a blank script never errors a frame.
+    #[serde(default)]
+    pub script: String,
+    /// A `use` node's linked shared module. `None` until picked. Overrides
+    /// aren't yet editable on this canvas, so a linked module runs at its
+    /// defaults (`Expr::Use` with no overrides).
+    #[serde(default)]
+    pub module: Option<ModuleId>,
 }
 
 impl GraphNode {

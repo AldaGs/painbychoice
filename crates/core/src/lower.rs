@@ -105,8 +105,22 @@ fn lower_out(
         "inPoint" => Expr::Time(TimeSource::In),
         "outPoint" => Expr::Time(TimeSource::Out),
         "t01" => Expr::Time(TimeSource::T01),
-        // use / geometry — not lowered in this pass. Neutral rather than a panic,
-        // so a graph mixing them still lowers.
+        // A Rhai leaf. Neutral while blank, so an empty field never errors.
+        "script" => {
+            if node.config.script.trim().is_empty() {
+                neutral()
+            } else {
+                Expr::Script(node.config.script.clone())
+            }
+        }
+        // A shared-module link. Overrides aren't editable on this canvas yet, so
+        // the module runs at its defaults. Neutral until a module is picked.
+        "use" => match node.config.module {
+            Some(module) => Expr::Use { module, overrides: Vec::new() },
+            None => neutral(),
+        },
+        // geometry / shapes — not lowered in this pass. Neutral rather than a
+        // panic, so a graph mixing them still lowers.
         _ => neutral(),
     };
     visiting.remove(&output.node);

@@ -345,6 +345,16 @@ impl App {
                     n.config.param = name;
                 }
             }
+            NgOp::SetScript { id, src } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.script = src;
+                }
+            }
+            NgOp::SetModule { id, module } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.module = module;
+                }
+            }
         }
     }
 
@@ -1662,6 +1672,9 @@ impl App {
             v
         };
         let ng_bindings = self.project.bindings.clone();
+        // Modules for a `use` node's picker: id + display name.
+        let ng_modules: Vec<(ModuleId, String)> =
+            self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
             let mut path = Vec::new();
@@ -1724,9 +1737,15 @@ impl App {
                         )
                     }
                     Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
-                    Editor::NodeGraph => {
-                        nodegraph_ui(ui, node_graph, node_registry, &ng_layers, &ng_bindings, &mut ng_edits)
-                    }
+                    Editor::NodeGraph => nodegraph_ui(
+                        ui,
+                        node_graph,
+                        node_registry,
+                        &ng_layers,
+                        &ng_modules,
+                        &ng_bindings,
+                        &mut ng_edits,
+                    ),
                     // vello paints the frame here; egui only measures the hole
                     // and floats the zoom toolbar over it. `max_rect` is the
                     // whole window (egui doesn't shrink it for the sibling
@@ -1856,6 +1875,8 @@ impl App {
                     | NgOp::SetValue { .. }
                     | NgOp::SetRef { .. }
                     | NgOp::SetParam { .. }
+                    | NgOp::SetScript { .. }
+                    | NgOp::SetModule { .. }
             );
             self.apply_ng_op(op);
             window.request_redraw();
