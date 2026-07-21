@@ -13,7 +13,6 @@
 //!
 //! The engine (`motion-core`) has no idea any of this exists.
 
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,11 +22,11 @@ use motion_core::{
     demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, Guides, Onion, ViewAids,
     eval::RenderItem as MRenderItem, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
     Comp, Document, EvalCtx, Expr, Project as MProject,
-    ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
+    ExprValue, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
     Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
-    lower_output, Binding, Edge, Endpoint, GraphNode, GraphNodeId, NodeCategory, NodeDescriptor,
-    NodeGraph, NodeRegistry, SocketType,
+    compile_modules, lower_geometry, lower_output, Binding, Edge, Endpoint, GraphCtx, GraphNode, GraphNodeId, NodeCategory,
+    NodeDescriptor, NodeGraph, NodeRegistry, ShapeBinding, SocketType, TextConfig,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
@@ -47,7 +46,6 @@ mod aids;
 mod app;
 mod dock;
 mod gizmo;
-mod graph;
 mod icon;
 mod layers;
 mod motionpath;
@@ -64,7 +62,6 @@ use aids::*;
 use app::*;
 use dock::*;
 use gizmo::*;
-use graph::*;
 use layers::*;
 use motionpath::*;
 use nodegraph::*;

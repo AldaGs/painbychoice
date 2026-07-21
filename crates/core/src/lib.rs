@@ -32,9 +32,10 @@ pub use node::{
     Stroke, Transform, ViewAids,
 };
 pub use graph::{
-    Binding, ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
+    Binding, ConnectError, Edge, Endpoint, GraphCtx, GraphError, GraphNode, GraphNodeId, NodeGraph,
+    ShapeBinding, TextConfig,
 };
-pub use lower::lower_output;
+pub use lower::{compile_modules, lower_geometry, lower_output};
 pub use raise::raise;
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,

@@ -55,12 +55,10 @@ pub(crate) const OPEN: &str = "\u{ea99}";
 pub(crate) const PRECOMPOSE: &str = "\u{eef7}";
 pub(crate) const TRIM: &str = "\u{eb1b}";
 
-// The property graph.
-pub(crate) const MODULE: &str = "\u{eb10}";
-pub(crate) const LINK: &str = "\u{eade}";
+// Keyframes. (The retired expression panel's module/link/expr/bake glyphs went
+// with it; the subsetted font still carries them until it is next regenerated,
+// which is harmless -- an unused glyph costs bytes, a missing one renders tofu.)
 pub(crate) const KEYFRAME: &str = "\u{f576}";
-pub(crate) const EXPR: &str = "\u{eeb2}";
-pub(crate) const BAKE: &str = "\u{ec0b}";
 
 // Layout and status.
 pub(crate) const SPLIT_V: &str = "\u{ead4}";

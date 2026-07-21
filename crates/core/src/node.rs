@@ -202,6 +202,37 @@ impl ParamValue {
         }
     }
 
+    /// The knob's value as a plain literal, when it *is* one.
+    ///
+    /// `None` for a keyframed or expression-driven knob — a knob is a `Value`
+    /// like any property, so it can be animated, and an editor that showed one
+    /// number for a whole track would be lying. Callers offer an editor only
+    /// when this is `Some`, and never overwrite a track with a constant behind
+    /// the user's back.
+    pub fn as_const(&self) -> Option<crate::expr::ExprValue> {
+        use crate::expr::ToExpr;
+        match self {
+            ParamValue::Num(Value::Const(v)) => Some(v.to_expr()),
+            ParamValue::Vec(Value::Const(v)) => Some(v.to_expr()),
+            ParamValue::Color(Value::Const(v)) => Some(v.to_expr()),
+            _ => None,
+        }
+    }
+
+    /// Set the knob to a constant, **keeping its declared type**. A literal of
+    /// the wrong shape is ignored rather than silently retyping the knob: an
+    /// expression reading `param("x")` as a vector must not find a number there
+    /// because an editor sent the wrong variant.
+    pub fn set_const(&mut self, v: crate::expr::ExprValue) {
+        use crate::expr::ExprValue as E;
+        match (self, v) {
+            (ParamValue::Num(slot), E::Num(n)) => *slot = Value::constant(n),
+            (ParamValue::Vec(slot), E::Vec2(p)) => *slot = Value::constant(p),
+            (ParamValue::Color(slot), E::Color(c)) => *slot = Value::constant(c),
+            _ => {}
+        }
+    }
+
     /// The label a picker shows, and the word a serialized param reads as.
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -844,12 +875,37 @@ pub struct Module {
     pub params: Vec<Param>,
     /// The graph fragment. Reads its knobs with `param("…")`, which resolve
     /// against the module's own scope rather than any node's.
+    ///
+    /// **This stays the IR** — it is what `eval_use` runs. When the module is
+    /// authored on the node canvas, `graph`/`output` below are the source and
+    /// this is their compiled result, recompiled on every edit. That's the same
+    /// "alongside, lowers to the IR" contract `Project.graph` has with the
+    /// properties it drives, applied one scope up.
     pub body: crate::expr::Expr,
+    /// The module's own node canvas — the **document scope** of the node
+    /// system. `#[serde(default)]` so a module authored before the canvas
+    /// existed loads with an empty graph; opening it seeds the graph by
+    /// *raising* `body`, so an old module becomes canvas-editable without a
+    /// migration and its layout persists from then on.
+    #[serde(default)]
+    pub graph: crate::graph::NodeGraph,
+    /// Which output of `graph` produces this module's value. `None` means the
+    /// body isn't graph-authored (nothing has been laid out yet, or the output
+    /// node was deleted) — in which case `body` is left exactly as it is rather
+    /// than being blanked by an empty canvas.
+    #[serde(default)]
+    pub output: Option<crate::graph::Endpoint>,
 }
 
 impl Module {
     pub fn new(name: impl Into<String>, body: crate::expr::Expr) -> Self {
-        Self { name: name.into(), params: Vec::new(), body }
+        Self {
+            name: name.into(),
+            params: Vec::new(),
+            body,
+            graph: crate::graph::NodeGraph::new(),
+            output: None,
+        }
     }
 
     /// Add or replace a knob. Same uniqueness rule as a node's parameters: a
@@ -911,6 +967,12 @@ pub struct Project {
     /// Drivers: each binds a `graph` output to a scene layer's property.
     #[serde(default)]
     pub bindings: Vec<crate::graph::Binding>,
+    /// Geometry drivers: each binds a `graph` geometry output to a scene
+    /// layer's *shape*. Separate from `bindings` because a shape isn't a
+    /// `Value` and so has no `PropPath` to name (see
+    /// [`crate::graph::ShapeBinding`]).
+    #[serde(default)]
+    pub shape_bindings: Vec<crate::graph::ShapeBinding>,
 }
 
 impl Project {
@@ -924,6 +986,7 @@ impl Project {
             modules: Default::default(),
             graph: crate::graph::NodeGraph::new(),
             bindings: Vec::new(),
+            shape_bindings: Vec::new(),
         }
     }
 
@@ -1164,5 +1227,46 @@ mod tests {
         let mut comp = comp_with_key(60.0, 120);
         comp.set_fps(f64::NAN);
         assert_eq!(key_frames(&comp), vec![0, 2], "120 frames @ 60fps is 2s, so frame 2 @ 1fps");
+    }
+}
+
+#[cfg(test)]
+mod knob_tests {
+    use super::*;
+    use crate::expr::ExprValue;
+
+
+    /// A knob's value must be *settable*, not just creatable — without this
+    /// every `param("x")` read resolves to the seed forever, which is exactly
+    /// how a knob-driven graph silently does nothing.
+    #[test]
+    fn a_knobs_constant_round_trips_through_the_editor_seam() {
+        let mut p = ParamValue::Num(Value::constant(0.0));
+        assert_eq!(p.as_const(), Some(ExprValue::Num(0.0)));
+        p.set_const(ExprValue::Num(12.5));
+        assert_eq!(p.as_const(), Some(ExprValue::Num(12.5)));
+    }
+
+    /// A literal of the wrong shape is ignored: an expression reading a vector
+    /// knob must not find a number there because an editor sent the wrong
+    /// variant.
+    #[test]
+    fn a_mistyped_literal_does_not_retype_the_knob() {
+        let mut p = ParamValue::Vec(Value::constant(Vec2::new(1.0, 2.0)));
+        p.set_const(ExprValue::Num(9.0));
+        assert_eq!(p.as_const(), Some(ExprValue::Vec2(Vec2::new(1.0, 2.0))), "unchanged");
+        assert_eq!(p.kind_name(), "vector");
+    }
+
+    /// An animated knob reports no constant, so an editor shows no field rather
+    /// than one number standing for a whole track (and flattening it on edit).
+    #[test]
+    fn an_animated_knob_has_no_constant_to_show() {
+        let track = Value::Keyframed(crate::value::Track::new(vec![
+            crate::value::Keyframe::linear(0, 1.0),
+            crate::value::Keyframe::linear(10, 5.0),
+        ]));
+        let p = ParamValue::Num(track);
+        assert!(p.as_const().is_none());
     }
 }

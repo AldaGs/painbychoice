@@ -106,10 +106,6 @@ pub(crate) struct App {
     pub(crate) pan_drag: Option<((f64, f64), (f64, f64))>,
     /// Next unused node id, for shapes created in-app.
     pub(crate) next_id: u64,
-    /// The module whose body is open on the graph canvas, if any. View state —
-    /// which module you're editing isn't part of the document. A delete clears
-    /// it (see the graph-op apply) so it can't dangle.
-    pub(crate) editing_module: Option<ModuleId>,
     /// AE's work area: a comp-level *preview* range that bounds the playback
     /// loop. View state, like `view` — reset when a comp opens, never saved with
     /// the document. `None` = the whole comp. Set with `B`/`N` at the playhead.
@@ -164,6 +160,10 @@ pub(crate) struct App {
     /// not saved — the graph *itself* (`Project::graph`) and its drivers
     /// (`Project::bindings`) are document data now and ride in the `.pbc`.
     pub(crate) node_registry: NodeRegistry,
+    /// Which graph the Nodes panel is editing — the project's, or one module's
+    /// body. View state (which scope you're looking at), not document data, so
+    /// it isn't saved: reopening a file starts at the project scope.
+    pub(crate) ng_scope: NgScope,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -223,6 +223,77 @@ pub(crate) fn apply_fps_edit(
     }
     if edits.fps_drag_stopped {
         *drag = None;
+    }
+}
+
+/// Compile every driver in `project` into comp `id` — the whole of what a
+/// recompile *does* to the document, as a free function so it's testable
+/// without a window (the same treatment `apply_fps_edit` gets).
+///
+/// Two kinds of driver, in two passes. A **value** driver lowers its graph
+/// output to an `Expr` and hands the target property a `Value::Expr`, so
+/// `evaluate` runs it. A **geometry** driver lowers a shape node's `geometry`
+/// output to a whole `Shape` and replaces the target layer's — the graph
+/// *authoring* geometry rather than only feeding numbers into a shape made
+/// elsewhere. An output that isn't a shape node's geometry lowers to `None` and
+/// is skipped, so a stale driver leaves the layer's own shape alone.
+///
+/// Lowering is frame-independent (it builds the recipe, it doesn't sample it),
+/// so this needn't know the frame.
+pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: CompId) {
+    // Lower first (borrows the graph + registry), then write (borrows the doc)
+    // — two passes, so the immutable and mutable borrows don't overlap. A
+    // driver's `prop` is a core `PropPath`; map it to the editor's `PropKind`
+    // to reach `prop_of_mut`.
+    let ctx = GraphCtx::new(reg, &project.modules);
+    let compiled: Vec<(NodeId, PropKind, Expr)> = project
+        .bindings
+        .iter()
+        .map(|b| {
+            let expr = lower_output(&project.graph, &ctx, &b.output);
+            (b.target, PropKind::from_path(b.prop), expr)
+        })
+        .collect();
+    let shapes: Vec<(NodeId, MShape)> = project
+        .shape_bindings
+        .iter()
+        .filter_map(|b| Some((b.target, lower_geometry(&project.graph, &ctx, &b.output)?)))
+        .collect();
+    let Some(comp) = project.comp_mut(id) else { return };
+    // Shapes first, properties second: a geometry driver decides the shape
+    // *kind*, and a property driver on `size`/`radius` then overrides that one
+    // param of it. The other order would have the rebuilt shape silently
+    // discard the property driver's work.
+    for (target, shape) in shapes {
+        if let Some(node) = comp.root.find_mut(target) {
+            node.shape = Some(shape);
+        }
+    }
+    for (target, prop, expr) in compiled {
+        if let Some(node) = comp.root.find_mut(target) {
+            if let Some(mut p) = prop_of_mut(node, prop) {
+                p.set_expr(expr);
+            }
+        }
+    }
+}
+
+/// The graph the Nodes panel is editing, by scope — the project's own, or one
+/// module's body. `None` when the scope names a module that's since been
+/// deleted, in which case the caller does nothing rather than editing the wrong
+/// graph.
+pub(crate) fn scoped_graph_mut(project: &mut MProject, scope: NgScope) -> Option<&mut NodeGraph> {
+    match scope {
+        NgScope::Project => Some(&mut project.graph),
+        NgScope::Module(id) => project.modules.get_mut(&id).map(|m| &mut m.graph),
+    }
+}
+
+/// The read-only counterpart of [`scoped_graph_mut`], for the UI pass.
+pub(crate) fn scoped_graph(project: &MProject, scope: NgScope) -> Option<&NodeGraph> {
+    match scope {
+        NgScope::Project => Some(&project.graph),
+        NgScope::Module(id) => project.modules.get(&id).map(|m| &m.graph),
     }
 }
 
@@ -288,7 +359,6 @@ impl App {
             nav: CanvasNav::default(),
             pan_drag: None,
             next_id,
-            editing_module: None,
             work_area: None,
             dope_label_w: 80.0,
             fps_drag: None,
@@ -300,6 +370,7 @@ impl App {
             guide_drag: None,
             aids_hot: false,
             node_registry: NodeRegistry::with_builtins(),
+            ng_scope: NgScope::Project,
         }
     }
 
@@ -308,10 +379,14 @@ impl App {
     /// function. A connection is validated against the registry inside
     /// [`NodeGraph::connect`]; a rejected drop simply doesn't wire.
     pub(crate) fn apply_ng_op(&mut self, op: NgOp) {
-        // The registry is a disjoint field from the project, so `connect` can
-        // borrow it immutably while the graph is borrowed mutably.
-        let reg = &self.node_registry;
-        let graph = &mut self.project.graph;
+        // `connect` needs a descriptor context (a `use` node's sockets come
+        // from the module it links), and in *module* scope the graph being
+        // edited lives inside the very map the context reads. A snapshot breaks
+        // that borrow knot; it costs one small clone per edited frame, never
+        // per rendered frame, since `apply_ng_op` runs only when an op fired.
+        let modules = self.project.modules.clone();
+        let ctx = GraphCtx::new(&self.node_registry, &modules);
+        let Some(graph) = scoped_graph_mut(&mut self.project, self.ng_scope) else { return };
         match op {
             NgOp::Add { kind, pos } => {
                 graph.add_node(kind, pos);
@@ -325,7 +400,7 @@ impl App {
                 graph.remove_node(id);
             }
             NgOp::Connect { from, to } => {
-                let _ = graph.connect(reg, from, to);
+                let _ = graph.connect(&ctx, from, to);
             }
             NgOp::Disconnect { edge } => {
                 graph.disconnect(&edge);
@@ -353,6 +428,21 @@ impl App {
             NgOp::SetModule { id, module } => {
                 if let Some(n) = graph.node_mut(id) {
                     n.config.module = module;
+                }
+            }
+            NgOp::SetText { id, text } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.text = text;
+                }
+            }
+            NgOp::SetWaveform { id, wave } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.wave = wave;
+                }
+            }
+            NgOp::ClearValue { id, socket } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.values.remove(&socket);
                 }
             }
         }
@@ -392,6 +482,59 @@ impl App {
         }
     }
 
+    /// Apply one **geometry**-driver edit. Same shape as `apply_binding_op`,
+    /// including the bake on removal: the layer keeps the shape the graph built,
+    /// but its params freeze to constants at `frame`, so it's hand-editable
+    /// again instead of stranded on expressions no node feeds any more.
+    pub(crate) fn apply_shape_binding_op(&mut self, op: ShapeBindingOp, frame: i64) {
+        match op {
+            ShapeBindingOp::Add { output, target } => {
+                self.project.shape_bindings.push(ShapeBinding { output, target });
+            }
+            ShapeBindingOp::SetOutput { index, output } => {
+                if let Some(b) = self.project.shape_bindings.get_mut(index) {
+                    b.output = output;
+                }
+            }
+            ShapeBindingOp::SetTarget { index, target } => {
+                if let Some(b) = self.project.shape_bindings.get_mut(index) {
+                    b.target = target;
+                }
+            }
+            ShapeBindingOp::Remove { index } => {
+                if index < self.project.shape_bindings.len() {
+                    let b = self.project.shape_bindings.remove(index);
+                    self.bake_shape_binding(&b, frame);
+                }
+            }
+        }
+    }
+
+    /// Freeze a graph-authored shape's params to constants at `frame` — what a
+    /// geometry driver's removal leaves behind. Resolves against a clone so the
+    /// read context can't alias the node being mutated (the same guard
+    /// `bake_binding` uses).
+    fn bake_shape_binding(&mut self, b: &ShapeBinding, frame: i64) {
+        let snapshot = self.doc().clone();
+        let mut ctx = EvalCtx::new(&snapshot, frame as f64);
+        let id = self.current;
+        if let Some(comp) = self.project.comp_mut(id) {
+            if let Some(node) = comp.root.find_mut(b.target) {
+                match node.shape.as_mut() {
+                    Some(MShape::Rect { size, radius }) => {
+                        size.bake_to_const(&mut ctx);
+                        radius.bake_to_const(&mut ctx);
+                    }
+                    Some(MShape::Ellipse { size }) => size.bake_to_const(&mut ctx),
+                    Some(MShape::Text { size, .. }) => size.bake_to_const(&mut ctx),
+                    // A `Path` has no `Value` params, and a group has no shape.
+                    Some(MShape::Path(_)) | None => {}
+                }
+            }
+        }
+        self.doc_rev += 1;
+    }
+
     /// Raise a scene property's expression onto the node canvas and bind it back
     /// — the **property-graph fold**. Reads the property's current `Expr`, raises
     /// it into the project graph as nodes, and adds a driver from the raised
@@ -412,7 +555,8 @@ impl App {
         // Raise (mutates the graph) using the registry — disjoint fields, so both
         // borrows coexist. Place the root clear of the usual spawn corner.
         let at = kurbo::Vec2::new(360.0, 40.0);
-        let output = motion_core::raise(&mut self.project.graph, &self.node_registry, &expr, at);
+        let ctx = GraphCtx::new(&self.node_registry, &self.project.modules);
+        let output = motion_core::raise(&mut self.project.graph, &ctx, &expr, at);
         self.project.bindings.push(Binding { output, target, prop });
         self.recompile_graph();
     }
@@ -423,30 +567,201 @@ impl App {
     /// know the frame. Run only when the graph or a driver changed — never per
     /// frame — since it writes the document and bumps `doc_rev`.
     pub(crate) fn recompile_graph(&mut self) {
-        // Lower first (borrows the graph + registry), then write (borrows the
-        // doc) — two passes, so the immutable and mutable borrows don't overlap.
-        // A driver's `prop` is a core `PropPath`; map it to the editor's
-        // `PropKind` to reach `prop_of_mut`.
-        let compiled: Vec<(NodeId, PropKind, Expr)> = self
-            .project
-            .bindings
-            .iter()
-            .map(|b| {
-                let expr = lower_output(&self.project.graph, &self.node_registry, &b.output);
-                (b.target, PropKind::from_path(b.prop), expr)
-            })
-            .collect();
-        let id = self.current;
-        if let Some(comp) = self.project.comp_mut(id) {
-            for (target, prop, expr) in compiled {
-                if let Some(node) = comp.root.find_mut(target) {
-                    if let Some(mut p) = prop_of_mut(node, prop) {
-                        p.set_expr(expr);
-                    }
+        // Module bodies first: a driver may link one, and `eval_use` runs the
+        // module's `body`, so a stale body would show through the link.
+        compile_modules(&mut self.project.modules, &self.node_registry);
+        compile_drivers(&mut self.project, &self.node_registry, self.current);
+        self.doc_rev += 1;
+    }
+
+    /// Apply one **module** edit — the document scope's ops.
+    ///
+    /// `New` opens the module it creates, because a module you can't see is a
+    /// dead end. Opening an existing one **seeds its canvas from its body** if
+    /// the canvas is empty: that's the fold again, one scope up, so a module
+    /// built in the old per-property editor becomes node-editable without a
+    /// migration, and its layout persists from then on.
+    pub(crate) fn apply_ng_module_op(&mut self, op: NgModuleOp) {
+        match op {
+            NgModuleOp::New => {
+                let n = self.project.modules.len() + 1;
+                let module = self
+                    .project
+                    .add_module(MModule::new(format!("Module {n}"), Expr::Lit(ExprValue::Num(0.0))));
+                self.open_module(module);
+            }
+            NgModuleOp::Rename { module, name } => {
+                if let Some(m) = self.project.modules.get_mut(&module) {
+                    m.name = name;
+                }
+            }
+            NgModuleOp::Delete { module } => {
+                self.project.modules.remove(&module);
+                // Don't strand the panel in a scope that no longer exists.
+                // Links to the gone module warn and fall back at evaluation
+                // time, exactly like any other dangling reference.
+                if self.ng_scope == NgScope::Module(module) {
+                    self.ng_scope = NgScope::Project;
+                }
+            }
+            NgModuleOp::SetOutput { module, output } => {
+                if let Some(m) = self.project.modules.get_mut(&module) {
+                    m.output = output;
                 }
             }
         }
-        self.doc_rev += 1;
+        self.recompile_graph();
+    }
+
+    /// Apply one **knob** edit, to either owner.
+    ///
+    /// A layer's knobs and a module's are the same idea at two scopes, so this
+    /// is one path with two arms rather than two ops. Recompiles afterwards
+    /// because both matter to lowering: a module's knob list *is* the socket
+    /// list of every `use` node linking it, and removing a knob a `param` node
+    /// still names leaves that read to warn and fall back at render time —
+    /// deliberately, the same warn-don't-fail contract a dangling ref follows.
+    pub(crate) fn apply_ng_knob_op(&mut self, op: NgKnobOp) {
+        match op {
+            NgKnobOp::Add { owner, name, kind } => match owner {
+                ParamOwner::Node(id) => {
+                    let comp = self.current;
+                    if let Some(node) =
+                        self.project.comp_mut(comp).and_then(|c| c.root.find_mut(id))
+                    {
+                        node.set_param(name, kind.seed());
+                    }
+                }
+                ParamOwner::Module(m) => {
+                    if let Some(m) = self.project.modules.get_mut(&m) {
+                        m.set_param(name, kind.seed());
+                    }
+                }
+            },
+            NgKnobOp::SetValue { owner, name, value } => match owner {
+                ParamOwner::Node(id) => {
+                    let comp = self.current;
+                    if let Some(node) =
+                        self.project.comp_mut(comp).and_then(|c| c.root.find_mut(id))
+                    {
+                        if let Some(p) = node.params.iter_mut().find(|p| p.name == name) {
+                            p.value.set_const(value);
+                        }
+                    }
+                }
+                ParamOwner::Module(m) => {
+                    if let Some(m) = self.project.modules.get_mut(&m) {
+                        if let Some(p) = m.params.iter_mut().find(|p| p.name == name) {
+                            p.value.set_const(value);
+                        }
+                    }
+                }
+            },
+            NgKnobOp::Remove { owner, name } => match owner {
+                ParamOwner::Node(id) => {
+                    let comp = self.current;
+                    if let Some(node) =
+                        self.project.comp_mut(comp).and_then(|c| c.root.find_mut(id))
+                    {
+                        node.remove_param(&name);
+                    }
+                }
+                ParamOwner::Module(m) => {
+                    if let Some(m) = self.project.modules.get_mut(&m) {
+                        m.remove_param(&name);
+                    }
+                }
+            },
+        }
+        self.recompile_graph();
+    }
+
+    /// Evaluate the selected `script` node's source at `frame`, for the live
+    /// result line under its editor — the value it currently produces, or its
+    /// error. `None` when the selection isn't a script node.
+    ///
+    /// Evaluated **in the context of a layer this script actually drives**,
+    /// found by walking forward from the node to any driver's output, so a
+    /// `param("x")` or `value(…)` previews the number it will really resolve
+    /// to. With no such layer (nothing bound yet, or a module body) it runs
+    /// without a node context, and a node-relative read reports its own
+    /// warning rather than being faked.
+    pub(crate) fn script_preview(&self, frame: f64) -> Option<(GraphNodeId, Result<String, String>)> {
+        let sel = nodegraph::read_selection(&self.egui_ctx)?;
+        let graph = scoped_graph(&self.project, self.ng_scope)?;
+        let node = graph.node(sel)?;
+        if node.kind != "script" {
+            return None;
+        }
+        let src = node.config.script.clone();
+        if src.trim().is_empty() {
+            return None;
+        }
+        let owner = self.driven_layer_for(graph, sel);
+        let doc = self.project.comp(self.current)?;
+        let mut ctx = EvalCtx::new(doc, frame);
+        ctx.modules = Some(&self.project.modules);
+        let run = |ctx: &mut EvalCtx| {
+            motion_core::eval_script_ctx(&src, ctx)
+                .map(|v| v.to_string())
+                .map_err(|e| e.lines().next().unwrap_or("error").to_string())
+        };
+        let result = match owner {
+            Some(id) => ctx.in_node(id, run),
+            None => run(&mut ctx),
+        };
+        Some((sel, result))
+    }
+
+    /// The layer a graph node's value ends up driving, if any: walk forward
+    /// from `from` through the wires, and take the first driver whose output
+    /// sits on a node we reached (or on `from` itself).
+    ///
+    /// Breadth-first and bounded by the node count, so a wide graph costs a
+    /// visit per node, not per path. Only used for a preview, so "the first
+    /// one" is a fine answer when a node feeds several layers.
+    fn driven_layer_for(&self, graph: &NodeGraph, from: GraphNodeId) -> Option<NodeId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([from]);
+        while let Some(n) = queue.pop_front() {
+            if !seen.insert(n) {
+                continue;
+            }
+            for e in graph.edges_from(n) {
+                queue.push_back(e.to.node);
+            }
+        }
+        self.project
+            .bindings
+            .iter()
+            .find(|b| seen.contains(&b.output.node))
+            .map(|b| b.target)
+            .or_else(|| {
+                self.project
+                    .shape_bindings
+                    .iter()
+                    .find(|b| seen.contains(&b.output.node))
+                    .map(|b| b.target)
+            })
+    }
+
+    /// Open a module's body on the canvas, seeding its graph from its `body`
+    /// the first time — so an existing module opens as the nodes that built it
+    /// rather than as a blank sheet that would silently replace it.
+    pub(crate) fn open_module(&mut self, module: ModuleId) {
+        self.ng_scope = NgScope::Module(module);
+        let Some(m) = self.project.modules.get(&module) else { return };
+        if !m.graph.nodes.is_empty() {
+            return;
+        }
+        // Raise against a snapshot: the context reads the modules map while the
+        // module being seeded is mutated out of it.
+        let body = m.body.clone();
+        let modules = self.project.modules.clone();
+        let ctx = GraphCtx::new(&self.node_registry, &modules);
+        let Some(m) = self.project.modules.get_mut(&module) else { return };
+        let output = motion_core::raise(&mut m.graph, &ctx, &body, kurbo::Vec2::new(40.0, 40.0));
+        m.output = Some(output);
     }
 
     /// Freeze a driven property to a constant at `frame` — what a driver's
@@ -1361,11 +1676,20 @@ impl App {
         self.presets = builtin_presets();
         let restored = match layout {
             Some(l) => {
-                self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
+                self.presets.extend(l.user_presets.into_iter().filter_map(|mut p| {
+                    p.dock.migrate_retired();
+                    p.dock.is_valid().then_some(p)
+                }));
                 l.dock
             }
             None => None,
         };
+        // A saved layout may name a retired panel; rewrite those leaves before
+        // validating, so an old file keeps the arrangement it had.
+        let restored = restored.map(|mut d| {
+            d.migrate_retired();
+            d
+        });
         self.dock = match restored {
             Some(d) if d.is_valid() => d,
             Some(_) => {
@@ -1378,7 +1702,7 @@ impl App {
         // already carries the lowered expressions (recompile ran before save), so
         // this is belt-and-braces — it keeps a hand-edited graph and its
         // properties consistent rather than trusting the file to be in sync.
-        if !self.project.bindings.is_empty() {
+        if !(self.project.bindings.is_empty() && self.project.shape_bindings.is_empty()) {
             self.recompile_graph();
         }
         self.seek_frame(0);
@@ -1556,13 +1880,6 @@ impl App {
             .map(|n| ClipInfo { timing: n.timing });
         // Snapshot for the graph panel (clones the selected node's expressions
         // and the module body being edited, if any).
-        let graph_info = GraphInfo::gather(
-            self.doc(),
-            &self.project.modules,
-            self.selected,
-            self.editing_module,
-            t,
-        );
 
         // The selected keyframe's outgoing easing segment, if it has one.
         // Only meaningful for a single key — a segment belongs to one key, and
@@ -1643,6 +1960,11 @@ impl App {
         let zoom_pct = (canvas_scale(self.doc(), canvas, self.nav, ppp) / ppp * 100.0).round() as i32;
         let is_fit = self.nav.zoom.is_none();
         let mut canvas_edits = CanvasEdits::default();
+        // The selected script node's live result, computed against the document
+        // *before* the UI pass (the panel can't borrow `App`), the same way the
+        // old panel's `GraphInfo::gather` did it. Taken here, before the `dock`
+        // borrow below, because it's a `&self` method rather than a field read.
+        let ng_script_preview = self.script_preview(t).map(|(_, r)| r);
         let dock = &mut self.dock;
         // Borrowed (not cloned) beside `dock`: disjoint fields, and the font
         // list is a few hundred strings we don't want to copy every frame.
@@ -1652,12 +1974,30 @@ impl App {
         // At most one layout edit (split/join/retype) from an area header this
         // frame; applied to the tree after the UI pass, never during it.
         let mut dock_cmd: Option<DockCmd> = None;
-        let mut graph_edits = GraphEdits::default();
         // The composition node graph + its registry, borrowed read-only for the
         // panel; its edits (at most one) applied after the pass. Disjoint fields
         // from `dock`, so these coexist with the mutable dock borrow.
-        let node_registry = &self.node_registry;
-        let node_graph = &self.project.graph;
+        // The panel edits whichever graph the scope names — the project's, or
+        // one module's body. A scope pointing at a deleted module falls back to
+        // the project graph rather than blanking the panel.
+        let ng_scope = self.ng_scope;
+        let node_graph =
+            scoped_graph(&self.project, ng_scope).unwrap_or(&self.project.graph);
+        // The panel resolves each node's descriptor per placed node (a `use`
+        // node's sockets are its module's knobs), so it takes a context rather
+        // than the bare registry.
+        let node_ctx = GraphCtx::new(&self.node_registry, &self.project.modules);
+        // Module-scope extras: the open module's knob names and its output.
+        let (ng_knobs, ng_module_output) = match ng_scope {
+            NgScope::Module(id) => match self.project.modules.get(&id) {
+                Some(m) => (
+                    m.params.iter().map(knob_info).collect::<Vec<_>>(),
+                    m.output.clone(),
+                ),
+                None => (Vec::new(), None),
+            },
+            NgScope::Project => (Vec::new(), None),
+        };
         let mut ng_edits = NgEdits::default();
         // Snapshots for the node panel's driver rows: the scene's layers (for the
         // target picker) and the current drivers (for display). Owned/cloned, so
@@ -1667,11 +2007,12 @@ impl App {
             // Field access, not `self.doc()`: the method borrows all of `self`,
             // which would collide with the `&mut self.dock` borrow above.
             if let Some(comp) = self.project.comp(self.current) {
-                collect_nodes(&comp.root, &mut v);
+                collect_layer_info(&comp.root, &mut v);
             }
             v
         };
         let ng_bindings = self.project.bindings.clone();
+        let ng_shape_bindings = self.project.shape_bindings.clone();
         // Modules for a `use` node's picker: id + display name.
         let ng_modules: Vec<(ModuleId, String)> =
             self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
@@ -1736,14 +2077,20 @@ impl App {
                             &FontList { all: font_families, recent: recent_fonts },
                         )
                     }
-                    Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
-                    Editor::NodeGraph => nodegraph_ui(
+                    // `Graph` is the retired expression panel; a layout mid-migration
+                    // can still name it, so it shows its replacement.
+                    Editor::Graph | Editor::NodeGraph => nodegraph_ui(
                         ui,
                         node_graph,
-                        node_registry,
+                        &node_ctx,
+                        ng_scope,
                         &ng_layers,
                         &ng_modules,
                         &ng_bindings,
+                        &ng_shape_bindings,
+                        &ng_knobs,
+                        ng_module_output.as_ref(),
+                        ng_script_preview.as_ref(),
                         &mut ng_edits,
                     ),
                     // vello paints the frame here; egui only measures the hole
@@ -1841,26 +2188,6 @@ impl App {
                 &mut dock_cmd,
             );
         });
-        // Open/close a module for editing (view state) before applying any op,
-        // so a delete-then-nothing leaves the panel in a sane place.
-        if let Some(change) = graph_edits.edit_module.take() {
-            self.editing_module = change;
-            window.request_redraw();
-        }
-        // Apply a graph edit (promote/bake/tree change, or a module-body edit)
-        // after the UI pass. Node-scoped ops no-op without a selection; module
-        // ops don't need one, so this runs regardless.
-        if let Some(op) = graph_edits.op.take() {
-            // A module delete must also close it if it was the one open, or the
-            // panel would keep editing a body that no longer exists.
-            if let GraphOp::DeleteModule { module } = &op {
-                if self.editing_module == Some(*module) {
-                    self.editing_module = None;
-                }
-            }
-            apply_graph_op(&mut self.project, self.current, self.selected, op, frame);
-            window.request_redraw();
-        }
         // Apply a composition node-graph edit (add/move/remove/connect/
         // disconnect/set-value). Connection validity is enforced inside the model.
         // A driver recompiles only when the *lowered result* could have changed —
@@ -1877,6 +2204,9 @@ impl App {
                     | NgOp::SetParam { .. }
                     | NgOp::SetScript { .. }
                     | NgOp::SetModule { .. }
+                    | NgOp::SetText { .. }
+                    | NgOp::SetWaveform { .. }
+                    | NgOp::ClearValue { .. }
             );
             self.apply_ng_op(op);
             window.request_redraw();
@@ -1886,7 +2216,31 @@ impl App {
             ng_changed = true;
             window.request_redraw();
         }
-        if ng_changed && !self.project.bindings.is_empty() {
+        if let Some(sop) = ng_edits.shape_binding.take() {
+            self.apply_shape_binding_op(sop, frame);
+            ng_changed = true;
+            window.request_redraw();
+        }
+        // Module ops and scope changes: both recompile on their own (a module
+        // op writes the document; a scope change may *seed* a module's canvas
+        // from its body), so neither goes through `ng_changed`.
+        if let Some(mop) = ng_edits.module_op.take() {
+            self.apply_ng_module_op(mop);
+            window.request_redraw();
+        }
+        if let Some(kop) = ng_edits.knob.take() {
+            self.apply_ng_knob_op(kop);
+            window.request_redraw();
+        }
+        if let Some(scope) = ng_edits.scope.take() {
+            match scope {
+                NgScope::Project => self.ng_scope = NgScope::Project,
+                NgScope::Module(id) => self.open_module(id),
+            }
+            window.request_redraw();
+        }
+        if ng_changed && !(self.project.bindings.is_empty() && self.project.shape_bindings.is_empty())
+        {
             self.recompile_graph();
             window.request_redraw();
         }

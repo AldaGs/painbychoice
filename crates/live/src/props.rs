@@ -834,9 +834,6 @@ impl PropRef<'_> {
     pub(crate) fn is_animated(&self) -> bool {
         on_prop!(self, v => v.is_animated())
     }
-    pub(crate) fn is_expr(&self) -> bool {
-        on_prop!(self, v => v.is_expr())
-    }
     /// The expression tree, if this property is expression-driven.
     pub(crate) fn expr(&self) -> Option<&Expr> {
         on_prop!(self, v => v.expr_ref())
@@ -864,10 +861,6 @@ impl PropRefMut<'_> {
     pub(crate) fn move_keys(&mut self, idxs: &[usize], delta: i64) {
         on_prop_mut!(self, v => { v.move_keys(idxs, delta); })
     }
-    /// Seed an expression from the current value (see [`Value::promote_to_expr`]).
-    pub(crate) fn promote_to_expr(&mut self, ctx: &mut EvalCtx) {
-        on_prop_mut!(self, v => v.promote_to_expr(ctx))
-    }
     /// Freeze an expression back to a constant (see [`Value::bake_to_const`]).
     pub(crate) fn bake_to_const(&mut self, ctx: &mut EvalCtx) {
         on_prop_mut!(self, v => v.bake_to_const(ctx))
@@ -880,9 +873,6 @@ impl PropRefMut<'_> {
         on_prop_mut!(self, v => **v = Value::expr(expr.clone()))
     }
 
-    pub(crate) fn expr_mut(&mut self) -> Option<&mut Expr> {
-        on_prop_mut!(self, v => v.expr_mut())
-    }
     pub(crate) fn remove_key(&mut self, index: usize) {
         on_prop_mut!(self, v => v.remove_key(index))
     }

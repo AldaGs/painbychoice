@@ -5,25 +5,6 @@
 
 use crate::*;
 
-/// Apply a graph op to a bare `Document`, for the tests that predate projects.
-///
-/// `apply_graph_op` takes the whole project now (modules are project-wide), so
-/// this wraps the doc, applies, and unwraps it again. Tests that exercise the
-/// module ops themselves use a real project instead.
-fn apply_op(doc: &mut Document, id: NodeId, op: GraphOp, frame: i64) {
-    let mut project = MProject::single(doc.clone());
-    let comp = project.root;
-    apply_graph_op(&mut project, comp, Some(id), op, frame);
-    *doc = project.comps.remove(&comp).expect("the comp survives");
-}
-
-/// Apply a graph op against a real project (at frame 0) — for the module/link
-/// tests, where the op reaches the project-wide registry, not just a comp.
-fn apply_op_full(project: &mut MProject, comp: CompId, id: NodeId, op: GraphOp) {
-    apply_graph_op(project, comp, Some(id), op, 0);
-}
-
-
 fn test_axis(view: TimelineView) -> Axis {
     // 8px pad each side → a 400px usable span.
     Axis::new(
@@ -708,402 +689,16 @@ fn only_content_areas_carry_a_header() {
     assert!(Editor::Layers.is_swappable());
     assert!(Editor::Properties.is_swappable());
     assert!(Editor::Dopesheet.is_swappable());
-    assert!(Editor::Graph.is_swappable());
     assert!(Editor::NodeGraph.is_swappable());
+    // The retired expression panel is not offerable — nothing may create a new
+    // leaf of it, even though a saved layout can still name one.
+    assert!(!Editor::Graph.is_swappable());
     assert!(!Editor::Canvas.is_swappable());
     assert!(!Editor::Comp.is_swappable());
     assert!(!Editor::Transport.is_swappable());
 }
 
-/// A one-node doc (id 1) with the given opacity, under a root.
-fn graph_doc(opacity: Value<f64>) -> (Document, NodeId) {
-    let n = MNode::group(1, "n")
-        .with_transform(Transform { opacity, ..Transform::default() });
-    let doc = Document::new(100.0, 100.0, MNode::group(0, "root").with_child(n));
-    (doc, NodeId(1))
-}
 
-fn resolved_opacity(doc: &Document, id: NodeId) -> f64 {
-    let node = doc.root.find(id).unwrap();
-    let mut ctx = EvalCtx::new(doc, 0.0);
-    ctx.in_node(node.id, |ctx| node.transform.opacity.resolve(ctx))
-}
-
-#[test]
-fn gather_lists_the_selected_nodes_properties() {
-    let (doc, id) = graph_doc(Value::constant(0.5));
-    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), None, 0.0);
-    let node = info.node.as_ref().unwrap();
-    let opacity = node.props.iter().find(|p| p.kind == PropKind::Opacity).unwrap();
-    assert!(!opacity.is_expr, "starts as a plain value");
-    assert!(opacity.expr.is_none());
-    // The reference-target list includes every node.
-    assert!(info.nodes.iter().any(|(nid, _)| *nid == 1));
-    assert!(info.nodes.iter().any(|(nid, _)| *nid == 0), "root too");
-}
-
-#[test]
-fn the_script_preview_resolves_against_the_document() {
-    // The panel's result line must use a doc-backed context: a doc-less
-    // preview would report "no node named 'root'" for a script that
-    // resolves fine at render time.
-    let (mut doc, id) = graph_doc(Value::expr(Expr::Script(
-        "value(\"root\", \"opacity\") + wiggle(0.0, 0.0)".into(),
-    )));
-    // Give the root a distinctive opacity to read back.
-    doc.root.transform.opacity = Value::constant(0.25);
-    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), None, 0.0);
-    let node = info.node.as_ref().unwrap();
-    let result = node.script_results.get(&(PropKind::Opacity, vec![])).unwrap();
-    assert_eq!(result.as_ref().unwrap(), "0.25");
-}
-
-#[test]
-fn the_script_preview_is_addressed_by_tree_path() {
-    // A script nested under an operator is keyed by its path, so two
-    // scripts in one tree can't show each other's result.
-    let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetKind { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], new: ExprKind::Add },
-        0,
-    );
-    for (slot, src) in [(0usize, "1.0"), (1, "2.0")] {
-        apply_op(
-            &mut doc,
-            id,
-            GraphOp::SetKind {
-                target: GraphTarget::Prop(PropKind::Opacity),
-                path: vec![slot],
-                new: ExprKind::Script,
-            },
-            0,
-        );
-        apply_op(
-            &mut doc,
-            id,
-            GraphOp::SetScript {
-                target: GraphTarget::Prop(PropKind::Opacity),
-                path: vec![slot],
-                src: src.into(),
-            },
-            0,
-        );
-    }
-    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), None, 0.0);
-    let node = info.node.as_ref().unwrap();
-    let at = |path: Vec<usize>| {
-        node.script_results.get(&(PropKind::Opacity, path)).unwrap().clone().unwrap()
-    };
-    assert_eq!(at(vec![0]), "1");
-    assert_eq!(at(vec![1]), "2");
-    assert!(
-        !node.script_results.contains_key(&(PropKind::Opacity, vec![])),
-        "the root is an Add, not a script"
-    );
-}
-
-#[test]
-fn a_bad_script_shows_one_line_of_error_in_the_preview() {
-    let (doc, id) =
-        graph_doc(Value::expr(Expr::Script("value(\"nope\", \"opacity\")".into())));
-    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), None, 0.0);
-    let node = info.node.as_ref().unwrap();
-    let err = node.script_results[&(PropKind::Opacity, vec![])].clone().unwrap_err();
-    assert!(err.contains("nope"), "{err}");
-    assert!(!err.contains('\n'), "one line, so it fits under the field");
-}
-
-#[test]
-fn add_param_then_remove_it_through_the_graph_ops() {
-    let (mut doc, id) = graph_doc(Value::constant(0.5));
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::AddParam { owner: ParamOwner::Node(id), name: "gain".into(), kind: ParamKind::Num },
-        0,
-    );
-    assert!(doc.root.find(id).unwrap().param("gain").is_some());
-    // The panel lists it, so a `param` node can pick it.
-    let info = GraphInfo::gather(&doc, &Default::default(), Some(id), None, 0.0);
-    let node = info.node.as_ref().unwrap();
-    assert_eq!(node.params, vec![("gain".to_string(), "number")]);
-
-    apply_op(&mut doc, id, GraphOp::RemoveParam { owner: ParamOwner::Node(id), name: "gain".into() }, 0);
-    assert!(doc.root.find(id).unwrap().param("gain").is_none());
-}
-
-#[test]
-fn a_param_node_drives_a_property_end_to_end() {
-    // The whole flow through the panel's ops: add a knob, point the
-    // property's expression at it, and see the property take its value.
-    let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::AddParam { owner: ParamOwner::Node(id), name: "gain".into(), kind: ParamKind::Num },
-        0,
-    );
-    doc.root
-        .find_mut(id)
-        .unwrap()
-        .set_param("gain", ParamValue::Num(Value::constant(0.8)));
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetKind { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], new: ExprKind::Param },
-        0,
-    );
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetParam { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], name: "gain".into() },
-        0,
-    );
-    assert_eq!(resolved_opacity(&doc, id), 0.8);
-}
-
-#[test]
-fn promote_edit_then_bake_round_trips_a_property() {
-    let (mut doc, id) = graph_doc(Value::constant(0.5));
-    // Promote seeds a literal of the current value — unchanged.
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    assert!(doc.root.find(id).unwrap().transform.opacity.is_expr());
-    assert_eq!(resolved_opacity(&doc, id), 0.5);
-    // Edit the literal.
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetLit { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], value: ExprValue::Num(0.9) },
-        0,
-    );
-    assert_eq!(resolved_opacity(&doc, id), 0.9);
-    // Bake back to a constant, freezing the value.
-    apply_op(&mut doc, id, GraphOp::Bake(PropKind::Opacity), 0);
-    assert!(!doc.root.find(id).unwrap().transform.opacity.is_expr());
-    assert_eq!(resolved_opacity(&doc, id), 0.9);
-}
-
-#[test]
-fn set_kind_grows_a_tree_that_evaluates() {
-    // Promote, turn the root into Add, then set its two children: 0.2 + 0.3.
-    let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetKind { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], new: ExprKind::Add },
-        0,
-    );
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetLit { target: GraphTarget::Prop(PropKind::Opacity), path: vec![0], value: ExprValue::Num(0.2) },
-        0,
-    );
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetLit { target: GraphTarget::Prop(PropKind::Opacity), path: vec![1], value: ExprValue::Num(0.3) },
-        0,
-    );
-    assert!((resolved_opacity(&doc, id) - 0.5).abs() < 1e-9);
-}
-
-fn box_at_path<'a>(boxes: &'a [ExprBox], path: &[usize]) -> &'a ExprBox {
-    boxes.iter().find(|b| b.path == path).expect("box for path")
-}
-
-#[test]
-fn layout_stacks_leaves_and_centres_parents() {
-    // A single leaf: one box at the top-left column.
-    let single = layout_expr(&Expr::num(1.0));
-    assert_eq!(single.len(), 1);
-    assert_eq!((single[0].depth, single[0].y), (0, 0.0));
-
-    // Add(Lit, Lit): two leaves stacked (the second below the first by at
-    // least the first's height), the operator centred between them.
-    let add = layout_expr(&Expr::Add(Box::new(Expr::num(1.0)), Box::new(Expr::num(2.0))));
-    assert_eq!(add.len(), 3);
-    let (root, a, b) = (
-        box_at_path(&add, &[]),
-        box_at_path(&add, &[0]),
-        box_at_path(&add, &[1]),
-    );
-    assert_eq!((root.depth, a.depth), (0, 1), "inputs one column right");
-    assert_eq!(a.y, 0.0);
-    assert!(b.y >= a.y + a.height, "second leaf clears the first");
-    assert!(
-        (root.center_y() - (a.center_y() + b.center_y()) / 2.0).abs() < 1e-4,
-        "operator centred over its inputs"
-    );
-}
-
-#[test]
-fn layout_handles_a_nested_tree() {
-    // Add(Lit, Mul(Lit, Lit)): three leaves stacked top-to-bottom; each
-    // parent centred on its children's span.
-    let e = Expr::Add(
-        Box::new(Expr::num(1.0)),
-        Box::new(Expr::Mul(Box::new(Expr::num(2.0)), Box::new(Expr::num(3.0)))),
-    );
-    let boxes = layout_expr(&e);
-    assert_eq!(boxes.len(), 5);
-    let cy = |p: &[usize]| box_at_path(&boxes, p).center_y();
-    assert!(cy(&[0]) < cy(&[1, 0]) && cy(&[1, 0]) < cy(&[1, 1]), "leaves stacked in order");
-    assert!((cy(&[1]) - (cy(&[1, 0]) + cy(&[1, 1])) / 2.0).abs() < 1e-4, "Mul centred");
-    assert!((cy(&[]) - (cy(&[0]) + cy(&[1])) / 2.0).abs() < 1e-4, "root centred on its span");
-    assert_eq!(box_at_path(&boxes, &[1, 1]).depth, 2, "deepest column");
-}
-
-#[test]
-fn taller_nodes_reserve_more_vertical_room() {
-    // A ref node is taller than a value node, and the leaf stacked below it
-    // clears its full height (so their boxes don't overlap).
-    let e = Expr::Add(
-        Box::new(Expr::reference(NodeId(1), PropPath::Position)),
-        Box::new(Expr::num(0.0)),
-    );
-    let boxes = layout_expr(&e);
-    let refb = box_at_path(&boxes, &[0]);
-    let litb = box_at_path(&boxes, &[1]);
-    assert!(refb.height > litb.height, "a ref box is taller than a value box");
-    assert!(litb.y >= refb.y + refb.height, "the box below clears the taller one");
-}
-
-#[test]
-fn set_script_drives_a_property_from_the_frame() {
-    let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetKind { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], new: ExprKind::Script },
-        0,
-    );
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetScript { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], src: "frame + 0.25".into() },
-        0,
-    );
-    // resolved_opacity samples at frame 0, so the script yields 0.25.
-    assert!((resolved_opacity(&doc, id) - 0.25).abs() < 1e-9);
-}
-
-#[test]
-fn set_ref_links_one_property_to_another() {
-    // Two nodes: a (id 1) opacity 0.4, b (id 2) empty; b.opacity references a.
-    let a = MNode::group(1, "a")
-        .with_transform(Transform { opacity: Value::constant(0.4), ..Transform::default() });
-    let b = MNode::group(2, "b");
-    let mut doc =
-        Document::new(100.0, 100.0, MNode::group(0, "root").with_child(a).with_child(b));
-    apply_op(&mut doc, NodeId(2), GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        NodeId(2),
-        GraphOp::SetRef {
-            target: GraphTarget::Prop(PropKind::Opacity),
-            path: vec![],
-            node: NodeId(1),
-            prop: PropPath::Opacity,
-            offset: 0.0,
-        },
-        0,
-    );
-    assert_eq!(resolved_opacity(&doc, NodeId(2)), 0.4, "b now mirrors a");
-}
-
-#[test]
-fn set_kind_to_a_generator_drives_the_property() {
-    // Promote, then retype the root to a ramp, and edit its `to` knob (slot
-    // 1) to 5 — at frame 30 (its default `end`) the ramp is fully at `to`.
-    let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetKind { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], new: ExprKind::Ramp },
-        0,
-    );
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetLit { target: GraphTarget::Prop(PropKind::Opacity), path: vec![1], value: ExprValue::Num(5.0) },
-        0,
-    );
-    let node = doc.root.find(id).unwrap();
-    let mut ctx = EvalCtx::new(&doc, 30.0);
-    let v = ctx.in_node(id, |ctx| node.transform.opacity.resolve(ctx));
-    assert!((v - 5.0).abs() < 1e-9, "ramp reaches its edited `to` at end");
-}
-
-#[test]
-fn set_waveform_retunes_an_oscillator_without_touching_its_knobs() {
-    // A saw at freq 1.0 (one cycle per frame), amp 1: at frame 0.5 sine gives
-    // 0 but saw gives 0; use a clearer split — sine(0.25 cycle)=1, square=1,
-    // saw(0.25)=−0.5. Switch sine→saw and read the change at a quarter cycle.
-    let (mut doc, id) = graph_doc(Value::constant(0.0));
-    apply_op(&mut doc, id, GraphOp::Promote(PropKind::Opacity), 0);
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetKind { target: GraphTarget::Prop(PropKind::Opacity), path: vec![], new: ExprKind::Oscillator },
-        0,
-    );
-    // freq 1.0 so `frame` counts cycles directly; amp 1, phase/offset 0.
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetLit { target: GraphTarget::Prop(PropKind::Opacity), path: vec![0], value: ExprValue::Num(1.0) },
-        0,
-    );
-    let sample = |doc: &Document| {
-        let node = doc.root.find(id).unwrap();
-        let mut ctx = EvalCtx::new(doc, 0.25);
-        ctx.in_node(id, |ctx| node.transform.opacity.resolve(ctx))
-    };
-    assert!((sample(&doc) - 1.0).abs() < 1e-9, "sine at a quarter cycle is +1");
-    apply_op(
-        &mut doc,
-        id,
-        GraphOp::SetWaveform {
-            target: GraphTarget::Prop(PropKind::Opacity),
-            path: vec![],
-            wave: Waveform::Saw,
-        },
-        0,
-    );
-    assert!((sample(&doc) + 0.5).abs() < 1e-9, "saw at a quarter cycle is −0.5");
-    // The knobs are untouched — freq is still the 1.0 we set.
-    let opacity = &doc.root.find(id).unwrap().transform.opacity;
-    match opacity {
-        Value::Expr(Expr::Gen(Generator::Oscillator { freq, wave, .. })) => {
-            assert_eq!(freq.to_string(), "1");
-            assert_eq!(*wave, Waveform::Saw);
-        }
-        _ => panic!("still an oscillator"),
-    }
-}
-
-#[test]
-fn a_generator_knob_box_reserves_room_for_its_label() {
-    // A noise generator lays out with its three knobs as child boxes; each
-    // knob box is taller than a bare literal because it reserves a line for
-    // its slot label, and the stack still clears (no overlap).
-    let e = Expr::seed(ExprKind::Noise);
-    let boxes = layout_expr(&e);
-    assert_eq!(boxes.len(), 4, "the generator plus three knob boxes");
-    let bare = box_height(&Expr::num(0.0), false);
-    let freq = box_at_path(&boxes, &[0]);
-    assert!(freq.height > bare, "a labelled knob reserves more than a bare value");
-    let amp = box_at_path(&boxes, &[1]);
-    assert!(amp.y >= freq.y + freq.height, "the knob below clears the labelled one");
-}
 
 /// A rect with every optional property present.
 fn full_node() -> MNode {
@@ -1353,372 +948,6 @@ fn the_root_cannot_be_precomposed() {
 
 // --- Module ops (the module UI) ---
 
-/// A one-node project whose opacity is expression-driven, ready to extract.
-fn project_with_expr_opacity() -> (MProject, CompId, NodeId) {
-    let node = MNode::shape(
-        1,
-        "dot",
-        MShape::Rect {
-            size: Value::constant(Vec2::new(10.0, 10.0)),
-            radius: Value::constant(0.0),
-        },
-    )
-    .with_transform(Transform {
-        opacity: Value::expr(Expr::Lit(ExprValue::Num(0.25))),
-        ..Transform::default()
-    });
-    let project = MProject::single(Document::new(
-        100.0,
-        100.0,
-        MNode::group(0, "root").with_child(node),
-    ));
-    let comp = project.root;
-    (project, comp, NodeId(1))
-}
-
-/// Extracting must be a **no-op on the rendered frame**: the recipe moves to the
-/// module and the property links it, so the value is identical either side.
-/// That's what makes it safe to press on work you care about.
-#[test]
-fn extracting_a_module_leaves_the_value_unchanged() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    let before = motion_core::evaluate_comp(&project, comp, 0.0).items[0].opacity;
-
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
-
-    assert_eq!(project.modules.len(), 1, "a module was created");
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
-    assert!((scene.items[0].opacity - before).abs() < 1e-9, "the frame is unchanged");
-
-    // And the property is now a link, not a copy of the recipe.
-    let node = project.comp(comp).unwrap().root.find(id).unwrap();
-    let expr = prop_of(node, PropKind::Opacity).unwrap().expr().cloned().unwrap();
-    assert!(matches!(expr, Expr::Use { .. }), "the property links the module");
-}
-
-/// The extracted module keeps the recipe itself, so editing the module is what
-/// changes the frame from then on.
-#[test]
-fn editing_the_extracted_module_drives_the_property() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
-    let module = *project.modules.keys().next().unwrap();
-
-    project.module_mut(module).unwrap().body = Expr::Lit(ExprValue::Num(0.75));
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!((scene.items[0].opacity - 0.75).abs() < 1e-9);
-}
-
-/// The kind picker seeds a `Use` by naming a module: choosing one over an
-/// already-promoted (non-`Use`) node emits `SetModule`, which must turn that node
-/// into a fresh link — pointing at the chosen module, with no overrides — and
-/// drive the property from the module's body.
-#[test]
-fn the_kind_picker_seeds_a_fresh_use_link() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    let module = project.add_module(MModule::new("half", Expr::Lit(ExprValue::Num(0.5))));
-
-    // The property is expr-driven but *not* a link (it's the promoted recipe).
-    // This is exactly the state the kind picker acts on — a box on the canvas.
-    apply_graph_op(
-        &mut project,
-        comp,
-        Some(id),
-        GraphOp::SetModule {
-            target: GraphTarget::Prop(PropKind::Opacity),
-            path: Vec::new(),
-            module,
-        },
-        0,
-    );
-
-    let node = project.comp(comp).unwrap().root.find(id).unwrap();
-    let expr = prop_of(node, PropKind::Opacity).unwrap().expr().cloned().unwrap();
-    match expr {
-        Expr::Use { module: m, overrides } => {
-            assert_eq!(m, module, "links the chosen module");
-            assert!(overrides.is_empty(), "a seeded link starts inheriting everything");
-        }
-        other => panic!("expected a fresh Use link, got {other:?}"),
-    }
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
-    assert!((scene.items[0].opacity - 0.5).abs() < 1e-9, "the module body drives it");
-}
-
-/// An override is a child box on the canvas now, so it's editable into any
-/// expression — not just a literal. Overriding a knob, then editing that
-/// override sub-expression through the ordinary canvas ops (its path is the
-/// link's path + the child slot) must drive the module, which is the whole point
-/// of the nested-override canvas.
-#[test]
-fn an_override_sub_expression_is_editable_on_the_canvas() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    // A module whose body just echoes its `amount` knob (default 0.4).
-    let module = project.add_module(
-        MModule::new("level", Expr::Param { node: None, name: "amount".into() })
-            .with_param("amount", ParamValue::Num(Value::constant(0.4))),
-    );
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
-    let opacity = |p: &MProject| motion_core::evaluate_comp(p, comp, 0.0).items[0].opacity;
-    assert!((opacity(&project) - 0.4).abs() < 1e-9, "inherits the default");
-
-    // Override `amount`: this seeds a literal `0` child at the link's slot 0.
-    apply_op_full(&mut project, comp, id, GraphOp::SetOverride {
-        target: GraphTarget::Prop(PropKind::Opacity),
-        path: Vec::new(),
-        name: "amount".into(),
-        value: Some(ExprValue::Num(0.0)),
-    });
-    assert!(opacity(&project).abs() < 1e-9, "the seeded override is 0");
-
-    // Now edit that override *child* (path [0]) into a script — the case that
-    // used to be un-editable. It must drive the knob.
-    apply_op_full(&mut project, comp, id, GraphOp::SetKind {
-        target: GraphTarget::Prop(PropKind::Opacity),
-        path: vec![0],
-        new: ExprKind::Script,
-    });
-    apply_op_full(&mut project, comp, id, GraphOp::SetScript {
-        target: GraphTarget::Prop(PropKind::Opacity),
-        path: vec![0],
-        src: "0.75".into(),
-    });
-
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
-    assert!((scene.items[0].opacity - 0.75).abs() < 1e-9, "the override expression drives it");
-}
-
-/// Overriding a knob and then clearing it must return the link to *inheriting*,
-/// not to some captured copy of the old value — that distinction is the whole
-/// point of a module.
-#[test]
-fn clearing_an_override_returns_the_link_to_inheriting() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    let module = project.add_module(
-        MModule::new("level", Expr::Param { node: None, name: "amount".into() })
-            .with_param("amount", ParamValue::Num(Value::constant(0.4))),
-    );
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
-    let opacity = |p: &MProject| motion_core::evaluate_comp(p, comp, 0.0).items[0].opacity;
-    assert!((opacity(&project) - 0.4).abs() < 1e-9, "inherits the module default");
-
-    // Override this one link.
-    apply_graph_op(
-        &mut project,
-        comp,
-        Some(id),
-        GraphOp::SetOverride {
-            target: GraphTarget::Prop(PropKind::Opacity),
-            path: Vec::new(),
-            name: "amount".into(),
-            value: Some(ExprValue::Num(0.9)),
-        },
-        0,
-    );
-    assert!((opacity(&project) - 0.9).abs() < 1e-9, "the override wins");
-
-    // Now change the module's default and clear the override: the link must
-    // follow the *new* default, proving it inherits rather than restoring 0.4.
-    project.module_mut(module).unwrap().params[0].value =
-        ParamValue::Num(Value::constant(0.1));
-    apply_graph_op(
-        &mut project,
-        comp,
-        Some(id),
-        GraphOp::SetOverride {
-            target: GraphTarget::Prop(PropKind::Opacity),
-            path: Vec::new(),
-            name: "amount".into(),
-            value: None,
-        },
-        0,
-    );
-    assert!((opacity(&project) - 0.1).abs() < 1e-9, "back to inheriting, at the new default");
-}
-
-/// Repointing a link keeps its overrides: knobs are matched by name, so a knob
-/// the two modules share carries over rather than being silently dropped.
-#[test]
-fn repointing_a_link_keeps_overrides_that_still_apply() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    let knob = |name: &str, default: f64| {
-        MModule::new(name, Expr::Param { node: None, name: "amount".into() })
-            .with_param("amount", ParamValue::Num(Value::constant(default)))
-    };
-    let a = project.add_module(knob("a", 0.2));
-    let b = project.add_module(knob("b", 0.8));
-
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::LinkModule { kind: PropKind::Opacity, module: a }, 0);
-    apply_graph_op(
-        &mut project,
-        comp,
-        Some(id),
-        GraphOp::SetOverride {
-            target: GraphTarget::Prop(PropKind::Opacity),
-            path: Vec::new(),
-            name: "amount".into(),
-            value: Some(ExprValue::Num(0.55)),
-        },
-        0,
-    );
-    apply_graph_op(
-        &mut project,
-        comp,
-        Some(id),
-        GraphOp::SetModule { target: GraphTarget::Prop(PropKind::Opacity), path: Vec::new(), module: b },
-        0,
-    );
-
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
-    assert!((scene.items[0].opacity - 0.55).abs() < 1e-9, "the override carried over");
-}
-
-/// Deleting a module doesn't rewrite its links — they warn and fall back, the
-/// same as any other dangling reference. A silent revert would hide the loss.
-#[test]
-fn deleting_a_module_leaves_its_links_warning() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    let module = project.add_module(MModule::new("gone", Expr::Lit(ExprValue::Num(0.3))));
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::DeleteModule { module }, 0);
-
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(
-        scene.warnings.iter().any(|(_, m)| m.contains("no longer exists")),
-        "{:?}",
-        scene.warnings
-    );
-}
-
-/// The headline of the graph-UI step: a module's *body* is edited on the same
-/// canvas a property is, addressed by [`GraphTarget::Module`] and applied
-/// through the same [`apply_graph_op`]. No node need be selected — the body
-/// isn't any node's property — so the op goes through with `selected: None`.
-#[test]
-fn editing_a_module_body_drives_every_link() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
-    let module = *project.modules.keys().next().unwrap();
-    let opacity = |p: &MProject| motion_core::evaluate_comp(p, comp, 0.0).items[0].opacity;
-    assert!((opacity(&project) - 0.25).abs() < 1e-9, "starts at the extracted value");
-
-    // Set the body's literal through the module target, with nothing selected.
-    apply_graph_op(
-        &mut project,
-        comp,
-        None,
-        GraphOp::SetLit {
-            target: GraphTarget::Module(module),
-            path: vec![],
-            value: ExprValue::Num(0.8),
-        },
-        0,
-    );
-    assert!((opacity(&project) - 0.8).abs() < 1e-9, "the link follows the edited body");
-}
-
-/// Growing the body's tree — kind picker → operator, then its operands — works
-/// through the module target exactly as it does for a property.
-#[test]
-fn a_module_body_grows_its_tree_through_set_kind() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
-    let module = *project.modules.keys().next().unwrap();
-    let target = GraphTarget::Module(module);
-    apply_graph_op(&mut project, comp, None, GraphOp::SetKind { target, path: vec![], new: ExprKind::Add }, 0);
-    apply_graph_op(&mut project, comp, None, GraphOp::SetLit { target, path: vec![0], value: ExprValue::Num(0.3) }, 0);
-    apply_graph_op(&mut project, comp, None, GraphOp::SetLit { target, path: vec![1], value: ExprValue::Num(0.4) }, 0);
-
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
-    assert!((scene.items[0].opacity - 0.7).abs() < 1e-9, "the two operands summed");
-}
-
-/// A module grows knobs the same way a node does, via [`ParamOwner::Module`],
-/// and its body reads one through a `param` node — the whole point of an
-/// editable module body, since the tunables are what a link overrides.
-#[test]
-fn a_module_knob_added_through_the_ops_drives_the_body() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
-    let module = *project.modules.keys().next().unwrap();
-    let target = GraphTarget::Module(module);
-    let opacity = |p: &MProject| motion_core::evaluate_comp(p, comp, 0.0).items[0].opacity;
-
-    // Add a knob, then point the body at it.
-    apply_graph_op(
-        &mut project,
-        comp,
-        None,
-        GraphOp::AddParam { owner: ParamOwner::Module(module), name: "level".into(), kind: ParamKind::Num },
-        0,
-    );
-    apply_graph_op(&mut project, comp, None, GraphOp::SetKind { target, path: vec![], new: ExprKind::Param }, 0);
-    apply_graph_op(&mut project, comp, None, GraphOp::SetParam { target, path: vec![], name: "level".into() }, 0);
-    assert!((opacity(&project) - 0.0).abs() < 1e-9, "reads the knob's neutral default");
-
-    // Move the knob's default: the body follows it.
-    project.module_mut(module).unwrap().set_param("level", ParamValue::Num(Value::constant(0.6)));
-    assert!((opacity(&project) - 0.6).abs() < 1e-9);
-
-    // Remove the knob: the body's `param("level")` warns and falls back, like
-    // any dangling reference — not a silent no-op.
-    apply_graph_op(
-        &mut project,
-        comp,
-        None,
-        GraphOp::RemoveParam { owner: ParamOwner::Module(module), name: "level".into() },
-        0,
-    );
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.iter().any(|(_, m)| m.contains("level")), "{:?}", scene.warnings);
-}
-
-/// `gather` exposes the edited module's body and knobs so the panel can draw
-/// them — and only when a module is actually opened for editing.
-#[test]
-fn gather_exposes_the_edited_module_body() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::ExtractModule { kind: PropKind::Opacity }, 0);
-    let module = *project.modules.keys().next().unwrap();
-    project.module_mut(module).unwrap().set_param("amp", ParamValue::Num(Value::constant(1.0)));
-    let doc = project.comp(comp).unwrap();
-
-    // Nothing opened → no module-edit view, even though the module exists.
-    let closed = GraphInfo::gather(doc, &project.modules, None, None, 0.0);
-    assert!(closed.editing.is_none());
-    assert_eq!(closed.modules.len(), 1, "but the module still lists");
-
-    // Opened → the body and its knobs come through.
-    let open = GraphInfo::gather(doc, &project.modules, None, Some(module), 0.0);
-    let edit = open.editing.expect("the opened module's body");
-    assert_eq!(edit.id, module);
-    assert!(matches!(edit.body, Expr::Lit(ExprValue::Num(_))), "the extracted body");
-    assert_eq!(edit.params, vec![("amp".to_string(), "number")]);
-}
-
-/// Renaming is just a label — every link is by id, so nothing breaks.
-#[test]
-fn renaming_a_module_keeps_its_links() {
-    let (mut project, comp, id) = project_with_expr_opacity();
-    let module = project.add_module(MModule::new("old", Expr::Lit(ExprValue::Num(0.3))));
-    apply_graph_op(&mut project, comp, Some(id), GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
-    apply_graph_op(
-        &mut project,
-        comp,
-        Some(id),
-        GraphOp::RenameModule { module, name: "new".into() },
-        0,
-    );
-    assert_eq!(project.module(module).unwrap().name, "new");
-    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
-    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
-    assert!((scene.items[0].opacity - 0.3).abs() < 1e-9);
-}
 
 /// Build a one-layer comp at `fps` with a rotation key on `frame`.
 fn comp_at_fps(fps: f64, frame: i64) -> motion_core::node::Comp {
@@ -3226,4 +2455,373 @@ fn a_drag_is_never_offered_its_own_subtree_or_ancestors() {
         assert!(excluded.contains(&id), "{id:?} must be excluded");
     }
     assert!(!excluded.contains(&NodeId(4)));
+}
+
+// ── Geometry drivers: the graph authoring a layer's shape. ───────────────────
+
+/// A project holding one empty group layer, ready to be given a shape.
+fn shape_driver_project() -> (MProject, CompId, NodeId) {
+    let target = MNode::group(1, "target");
+    let comp = Comp::new(200.0, 200.0, MNode::group(0, "root").with_child(target));
+    let project = MProject::single(comp);
+    let root = project.root;
+    (project, root, NodeId(1))
+}
+
+/// The headline of shape lowering: a rectangle node's `geometry` output, bound
+/// to a layer, *makes* that layer a rectangle — kind and params both — and a
+/// wire into one of its params animates it. The layer starts with no shape at
+/// all, so nothing but the graph could have put one there.
+#[test]
+fn a_geometry_driver_authors_a_layers_shape() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let rect = project.graph.add_node("rect", Vec2::new(0.0, 0.0));
+    let ramp = project.graph.add_node("ramp", Vec2::new(-200.0, 0.0));
+    // ramp 0 → 40 over frames 0..10, into the corner radius.
+    project.graph.node_mut(ramp).unwrap().set_value("to", ExprValue::Num(40.0));
+    project.graph.node_mut(ramp).unwrap().set_value("end", ExprValue::Num(10.0));
+    project
+        .graph
+        .connect(&GraphCtx::bare(&reg), Endpoint::new(ramp, "value"), Endpoint::new(rect, "radius"))
+        .unwrap();
+    project
+        .shape_bindings
+        .push(ShapeBinding { output: Endpoint::new(rect, "geometry"), target });
+
+    compile_drivers(&mut project, &reg, comp);
+
+    let node = project.comp(comp).unwrap().root.find(target).unwrap();
+    let Some(MShape::Rect { radius, .. }) = &node.shape else {
+        panic!("the driver should have made it a rect, got {:?}", node.shape)
+    };
+    assert!(radius.is_expr(), "a graph-authored param is expression-driven");
+    // The animation reaches the rendered frame, not just the model.
+    let bounds = |f: f64| evaluate_comp(&project, comp, f).place(target).unwrap().bounds;
+    assert!(bounds(0.0).is_some(), "the layer draws once the graph gave it a shape");
+    // A 200×200 square with a growing corner radius loses area at the corners,
+    // so the path changes with the frame — proof the wire is live.
+    let ctx_radius = |f: f64| {
+        let n = project.comp(comp).unwrap().root.find(target).unwrap();
+        let Some(MShape::Rect { radius, .. }) = &n.shape else { unreachable!() };
+        radius.resolve(&mut EvalCtx::new(project.comp(comp).unwrap(), f))
+    };
+    assert_eq!(ctx_radius(0.0), 0.0);
+    assert_eq!(ctx_radius(10.0), 40.0);
+}
+
+/// A **value** driver on `size` still wins over the geometry driver that made
+/// the shape: the geometry pass decides the kind, the property pass then
+/// overrides that one param. The other order would silently discard it.
+#[test]
+fn a_property_driver_overrides_one_param_of_a_graph_authored_shape() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let rect = project.graph.add_node("rect", Vec2::new(0.0, 0.0));
+    let v = project.graph.add_node("value", Vec2::new(-200.0, 0.0));
+    project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Vec2(Vec2::new(50.0, 50.0)));
+    project
+        .shape_bindings
+        .push(ShapeBinding { output: Endpoint::new(rect, "geometry"), target });
+    project.bindings.push(Binding {
+        output: Endpoint::new(v, "value"),
+        target,
+        prop: PropPath::ShapeSize,
+    });
+
+    compile_drivers(&mut project, &reg, comp);
+
+    let node = project.comp(comp).unwrap().root.find(target).unwrap();
+    let Some(MShape::Rect { size, .. }) = &node.shape else { panic!("{:?}", node.shape) };
+    let got = size.resolve(&mut EvalCtx::new(project.comp(comp).unwrap(), 0.0));
+    assert_eq!(got, Vec2::new(50.0, 50.0), "the property driver's size, not the rect node's 200");
+}
+
+/// A geometry driver whose output isn't a shape node's geometry (a stale
+/// binding left pointing at a math node) leaves the layer's own shape alone
+/// rather than blanking it.
+#[test]
+fn a_stale_geometry_driver_leaves_the_shape_untouched() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    // Give the layer a hand-made ellipse first.
+    project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().shape =
+        Some(MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
+    let add = project.graph.add_node("add", Vec2::new(0.0, 0.0));
+    project
+        .shape_bindings
+        .push(ShapeBinding { output: Endpoint::new(add, "geometry"), target });
+
+    compile_drivers(&mut project, &reg, comp);
+
+    let node = project.comp(comp).unwrap().root.find(target).unwrap();
+    assert!(matches!(node.shape, Some(MShape::Ellipse { .. })), "{:?}", node.shape);
+}
+
+// ── Module scope: the canvas authoring a shared module's body. ───────────────
+
+/// Opening a module whose canvas is empty **seeds it from the body**, so an
+/// existing module becomes node-editable without a migration — and lowering it
+/// straight back reproduces the body it came from, rather than replacing a
+/// working module with a blank sheet.
+#[test]
+fn opening_a_module_seeds_its_canvas_from_its_body() {
+    let reg = NodeRegistry::with_builtins();
+    let body = Expr::Mul(
+        Box::new(Expr::Time(motion_core::expr::TimeSource::T01)),
+        Box::new(Expr::Lit(ExprValue::Num(90.0))),
+    );
+    let mut modules = std::collections::BTreeMap::new();
+    modules.insert(ModuleId(1), MModule::new("spin", body.clone()));
+
+    // What `App::open_module` does, without a window.
+    let snapshot = modules.clone();
+    let ctx = GraphCtx::new(&reg, &snapshot);
+    let m = modules.get_mut(&ModuleId(1)).unwrap();
+    let output = motion_core::raise(&mut m.graph, &ctx, &body, Vec2::new(40.0, 40.0));
+    m.output = Some(output);
+    assert!(!modules[&ModuleId(1)].graph.nodes.is_empty(), "the body became nodes");
+
+    // Recompiling from the seeded canvas gives back the same body.
+    compile_modules(&mut modules, &reg);
+    assert_eq!(modules[&ModuleId(1)].body.to_string(), body.to_string());
+}
+
+/// A module knob added in module scope becomes an input socket on every `use`
+/// node linking it — the descriptor seam and the document scope meeting. This
+/// is what makes an override wireable at all.
+#[test]
+fn a_module_knob_becomes_a_socket_on_its_links() {
+    let reg = NodeRegistry::with_builtins();
+    let mut modules = std::collections::BTreeMap::new();
+    modules.insert(ModuleId(1), MModule::new("spin", Expr::Lit(ExprValue::Num(0.0))));
+
+    let mut g = NodeGraph::new();
+    let u = g.add_node("use", Vec2::ZERO);
+    g.node_mut(u).unwrap().config.module = Some(ModuleId(1));
+    assert!(
+        GraphCtx::new(&reg, &modules).descriptor_for(g.node(u).unwrap()).unwrap().inputs.is_empty(),
+        "no knobs yet"
+    );
+
+    // Add one, the way `NgModuleOp::AddKnob` does.
+    modules
+        .get_mut(&ModuleId(1))
+        .unwrap()
+        .set_param("speed", ParamValue::Num(Value::constant(0.0)));
+    let ctx = GraphCtx::new(&reg, &modules);
+    let desc = ctx.descriptor_for(g.node(u).unwrap()).unwrap();
+    assert!(desc.find_input("speed").is_some(), "the knob is a socket on the link");
+}
+
+// ── Layer exposed knobs: one recipe fitting many layers. ────────────────────
+
+/// A placed layer's rotation in degrees, read out of its world matrix — the
+/// angle that actually reached the frame, rather than the recipe that made it.
+fn placed_angle_deg(scene: &MScene, id: NodeId) -> f64 {
+    let c = scene.place(id).expect("the layer is placed").world.as_coeffs();
+    c[1].atan2(c[0]).to_degrees()
+}
+
+/// The point of a layer knob: **one** graph output drives several layers, each
+/// at its own value, because a `param` node lowers to a node-*relative*
+/// `Expr::Param` that resolves against whichever layer the driver points at.
+/// Two layers, two knob values, one recipe.
+#[test]
+fn one_param_recipe_drives_two_layers_at_their_own_knob_values() {
+    let mut a = MNode::group(1, "a");
+    let mut b = MNode::group(2, "b");
+    a.set_param("gain", ParamValue::Num(Value::constant(10.0)));
+    b.set_param("gain", ParamValue::Num(Value::constant(40.0)));
+    let comp = Comp::new(64.0, 64.0, MNode::group(0, "root").with_child(a).with_child(b));
+    let mut project = MProject::single(comp);
+    let comp_id = project.root;
+    let reg = NodeRegistry::with_builtins();
+
+    // One `param("gain")` node, bound to both layers' rotation.
+    let p = project.graph.add_node("param", Vec2::ZERO);
+    project.graph.node_mut(p).unwrap().config.param = "gain".into();
+    for target in [NodeId(1), NodeId(2)] {
+        project.bindings.push(Binding {
+            output: Endpoint::new(p, "value"),
+            target,
+            prop: PropPath::Rotation,
+        });
+    }
+    compile_drivers(&mut project, &reg, comp_id);
+
+    // Read it back through `evaluate_comp`, not off the property: a `param`
+    // node lowers to a node-*relative* read, which only resolves inside the
+    // walk that knows which layer it is evaluating.
+    let scene = evaluate_comp(&project, comp_id, 0.0);
+    assert!((placed_angle_deg(&scene, NodeId(1)) - 10.0).abs() < 1e-6);
+    assert!(
+        (placed_angle_deg(&scene, NodeId(2)) - 40.0).abs() < 1e-6,
+        "the same recipe reads each layer's own knob"
+    );
+}
+
+/// Removing a knob a `param` node still reads doesn't break the frame: the read
+/// warns and falls back to zero, the same warn-don't-fail contract a dangling
+/// reference follows.
+#[test]
+fn removing_a_knob_a_param_still_reads_falls_back_instead_of_failing() {
+    let mut layer = MNode::group(1, "a");
+    layer.set_param("gain", ParamValue::Num(Value::constant(7.0)));
+    let comp = Comp::new(64.0, 64.0, MNode::group(0, "root").with_child(layer));
+    let mut project = MProject::single(comp);
+    let comp_id = project.root;
+    let reg = NodeRegistry::with_builtins();
+
+    let p = project.graph.add_node("param", Vec2::ZERO);
+    project.graph.node_mut(p).unwrap().config.param = "gain".into();
+    project.bindings.push(Binding {
+        output: Endpoint::new(p, "value"),
+        target: NodeId(1),
+        prop: PropPath::Rotation,
+    });
+    compile_drivers(&mut project, &reg, comp_id);
+
+    let scene = evaluate_comp(&project, comp_id, 0.0);
+    assert!((placed_angle_deg(&scene, NodeId(1)) - 7.0).abs() < 1e-6);
+
+    // Pull the knob out from under it.
+    project.comp_mut(comp_id).unwrap().root.find_mut(NodeId(1)).unwrap().remove_param("gain");
+    compile_drivers(&mut project, &reg, comp_id);
+    let scene = evaluate_comp(&project, comp_id, 0.0);
+    assert!(
+        placed_angle_deg(&scene, NodeId(1)).abs() < 1e-6,
+        "a gone knob reads neutral, it doesn't panic"
+    );
+    assert!(
+        scene.warnings.iter().any(|(_, w)| w.contains("gain")),
+        "and it says so: {:?}",
+        scene.warnings
+    );
+}
+
+// ── Module semantics, ported from the retired expression panel. ─────────────
+//
+// These covered `GraphOp::{RenameModule, DeleteModule, SetModule}` and body
+// editing. The capabilities didn't go away with that panel — they moved to the
+// Nodes panel's module scope — so their guarantees are re-pinned here against
+// the node path that owns them now.
+
+/// A module with one knob and a body reading it, linked from a graph.
+fn linked_module_project() -> (MProject, NodeRegistry, ModuleId, GraphNodeId) {
+    let comp = Comp::new(64.0, 64.0, MNode::group(0, "root").with_child(MNode::group(1, "a")));
+    let mut project = MProject::single(comp);
+    let reg = NodeRegistry::with_builtins();
+    let mut m = MModule::new("spin", Expr::Lit(ExprValue::Num(0.0)));
+    m.set_param("amp", ParamValue::Num(Value::constant(3.0)));
+    let p = m.graph.add_node("param", Vec2::ZERO);
+    m.graph.node_mut(p).unwrap().config.param = "amp".into();
+    m.output = Some(Endpoint::new(p, "value"));
+    let id = project.add_module(m);
+    compile_modules(&mut project.modules, &reg);
+
+    let u = project.graph.add_node("use", Vec2::ZERO);
+    project.graph.node_mut(u).unwrap().config.module = Some(id);
+    project.bindings.push(Binding {
+        output: Endpoint::new(u, "value"),
+        target: NodeId(1),
+        prop: PropPath::Rotation,
+    });
+    let comp_id = project.root;
+    compile_drivers(&mut project, &reg, comp_id);
+    (project, reg, id, u)
+}
+
+/// Renaming a module keeps its links: a link names the module by **id**, so the
+/// label is free to change under it.
+#[test]
+fn renaming_a_module_keeps_its_links() {
+    let (mut project, _reg, id, _u) = linked_module_project();
+    let before = placed_angle_deg(&evaluate_comp(&project, project.root, 0.0), NodeId(1));
+    project.modules.get_mut(&id).unwrap().name = "renamed".into();
+    let after = placed_angle_deg(&evaluate_comp(&project, project.root, 0.0), NodeId(1));
+    assert!((before - after).abs() < 1e-9, "the link followed the rename");
+    assert!((after - 3.0).abs() < 1e-9, "and still runs the body");
+}
+
+/// Deleting a module leaves its links **warning and falling back**, not
+/// crashing — the same contract a dangling reference follows everywhere else.
+#[test]
+fn deleting_a_module_leaves_its_links_warning() {
+    let (mut project, _reg, id, _u) = linked_module_project();
+    project.modules.remove(&id);
+    let scene = evaluate_comp(&project, project.root, 0.0);
+    assert!(placed_angle_deg(&scene, NodeId(1)).abs() < 1e-9, "falls back to neutral");
+    assert!(
+        scene.warnings.iter().any(|(_, w)| w.contains("no longer exists")),
+        "and says so: {:?}",
+        scene.warnings
+    );
+}
+
+/// Editing a module's body on its canvas drives **every** link — the whole
+/// reason a module exists rather than copying a recipe per property.
+#[test]
+fn editing_a_module_body_drives_every_link() {
+    let (mut project, reg, id, _u) = linked_module_project();
+    // A second layer, linked to the same module.
+    project.comp_mut(project.root).unwrap().root.children.push(MNode::group(2, "b"));
+    let u2 = project.graph.add_node("use", Vec2::new(0.0, 200.0));
+    project.graph.node_mut(u2).unwrap().config.module = Some(id);
+    project.bindings.push(Binding {
+        output: Endpoint::new(u2, "value"),
+        target: NodeId(2),
+        prop: PropPath::Rotation,
+    });
+    let comp_id = project.root;
+    compile_drivers(&mut project, &reg, comp_id);
+
+    // Rebuild the body on the module's own canvas: param(amp) * 10.
+    {
+        let m = project.modules.get_mut(&id).unwrap();
+        let p = m.output.clone().unwrap().node;
+        let ten = m.graph.add_node("value", Vec2::new(0.0, 60.0));
+        m.graph.node_mut(ten).unwrap().set_value("value", ExprValue::Num(10.0));
+        let mul = m.graph.add_node("mul", Vec2::new(200.0, 0.0));
+        let ctx = &GraphCtx::bare(&reg);
+        m.graph.connect(ctx, Endpoint::new(p, "value"), Endpoint::new(mul, "a")).unwrap();
+        m.graph.connect(ctx, Endpoint::new(ten, "value"), Endpoint::new(mul, "b")).unwrap();
+        m.output = Some(Endpoint::new(mul, "result"));
+    }
+    compile_modules(&mut project.modules, &reg);
+    compile_drivers(&mut project, &reg, comp_id);
+
+    let scene = evaluate_comp(&project, comp_id, 0.0);
+    for id in [NodeId(1), NodeId(2)] {
+        assert!(
+            (placed_angle_deg(&scene, id) - 30.0).abs() < 1e-9,
+            "{id:?} should follow the edited body"
+        );
+    }
+}
+
+/// Re-pointing a link at a different module keeps the overrides whose knob
+/// names the new module also has, and drops the rest — an override is keyed by
+/// name, so it applies wherever that name means something.
+#[test]
+fn repointing_a_link_keeps_overrides_that_still_apply() {
+    let (mut project, reg, _id, u) = linked_module_project();
+    project.graph.node_mut(u).unwrap().set_value("amp", ExprValue::Num(9.0));
+    project.graph.node_mut(u).unwrap().set_value("gone", ExprValue::Num(1.0));
+
+    // A second module sharing the `amp` knob but not `gone`.
+    let mut other = MModule::new("other", Expr::Lit(ExprValue::Num(0.0)));
+    other.set_param("amp", ParamValue::Num(Value::constant(1.0)));
+    let p = other.graph.add_node("param", Vec2::ZERO);
+    other.graph.node_mut(p).unwrap().config.param = "amp".into();
+    other.output = Some(Endpoint::new(p, "value"));
+    let other_id = project.add_module(other);
+    compile_modules(&mut project.modules, &reg);
+
+    project.graph.node_mut(u).unwrap().config.module = Some(other_id);
+    let ctx = GraphCtx::new(&reg, &project.modules);
+    let expr = lower_output(&project.graph, &ctx, &Endpoint::new(u, "value"));
+    let Expr::Use { overrides, .. } = &expr else { panic!("{expr:?}") };
+    assert_eq!(overrides.len(), 1, "only knobs the new module has: {overrides:?}");
+    assert_eq!(overrides[0].0, "amp");
 }

@@ -1785,9 +1785,124 @@ clock reads as a number.) **`script` and `use` node kinds now exist**, so the
 canvas covers what the old per-property editor does: `script` is a Rhai leaf
 (`config.script` → `Expr::Script`, edited in the inspector), `use` links a shared
 module (`config.module` → `Expr::Use`, picked from the project's modules) — both
-raise/lower round-trip (a plain `use`; module *overrides* aren't yet editable on
-this canvas, so a `use` with overrides links at the module's defaults). Still
-ahead: shape/geometry lowering, then retiring the old `Editor::Graph` panel. (4) The compositor stage — the real gate for effects/mattes/masks.
+raise/lower round-trip.
+**Per-node descriptor resolution ✅ — the registry's one real limitation, lifted.**
+`kind → descriptor` is enough only while every node of a kind has the same
+sockets, and a `use` node breaks that: its inputs are the *linked module's*
+knobs, so two `use` nodes in one graph have different shapes. Resolution is now
+per **placed node** through `GraphCtx { reg, modules }` (`core/src/graph.rs`),
+whose `descriptor_for(node) -> Option<Cow<NodeDescriptor>>` returns the kind's
+static descriptor borrowed (free) for everything else and an owned, specialized
+one for a linked `use`. Everything that reads sockets — `connect`, `validate`,
+`lower_*`, `raise`, and the panel's drawing — goes through it rather than the
+registry, so the *canvas* needed no special case: a module's knobs appear as
+ordinary typed, colour-coded input sockets and an **override is a wire from any
+node**, not a literal in a side panel. Consequences: a knob is type-checked like
+any socket; **unwired and unset means *inherit*** (the resting state has no
+default, because a module default is resolved lazily in the caller's scope and a
+literal copy of it would stop retiming), so lowering emits an override only for
+a knob that is wired or has a stored literal; and `raise` now reproduces a
+link's overrides, closing the last lossy case — **`lower(raise(e)) == e` now
+holds across the whole `Expr` enum**. The inspector shows each knob in one of
+three states (wired / overridden / inheriting) with `override` and `×` to move
+between the last two — the old link box's two-state toggle plus the third state
+only a canvas can offer. An `osc` node also carries its **waveform** in config
+now (it selects which function the generator *is*, so nothing wires into it),
+which fixes the same class of bug: a square oscillator imported onto the canvas
+used to come back a sine.
+**Shape/geometry lowering now works, so the graph can *author* geometry and not
+only drive values.** Two halves. (a) A shape node's **scalar outputs echo its
+resolved params** — `rect.size`/`rect.radius`/`ellipse.size`/`text.size` hand
+back whatever feeds the input of the same id, so math chains off a rectangle's
+size (the object-scope case above). The echo is read structurally from the
+socket-id pairing, pinned by a registry test, so a new shape primitive needs no
+arm in `lower`. (b) `lower_geometry(graph, reg, endpoint) -> Option<Shape>`
+compiles a `geometry` output to a whole `Shape` whose every param is a
+`Value::Expr` of the lowered input — so a wired `size` animates through
+`evaluate` exactly like a hand-written expression, and an unwired one rests on
+the descriptor's default (which now matches the layers panel's add-shape seeds,
+so a canvas rect *is* the toolbar's rect). A **geometry driver**
+(`motion_core::ShapeBinding`, a project field beside `bindings`, serde-defaulted)
+binds such an output to a layer and replaces its `Shape` on every recompile;
+removing one bakes the params to constants, like a value driver. Drivers run
+**shapes first, properties second**, so a geometry driver decides the shape
+*kind* and a value driver on `size`/`radius` can still override that one param.
+Text's non-animatable half (content / family / align / wrap) rides in
+`NodeConfig::text` (a `TextConfig`) because `ExprValue` has no string — the same
+reason `Shape::Text` keeps them as plain fields. The Nodes panel gained a
+**Geometry** driver section and vector + text inspector fields; the driver
+pickers are now type-filtered, so a geometry output is never offered to a
+property driver. `App::recompile_graph`'s body moved to the free fn
+`compile_drivers(project, reg, comp)` so it's testable without a window.
+**Retiring `Editor::Graph` is gated on three capabilities that still live only
+there** — audited before touching it, because deleting the panel would delete
+working features:
+  1. ~~a link's module **overrides**~~ ✅ (the descriptor seam above);
+  2. ~~an oscillator's **waveform**~~ ✅;
+  3. ~~**exposed params**~~ ✅ — one owner-agnostic `NgKnobOp` and one `knobs_ui`
+     serve both scopes, because a knob *is* the same idea at both: a named value
+     `param("x")` reads from whatever owns the expression. Project scope gained
+     a **Layer knobs** section (pick a layer, add num/vec/col knobs, remove
+     them); module scope's knob editor is now the same widget, so module knobs
+     gained the vector and colour types they lacked. The `param` node's editor
+     is a picker over every knob exposed anywhere in the scene (labelled with
+     which layers expose it) **plus** a free-text field, because a `param` node
+     lowers to a node-*relative* `Expr::Param { node: None, .. }` — there is no
+     single owner whose knobs are *the* candidate list, and naming a knob that
+     doesn't exist yet is legitimate. A name nothing exposes is flagged in
+     amber, not refused. This is what lets one graph output fit many layers: one
+     `osc × param("gain")` drives five layers at five gains, no five graphs.
+     **This pass also closed a hole older than the node graph:** nothing in the
+     app had ever *set* a knob's value — `ParamValue` was constructed by
+     `ParamKind::seed()` and never edited again — so every `param("x")` read
+     resolved to its seed of 0 and any knob-driven recipe silently did nothing.
+     `ParamValue::as_const`/`set_const` (core, typed: a literal of the wrong
+     shape is ignored rather than retyping the knob) plus a per-row editor in
+     `knobs_ui` fix it. A keyframed or expression-driven knob shows "animated"
+     and no field, since one number can't stand for a track and writing it back
+     would flatten it.
+  4. ~~**module authoring + body scope**~~ ✅ — resolved in favour of giving
+     `Module` its own `NodeGraph` + `output: Option<Endpoint>`, the same
+     "alongside, lowers to the IR" shape `Project.graph` has with the properties
+     it drives. `compile_modules(modules, reg)` lowers each module whose
+     `output` is set into its `body` (which stays the IR `eval_use` runs); a
+     module with **no** `output` is left alone, so an empty canvas can't blank a
+     body authored elsewhere. The Nodes panel gained an `NgScope`
+     (Project | Module) — same panel, same ops, different graph, which is the
+     three-scopes design rather than three editors — with a Modules list
+     (new/edit), rename/delete, an output picker, and knob add/remove (a knob
+     added here becomes an input socket on every `use` node linking the module).
+     **Opening a module seeds its canvas by raising its `body`**, so a module
+     built in the old editor becomes node-editable with no migration and its
+     layout persists from then on. Recompile order is modules-then-drivers, since
+     a driver may link one. Guard against the two editors fighting over one body:
+     a body edit made in the *old* panel clears the module's `output`, handing
+     ownership back, because the editor you just typed into should win.
+**`Editor::Graph` is retired** (all four blockers closed, plus the script live
+result ported: the selected `script` node now shows the value it evaluates to,
+or its error in red, computed before the UI pass against a layer the script
+actually drives — found by walking forward from the node to the first driver
+that reads it, so a `param`/`value` read previews the number it will really
+resolve to). `live/src/graph.rs` is gone (-1335 lines); its surviving shared
+vocabulary (`PROP_PATHS`, `prop_path_label`, `ParamOwner`, `ParamKind`,
+`SCRIPT_HELP`) moved into `nodegraph.rs`, the only remaining user. **One
+capability was consciously dropped:** `ExtractModule`, which lifted a property's
+expression into a new module in one click — with module scope and Import both on
+the canvas, it was a shortcut, not a capability.
+
+Two things worth knowing about the retirement. **The `Editor::Graph` enum variant
+stays**, excluded from `SWAPPABLE` so nothing can create one: the dock layout is
+*document data*, and an unknown variant is a hard serde error that would fail an
+entire `.pbc`, not just its layout. `Dock::migrate_retired()` rewrites such a
+leaf to `NodeGraph` on load, so a file saved with the old panel docked keeps the
+arrangement it had. **29 tests went with the panel** — the ones covering its box
+geometry (`layout_expr`, `box_height`) were genuinely dead, but the ones covering
+*semantics* that merely moved (module rename/delete, body edits reaching every
+link, overrides surviving a re-point) are re-pinned against the node path that
+owns them now.
+Also still ahead: raising a `Shape` back onto the canvas (`lower_geometry`'s
+inverse — the Import row only handles properties). (4) The compositor stage —
+the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.

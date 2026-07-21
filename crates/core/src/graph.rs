@@ -14,14 +14,100 @@
 //! the model is: it must be testable without a window, and it will become
 //! document data once lowering lands.
 
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 
 use kurbo::Vec2;
 use serde::{Deserialize, Serialize};
 
-use crate::expr::PropPath;
+use crate::expr::{PropPath, Waveform};
 use crate::node::{ModuleId, NodeId};
-use crate::registry::NodeRegistry;
+use crate::registry::{NodeDescriptor, NodeRegistry};
+use crate::socket::Socket;
+use crate::text::TextAlign;
+
+/// Everything needed to resolve a graph node's **descriptor**: the registry of
+/// node kinds, plus the project's modules.
+///
+/// The registry alone answers `kind → descriptor`, which is enough while every
+/// node of a kind has the same sockets. A `use` node breaks that: its inputs are
+/// the *linked module's* knobs, so two `use` nodes in one graph have different
+/// shapes. Resolution therefore has to happen per **placed node**, not per kind
+/// — see [`GraphCtx::descriptor_for`] — and everything that reads sockets
+/// (connecting, validating, lowering, drawing) goes through this rather than
+/// touching the registry directly.
+///
+/// A borrowing view, built per call: it holds no state of its own, so it can't
+/// go stale against a project that just changed.
+#[derive(Clone, Copy)]
+pub struct GraphCtx<'a> {
+    pub reg: &'a NodeRegistry,
+    pub modules: &'a std::collections::BTreeMap<ModuleId, crate::node::Module>,
+}
+
+/// A module map with nothing in it — for the tests and callers that have no
+/// project, so `GraphCtx` needn't be `Option`al.
+static NO_MODULES: std::sync::LazyLock<std::collections::BTreeMap<ModuleId, crate::node::Module>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl<'a> GraphCtx<'a> {
+    pub fn new(
+        reg: &'a NodeRegistry,
+        modules: &'a std::collections::BTreeMap<ModuleId, crate::node::Module>,
+    ) -> Self {
+        Self { reg, modules }
+    }
+
+    /// A context over `reg` with no modules — for a graph that links none, and
+    /// for tests of the kinds that don't care.
+    pub fn bare(reg: &'a NodeRegistry) -> Self {
+        Self { reg, modules: &NO_MODULES }
+    }
+
+    /// The descriptor for one **placed** node: its kind's static descriptor,
+    /// specialized where the node's config changes its shape.
+    ///
+    /// Today the only specialization is a `use` node, which grows one input
+    /// socket per knob of the module it links — that's what makes an override
+    /// *wireable* by any node instead of a literal typed into a side panel.
+    /// Borrowed (free) for every other kind; the clone happens only for a `use`
+    /// that actually resolves a module.
+    ///
+    /// **An override socket has no default, deliberately.** Unwired and unset
+    /// means *inherit* the module's own default — override is a layering, not a
+    /// fork — so there is no resting literal for lowering to read. See
+    /// [`crate::lower`].
+    pub fn descriptor_for(&self, node: &GraphNode) -> Option<Cow<'a, NodeDescriptor>> {
+        let desc = self.reg.get(&node.kind)?;
+        if node.kind != "use" {
+            return Some(Cow::Borrowed(desc));
+        }
+        // An unlinked `use`, or one whose module was deleted, keeps the bare
+        // descriptor: no knobs to offer. It lowers to neutral anyway.
+        let Some(def) = node.config.module.and_then(|m| self.modules.get(&m)) else {
+            return Some(Cow::Borrowed(desc));
+        };
+        let mut specialized = desc.clone();
+        for p in &def.params {
+            specialized.inputs.push(Socket::new(&p.name, &p.name, param_socket_type(&p.value)));
+        }
+        Some(Cow::Owned(specialized))
+    }
+}
+
+/// The socket type a module knob presents. [`ParamValue`] mirrors the three
+/// `ExprValue` kinds, so this is total and exact.
+///
+/// [`ParamValue`]: crate::node::ParamValue
+fn param_socket_type(v: &crate::node::ParamValue) -> crate::socket::SocketType {
+    use crate::node::ParamValue;
+    use crate::socket::SocketType;
+    match v {
+        ParamValue::Num(_) => SocketType::Number,
+        ParamValue::Vec(_) => SocketType::Vector,
+        ParamValue::Color(_) => SocketType::Color,
+    }
+}
 
 /// Stable identity for a node *within a graph* — distinct from a scene
 /// [`crate::node::NodeId`], which identifies a layer in the `Node` tree. A wire
@@ -84,6 +170,59 @@ pub struct NodeConfig {
     /// defaults (`Expr::Use` with no overrides).
     #[serde(default)]
     pub module: Option<ModuleId>,
+    /// An `osc` node's waveform. Not a socket: it selects *which* function the
+    /// generator is, not a value fed into one, so there's nothing for a wire to
+    /// carry. Defaults to `Sine`, the generator's own default, so an `osc`
+    /// placed before this field existed reads back unchanged.
+    #[serde(default)]
+    pub wave: Waveform,
+    /// A `text` node's non-animatable typography — the fields
+    /// [`crate::node::Shape::Text`] holds as plain data because [`ExprValue`]
+    /// has no string variant. Only the font *size* is a socket, so everything
+    /// else a text shape needs has to live here.
+    ///
+    /// [`ExprValue`]: crate::expr::ExprValue
+    #[serde(default)]
+    pub text: TextConfig,
+}
+
+/// The plain-data half of a `text` node — everything
+/// [`crate::node::Shape::Text`] carries that isn't the animatable `size`
+/// socket. Split into its own struct so [`NodeConfig`] doesn't sprout four
+/// loose text fields, and so lowering can hand the whole group over at once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextConfig {
+    /// The string to shape. Seeded with visible placeholder text for the same
+    /// reason the layers panel's add-text button is: an empty text node would
+    /// shape to an empty path and look like the node does nothing.
+    pub content: String,
+    /// System font family name. Empty (or not installed) → sans-serif.
+    pub family: String,
+    pub align: TextAlign,
+    /// Wrap width; `None` keeps the text on one line.
+    pub max_width: Option<f64>,
+}
+
+impl Default for TextConfig {
+    fn default() -> Self {
+        Self { content: "Text".into(), family: String::new(), align: TextAlign::Left, max_width: None }
+    }
+}
+
+/// A **geometry driver**: a graph `geometry` output feeding a scene layer's
+/// *shape*. The counterpart to [`Binding`], and the thing that lets the graph
+/// **author** geometry rather than only drive numbers into a shape someone else
+/// made — a bound layer's `Shape` is rebuilt from the graph on every recompile,
+/// its params carrying the lowered `Expr`s as `Value::Expr`.
+///
+/// Deliberately *not* folded into `Binding`: a `Binding` names a [`PropPath`],
+/// and geometry has none — it isn't an interpolatable `Value`, which is the
+/// same reason `SocketType::Geometry` has no `ExprValue`. One binding kind per
+/// thing bound keeps both honest.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShapeBinding {
+    pub output: Endpoint,
+    pub target: NodeId,
 }
 
 impl GraphNode {
@@ -235,13 +374,13 @@ impl NodeGraph {
     /// edge on success.
     pub fn connect(
         &mut self,
-        reg: &NodeRegistry,
+        ctx: &GraphCtx,
         from: Endpoint,
         to: Endpoint,
     ) -> Result<Edge, ConnectError> {
         // Both endpoints' nodes and kinds must resolve.
-        let from_ty = self.output_type(reg, &from)?;
-        let to_ty = self.input_type(reg, &to)?;
+        let from_ty = self.output_type(ctx, &from)?;
+        let to_ty = self.input_type(ctx, &to)?;
         if !from_ty.feeds(to_ty) {
             return Err(ConnectError::TypeMismatch { from: from_ty, to: to_ty });
         }
@@ -278,21 +417,23 @@ impl NodeGraph {
     /// needs (missing node / unknown kind / no such output socket).
     fn output_type(
         &self,
-        reg: &NodeRegistry,
+        ctx: &GraphCtx,
         ep: &Endpoint,
     ) -> Result<crate::socket::SocketType, ConnectError> {
         let node = self.node(ep.node).ok_or(ConnectError::NodeMissing(ep.node))?;
-        let desc = reg.get(&node.kind).ok_or_else(|| ConnectError::UnknownKind(node.kind.clone()))?;
+        let desc =
+            ctx.descriptor_for(node).ok_or_else(|| ConnectError::UnknownKind(node.kind.clone()))?;
         desc.find_output(&ep.socket).map(|s| s.ty).ok_or_else(|| ConnectError::NoSuchSocket(ep.clone()))
     }
 
     fn input_type(
         &self,
-        reg: &NodeRegistry,
+        ctx: &GraphCtx,
         ep: &Endpoint,
     ) -> Result<crate::socket::SocketType, ConnectError> {
         let node = self.node(ep.node).ok_or(ConnectError::NodeMissing(ep.node))?;
-        let desc = reg.get(&node.kind).ok_or_else(|| ConnectError::UnknownKind(node.kind.clone()))?;
+        let desc =
+            ctx.descriptor_for(node).ok_or_else(|| ConnectError::UnknownKind(node.kind.clone()))?;
         desc.find_input(&ep.socket).map(|s| s.ty).ok_or_else(|| ConnectError::NoSuchSocket(ep.clone()))
     }
 
@@ -322,18 +463,18 @@ impl NodeGraph {
     /// clean. Called after a load so a hand-edited or plugin-shy file surfaces
     /// its issues instead of failing to open — the same discipline as
     /// `Dock::is_valid` and the grid-spacing clamp.
-    pub fn validate(&self, reg: &NodeRegistry) -> Vec<GraphError> {
+    pub fn validate(&self, ctx: &GraphCtx) -> Vec<GraphError> {
         let mut out = Vec::new();
         for node in &self.nodes {
-            if reg.get(&node.kind).is_none() {
+            if ctx.descriptor_for(node).is_none() {
                 out.push(GraphError::UnknownKind { node: node.id, kind: node.kind.clone() });
             }
         }
         // One wire per input: report an input fed more than once.
         let mut seen_inputs: HashSet<&Endpoint> = HashSet::new();
         for edge in &self.edges {
-            let out_ty = self.output_type(reg, &edge.from);
-            let in_ty = self.input_type(reg, &edge.to);
+            let out_ty = self.output_type(ctx, &edge.from);
+            let in_ty = self.input_type(ctx, &edge.to);
             match (out_ty, in_ty) {
                 (Ok(a), Ok(b)) if !a.feeds(b) => {
                     out.push(GraphError::TypeMismatch { edge: edge.clone(), from: a, to: b });
@@ -373,6 +514,8 @@ mod tests {
     use crate::registry::NodeRegistry;
     use crate::socket::SocketType;
 
+    /// The built-in registry, kept alive by the caller so a `GraphCtx` can
+    /// borrow it. Tests that link no module use `GraphCtx::bare`.
     fn reg() -> NodeRegistry {
         NodeRegistry::with_builtins()
     }
@@ -380,19 +523,20 @@ mod tests {
     #[test]
     fn a_valid_wire_connects_and_a_type_mismatch_is_refused() {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         // rect.size (Vector output) → add.a (Number input) is a type mismatch.
         let rect = g.add_node("rect", Vec2::ZERO);
         let add = g.add_node("add", Vec2::new(200.0, 0.0));
         let err = g
-            .connect(&reg, Endpoint::new(rect, "size"), Endpoint::new(add, "a"))
+            .connect(ctx, Endpoint::new(rect, "size"), Endpoint::new(add, "a"))
             .unwrap_err();
         assert_eq!(
             err,
             ConnectError::TypeMismatch { from: SocketType::Vector, to: SocketType::Number }
         );
         // rect.radius (Number output) → add.a (Number input) is fine.
-        let ok = g.connect(&reg, Endpoint::new(rect, "radius"), Endpoint::new(add, "a"));
+        let ok = g.connect(ctx, Endpoint::new(rect, "radius"), Endpoint::new(add, "a"));
         assert!(ok.is_ok(), "{ok:?}");
         assert_eq!(g.edges.len(), 1);
     }
@@ -400,12 +544,13 @@ mod tests {
     #[test]
     fn an_input_takes_one_wire_and_a_second_replaces_the_first() {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let v1 = g.add_node("value", Vec2::ZERO);
         let v2 = g.add_node("value", Vec2::new(0.0, 60.0));
         let add = g.add_node("add", Vec2::new(200.0, 0.0));
-        g.connect(&reg, Endpoint::new(v1, "value"), Endpoint::new(add, "a")).unwrap();
-        g.connect(&reg, Endpoint::new(v2, "value"), Endpoint::new(add, "a")).unwrap();
+        g.connect(ctx, Endpoint::new(v1, "value"), Endpoint::new(add, "a")).unwrap();
+        g.connect(ctx, Endpoint::new(v2, "value"), Endpoint::new(add, "a")).unwrap();
         assert_eq!(g.edges.len(), 1, "the second wire replaces the first");
         assert_eq!(g.incoming(&Endpoint::new(add, "a")).unwrap().from.node, v2);
     }
@@ -413,41 +558,44 @@ mod tests {
     #[test]
     fn a_wire_that_would_close_a_cycle_is_refused() {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let a = g.add_node("neg", Vec2::ZERO);
         let b = g.add_node("neg", Vec2::new(200.0, 0.0));
         // a.result → b.a, then b.result → a.a would loop.
-        g.connect(&reg, Endpoint::new(a, "result"), Endpoint::new(b, "a")).unwrap();
+        g.connect(ctx, Endpoint::new(a, "result"), Endpoint::new(b, "a")).unwrap();
         let err = g
-            .connect(&reg, Endpoint::new(b, "result"), Endpoint::new(a, "a"))
+            .connect(ctx, Endpoint::new(b, "result"), Endpoint::new(a, "a"))
             .unwrap_err();
         assert_eq!(err, ConnectError::WouldCycle);
         // A node feeding its own input is the degenerate cycle.
-        let self_loop = g.connect(&reg, Endpoint::new(a, "result"), Endpoint::new(a, "a"));
+        let self_loop = g.connect(ctx, Endpoint::new(a, "result"), Endpoint::new(a, "a"));
         assert_eq!(self_loop.unwrap_err(), ConnectError::WouldCycle);
     }
 
     #[test]
     fn connecting_a_missing_socket_or_node_errors() {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let add = g.add_node("add", Vec2::ZERO);
         // `add` has no output called "nope".
-        let bad_socket = g.connect(&reg, Endpoint::new(add, "nope"), Endpoint::new(add, "a"));
+        let bad_socket = g.connect(ctx, Endpoint::new(add, "nope"), Endpoint::new(add, "a"));
         assert!(matches!(bad_socket, Err(ConnectError::NoSuchSocket(_))));
         // A node id that isn't in the graph.
         let ghost = GraphNodeId(999);
-        let missing = g.connect(&reg, Endpoint::new(ghost, "value"), Endpoint::new(add, "a"));
+        let missing = g.connect(ctx, Endpoint::new(ghost, "value"), Endpoint::new(add, "a"));
         assert_eq!(missing, Err(ConnectError::NodeMissing(ghost)));
     }
 
     #[test]
     fn removing_a_node_drops_its_wires_and_ids_are_not_reused() {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let v = g.add_node("value", Vec2::ZERO);
         let add = g.add_node("add", Vec2::new(200.0, 0.0));
-        g.connect(&reg, Endpoint::new(v, "value"), Endpoint::new(add, "a")).unwrap();
+        g.connect(ctx, Endpoint::new(v, "value"), Endpoint::new(add, "a")).unwrap();
         assert!(g.remove_node(v));
         assert!(g.edges.is_empty(), "the incident wire went with the node");
         // A fresh node must not reuse the removed id, or the dropped wire could
@@ -471,31 +619,43 @@ mod tests {
             target: NodeId(0),
             prop: PropPath::Rotation,
         });
+        // A geometry driver and a text node's plain-data config ride along too —
+        // both are document data, so both must survive the trip.
+        let text = project.graph.add_node("text", Vec2::new(20.0, 120.0));
+        project.graph.node_mut(text).unwrap().config.text.content = "hello".into();
+        project
+            .shape_bindings
+            .push(ShapeBinding { output: Endpoint::new(text, "geometry"), target: NodeId(0) });
 
         let json = serde_json::to_string(&project).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(back.graph, project.graph);
         assert_eq!(back.bindings, project.bindings);
+        assert_eq!(back.shape_bindings, project.shape_bindings);
 
-        // A legacy project JSON with neither field loads with empty defaults.
+        // A legacy project JSON with none of the fields loads with empty
+        // defaults — including one written before geometry drivers existed.
         let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = legacy.as_object_mut().unwrap();
         obj.remove("graph");
         obj.remove("bindings");
+        obj.remove("shape_bindings");
         let old: Project = serde_json::from_value(legacy).unwrap();
         assert!(old.graph.nodes.is_empty() && old.bindings.is_empty());
+        assert!(old.shape_bindings.is_empty());
     }
 
     #[test]
     fn validate_reports_unknown_kinds_and_survives_a_round_trip() {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         g.add_node("acme.missing", Vec2::ZERO); // plugin not loaded
         let good = g.add_node("value", Vec2::new(0.0, 60.0));
         let add = g.add_node("add", Vec2::new(200.0, 0.0));
-        g.connect(&reg, Endpoint::new(good, "value"), Endpoint::new(add, "a")).unwrap();
+        g.connect(ctx, Endpoint::new(good, "value"), Endpoint::new(add, "a")).unwrap();
 
-        let problems = g.validate(&reg);
+        let problems = g.validate(ctx);
         assert!(problems.iter().any(|p| matches!(
             p,
             GraphError::UnknownKind { kind, .. } if kind == "acme.missing"

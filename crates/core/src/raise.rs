@@ -10,15 +10,15 @@
 //! composition graph are two *views of one substrate* rather than two editors —
 //! which is the whole point of the fold.
 //!
-//! `lower(raise(e)) == e` for the lowerable subset (value / math / generator /
-//! ref / param / time), so a round trip is lossless there; a `Script`/`Use`
-//! (no node kind yet) raises to a placeholder rather than panicking.
+//! `lower(raise(e)) == e` across the whole `Expr` enum — value / math /
+//! generator / ref / param / time / script / module link, overrides and all —
+//! so a round trip is lossless and importing a recipe onto the canvas can't
+//! quietly change it.
 
 use kurbo::Vec2;
 
 use crate::expr::{Expr, Generator, TimeSource};
-use crate::graph::{Endpoint, NodeGraph};
-use crate::registry::NodeRegistry;
+use crate::graph::{Endpoint, GraphCtx, NodeGraph};
 
 /// Column width and row height for the auto-layout — children sit one column to
 /// the left of their parent (output flows left→right), stacked down the rows.
@@ -28,16 +28,16 @@ const ROW: f64 = 96.0;
 /// Raise `expr` into `graph`, laying its nodes out with the root near `at`, and
 /// return the output [`Endpoint`] that produces its value — ready to wire into a
 /// driver or another node.
-pub fn raise(graph: &mut NodeGraph, reg: &NodeRegistry, expr: &Expr, at: Vec2) -> Endpoint {
+pub fn raise(graph: &mut NodeGraph, ctx: &GraphCtx, expr: &Expr, at: Vec2) -> Endpoint {
     let mut cursor_y = at.y;
-    raise_rec(graph, reg, expr, at.x, &mut cursor_y).0
+    raise_rec(graph, ctx, expr, at.x, &mut cursor_y).0
 }
 
 /// Returns the created root's output endpoint and the y it was placed at (so a
 /// parent can centre on the span of its children).
 fn raise_rec(
     graph: &mut NodeGraph,
-    reg: &NodeRegistry,
+    ctx: &GraphCtx,
     expr: &Expr,
     x: f64,
     cursor_y: &mut f64,
@@ -75,26 +75,39 @@ fn raise_rec(
             let (id, y) = leaf(graph, kind);
             (Endpoint::new(id, socket), y)
         }
-        Expr::Add(a, b) => op2(graph, reg, "add", a, b, x, cursor_y),
-        Expr::Mul(a, b) => op2(graph, reg, "mul", a, b, x, cursor_y),
+        Expr::Add(a, b) => op2(graph, ctx, "add", a, b, x, cursor_y),
+        Expr::Mul(a, b) => op2(graph, ctx, "mul", a, b, x, cursor_y),
         Expr::Neg(a) => {
-            let (ea, cy) = raise_rec(graph, reg, a, x - COL, cursor_y);
+            let (ea, cy) = raise_rec(graph, ctx, a, x - COL, cursor_y);
             let id = graph.add_node("neg", Vec2::new(x, cy));
-            let _ = graph.connect(reg, ea, Endpoint::new(id, "a"));
+            let _ = graph.connect(ctx, ea, Endpoint::new(id, "a"));
             (Endpoint::new(id, "result"), cy)
         }
-        Expr::Gen(g) => raise_generator(graph, reg, g, x, cursor_y),
+        Expr::Gen(g) => raise_generator(graph, ctx, g, x, cursor_y),
         Expr::Script(src) => {
             let (id, y) = leaf(graph, "script");
             graph.node_mut(id).unwrap().config.script = src.clone();
             (Endpoint::new(id, "value"), y)
         }
-        // A module link. The canvas can't yet edit overrides, so they're dropped
-        // here — a `use` with overrides doesn't round-trip losslessly (it links
-        // the module at its defaults). A plain `use` round-trips exactly.
-        Expr::Use { module, .. } => {
+        // A module link. Its overrides are raised as ordinary sub-graphs wired
+        // into the knob sockets `GraphCtx::descriptor_for` grows for the linked
+        // module — so an override is a *recipe* on the canvas, editable by any
+        // node, exactly as it was in the per-property editor. A knob left
+        // inheriting gets no wire, which is how lowering reads inheritance back.
+        Expr::Use { module, overrides } => {
             let (id, y) = leaf(graph, "use");
             graph.node_mut(id).unwrap().config.module = Some(*module);
+            // The node must know its module *before* the wires go in: the knob
+            // sockets don't exist until it does, and `connect` validates
+            // against them.
+            let mut raised = Vec::new();
+            for (name, expr) in overrides {
+                let (e, _) = raise_rec(graph, ctx, expr, x - COL, cursor_y);
+                raised.push((name.clone(), e));
+            }
+            for (name, e) in raised {
+                let _ = graph.connect(ctx, e, Endpoint::new(id, name));
+            }
             (Endpoint::new(id, "value"), y)
         }
     }
@@ -104,36 +117,39 @@ fn raise_rec(
 /// operator centred on them, wire them into `a`/`b`.
 fn op2(
     graph: &mut NodeGraph,
-    reg: &NodeRegistry,
+    ctx: &GraphCtx,
     kind: &str,
     a: &Expr,
     b: &Expr,
     x: f64,
     cursor_y: &mut f64,
 ) -> (Endpoint, f64) {
-    let (ea, ya) = raise_rec(graph, reg, a, x - COL, cursor_y);
-    let (eb, yb) = raise_rec(graph, reg, b, x - COL, cursor_y);
+    let (ea, ya) = raise_rec(graph, ctx, a, x - COL, cursor_y);
+    let (eb, yb) = raise_rec(graph, ctx, b, x - COL, cursor_y);
     let center = (ya + yb) / 2.0;
     let id = graph.add_node(kind, Vec2::new(x, center));
-    let _ = graph.connect(reg, ea, Endpoint::new(id, "a"));
-    let _ = graph.connect(reg, eb, Endpoint::new(id, "b"));
+    let _ = graph.connect(ctx, ea, Endpoint::new(id, "a"));
+    let _ = graph.connect(ctx, eb, Endpoint::new(id, "b"));
     (Endpoint::new(id, "result"), center)
 }
 
 /// Raise a generator, wiring each knob `Expr` into the matching input socket.
 fn raise_generator(
     graph: &mut NodeGraph,
-    reg: &NodeRegistry,
+    ctx: &GraphCtx,
     g: &Generator,
     x: f64,
     cursor_y: &mut f64,
 ) -> (Endpoint, f64) {
-    // (kind, knob sockets in order) — the knob Exprs line up with these.
+    // (kind, knob sockets in order) — the knob Exprs line up with these. The
+    // oscillator's waveform isn't a knob (nothing wires into it), so it rides
+    // along as config, set on the node once it exists.
+    let mut wave = None;
     let (kind, knobs): (&str, Vec<(&str, &Expr)>) = match g {
-        Generator::Oscillator { freq, amp, phase, offset, .. } => (
-            "osc",
-            vec![("freq", freq), ("amp", amp), ("phase", phase), ("offset", offset)],
-        ),
+        Generator::Oscillator { freq, amp, phase, offset, wave: w } => {
+            wave = Some(*w);
+            ("osc", vec![("freq", freq), ("amp", amp), ("phase", phase), ("offset", offset)])
+        }
         Generator::Noise { freq, amp, seed } => {
             ("noise", vec![("freq", freq), ("amp", amp), ("seed", seed)])
         }
@@ -147,7 +163,7 @@ fn raise_generator(
     let mut centers = Vec::new();
     let mut endpoints = Vec::new();
     for (socket, knob) in &knobs {
-        let (e, y) = raise_rec(graph, reg, knob, x - COL, cursor_y);
+        let (e, y) = raise_rec(graph, ctx, knob, x - COL, cursor_y);
         centers.push(y);
         endpoints.push((*socket, e));
     }
@@ -155,8 +171,11 @@ fn raise_generator(
         + centers.last().copied().unwrap_or(*cursor_y))
         / 2.0;
     let id = graph.add_node(kind, Vec2::new(x, center));
+    if let Some(w) = wave {
+        graph.node_mut(id).unwrap().config.wave = w;
+    }
     for (socket, e) in endpoints {
-        let _ = graph.connect(reg, e, Endpoint::new(id, socket));
+        let _ = graph.connect(ctx, e, Endpoint::new(id, socket));
     }
     (Endpoint::new(id, "value"), center)
 }
@@ -166,8 +185,11 @@ mod tests {
     use super::*;
     use crate::expr::{ExprValue, PropPath, Waveform};
     use crate::lower::lower_output;
+    use crate::registry::NodeRegistry;
     use crate::node::{ModuleId, NodeId};
 
+    /// The built-in registry, kept alive by the caller so a `GraphCtx` can
+    /// borrow it. Tests that link no module use `GraphCtx::bare`.
     fn reg() -> NodeRegistry {
         NodeRegistry::with_builtins()
     }
@@ -177,9 +199,10 @@ mod tests {
     /// printed form, which captures structure and every leaf value.
     fn round_trips(expr: Expr) {
         let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
-        let ep = raise(&mut g, &reg, &expr, Vec2::ZERO);
-        let back = lower_output(&g, &reg, &ep);
+        let ep = raise(&mut g, ctx, &expr, Vec2::ZERO);
+        let back = lower_output(&g, ctx, &ep);
         assert_eq!(back.to_string(), expr.to_string(), "round trip changed the expression");
     }
 
@@ -212,6 +235,36 @@ mod tests {
         round_trips(expr);
     }
 
+    /// A non-sine oscillator keeps its waveform across the fold. Before the
+    /// node carried one, a square raised onto the canvas lowered back as a sine
+    /// — the recipe silently changed shape on import.
+    #[test]
+    fn an_oscillators_waveform_survives_the_fold() {
+        let expr = Expr::Gen(Generator::Oscillator {
+            freq: Box::new(Expr::Lit(ExprValue::Num(0.5))),
+            amp: Box::new(Expr::Lit(ExprValue::Num(2.0))),
+            phase: Box::new(Expr::Lit(ExprValue::Num(0.0))),
+            offset: Box::new(Expr::Lit(ExprValue::Num(0.0))),
+            wave: Waveform::Square,
+        });
+        round_trips(expr);
+
+        // …and it's the *node's* waveform doing it, not a coincidence of
+        // printing: the raised node carries the square in its config.
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let expr = Expr::Gen(Generator::Oscillator {
+            freq: Box::new(Expr::Lit(ExprValue::Num(0.5))),
+            amp: Box::new(Expr::Lit(ExprValue::Num(1.0))),
+            phase: Box::new(Expr::Lit(ExprValue::Num(0.0))),
+            offset: Box::new(Expr::Lit(ExprValue::Num(0.0))),
+            wave: Waveform::Saw,
+        });
+        let ep = raise(&mut g, ctx, &expr, Vec2::ZERO);
+        assert_eq!(g.node(ep.node).unwrap().config.wave, Waveform::Saw);
+    }
+
     #[test]
     fn a_time_source_feeding_math_round_trips() {
         // localTime into a mul — proves a Time output wires into a Number input.
@@ -237,5 +290,40 @@ mod tests {
     fn a_plain_module_link_round_trips() {
         let expr = Expr::Use { module: ModuleId(3), overrides: Vec::new() };
         round_trips(expr);
+    }
+
+    /// A link's **overrides** round-trip too, now that a `use` node's sockets
+    /// come from the module it links. Before that, raising dropped them and the
+    /// link silently fell back to the module's defaults on import.
+    #[test]
+    fn a_module_links_overrides_round_trip() {
+        use crate::node::{Module, ParamValue};
+        let module = Module::new("pulse", Expr::Param { node: None, name: "amp".into() })
+            .with_param("amp", ParamValue::Num(crate::value::Value::constant(1.0)))
+            .with_param("rate", ParamValue::Num(crate::value::Value::constant(2.0)));
+        let modules: std::collections::BTreeMap<_, _> =
+            [(ModuleId(3), module)].into_iter().collect();
+        let reg = reg();
+        let ctx = &GraphCtx::new(&reg, &modules);
+
+        // `amp` overridden with a real sub-expression; `rate` left inheriting.
+        let expr = Expr::Use {
+            module: ModuleId(3),
+            overrides: vec![(
+                "amp".into(),
+                Expr::Mul(
+                    Box::new(Expr::Lit(ExprValue::Num(4.0))),
+                    Box::new(Expr::Time(TimeSource::T01)),
+                ),
+            )],
+        };
+        let mut g = NodeGraph::new();
+        let ep = raise(&mut g, ctx, &expr, Vec2::ZERO);
+        let back = lower_output(&g, ctx, &ep);
+        assert_eq!(back.to_string(), expr.to_string());
+        // The inherited knob really is absent, not overridden with a copy of
+        // its default — a copy would stop retiming in the caller's scope.
+        let Expr::Use { overrides, .. } = &back else { panic!("{back:?}") };
+        assert_eq!(overrides.len(), 1, "only the touched knob is overridden");
     }
 }

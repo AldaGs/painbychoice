@@ -25,14 +25,22 @@ pub(crate) enum Editor {
     Properties,
     Transport,
     Dopesheet,
-    /// The expression/node-graph editor: builds a `Value::Expr` on the selected
-    /// node's properties. Not in the default layout — summon it into any content
-    /// area with the area-header picker.
+    /// **Retired.** The old per-property expression editor, replaced entirely by
+    /// [`Editor::NodeGraph`] once the node canvas covered everything it did
+    /// (module authoring and body scope, link overrides, oscillator waveforms,
+    /// exposed knobs, and the script live result).
+    ///
+    /// The variant stays because it is **document data**: a `.pbc` saved while
+    /// an area showed this panel names it in the stored layout, and an unknown
+    /// variant is a hard serde error — it would fail the whole file, not just
+    /// the layout. [`Dock::migrate_retired`] rewrites such a leaf to
+    /// `NodeGraph` on load; nothing can produce a new one, since it isn't in
+    /// [`SWAPPABLE`].
     Graph,
     /// The composition node-graph editor: a Blender-style canvas of typed nodes
-    /// wired output→input, drawn from the `NodeRegistry`. Like `Graph`, it runs
-    /// its own scroll area and isn't in the default layout — summon it with the
-    /// area-header picker.
+    /// wired output→input, drawn from the `NodeRegistry`. It runs its own scroll
+    /// area and isn't in the default layout — summon it with the area-header
+    /// picker.
     NodeGraph,
 }
 
@@ -44,8 +52,8 @@ pub(crate) enum Editor {
 /// and **Transport** are fixed chrome. So those three carry no area header:
 /// they can't be swapped away, split, or closed, which is exactly what keeps
 /// the canvas invariants intact while the content panels rearrange around them.
-pub(crate) const SWAPPABLE: [Editor; 5] =
-    [Editor::Layers, Editor::Properties, Editor::Dopesheet, Editor::Graph, Editor::NodeGraph];
+pub(crate) const SWAPPABLE: [Editor; 4] =
+    [Editor::Layers, Editor::Properties, Editor::Dopesheet, Editor::NodeGraph];
 
 impl Editor {
     /// Human name shown in the area-header picker.
@@ -57,7 +65,9 @@ impl Editor {
             Editor::Properties => "Properties",
             Editor::Transport => "Transport",
             Editor::Dopesheet => "Dopesheet",
-            Editor::Graph => "Graph",
+            // Retired — see `Editor::Graph`. Labelled as what it becomes, since
+            // the only way to see one is a saved layout mid-migration.
+            Editor::Graph => "Nodes",
             Editor::NodeGraph => "Nodes",
         }
     }
@@ -318,6 +328,27 @@ impl Dock {
     /// the default: exactly one canvas — the single vello target and the tree's
     /// innermost leaf — plus the two headerless toolbars, which no picker can
     /// re-add if a bad layout dropped them.
+    /// Rewrite any leaf showing a **retired** editor to its replacement.
+    ///
+    /// Run on every loaded layout, before [`Self::is_valid`]. A saved `.pbc`
+    /// can name a panel that no longer exists — the layout is document data,
+    /// and the code that wrote it is gone — so retiring a panel has to migrate
+    /// its leaves rather than strand or discard the whole arrangement the user
+    /// built. Today that's `Graph` → `NodeGraph`, the panel that replaced it.
+    pub(crate) fn migrate_retired(&mut self) {
+        match self {
+            Dock::Leaf(e) => {
+                if *e == Editor::Graph {
+                    *e = Editor::NodeGraph;
+                }
+            }
+            Dock::Split { first, second, .. } => {
+                first.migrate_retired();
+                second.migrate_retired();
+            }
+        }
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         fn tally(d: &Dock, canvas: &mut u32, comp: &mut u32, transport: &mut u32) {
             match d {

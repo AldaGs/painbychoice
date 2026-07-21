@@ -318,8 +318,12 @@ impl TimeSource {
 /// A periodic waveform for [`Generator::Oscillator`]. Sampled over a phase in
 /// *cycles* (`1.0` = one full period), so every shape shares the oscillator's
 /// `freq`/`phase` units. Each returns a value in `[-1, 1]`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `Sine` is the default — the shape an oscillator is unless something says
+/// otherwise, and what a graph node lowers to when its config predates the
+/// waveform field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Waveform {
+    #[default]
     Sine,
     Triangle,
     Square,

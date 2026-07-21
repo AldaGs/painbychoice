@@ -264,22 +264,29 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
     // Unwired input defaults (math operands, generator knobs) mirror the IR's
     // own seed values, so lowering a fresh node reproduces `Expr::seed`.
     let num = crate::expr::ExprValue::Num;
+    let vec2 = |x, y| crate::expr::ExprValue::Vec2(kurbo::Vec2::new(x, y));
     vec![
         // ── Geometry: a shape's params are inputs; it outputs its geometry and
-        //    echoes its resolved params so math can chain off them. ───────────
+        //    echoes its resolved params so math can chain off them. An echo
+        //    output shares its input's id and type — that pairing *is* the echo,
+        //    and `lower_out` reads it structurally rather than per-kind.
+        //
+        //    Their defaults match the layers panel's add-shape seeds, so a rect
+        //    dropped on the canvas is the same rect the toolbar makes. ─────────
         NodeDescriptor::new("rect", Cat::Geometry, "Rectangle")
-            .input("size", "Size", Vector)
-            .input("radius", "Radius", Number)
+            .input_def("size", "Size", Vector, vec2(200.0, 200.0))
+            .input_def("radius", "Radius", Number, num(0.0))
             .output("geometry", "Geometry", Geometry)
             .output("size", "Size", Vector)
             .output("radius", "Radius", Number),
         NodeDescriptor::new("ellipse", Cat::Geometry, "Ellipse")
-            .input("size", "Size", Vector)
+            .input_def("size", "Size", Vector, vec2(200.0, 200.0))
             .output("geometry", "Geometry", Geometry)
             .output("size", "Size", Vector),
         NodeDescriptor::new("text", Cat::Geometry, "Text")
-            .input("size", "Font Size", Number)
-            .output("geometry", "Geometry", Geometry),
+            .input_def("size", "Font Size", Number, num(96.0))
+            .output("geometry", "Geometry", Geometry)
+            .output("size", "Font Size", Number),
         // ── Math: an input (or two) and a result. ────────────────────────────
         NodeDescriptor::new("add", Cat::Math, "Add")
             .input_def("a", "A", Number, num(0.0))
@@ -404,6 +411,31 @@ mod tests {
                 "built-in '{}' is in {:?}, which needs the compositor stage",
                 d.id,
                 d.category,
+            );
+        }
+    }
+
+    /// A geometry node's scalar outputs are **echoes**: each shares an input's
+    /// id and type. That pairing is what `lower_out` reads to pass a resolved
+    /// param through to math, structurally rather than per-kind — an output that
+    /// didn't pair up would lower to nothing.
+    #[test]
+    fn a_geometry_nodes_scalar_outputs_echo_its_inputs() {
+        let reg = NodeRegistry::with_builtins();
+        for id in ["rect", "ellipse", "text"] {
+            let d = reg.get(id).unwrap();
+            assert_eq!(d.outputs[0].id, "geometry", "{id}: the geometry output comes first");
+            for s in &d.outputs[1..] {
+                let echoed = d
+                    .find_input(&s.id)
+                    .unwrap_or_else(|| panic!("{id}.{} echoes no input of that id", s.id));
+                assert_eq!(echoed.ty, s.ty, "{id}.{}: the echo's type differs", s.id);
+            }
+            // Every shape param has a resting literal, so an unwired shape node
+            // lowers to a *visible* shape rather than a zero-sized one.
+            assert!(
+                d.inputs.iter().all(|s| s.default.is_some()),
+                "{id}: a shape param with no default would lower to zero"
             );
         }
     }
