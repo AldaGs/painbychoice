@@ -1153,7 +1153,10 @@ the Nuke-style *image* graph. Pre-comps come before the big graph because a comp
 graph is last because it needs the raster compositor stage below, which isn't
 built. Note the distinction: today's graph is a **property** graph (values into
 properties); Nuke's is an **image** graph (operations on pixels). They're
-different machines.
+different machines. The plan for that scene/composition graph — how it lowers to
+the existing IR, and the node-descriptor + socket registry that lets a new
+object/effect/plugin auto-integrate as a node — is spec'd in *The composition node
+graph — one node system, three scopes* in the Design decisions section below.
 
 **Canvas gizmos + grids (added 2026-07-20).** Not part of the agreed sequence
 above — it came in sideways as a preview-panel need. The **transform gizmo is
@@ -1629,6 +1632,126 @@ document-wide-graph step rather than inventing a sixth subsystem.
 local-time sources (with pre-comps) → the linked module + override (with the
 document-wide property graph); footage rides its own track and gates only the
 video background.
+
+### The composition node graph — one node system, three scopes (agreed — not yet built)
+
+The differentiator past today's per-property expression editor, and the home for
+"drive animation with nodes." Decided 2026-07-21. **Nothing here is built yet**;
+this records the model so the reasoning survives, like every subsection above.
+
+**Two graphs, named.** What `graph.rs` renders today is a *property* graph: pick
+a node, promote one property, edit its `Expr` tree (`Lit`/`Ref`/`Add·Mul·Neg`/
+`Gen`/`Script`/`Param`/`Use`) as an auto-laid-out **tree** (`layout_expr`) whose
+wires only run parent→child. Values flow *into one property*. What "nodes to
+drive animation" asks for is a *scene/composition* graph: a free-form **DAG** of
+whole things — a rectangle with output sockets, math with input+result, comps
+wiring mattes/masks/effectors/adjustment-layers/parenting — where outputs are
+*shared*, not owned by one property. These are different machines (the Roadmap
+already draws the line: property graph ✅ vs. the Nuke-style image graph, unbuilt).
+This doc is the plan for the second, built so both become **one node system at
+different scopes** rather than two unrelated panels.
+
+**The model decision: alongside, lowering to the IR.** The `Node`/`Comp` tree
+stays the **structural spine** — layers, groups, parenting, precomp instancing.
+The node graph is an **authoring front-end that lowers to today's `Node`/`Expr`
+IR**; `evaluate(doc, t)` stays the single pure entry point and is not touched.
+This is the EBN "IR + dumb-printer" discipline applied once more (graph = source,
+`Node`/`Expr` = IR, `evaluate` = the tree-walk), and it is also what Blender and
+Nuke actually do — an outliner/tree *and* node editors, not one replacing the
+other. Rejected: making the graph the primary document model. It reads more
+unified on a slide, but it rewrites the doc model, serialization, and every panel
+and test built on the tree — to buy nothing `evaluate` can't already do, since
+the memo + `visiting` cycle guard in `EvalCtx` already evaluate a shared-output
+DAG.
+
+**Multi-level = three scopes of the same node system.** "Make the nodes
+multi-level / distinguish layers and compositions" resolves to *where* a graph is
+scoped, not three separate editors:
+- **Object scope** — a layer's own driver/geometry network. Today's property
+  graph, generalized: a `Rect` node's `size`/`radius` become **output sockets**,
+  so math can read them, instead of a promoted-property tree hidden inside one
+  value.
+- **Composition scope** — layers/comps/effects/mattes as nodes; wiring expresses
+  the compositing, matte/track-matte, effector, and parenting relationships that
+  aren't a single value.
+- **Document scope** — shared modules (already first-class: `Module` +
+  `Expr::Use`).
+
+A **composition node is a group you can enter** — Blender's node groups / Nuke's
+Groups — which is the same act as opening a precomp today. "Layer vs composition"
+is then just *leaf node vs enterable group node*, and nesting is the `precomp`
+link that already exists.
+
+**The keystone that gates everything else: a node-type descriptor + socket
+registry.** This is the answer to "how does adding a new object/layer/effect/
+plugin already integrate itself as a node." Today `Shape`, `ExprKind`, and
+`Generator` are **closed enums matched exhaustively**, with **per-kind editors
+hand-written in `graph.rs`** (`expr_box`, `ref_editor`, `wave_editor`, …). That
+is the *opposite* of auto-integration: a new type means editing the enum, the
+`apply_graph_op` arms, and the UI. The fix is a metadata layer — headless,
+`core`, unit-tested, in the grain of the crate's discipline:
+- **`SocketType`** — the port type system. The three `ExprValue` kinds (Number /
+  Vec2 / Color) plus the scene-graph kinds (Geometry/Path, Layer/Render,
+  Matte/Alpha, Time). **Each type carries a colour** — that *is* Blender's
+  colour-coded dots, defined in one place instead of scattered through the UI.
+- **`NodeDescriptor`** — per node kind: id, category, label, input sockets
+  (name, type, default), output sockets (name, type), and its eval behaviour.
+- **A registry** `kind-id → descriptor`. Built-ins register at startup; WASM /
+  native plugins register *identically* later. This is exactly the already-agreed
+  plugin seam ("effects, generators, importers, exporters as trait objects behind
+  registries; dogfood our built-ins through the same seams; a third-party plugin
+  is just another registered impl") — the descriptor is that seam, made concrete.
+
+The UI then draws **any** node from its descriptor (rounded box, input dots left /
+output dots right coloured by `SocketType`, bezier wires), so a new node type
+appears in the graph for free. The closed IR enums **stay** as the evaluation
+substrate — the descriptor is *metadata that lowers to them*, never a second
+evaluator. A new native primitive still adds its enum arm; what the registry buys
+is that the *graph and its UI* need no change, and that a plugin can contribute a
+kind the core enum doesn't have (lowering through a generic plugin/`Script` arm).
+
+**What lowers to what** (the "alongside" contract, made concrete):
+
+| Graph node | Lowers to |
+| --- | --- |
+| Rectangle / shape (with output sockets) | `Node { shape: Shape::Rect… }`; sockets read its `Value`s |
+| Math (input + result) | an `Expr` subtree (`Add`/`Mul`/`Neg`/`Gen`/`Script`) |
+| Reference / driver wire | `Expr::Ref` / `Expr::Param` — the memo collapses shared reads |
+| Module / reuse | `Expr::Use { module, overrides }` |
+| Group / parent | tree nesting (`Node.children` + the transform compose) |
+| Composition instance | `Node.precomp: CompId` |
+| Effect / matte / mask / adjustment layer | **the compositor stage — not built** |
+
+**The honest gate: half the wish-list needs the compositor stage.** Effects (and
+their properties-panel UI), mattes, masks, adjustment layers, and pixel-level
+effectors are all facets of the *one* unbuilt subsystem this README already
+specifies (offscreen layer target → ordered effect passes → composite with blend
++ opacity + mask). They can exist as **descriptors/stubs** in the graph
+immediately — a node with the right sockets and colour — but they cannot *do*
+anything until that stage lands. Effect params are `Value<T>`, so once the stage
+exists they animate through the same graph for free. So the node UI and the
+value/geometry/math/parenting/module nodes are buildable now; the *effect* half is
+buildable only behind the compositor. Don't promise the effect nodes before that
+gate.
+
+**UI.** Blender-style, descriptor-driven. Reuse the geometry already in
+`graph.rs` — `box_height`, the rect/stroke draw, drag-to-move, the wire
+`line_segment` (upgraded to a bezier) — but drive it from a stored
+`Graph { nodes, edges }` and node descriptors, not a per-property `layout_expr`
+tree re-derived each frame. Same `*Edits`-struct discipline every panel follows
+(the egui closure never borrows `App`; report ops, apply after).
+
+**Build order.** (1) `SocketType` + `NodeDescriptor` + registry, headless and
+tested. (2) The generic graph model + descriptor-driven panel. (3) Lowering to
+the `Node`/`Expr` IR, and folding today's property graph in as the object-scope
+case. (4) The compositor stage — the real gate for effects/mattes/masks. (5)
+Effect nodes + their properties-panel show, then plugins registering descriptors
+like built-ins. Steps 1–3 need no new engine; step 4 is the large separate track.
+
+**Invariants to protect.** `evaluate` stays the one pure entry point; the closed
+IR enums stay the evaluation substrate (descriptors are metadata, not a rival
+evaluator); the tree stays the structural spine; a new node type is a registered
+descriptor, not a UI edit.
 
 ### The two unifying insights (why this isn't N separate projects)
 
