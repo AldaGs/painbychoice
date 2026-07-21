@@ -293,7 +293,10 @@ pub(crate) enum GraphOp {
     ExtractModule { kind: PropKind },
     /// Point this property at an existing module (promoting it if needed).
     LinkModule { kind: PropKind, module: ModuleId },
-    /// Repoint an existing link at a different module.
+    /// Point the node at `path` at `module` as a link. Repoints an existing
+    /// `Use` (keeping its overrides) *or* seeds a fresh one over any other kind
+    /// (starting with no overrides) — which is how the kind picker creates a
+    /// `Use`, since a bare `ExprKind` can't name the module.
     SetModule { target: GraphTarget, path: Vec<usize>, module: ModuleId },
     /// Override one knob at a link site, or clear it back to inheriting.
     SetOverride { target: GraphTarget, path: Vec<usize>, name: String, value: Option<ExprValue> },
@@ -337,8 +340,9 @@ pub(crate) fn box_height(expr: &Expr, labeled: bool) -> f32 {
         Expr::Gen(_) => 30.0,
         // A layer-clock leaf has no controls at all — it *is* its kind picker.
         Expr::Time(_) => 30.0,
-        // A module link shows which module it points at; its overrides get an
-        // editor with the module picker, in the graph-UI step.
+        // A module link shows the module picker plus one inherit/override toggle
+        // row per knob; each *overridden* knob's value is a wired-in child box
+        // (its overrides are the node's children now), not edited in here.
         Expr::Use { .. } => 50.0,
         Expr::Add(..) | Expr::Mul(..) | Expr::Neg(..) => 30.0,
     };
@@ -388,7 +392,11 @@ pub(crate) fn layout_expr(expr: &Expr) -> Vec<ExprBox> {
         } else {
             let (mut first, mut last) = (0.0, 0.0);
             for slot in 0..expr.arity() {
-                let child_labeled = expr.slot_label(slot).is_some();
+                // A link's override children are labelled with the knob name
+                // (derived in the canvas, not core), so reserve the label line
+                // for them the same way a generator knob's does.
+                let child_labeled =
+                    matches!(expr, Expr::Use { .. }) || expr.slot_label(slot).is_some();
                 path.push(slot);
                 let c = rec(
                     child_ref(expr, slot).unwrap(),
@@ -639,16 +647,22 @@ pub(crate) fn expr_canvas(
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             egui::StrokeKind::Inside,
         );
-        // A generator knob shows its name (`freq`/`amp`/…) so a wired box is
-        // read the same as the labelled slot it fills; operator operands are
-        // positional and unlabelled.
+        // A generator knob shows its name (`freq`/`amp`/…) and a link override
+        // shows the knob it overrides, so a wired box is read the same as the
+        // labelled slot it fills; operator operands are positional and
+        // unlabelled. A link's override name is dynamic (owned), so it's derived
+        // here rather than through core's `&'static` slot labels.
         let slot_label = b.path.split_last().and_then(|(&slot, parent)| {
-            expr.at(parent).and_then(|p| p.slot_label(slot))
+            let p = expr.at(parent)?;
+            match p {
+                Expr::Use { overrides, .. } => overrides.get(slot).map(|(n, _)| n.clone()),
+                _ => p.slot_label(slot).map(str::to_string),
+            }
         });
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(5.0)));
         expr_box(
-            &mut child, node, target, frame, &b.path, slot_label, nodes, params, results,
-            modules, out,
+            &mut child, node, target, frame, &b.path, slot_label.as_deref(), nodes, params,
+            results, modules, out,
         );
     }
 
@@ -685,6 +699,28 @@ pub(crate) fn expr_box(
                     out.op = Some(GraphOp::SetKind { target, path: path.to_vec(), new: k });
                 }
             }
+            // `Use` is deliberately absent from `ExprKind::ALL`: seeding a link
+            // needs a module to point at, which a bare kind can't carry. So the
+            // picker lists the modules themselves — each seeds a fresh link via
+            // `SetModule`, which replaces whatever's here with `use <module>`
+            // (no overrides, since the node wasn't a link). This is the kind
+            // picker's half of the graph-UI "seed a `Use`" step.
+            if !modules.is_empty() {
+                ui.separator();
+                ui.weak("use module");
+                let cur_module = match expr {
+                    Expr::Use { module, .. } => Some(*module),
+                    _ => None,
+                };
+                for m in modules {
+                    if ui.selectable_label(cur_module == Some(m.id), &m.name).clicked()
+                        && cur_module != Some(m.id)
+                    {
+                        out.op =
+                            Some(GraphOp::SetModule { target, path: path.to_vec(), module: m.id });
+                    }
+                }
+            }
         });
     match expr {
         Expr::Lit(v) => lit_editor(ui, *v, target, path, out),
@@ -715,6 +751,13 @@ pub(crate) fn expr_box(
 /// Inherit is the resting state and is spelled out rather than implied by a
 /// blank field — the whole point of a module is that unset knobs keep following
 /// the definition, and a UI that can't show the difference hides it.
+///
+/// Each overridden knob's *value* is a wired-in child box on the canvas (a
+/// link's overrides are its tree children now), edited like any other
+/// sub-expression — so an override can be a literal, a `ref`, a `param`, a
+/// script, anything. This row only toggles the two states: pressing **override**
+/// seeds a literal `0` child to start from, **inherit** (the `x`) drops the
+/// override so the knob follows the module again.
 pub(crate) fn use_editor(
     ui: &mut egui::Ui,
     module: ModuleId,
@@ -739,81 +782,34 @@ pub(crate) fn use_editor(
         });
     let Some(current) = current else { return };
     for name in &current.params {
-        let overridden = overrides.iter().find(|(n, _)| n == name);
+        let overridden = overrides.iter().any(|(n, _)| n == name);
         ui.horizontal(|ui| {
             ui.small(name);
-            match overridden {
-                Some((_, Expr::Lit(v))) => {
-                    let mut value = *v;
-                    let changed = match &mut value {
-                        ExprValue::Num(n) => {
-                            ui.add(egui::DragValue::new(n).speed(0.01)).changed()
-                        }
-                        ExprValue::Vec2(v) => {
-                            let a = ui.add(egui::DragValue::new(&mut v.x).speed(0.5)).changed();
-                            let b = ui.add(egui::DragValue::new(&mut v.y).speed(0.5)).changed();
-                            a || b
-                        }
-                        ExprValue::Color(c) => {
-                            let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
-                            let changed = ui.color_edit_button_rgb(&mut rgb).changed();
-                            if changed {
-                                *c = MColor::rgba(
-                                    rgb[0] as f64,
-                                    rgb[1] as f64,
-                                    rgb[2] as f64,
-                                    c.a,
-                                );
-                            }
-                            changed
-                        }
-                    };
-                    if changed {
-                        out.op = Some(GraphOp::SetOverride {
-                            target,
-                            path: path.to_vec(),
-                            name: name.clone(),
-                            value: Some(value),
-                        });
-                    }
-                    if ui.small_button("x").on_hover_text("Inherit from the module").clicked() {
-                        out.op = Some(GraphOp::SetOverride {
-                            target,
-                            path: path.to_vec(),
-                            name: name.clone(),
-                            value: None,
-                        });
-                    }
+            if overridden {
+                // The value lives in the wired child box labelled `name`; here
+                // we only offer to stop overriding.
+                ui.weak("override →");
+                if ui.small_button("x").on_hover_text("Inherit from the module").clicked() {
+                    out.op = Some(GraphOp::SetOverride {
+                        target,
+                        path: path.to_vec(),
+                        name: name.clone(),
+                        value: None,
+                    });
                 }
-                // A non-literal override (an expression) is shown, not edited:
-                // it would need its own nested canvas at the link site. The
-                // module *body* now has a canvas (open it from the modules
-                // list); an override sub-expression still doesn't.
-                Some((_, expr)) => {
-                    ui.weak(expr.to_string());
-                    if ui.small_button("x").clicked() {
-                        out.op = Some(GraphOp::SetOverride {
-                            target,
-                            path: path.to_vec(),
-                            name: name.clone(),
-                            value: None,
-                        });
-                    }
-                }
-                None => {
-                    if ui
-                        .small_button("inherit")
-                        .on_hover_text("Following the module — click to override here")
-                        .clicked()
-                    {
-                        out.op = Some(GraphOp::SetOverride {
-                            target,
-                            path: path.to_vec(),
-                            name: name.clone(),
-                            value: Some(ExprValue::Num(0.0)),
-                        });
-                    }
-                }
+            } else if ui
+                .small_button("inherit")
+                .on_hover_text("Following the module — click to override here")
+                .clicked()
+            {
+                // Seed a literal `0`; it appears as a child box to edit into
+                // anything (a ref, a param, a script) from its kind picker.
+                out.op = Some(GraphOp::SetOverride {
+                    target,
+                    path: path.to_vec(),
+                    name: name.clone(),
+                    value: Some(ExprValue::Num(0.0)),
+                });
             }
         });
     }

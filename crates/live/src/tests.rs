@@ -17,6 +17,12 @@ fn apply_op(doc: &mut Document, id: NodeId, op: GraphOp, frame: i64) {
     *doc = project.comps.remove(&comp).expect("the comp survives");
 }
 
+/// Apply a graph op against a real project (at frame 0) — for the module/link
+/// tests, where the op reaches the project-wide registry, not just a comp.
+fn apply_op_full(project: &mut MProject, comp: CompId, id: NodeId, op: GraphOp) {
+    apply_graph_op(project, comp, Some(id), op, 0);
+}
+
 
 fn test_axis(view: TimelineView) -> Axis {
     // 8px pad each side → a 400px usable span.
@@ -1401,6 +1407,87 @@ fn editing_the_extracted_module_drives_the_property() {
     project.module_mut(module).unwrap().body = Expr::Lit(ExprValue::Num(0.75));
     let scene = motion_core::evaluate_comp(&project, comp, 0.0);
     assert!((scene.items[0].opacity - 0.75).abs() < 1e-9);
+}
+
+/// The kind picker seeds a `Use` by naming a module: choosing one over an
+/// already-promoted (non-`Use`) node emits `SetModule`, which must turn that node
+/// into a fresh link — pointing at the chosen module, with no overrides — and
+/// drive the property from the module's body.
+#[test]
+fn the_kind_picker_seeds_a_fresh_use_link() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    let module = project.add_module(MModule::new("half", Expr::Lit(ExprValue::Num(0.5))));
+
+    // The property is expr-driven but *not* a link (it's the promoted recipe).
+    // This is exactly the state the kind picker acts on — a box on the canvas.
+    apply_graph_op(
+        &mut project,
+        comp,
+        Some(id),
+        GraphOp::SetModule {
+            target: GraphTarget::Prop(PropKind::Opacity),
+            path: Vec::new(),
+            module,
+        },
+        0,
+    );
+
+    let node = project.comp(comp).unwrap().root.find(id).unwrap();
+    let expr = prop_of(node, PropKind::Opacity).unwrap().expr().cloned().unwrap();
+    match expr {
+        Expr::Use { module: m, overrides } => {
+            assert_eq!(m, module, "links the chosen module");
+            assert!(overrides.is_empty(), "a seeded link starts inheriting everything");
+        }
+        other => panic!("expected a fresh Use link, got {other:?}"),
+    }
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+    assert!((scene.items[0].opacity - 0.5).abs() < 1e-9, "the module body drives it");
+}
+
+/// An override is a child box on the canvas now, so it's editable into any
+/// expression — not just a literal. Overriding a knob, then editing that
+/// override sub-expression through the ordinary canvas ops (its path is the
+/// link's path + the child slot) must drive the module, which is the whole point
+/// of the nested-override canvas.
+#[test]
+fn an_override_sub_expression_is_editable_on_the_canvas() {
+    let (mut project, comp, id) = project_with_expr_opacity();
+    // A module whose body just echoes its `amount` knob (default 0.4).
+    let module = project.add_module(
+        MModule::new("level", Expr::Param { node: None, name: "amount".into() })
+            .with_param("amount", ParamValue::Num(Value::constant(0.4))),
+    );
+    apply_graph_op(&mut project, comp, Some(id), GraphOp::LinkModule { kind: PropKind::Opacity, module }, 0);
+    let opacity = |p: &MProject| motion_core::evaluate_comp(p, comp, 0.0).items[0].opacity;
+    assert!((opacity(&project) - 0.4).abs() < 1e-9, "inherits the default");
+
+    // Override `amount`: this seeds a literal `0` child at the link's slot 0.
+    apply_op_full(&mut project, comp, id, GraphOp::SetOverride {
+        target: GraphTarget::Prop(PropKind::Opacity),
+        path: Vec::new(),
+        name: "amount".into(),
+        value: Some(ExprValue::Num(0.0)),
+    });
+    assert!(opacity(&project).abs() < 1e-9, "the seeded override is 0");
+
+    // Now edit that override *child* (path [0]) into a script — the case that
+    // used to be un-editable. It must drive the knob.
+    apply_op_full(&mut project, comp, id, GraphOp::SetKind {
+        target: GraphTarget::Prop(PropKind::Opacity),
+        path: vec![0],
+        new: ExprKind::Script,
+    });
+    apply_op_full(&mut project, comp, id, GraphOp::SetScript {
+        target: GraphTarget::Prop(PropKind::Opacity),
+        path: vec![0],
+        src: "0.75".into(),
+    });
+
+    let scene = motion_core::evaluate_comp(&project, comp, 0.0);
+    assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+    assert!((scene.items[0].opacity - 0.75).abs() < 1e-9, "the override expression drives it");
 }
 
 /// Overriding a knob and then clearing it must return the link to *inheriting*,

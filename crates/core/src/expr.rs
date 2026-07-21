@@ -596,23 +596,27 @@ impl Expr {
             Expr::Add(..) | Expr::Mul(..) => 2,
             Expr::Neg(..) => 1,
             Expr::Gen(g) => g.arity(),
+            // A link's children are its overrides, in order — so the canvas
+            // lays each override out as a wired box and edits it like any other
+            // sub-expression. A link with no overrides is still a leaf.
+            Expr::Use { overrides, .. } => overrides.len(),
             Expr::Lit(_)
             | Expr::Ref { .. }
             | Expr::Param { .. }
             | Expr::Script(_)
-            | Expr::Use { .. }
             | Expr::Time(_) => 0,
         }
     }
 
     /// Borrow this node's child at `slot` (one level), whatever the kind — the
-    /// operator operands *or* a generator's knobs. Lets an editor walk inputs
-    /// without matching on the variant.
+    /// operator operands, a generator's knobs, *or* a link's overrides. Lets an
+    /// editor walk inputs without matching on the variant.
     pub fn child(&self, slot: usize) -> Option<&Expr> {
         match (self, slot) {
             (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => Some(a),
             (Expr::Add(_, b) | Expr::Mul(_, b), 1) => Some(b),
             (Expr::Gen(g), _) => g.knob(slot),
+            (Expr::Use { overrides, .. }, _) => overrides.get(slot).map(|(_, e)| e),
             _ => None,
         }
     }
@@ -636,6 +640,7 @@ impl Expr {
             (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_ref(),
             (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_ref(),
             (Expr::Gen(g), _) => g.knob(slot)?,
+            (Expr::Use { overrides, .. }, _) => &overrides.get(slot)?.1,
             _ => return None,
         };
         child.at(rest)
@@ -651,6 +656,7 @@ impl Expr {
             (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_mut(),
             (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_mut(),
             (Expr::Gen(g), _) => g.knob_mut(slot)?,
+            (Expr::Use { overrides, .. }, _) => &mut overrides.get_mut(slot)?.1,
             _ => return None,
         };
         child.at_mut(rest)
@@ -669,7 +675,10 @@ pub enum ExprKind {
     Script,
     /// A link to a shared module. Deliberately **not** in [`ExprKind::ALL`]:
     /// that list is the graph picker, and seeding a link needs a module to point
-    /// at, which wants a picker of its own (the Blender-standard graph UI step).
+    /// at, which a bare kind can't carry. The picker instead lists the modules
+    /// themselves and seeds the link with a `SetModule` op (see the graph UI's
+    /// kind picker), so a `Use` is created by choosing *which* module, not just
+    /// the kind.
     Use,
     LocalTime,
     InPoint,
@@ -1608,6 +1617,39 @@ mod tests {
         assert_eq!(e.to_string(), "(2 + (3 * 9))");
         // A slot past the node's arity is None (Neg has only slot 0).
         assert!(Expr::seed(ExprKind::Neg).at_mut(&[1]).is_none());
+    }
+
+    #[test]
+    fn a_links_overrides_are_addressable_children() {
+        // A link with two overrides has arity 2, its children are those override
+        // expressions in order, and `at_mut` reaches into one to edit it — which
+        // is what lets the graph canvas render and edit overrides as wired boxes.
+        let mut e = Expr::Use {
+            module: ModuleId(3),
+            overrides: vec![
+                ("amount".into(), Expr::num(0.2)),
+                ("speed".into(), Expr::num(1.0)),
+            ],
+        };
+        assert_eq!(e.arity(), 2);
+        assert!(matches!(e.child(0), Some(Expr::Lit(ExprValue::Num(n))) if *n == 0.2));
+        assert!(matches!(e.child(1), Some(Expr::Lit(ExprValue::Num(n))) if *n == 1.0));
+        assert!(e.child(2).is_none());
+
+        // Edit the second override into a reference; the first is untouched.
+        *e.at_mut(&[1]).unwrap() = Expr::reference(NodeId(7), PropPath::Opacity);
+        match &e {
+            Expr::Use { overrides, .. } => {
+                assert!(matches!(overrides[0].1, Expr::Lit(_)));
+                assert_eq!(overrides[0].0, "amount");
+                assert!(matches!(overrides[1].1, Expr::Ref { .. }));
+                assert_eq!(overrides[1].0, "speed", "the knob name is kept");
+            }
+            _ => unreachable!(),
+        }
+
+        // A link with no overrides is still a leaf.
+        assert_eq!(Expr::Use { module: ModuleId(0), overrides: vec![] }.arity(), 0);
     }
 
     #[test]
