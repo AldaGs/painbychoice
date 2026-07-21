@@ -2511,3 +2511,40 @@ fn rulers_only_claim_space_when_they_are_shown() {
     let (l, t) = ruler_inset(true);
     assert!(l > 0.0 && t > 0.0, "rulers must claim space on both axes");
 }
+
+/// Guides are grabbed by proximity to their line, within a few points either
+/// side. The band has to be wide enough to hit but narrow enough that two
+/// nearby guides stay separable — and the *nearest* one wins.
+#[test]
+fn a_guide_is_grabbed_from_a_narrow_band_around_its_line() {
+    let fit = Affine::IDENTITY;
+    let guides = vec![
+        Guide { axis: GuideAxis::Vertical, at: 100.0 },
+        Guide { axis: GuideAxis::Horizontal, at: 50.0 },
+    ];
+    // Dead on the vertical guide, and just off it.
+    assert_eq!(guide_under(&guides, fit, 1.0, egui::pos2(100.0, 200.0)), Some(0));
+    assert_eq!(guide_under(&guides, fit, 1.0, egui::pos2(102.0, 200.0)), Some(0));
+    assert_eq!(guide_under(&guides, fit, 1.0, egui::pos2(140.0, 200.0)), None);
+    // The horizontal one is matched on y, whatever x is.
+    assert_eq!(guide_under(&guides, fit, 1.0, egui::pos2(999.0, 50.0)), Some(1));
+    // Nowhere near either.
+    assert_eq!(guide_under(&guides, fit, 1.0, egui::pos2(400.0, 400.0)), None);
+}
+
+/// The grab band is in *screen* points, so zooming out must not make guides
+/// harder to grab: a guide 40 comp-units away is far off screen at 0.1x, and
+/// one 2 comp-units away is a long way off at 8x.
+#[test]
+fn the_guide_grab_band_follows_the_screen_not_the_composition() {
+    let guides = vec![Guide { axis: GuideAxis::Vertical, at: 100.0 }];
+    // Zoomed out 10x: the guide sits at screen x = 10.
+    let out = Affine::scale(0.1);
+    assert_eq!(guide_under(&guides, out, 1.0, egui::pos2(10.0, 0.0)), Some(0));
+    assert_eq!(guide_under(&guides, out, 1.0, egui::pos2(30.0, 0.0)), None);
+    // Zoomed in 8x: the guide sits at screen x = 800, and 2 comp-units away
+    // (screen 816) is now well outside the band.
+    let inn = Affine::scale(8.0);
+    assert_eq!(guide_under(&guides, inn, 1.0, egui::pos2(800.0, 0.0)), Some(0));
+    assert_eq!(guide_under(&guides, inn, 1.0, egui::pos2(816.0, 0.0)), None);
+}

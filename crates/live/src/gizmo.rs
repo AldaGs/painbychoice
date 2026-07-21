@@ -415,7 +415,16 @@ pub(crate) fn gizmo_ui(
 
     if let Some(resp) = &resp {
         if resp.drag_started() {
-            if let (Some(p), Some(handle)) = (pointer, over) {
+            // Hit-test where the button went **down**. egui reports
+            // `drag_started` only once the pointer has passed its drag
+            // threshold, so the live position may already have slid off the
+            // handle — testing it would silently drop the grab. (Note
+            // `interact_pointer_pos()` is not this: it follows the ongoing
+            // interaction rather than staying at the press.) The handles here
+            // are large enough that this rarely bit, but it is the same bug
+            // that made guides need a held click.
+            let press = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer);
+            if let (Some(p), Some(handle)) = (press, press.and_then(|p| hit(&l, p))) {
                 *drag = Some(GizmoDrag {
                     handle,
                     node: target.node,

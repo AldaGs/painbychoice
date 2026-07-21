@@ -29,7 +29,7 @@ use crate::*;
 pub(crate) const RULER: f32 = 18.0;
 
 /// How close (in points) the pointer must come to a guide to grab it.
-const GUIDE_GRAB: f32 = 4.0;
+const GUIDE_GRAB: f32 = 5.0;
 
 const GRID_MAJOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(120, 130, 150, 90);
 const GRID_MINOR: egui::Color32 = egui::Color32::from_rgba_premultiplied(120, 130, 150, 38);
@@ -245,8 +245,25 @@ pub(crate) fn draw_rulers(
     (top, left)
 }
 
+/// Which ruler `p` falls in, and therefore which guide a press there would
+/// create: pulling *down* from the top ruler gives a horizontal line, and out
+/// from the left ruler a vertical one — the guide runs parallel to its ruler.
+fn ruler_axis_at(
+    top: Option<egui::Rect>,
+    left: Option<egui::Rect>,
+    p: egui::Pos2,
+) -> Option<GuideAxis> {
+    if top.is_some_and(|r| r.contains(p)) {
+        Some(GuideAxis::Horizontal)
+    } else if left.is_some_and(|r| r.contains(p)) {
+        Some(GuideAxis::Vertical)
+    } else {
+        None
+    }
+}
+
 /// Which guide (if any) the pointer is near, as an index into `guides`.
-fn guide_under(guides: &[Guide], fit: Affine, ppp: f64, p: egui::Pos2) -> Option<usize> {
+pub(crate) fn guide_under(guides: &[Guide], fit: Affine, ppp: f64, p: egui::Pos2) -> Option<usize> {
     guides.iter().position(|g| {
         let at = screen_coord(g.axis, fit, ppp, g.at);
         let d = match g.axis {
@@ -285,18 +302,7 @@ pub(crate) fn aids_ui(
 
     let pointer = ui.ctx().pointer_latest_pos();
     let in_canvas = pointer.is_some_and(|p| canvas.contains(p));
-    // Which guide a press in a ruler would create. Pulling *down* from the top
-    // ruler gives a horizontal line, and out from the left ruler a vertical one
-    // — the guide runs parallel to the ruler you dragged it from.
-    let over_ruler = pointer.and_then(|p| {
-        if top.is_some_and(|r| r.contains(p)) {
-            Some(GuideAxis::Horizontal)
-        } else if left.is_some_and(|r| r.contains(p)) {
-            Some(GuideAxis::Vertical)
-        } else {
-            None
-        }
-    });
+    let over_ruler = pointer.and_then(|p| ruler_axis_at(top, left, p));
 
     // Guides are only grabbable when shown — a hidden guide must not intercept
     // a click on the artwork underneath it.
@@ -317,14 +323,24 @@ pub(crate) fn aids_ui(
         let resp = ui.interact(region, ui.id().with("aids"), egui::Sense::click_and_drag());
 
         if resp.drag_started() {
-            if let Some(p) = pointer {
-                *drag = match (over_ruler, hot) {
-                    // Dragging out of a ruler makes a guide perpendicular to it:
-                    // pull down from the top ruler and you get a horizontal line.
+            // Hit-test where the button went **down**, not where the pointer is
+            // now. egui only reports `drag_started` once the pointer has moved
+            // past its drag threshold, and by then it has usually left the few
+            // points around the guide — so testing the live position finds
+            // nothing and the grab silently fails. That was the bug behind
+            // "I have to hold the click to drag a guide": holding still kept
+            // the pointer inside the band long enough to be found.
+            //
+            // `interact_pointer_pos()` is *not* this — it tracks the ongoing
+            // interaction, so it moves with the drag. `press_origin` is the
+            // press point.
+            let press = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer);
+            if let Some(p) = press {
+                *drag = match (ruler_axis_at(top, left, p), guide_under(&aids.guides.items, fit, ppp, p)) {
                     (Some(axis), _) => {
                         Some(GuideDrag { axis, index: None, at: comp_coord(axis, fit, ppp, p) })
                     }
-                    (None, Some(i)) => {
+                    (None, Some(i)) if aids.guides.visible => {
                         let g = aids.guides.items[i];
                         Some(GuideDrag {
                             axis: g.axis,

@@ -738,6 +738,18 @@ Two rules keep this safe:
   horizontal scrolling would desync the dopesheet tracks from the ruler (frames
   map across the panel's *width*), and letting it auto-shrink reintroduces the
   same bug from the other side.
+- **Hit-test a drag at `press_origin`, never at the live pointer.** egui reports
+  `drag_started()` only once the pointer has moved past its drag threshold, so
+  by the time you handle it the pointer has usually left the small target that
+  was under the press. Resolving "what did they grab?" against
+  `pointer_latest_pos()` therefore finds nothing and the grab silently fails —
+  the smaller the target, the more often. This is what made guides need a *held*
+  click to drag: holding still kept the pointer inside the 5pt band long enough
+  to be found. Use `ui.ctx().input(|i| i.pointer.press_origin())`.
+  **`Response::interact_pointer_pos()` is not a substitute** — despite the name
+  it tracks the ongoing interaction and moves with the drag. Both `aids.rs` and
+  `gizmo.rs` resolve their grabs this way; the gizmo's handles are big enough
+  that it rarely misfired, which is exactly why it went unnoticed there.
 - **`is_pointer_over_egui` is area-based, not widget-based.** It asks which
   *layer* is under the pointer, and for the background layer whether the point
   falls outside the root `Ui`'s available rect. So it is `false` everywhere in
