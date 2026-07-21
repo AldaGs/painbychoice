@@ -545,6 +545,8 @@ pub(crate) struct CompEdits {
     pub(crate) duration: Option<f64>,
     /// A new composition background colour, as egui's `[f32; 3]`.
     pub(crate) bg: Option<[f32; 3]>,
+    /// A new passepartout strength, 0.0–1.0.
+    pub(crate) passepartout: Option<f64>,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -579,6 +581,7 @@ pub(crate) fn comp_ui(
     fps: f64,
     duration: f64,
     bg: MColor,
+    passepartout: f64,
     out: &mut CompEdits,
     presets: &[String],
     name_buf: &mut String,
@@ -688,6 +691,23 @@ pub(crate) fn comp_ui(
             .changed()
         {
             out.bg = Some(rgb);
+        }
+
+        // Passepartout: how hard the preview dims outside the frame. Shown as a
+        // percentage because that is how you think about it; stored 0–1.
+        ui.label("PP");
+        let mut pct = passepartout * 100.0;
+        if ui
+            .add(
+                egui::DragValue::new(&mut pct)
+                    .speed(1.0)
+                    .range(0.0..=100.0)
+                    .suffix("%"),
+            )
+            .on_hover_text("Passepartout: dim outside the comp bounds (preview only)")
+            .changed()
+        {
+            out.passepartout = Some(pct / 100.0);
         }
         ui.separator();
 

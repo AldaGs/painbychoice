@@ -800,6 +800,74 @@ order past #5* below (pre-comps first). The stages of each item:
      box's kind menu seeds it, and edits route through the same `GraphOp` /
      `apply_graph_op` path as every other node, so the whole flow is unit-tested.
 
+## Text
+
+`Shape::Text { content, family, size, align, max_width }` — `core/src/text.rs`.
+Two decisions, both load-bearing:
+
+**Text resolves to glyph *outlines*, not glyph runs.** `Shape::to_path(ctx)` is
+the seam every renderer consumes, so shaping into a `BezPath` means a text layer
+fills, strokes, transforms, keyframes, and animates through the *existing*
+pipeline — the SVG backend and the offline `motion` binary render text without
+knowing it exists, and **no renderer changed at all** to add this. Handing vello
+glyph runs (the obvious route, and what an earlier note here assumed) would have
+been live-only. parley does the real work — bidi, script segmentation, font
+fallback, line breaking, alignment — and skrifa pulls outlines for the shaped
+glyph ids; the only coordinate work here is the y-flip from font space (y-up,
+from the baseline) into layout space (y-down). Text is centred on the origin, the
+convention `Rect`/`Ellipse` already follow, so anchor/rotation/scale behave.
+
+**Families resolve against the system font set** — so `family` stores a *name*,
+never font bytes. **This is the one place the engine is not deterministic:**
+everywhere else `evaluate(doc, t)` is pure, so a render matches the preview and
+tests pin output; a `.pbc` naming "Futura" instead draws Futura where it's
+installed and a fallback where it isn't. An unknown or blank family falls back
+through the generic sans-serif stack rather than failing, so a project from
+another machine still draws. The tests in `text.rs` therefore assert *structure*
+(non-empty path, bigger size ⇒ bigger box, wrapping ⇒ taller and narrower,
+unknown family still draws) and never exact coordinates.
+
+Only `size` is a `Value`, so it's the only keyframable/expression-drivable text
+channel (`PropKind::TextSize`, `PropPath::TextSize` → `text_size` in scripts).
+`content` is a plain `String` because [`Value`] carries only interpolatable,
+expression-typed values (`f64`/`Vec2`/`Color`) — there's no string in
+`ExprValue`, so **a keyframed or scripted string (a typewriter effect) needs a
+wider value model** and is the obvious next step for this primitive.
+
+Shaping contexts (parley's `FontContext`/`LayoutContext`) are `thread_local` and
+reused, like `expr.rs`'s script engine — enumerating system fonts is far too
+expensive to redo per frame.
+
+### Picking a font, and when one is missing
+
+A missing font is **invisible by construction**: parley substitutes and the text
+draws perfectly well in the wrong face, so nothing about the frame reveals it.
+Hence `text::font_exists` and two places that report it:
+
+- **`scene.warnings`** — `Shape::to_path` warns through `EvalCtx::warn_here`
+  (widened to `pub(crate)` so a *shape* can warn, not just an expression), which
+  puts it behind the comp bar's existing amber indicator for free. Same channel
+  as a broken script, same "fall back to something drawable but say so" rule as a
+  dangling `Ref`.
+- **The Font row** — an amber warning glyph beside the picker, naming the font
+  and explaining that the project still stores the name, so it will look right on
+  a machine that has it.
+
+A **blank family is never "missing"**: it means "use the default" deliberately, so
+it reports as existing and never warns — otherwise every new text layer would
+ship with a warning on it.
+
+The picker itself follows the modern-editor shape: a searchable list of every
+installed family with recently-applied fonts pinned on top, and **hover to
+preview, click to apply**. Hovering only reports
+`PropEdits::text_family_preview`; `App::preview_project` then renders *that*
+frame from a throwaway clone with the family swapped in, so browsing hundreds of
+fonts never touches the document and needs no undo. The clone only happens while
+a row is hovered, so the common path pays nothing. Recents are session-only
+(`remember_font`, a free function so its most-recently-used ordering is
+unit-tested) — they're app state, not project state, so they stay out of the
+`.pbc`.
+
 **Agreed order past #5** (decided 2026-07-19): multi-composition / pre-comps ✅
 → document-wide property graph ✅ → Blender-standard graph UI (in progress) →
 the Nuke-style *image* graph. Pre-comps come before the big graph because a comp
@@ -1207,12 +1275,12 @@ of them update; but any single subtitle can **override** it and diverge.
 This is not one feature — it's the intersection of five, most already on the
 roadmap. What it needs, and where each piece lands:
 
-1. **Text layers** (new authoring primitive) — a `Shape::Text` (or a dedicated
-   node kind) with a `Value<String>` content plus font/size/alignment. Vello's
-   text support is thin, so this pulls in a shaper (`parley` / `cosmic-text` →
-   glyph runs → vello). Subtitles are just text layers whose in/out match each
-   caption's timing. *When:* a near-term primitive, **independent of the graph
-   work** — it can land any time, but the story can't start without it.
+1. ~~**Text layers**~~ ✅ **Done (2026-07-20).** `Shape::Text { content, family,
+   size, align, max_width }`, shaped with **parley** (bidi, script segmentation,
+   font fallback, line breaking, alignment) against **system fonts**, with
+   **skrifa** pulling the outlines for the shaped glyph ids. See *Text* below for
+   the two decisions that shaped it. Subtitles are just text layers whose in/out
+   match each caption's timing.
 
 2. **A layer time model — in/out points** (`core` change) — today a node has no
    time range: the comp has a single `duration` and every layer is live for all

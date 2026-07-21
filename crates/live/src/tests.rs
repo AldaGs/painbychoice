@@ -2217,3 +2217,102 @@ fn every_content_leaf_is_kept_from_resizing_its_own_panel() {
     assert!(!Editor::Comp.scroll_wrapped());
     assert!(!Editor::Transport.scroll_wrapped());
 }
+
+/// The font picker's "Recent" section is a most-recently-used list: re-picking a
+/// font already there moves it to the front instead of duplicating it, and the
+/// list stays capped. Without the move-to-front, the section would drift into
+/// "fonts I used once, ages ago".
+#[test]
+fn recent_fonts_are_most_recently_used_and_deduplicated() {
+    let mut recent = Vec::new();
+    remember_font(&mut recent, "Georgia");
+    remember_font(&mut recent, "Inter");
+    assert_eq!(recent, ["Inter", "Georgia"], "most recent first");
+
+    // Re-picking an existing font moves it up rather than adding a copy.
+    remember_font(&mut recent, "Georgia");
+    assert_eq!(recent, ["Georgia", "Inter"], "moved to front, not duplicated");
+
+    // "System default" isn't a font choice, so it never enters the list.
+    remember_font(&mut recent, "");
+    remember_font(&mut recent, "   ");
+    assert_eq!(recent, ["Georgia", "Inter"], "blank family is not a recent font");
+
+    // And the list is capped.
+    for i in 0..RECENT_FONTS + 5 {
+        remember_font(&mut recent, &format!("Font {i}"));
+    }
+    assert_eq!(recent.len(), RECENT_FONTS, "capped");
+    assert_eq!(recent[0], format!("Font {}", RECENT_FONTS + 4), "newest first");
+}
+
+// --- Passepartout ----------------------------------------------------------
+
+/// Is `p` painted by the passepartout? Must be asked with the **even-odd** rule,
+/// because that is what `to_vello` fills the path with. `Shape::contains` uses
+/// *nonzero*, and the two disagree exactly where it matters: the hole and the
+/// outer rect wind the same way, so nonzero counts the comp interior as inside
+/// (winding 2) while even-odd correctly reads it as the hole.
+fn dimmed(path: &kurbo::BezPath, p: Point) -> bool {
+    path.winding(p) % 2 != 0
+}
+
+/// The passepartout is a canvas-sized rect with the composition punched out of
+/// it, so the dimming covers the surroundings and stops exactly at the frame.
+#[test]
+fn the_passepartout_covers_the_canvas_and_spares_the_comp() {
+    let comp = kurbo::Rect::new(0.0, 0.0, 100.0, 50.0);
+    let canvas = kurbo::Rect::new(0.0, 0.0, 400.0, 300.0);
+    // Comp scaled 2x and offset, the way `fit` places it.
+    let fit = Affine::translate((50.0, 40.0)) * Affine::scale(2.0);
+    let path = passepartout_path(fit, comp, canvas);
+
+    // A point well outside the frame is dimmed; the frame's centre is not.
+    assert!(dimmed(&path, Point::new(10.0, 10.0)), "the surroundings are dimmed");
+    assert!(
+        !dimmed(&path, Point::new(150.0, 90.0)),
+        "the comp interior is spared"
+    );
+    // Just inside each edge of the placed comp (50,40)-(250,140) stays clear.
+    for p in [
+        Point::new(52.0, 90.0),
+        Point::new(248.0, 90.0),
+        Point::new(150.0, 42.0),
+        Point::new(150.0, 138.0),
+    ] {
+        assert!(!dimmed(&path, p), "{p:?} is inside the frame");
+    }
+    // And just outside each of those edges is dimmed.
+    for p in [
+        Point::new(48.0, 90.0),
+        Point::new(252.0, 90.0),
+        Point::new(150.0, 38.0),
+        Point::new(150.0, 142.0),
+    ] {
+        assert!(dimmed(&path, p), "{p:?} is outside the frame");
+    }
+}
+
+/// Zoomed in past the edges of the preview, the comp is *larger* than the
+/// canvas. The hole must still be a hole: if the outer rect didn't grow to
+/// contain it, even-odd would invert and dim the frame instead of its
+/// surroundings — the exact opposite of the feature.
+#[test]
+fn a_comp_larger_than_the_canvas_does_not_invert_the_passepartout() {
+    let comp = kurbo::Rect::new(0.0, 0.0, 100.0, 100.0);
+    let canvas = kurbo::Rect::new(0.0, 0.0, 200.0, 200.0);
+    // 4x zoom: the comp covers (-100,-100)-(300,300), swallowing the canvas.
+    let fit = Affine::translate((-100.0, -100.0)) * Affine::scale(4.0);
+    let path = passepartout_path(fit, comp, canvas);
+
+    for p in [
+        Point::new(100.0, 100.0),
+        Point::new(5.0, 5.0),
+        Point::new(195.0, 195.0),
+    ] {
+        assert!(
+            !dimmed(&path, p),
+            "{p:?} is inside the comp, so nothing visible should be dimmed"
+        );
+    }
+}

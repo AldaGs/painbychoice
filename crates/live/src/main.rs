@@ -18,13 +18,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kurbo::{Affine, Point, Shape as _, Stroke as KurboStroke, Vec2};
+use kurbo::{Affine, BezPath, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
     demo::demo_document, evaluate_comp, node::ParamValue, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
     Comp, Document, EvalCtx, Expr, Project as MProject,
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
-    Scene as MScene, Shape as MShape, Transform, Value, Waveform,
+    Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};

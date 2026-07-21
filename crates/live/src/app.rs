@@ -14,6 +14,28 @@ pub(crate) enum RenderState {
     Suspended(Option<Arc<Window>>),
 }
 
+/// How many recently-applied fonts the picker pins above the full list. Enough
+/// to cover the handful a project actually uses, short enough to stay scannable.
+pub(crate) const RECENT_FONTS: usize = 8;
+
+/// Record `family` as just-used: most recent first, no duplicates, capped at
+/// [`RECENT_FONTS`]. Re-applying a font already in the list **moves** it to the
+/// front rather than adding a second copy, which is what keeps the section a
+/// true most-recently-used order.
+///
+/// A free function so the ordering rules are unit-tested without a window —
+/// the same reason `apply_fps_edit` and `apply_graph_op` are free functions.
+pub(crate) fn remember_font(recent: &mut Vec<String>, family: &str) {
+    // The empty family is "system default", a state rather than a font choice;
+    // pinning it as "recent" would be noise.
+    if family.trim().is_empty() {
+        return;
+    }
+    recent.retain(|f| f != family);
+    recent.insert(0, family.to_string());
+    recent.truncate(RECENT_FONTS);
+}
+
 pub(crate) struct App {
     pub(crate) context: RenderContext,
     /// One vello renderer per wgpu device, indexed by `RenderSurface::dev_id`.
@@ -60,6 +82,19 @@ pub(crate) struct App {
     /// Edit buffer for the open comp's name, so typing doesn't rewrite the
     /// document on every keystroke. Same take/restore dance as the preset name.
     pub(crate) comp_name_buf: String,
+    /// Every system font family, gathered once at startup. Enumerating the
+    /// system collection is far too slow to redo per frame, and the list can't
+    /// system collection is far too slow to redo per frame, and the list can't
+    /// change while the app runs.
+    pub(crate) font_families: Vec<String>,
+    /// Fonts applied this session, most recent first — the picker's "Recent"
+    /// section. Session-only on purpose: it's app state, not project state, so
+    /// it has no business in the `.pbc`.
+    pub(crate) recent_fonts: Vec<String>,
+    /// The family currently *hovered* in the font picker. Rendered instead of
+    /// the node's own family for that frame, so hovering previews the font
+    /// without touching the document — only a click commits (see `render`).
+    pub(crate) font_preview: Option<String>,
     /// Canvas area in physical pixels, measured from the layout tree's canvas
     /// leaf during the last UI pass. `None` until the first pass has run.
     pub(crate) canvas_rect: Option<kurbo::Rect>,
@@ -219,6 +254,11 @@ impl App {
             key_clipboard: None,
             view,
             dock: Dock::default_layout(),
+            // Enumerated once here: the system font collection is expensive to
+            // build and can't change under us while the app is running.
+            font_families: motion_core::text::system_families(),
+            recent_fonts: Vec::new(),
+            font_preview: None,
             presets: builtin_presets(),
             preset_name_buf: String::new(),
             comp_name_buf: String::new(),
@@ -655,6 +695,33 @@ impl App {
             }
         }
 
+        // Text. Only `size` goes through `set_at` (it's the one `Value` here and
+        // so the one that can auto-key); the rest are plain fields assigned
+        // outright.
+        if let Some(MShape::Text { content, family, size, align, max_width }) = node.shape.as_mut()
+        {
+            if let Some(v) = e.text_content.clone() {
+                *content = v;
+                changed = true;
+            }
+            if let Some(v) = e.text_family.clone() {
+                *family = v;
+                changed = true;
+            }
+            if let Some(v) = e.text_size {
+                size.set_at(frame, v);
+                changed = true;
+            }
+            if let Some(v) = e.text_align {
+                *align = v;
+                changed = true;
+            }
+            if let Some(v) = e.text_max_width {
+                *max_width = v;
+                changed = true;
+            }
+        }
+
         // Stopwatch clicks: insert a keyframe at the playhead (promoting a
         // constant to a track the first time). Driven off `PropKind` so a new
         // animatable property needs no new branch here.
@@ -869,6 +936,21 @@ impl App {
             )
             .with_fill(fill)
             .with_transform(at_center),
+            // Seeded with visible placeholder text: an empty text layer would
+            // shape to an empty path and look like the add button did nothing.
+            NewShape::Text => MNode::shape(
+                id,
+                format!("Text {id}"),
+                MShape::Text {
+                    content: "Text".to_string(),
+                    family: String::new(),
+                    size: Value::constant(96.0),
+                    align: TextAlign::Left,
+                    max_width: None,
+                },
+            )
+            .with_fill(fill)
+            .with_transform(at_center),
             NewShape::Group => MNode::group(id, format!("Group {id}")).with_transform(at_center),
         };
 
@@ -1037,6 +1119,29 @@ impl App {
         true
     }
 
+    /// A throwaway copy of the project with the hovered font swapped into the
+    /// selected text layer, or `None` when nothing is being previewed.
+    ///
+    /// This is what makes "hover to preview, click to apply" non-destructive:
+    /// the document keeps the family it had, and the substitution lives exactly
+    /// one frame. The clone only happens while the picker is open and the
+    /// pointer is over a row, so the common path pays nothing.
+    pub(crate) fn preview_project(&self) -> Option<MProject> {
+        let family = self.font_preview.as_ref()?;
+        let id = self.selected?;
+        let mut preview = self.project.clone();
+        let node = preview.comp_mut(self.current)?.root.find_mut(id)?;
+        match node.shape.as_mut() {
+            Some(MShape::Text { family: f, .. }) => {
+                *f = family.clone();
+                Some(preview)
+            }
+            // Hovering a font with a non-text layer selected previews nothing
+            // rather than cloning for no reason.
+            _ => None,
+        }
+    }
+
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
     pub(crate) fn render(&mut self, window: &Window) {
         // The whole render path is in the frame domain; seconds only ever
@@ -1044,7 +1149,10 @@ impl App {
         let frame = self.current_frame();
         let t = frame as f64;
         let last_frame = self.doc().duration_frames().max(1);
-        let scene = evaluate_comp(&self.project, self.current, t);
+        // While a font is hovered in the picker, this frame is drawn from a
+        // preview copy instead of the real project (see `preview_project`).
+        let previewing = self.preview_project();
+        let scene = evaluate_comp(previewing.as_ref().unwrap_or(&self.project), self.current, t);
         // Warnings are re-derived every frame, so print only when the set
         // actually changes — a broken script would otherwise spam stderr at the
         // refresh rate. The current set is kept for the comp bar's indicator.
@@ -1085,7 +1193,9 @@ impl App {
         }
 
         let bg = self.doc().bg;
-        self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, self.selected);
+        let pp = self.doc().passepartout;
+        self.vscene =
+            to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, pp, canvas, self.selected);
 
         // Snapshot the selected node's properties before the UI closure so the
         // egui code borrows a plain struct, never `self`.
@@ -1150,6 +1260,7 @@ impl App {
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
         let duration = self.doc().duration;
         let comp_bg = self.doc().bg;
+        let comp_pp = self.doc().passepartout;
         let timebase = self.doc().timebase();
         let view = self.view;
         let work_area = self.work_area;
@@ -1193,6 +1304,10 @@ impl App {
         let is_fit = self.nav.zoom.is_none();
         let mut canvas_edits = CanvasEdits::default();
         let dock = &mut self.dock;
+        // Borrowed (not cloned) beside `dock`: disjoint fields, and the font
+        // list is a few hundred strings we don't want to copy every frame.
+        let font_families = &self.font_families;
+        let recent_fonts = &self.recent_fonts;
         let mut canvas_pts: Option<egui::Rect> = None;
         // At most one layout edit (split/join/retype) from an area header this
         // frame; applied to the tree after the UI pass, never during it.
@@ -1214,6 +1329,7 @@ impl App {
                         doc_fps,
                         duration,
                         comp_bg,
+                        comp_pp,
                         &mut comp,
                         &preset_names,
                         &mut preset_name_buf,
@@ -1248,7 +1364,14 @@ impl App {
                         &mut dope,
                     ),
                     Editor::Properties => {
-                        properties_ui(ui, &sel_info, &mut edits, &ease_info, &mut ease_out)
+                        properties_ui(
+                            ui,
+                            &sel_info,
+                            &mut edits,
+                            &ease_info,
+                            &mut ease_out,
+                            &FontList { all: font_families, recent: recent_fonts },
+                        )
                     }
                     Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
                     // vello paints the frame here; egui only measures the hole
@@ -1473,12 +1596,28 @@ impl App {
         // re-evaluate so the change is visible on this very frame.
         self.gizmo_drag = gizmo_drag;
         self.gizmo_hot = gizmo_hot;
+        // The hovered font, straight from this frame's picker: `None` (nothing
+        // hovered, or the picker closed) is what *ends* a preview, so this is a
+        // plain assignment rather than a conditional one. A repaint is due
+        // whenever it changes, or the preview would linger a frame.
+        if self.font_preview != edits.text_family_preview {
+            self.font_preview = edits.text_family_preview.clone();
+            window.request_redraw();
+        }
+        // A click commits the font, so it joins the recents.
+        if let Some(family) = edits.text_family.as_ref() {
+            remember_font(&mut self.recent_fonts, family);
+        }
         let mut dirty = self.apply_edits(frame, &edits);
         // Applied here rather than with the other comp settings above so it can
         // mark the scene dirty — the backdrop is baked into `vscene`, which is
         // only rebuilt when something says it changed.
         if let Some(rgb) = comp.bg {
             self.doc_mut().bg = rgb_color(rgb);
+            dirty = true;
+        }
+        if let Some(pp) = comp.passepartout {
+            self.doc_mut().passepartout = pp.clamp(0.0, 1.0);
             dirty = true;
         }
         if let Some(delta) = dope.move_by {
@@ -1534,9 +1673,16 @@ impl App {
             dirty |= self.load();
         }
         if dirty {
-            let scene = evaluate_comp(&self.project, self.current, t);
+            // Re-derive the preview rather than reusing the one from the top of
+            // the frame: an edit may have just changed the node it applies to,
+            // and a font being hovered must survive an unrelated change.
+            let previewing = self.preview_project();
+            let scene =
+                evaluate_comp(previewing.as_ref().unwrap_or(&self.project), self.current, t);
             let bg = self.doc().bg;
-            self.vscene = to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, self.selected);
+            let pp = self.doc().passepartout;
+        self.vscene =
+            to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, pp, canvas, self.selected);
         }
 
         self.egui_state

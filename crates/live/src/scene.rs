@@ -72,31 +72,32 @@ pub(crate) fn to_peniko(c: MColor, opacity: f64) -> Color {
 }
 
 /// Convert an evaluated engine `Scene` into a `vello::Scene`, prepending a
-/// global transform that fits the composition into the window. The composition
-/// bounds are drawn first (so the editable frame is visible), then the shapes,
-/// then the selection outline on top.
+/// global transform that fits the composition into the window.
+///
+/// Draw order is load-bearing: composition background, then the shapes, then
+/// the **passepartout** dimming everything outside the frame, then the frame
+/// border, then the selection outline. The passepartout has to come after the
+/// shapes (it dims the parts of them that hang outside the frame, which is the
+/// whole point) but before the border and the selection, which stay crisp.
+///
+/// `canvas` is the preview area in **physical pixels** — the passepartout needs
+/// to know how far to reach, and it is the only thing here that does.
 pub(crate) fn to_vello(
     scene: &MScene,
     fit: Affine,
     comp: (f64, f64),
     bg: MColor,
+    passepartout: f64,
+    canvas: kurbo::Rect,
     selected: Option<NodeId>,
 ) -> VScene {
     let mut vs = VScene::new();
 
-    // Composition frame: the comp's own background colour plus a border, so the
-    // comp bounds stand out from the letterbox and resolution changes are
-    // visible. The fill is a per-comp user setting (`Comp::bg`), not a constant.
+    // Composition frame: the comp's own background colour. A per-comp user
+    // setting (`Comp::bg`), not a constant.
     let comp_rect = kurbo::Rect::new(0.0, 0.0, comp.0, comp.1);
     vs.fill(Fill::NonZero, fit, to_peniko(bg, 1.0), None, &comp_rect);
     let scale = fit.as_coeffs()[0].abs().max(1e-6);
-    vs.stroke(
-        &KurboStroke::new(1.5 / scale),
-        fit,
-        Color::new([0.35, 0.37, 0.42, 1.0]),
-        None,
-        &comp_rect,
-    );
 
     for item in &scene.items {
         let xf = fit * item.transform;
@@ -113,6 +114,28 @@ pub(crate) fn to_vello(
             );
         }
     }
+    // Passepartout: dim everything outside the comp bounds, so the frame reads
+    // as the shot and whatever is parked off-stage recedes without vanishing.
+    if passepartout > 0.0 {
+        vs.fill(
+            Fill::EvenOdd,
+            Affine::IDENTITY,
+            Color::new([0.0, 0.0, 0.0, passepartout.clamp(0.0, 1.0) as f32]),
+            None,
+            &passepartout_path(fit, comp_rect, canvas),
+        );
+    }
+
+    // Frame border, over both the shapes and the passepartout — it marks where
+    // the render will crop, so nothing should paint over it.
+    vs.stroke(
+        &KurboStroke::new(1.5 / scale),
+        fit,
+        Color::new([0.35, 0.37, 0.42, 1.0]),
+        None,
+        &comp_rect,
+    );
+
     // Selection outline on top of everything.
     if let Some(sel) = selected {
         if let Some(item) = scene.items.iter().find(|i| i.source == sel) {
@@ -128,6 +151,38 @@ pub(crate) fn to_vello(
         }
     }
     vs
+}
+
+/// The passepartout region: everything in `canvas` that is *not* inside the
+/// composition, as a single path in **physical pixels** (hence the identity
+/// transform at the fill site — `fit` is already applied to the hole).
+///
+/// Two subpaths, filled even-odd, so the comp rect punches a hole in the canvas
+/// rect. Building it as one path rather than four border rectangles matters at
+/// fractional zoom: abutting rects leave hairline seams where their edges land
+/// mid-pixel, and the seams shimmer as you pan.
+///
+/// The outer rect is `canvas` **unioned** with the comp so a comp larger than
+/// the visible area still closes the hole. Without that the hole would extend
+/// past the outer boundary and even-odd would invert, dimming the frame itself
+/// and leaving the surroundings clear.
+pub(crate) fn passepartout_path(fit: Affine, comp: kurbo::Rect, canvas: kurbo::Rect) -> BezPath {
+    // `fit` is translate + uniform scale, never a rotation, so the comp stays
+    // axis-aligned and its image is fully described by two corners.
+    let a = fit * Point::new(comp.x0, comp.y0);
+    let b = fit * Point::new(comp.x1, comp.y1);
+    let hole = kurbo::Rect::new(a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y));
+    let outer = canvas.union(hole);
+
+    let mut path = BezPath::new();
+    for r in [outer, hole] {
+        path.move_to((r.x0, r.y0));
+        path.line_to((r.x1, r.y0));
+        path.line_to((r.x1, r.y1));
+        path.line_to((r.x0, r.y1));
+        path.close_path();
+    }
+    path
 }
 
 /// Pick the front-most scene item under a point given in physical pixels.
