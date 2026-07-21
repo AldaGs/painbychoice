@@ -31,7 +31,7 @@ pub use node::{
     Stroke, Transform, ViewAids,
 };
 pub use graph::{
-    ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
+    Binding, ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
 };
 pub use lower::lower_output;
 pub use registry::{

@@ -26,8 +26,8 @@ use motion_core::{
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
     Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
-    lower_output, Edge, Endpoint, GraphNode, GraphNodeId, NodeCategory, NodeDescriptor, NodeGraph,
-    NodeRegistry, SocketType,
+    lower_output, Binding, Edge, Endpoint, GraphNode, GraphNodeId, NodeCategory, NodeDescriptor,
+    NodeGraph, NodeRegistry, SocketType,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};

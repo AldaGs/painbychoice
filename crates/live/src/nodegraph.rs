@@ -44,25 +44,13 @@ pub(crate) enum NgOp {
     SetValue { id: GraphNodeId, socket: String, value: ExprValue },
 }
 
-/// A **driver**: a graph output socket feeding a scene layer's property. The
-/// bridge from the value graph to the scene tree — the graph produces a number,
-/// the binding says which property it becomes. Applied by lowering the output to
-/// an `Expr` and setting the property to `Value::Expr`, so `evaluate` sees an
-/// ordinary expression-driven property and the picture moves.
-#[derive(Clone)]
-pub(crate) struct Binding {
-    pub(crate) output: Endpoint,
-    pub(crate) target: NodeId,
-    pub(crate) prop: PropKind,
-}
-
-/// One deferred edit to the driver list. Separate from [`NgOp`] because it
-/// touches `App::bindings`, not the graph model.
+/// One deferred edit to the driver list ([`motion_core::Binding`]). Separate
+/// from [`NgOp`] because it touches the project's drivers, not the graph model.
 pub(crate) enum BindingOp {
-    Add { output: Endpoint, target: NodeId, prop: PropKind },
+    Add { output: Endpoint, target: NodeId, prop: PropPath },
     SetOutput { index: usize, output: Endpoint },
     SetTarget { index: usize, target: NodeId },
-    SetProp { index: usize, prop: PropKind },
+    SetProp { index: usize, prop: PropPath },
     Remove { index: usize },
 }
 
@@ -203,7 +191,7 @@ fn drivers_ui(
             out.binding = Some(BindingOp::Add {
                 output: outputs[0].0.clone(),
                 target: NodeId(layers[0].0),
-                prop: PropKind::Rotation,
+                prop: PropPath::Rotation,
             });
         }
     });
@@ -252,10 +240,12 @@ fn drivers_ui(
             );
             egui::ComboBox::from_id_salt(("drv_prop", i))
                 .width(80.0)
-                .selected_text(b.prop.label())
+                .selected_text(prop_path_label(b.prop))
                 .show_ui(ui, |ui| {
-                    for k in PropKind::ALL {
-                        if ui.selectable_label(k == b.prop, k.label()).clicked() && k != b.prop {
+                    for k in PROP_PATHS {
+                        if ui.selectable_label(k == b.prop, prop_path_label(k)).clicked()
+                            && k != b.prop
+                        {
                             out.binding = Some(BindingOp::SetProp { index: i, prop: k });
                         }
                     }

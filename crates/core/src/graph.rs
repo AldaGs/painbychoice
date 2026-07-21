@@ -19,6 +19,8 @@ use std::collections::{HashSet, VecDeque};
 use kurbo::Vec2;
 use serde::{Deserialize, Serialize};
 
+use crate::expr::PropPath;
+use crate::node::NodeId;
 use crate::registry::NodeRegistry;
 
 /// Stable identity for a node *within a graph* — distinct from a scene
@@ -124,6 +126,21 @@ pub enum GraphError {
     TypeMismatch { edge: Edge, from: crate::socket::SocketType, to: crate::socket::SocketType },
     /// More than one wire feeds a single input socket — an input takes one.
     MultipleInputs(Endpoint),
+}
+
+/// A **driver**: a graph output socket feeding a scene layer's property. The
+/// bridge from the value graph to the scene tree — the graph produces a value,
+/// the binding says which property of which layer it becomes. The editor lowers
+/// the output to an `Expr` and sets that property to `Value::Expr`, so
+/// `evaluate` runs it like any other expression-driven property.
+///
+/// `prop` is core's [`PropPath`] (not the editor's `PropKind`) so a driver is
+/// document data and serializes with the project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Binding {
+    pub output: Endpoint,
+    pub target: NodeId,
+    pub prop: PropPath,
 }
 
 /// A graph of placed nodes and the wires between them. The `next_id` counter
@@ -406,6 +423,36 @@ mod tests {
         // silently reattach.
         let w = g.add_node("value", Vec2::ZERO);
         assert_ne!(w, v);
+    }
+
+    /// The graph and its drivers are document data: a project must carry them
+    /// through a save/load, and a `.pbc` written before they existed must still
+    /// load (with empty defaults) rather than fail to parse.
+    #[test]
+    fn a_project_persists_its_graph_and_drivers() {
+        use crate::expr::PropPath;
+        use crate::node::{Comp, Node, NodeId, Project};
+
+        let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        let osc = project.graph.add_node("osc", Vec2::new(20.0, 20.0));
+        project.bindings.push(Binding {
+            output: Endpoint::new(osc, "value"),
+            target: NodeId(0),
+            prop: PropPath::Rotation,
+        });
+
+        let json = serde_json::to_string(&project).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.graph, project.graph);
+        assert_eq!(back.bindings, project.bindings);
+
+        // A legacy project JSON with neither field loads with empty defaults.
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = legacy.as_object_mut().unwrap();
+        obj.remove("graph");
+        obj.remove("bindings");
+        let old: Project = serde_json::from_value(legacy).unwrap();
+        assert!(old.graph.nodes.is_empty() && old.bindings.is_empty());
     }
 
     #[test]

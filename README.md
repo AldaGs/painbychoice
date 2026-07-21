@@ -1762,10 +1762,13 @@ existing `prop_of_mut(...).set_expr(...)`, so `evaluate` runs it and the picture
 moves — dropping a driver bakes the property to a constant at its current value.
 The Nodes panel gained a **Drivers** section (bind output→layer→property) and a
 selected-node **inspector** (drag editors for a `value` constant and unwired
-numeric inputs), with node selection on the canvas. Still ahead in (3):
-`ref`/`param`/`use`/time-source/shape lowering (they need target-addressing the
-model doesn't carry yet), the property-graph fold, and persisting the graph in
-the `.pbc`. (4) The compositor stage — the real gate for effects/mattes/masks.
+numeric inputs), with node selection on the canvas. **The graph now persists**:
+`NodeGraph` and its drivers (`Vec<Binding>`, keyed by core `PropPath`) are
+project-level fields on `motion_core::Project`, so they ride in the `.pbc`
+serialization already used for the document, with `#[serde(default)]` so older
+files load with an empty graph; load re-syncs the driven properties. Still ahead
+in (3): `ref`/`param`/`use`/time-source/shape lowering (they need
+target-addressing the model doesn't carry yet) and the property-graph fold. (4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.
