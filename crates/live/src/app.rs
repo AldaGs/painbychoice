@@ -166,6 +166,10 @@ pub(crate) struct App {
     /// now — step 2 builds the model and its panel; lowering it to the `Node`/
     /// `Expr` IR and saving it with the document is step 3.
     pub(crate) node_graph: NodeGraph,
+    /// Drivers: each binds a graph output to a scene layer's property.
+    /// `recompile_graph` lowers them and hands each an `Expr`, so the graph
+    /// moves the picture. Authoring state alongside `node_graph`, not yet saved.
+    pub(crate) bindings: Vec<Binding>,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -303,6 +307,7 @@ impl App {
             aids_hot: false,
             node_registry: NodeRegistry::with_builtins(),
             node_graph: NodeGraph::new(),
+            bindings: Vec::new(),
         }
     }
 
@@ -329,7 +334,88 @@ impl App {
             NgOp::Disconnect { edge } => {
                 self.node_graph.disconnect(&edge);
             }
+            NgOp::SetValue { id, socket, value } => {
+                if let Some(n) = self.node_graph.node_mut(id) {
+                    n.set_value(socket, value);
+                }
+            }
         }
+    }
+
+    /// Apply one driver-list edit. `Remove` **bakes** the property to a constant
+    /// at its current value first, so dropping a driver leaves the layer where it
+    /// was and hands it back to hand-editing rather than stranding it on a stale
+    /// expression.
+    pub(crate) fn apply_binding_op(&mut self, op: BindingOp, frame: i64) {
+        match op {
+            BindingOp::Add { output, target, prop } => {
+                self.bindings.push(Binding { output, target, prop });
+            }
+            BindingOp::SetOutput { index, output } => {
+                if let Some(b) = self.bindings.get_mut(index) {
+                    b.output = output;
+                }
+            }
+            BindingOp::SetTarget { index, target } => {
+                if let Some(b) = self.bindings.get_mut(index) {
+                    b.target = target;
+                }
+            }
+            BindingOp::SetProp { index, prop } => {
+                if let Some(b) = self.bindings.get_mut(index) {
+                    b.prop = prop;
+                }
+            }
+            BindingOp::Remove { index } => {
+                if index < self.bindings.len() {
+                    let b = self.bindings.remove(index);
+                    self.bake_binding(&b, frame);
+                }
+            }
+        }
+    }
+
+    /// Recompile every driver: lower its graph output to an `Expr` and set the
+    /// target property to `Value::Expr`, so `evaluate` runs it. Lowering is
+    /// frame-independent (it builds the recipe, doesn't sample it), so this needn't
+    /// know the frame. Run only when the graph or a driver changed — never per
+    /// frame — since it writes the document and bumps `doc_rev`.
+    pub(crate) fn recompile_graph(&mut self) {
+        // Lower first (borrows the graph + registry), then write (borrows the
+        // doc) — two passes, so the immutable and mutable borrows don't overlap.
+        let compiled: Vec<(NodeId, PropKind, Expr)> = self
+            .bindings
+            .iter()
+            .map(|b| (b.target, b.prop, lower_output(&self.node_graph, &self.node_registry, &b.output)))
+            .collect();
+        let id = self.current;
+        if let Some(comp) = self.project.comp_mut(id) {
+            for (target, prop, expr) in compiled {
+                if let Some(node) = comp.root.find_mut(target) {
+                    if let Some(mut p) = prop_of_mut(node, prop) {
+                        p.set_expr(expr);
+                    }
+                }
+            }
+        }
+        self.doc_rev += 1;
+    }
+
+    /// Freeze a driven property to a constant at `frame` — what a driver's
+    /// removal leaves behind. Resolves against a clone so the read context can't
+    /// alias the node being mutated (same guard as `GraphOp::Bake`).
+    fn bake_binding(&mut self, b: &Binding, frame: i64) {
+        let snapshot = self.doc().clone();
+        let mut ctx = EvalCtx::new(&snapshot, frame as f64);
+        let id = self.current;
+        if let Some(comp) = self.project.comp_mut(id) {
+            if let Some(node) = comp.root.find_mut(b.target) {
+                if let Some(mut p) = prop_of_mut(node, b.prop) {
+                    p.bake_to_const(&mut ctx);
+                }
+            }
+        }
+        self.doc_rev += 1;
     }
 
     /// Apply one frame's worth of alignment-aid intent to the open comp.
@@ -1518,6 +1604,19 @@ impl App {
         let node_registry = &self.node_registry;
         let node_graph = &self.node_graph;
         let mut ng_edits = NgEdits::default();
+        // Snapshots for the node panel's driver rows: the scene's layers (for the
+        // target picker) and the current drivers (for display). Owned/cloned, so
+        // they don't borrow `self` into the closure.
+        let ng_layers = {
+            let mut v = Vec::new();
+            // Field access, not `self.doc()`: the method borrows all of `self`,
+            // which would collide with the `&mut self.dock` borrow above.
+            if let Some(comp) = self.project.comp(self.current) {
+                collect_nodes(&comp.root, &mut v);
+            }
+            v
+        };
+        let ng_bindings = self.bindings.clone();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
             let mut path = Vec::new();
@@ -1580,7 +1679,9 @@ impl App {
                         )
                     }
                     Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
-                    Editor::NodeGraph => nodegraph_ui(ui, node_graph, node_registry, &mut ng_edits),
+                    Editor::NodeGraph => {
+                        nodegraph_ui(ui, node_graph, node_registry, &ng_layers, &ng_bindings, &mut ng_edits)
+                    }
                     // vello paints the frame here; egui only measures the hole
                     // and floats the zoom toolbar over it. `max_rect` is the
                     // whole window (egui doesn't shrink it for the sibling
@@ -1697,9 +1798,25 @@ impl App {
             window.request_redraw();
         }
         // Apply a composition node-graph edit (add/move/remove/connect/
-        // disconnect). Connection validity is enforced inside the model.
+        // disconnect/set-value). Connection validity is enforced inside the model.
+        // A driver recompiles only when the *lowered result* could have changed —
+        // a plain move can't, so it skips the document write a recompile does.
+        let mut ng_changed = false;
         if let Some(op) = ng_edits.op.take() {
+            ng_changed = matches!(
+                op,
+                NgOp::Connect { .. } | NgOp::Disconnect { .. } | NgOp::Remove { .. } | NgOp::SetValue { .. }
+            );
             self.apply_ng_op(op);
+            window.request_redraw();
+        }
+        if let Some(bop) = ng_edits.binding.take() {
+            self.apply_binding_op(bop, frame);
+            ng_changed = true;
+            window.request_redraw();
+        }
+        if ng_changed && !self.bindings.is_empty() {
+            self.recompile_graph();
             window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area

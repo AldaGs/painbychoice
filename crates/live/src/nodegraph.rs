@@ -39,11 +39,37 @@ pub(crate) enum NgOp {
     Connect { from: Endpoint, to: Endpoint },
     /// Remove a specific wire.
     Disconnect { edge: Edge },
+    /// Set a node's stored literal for a socket — a `value` node's constant, or
+    /// an unwired input's resting value. Re-lowers any driver reading it.
+    SetValue { id: GraphNodeId, socket: String, value: ExprValue },
+}
+
+/// A **driver**: a graph output socket feeding a scene layer's property. The
+/// bridge from the value graph to the scene tree — the graph produces a number,
+/// the binding says which property it becomes. Applied by lowering the output to
+/// an `Expr` and setting the property to `Value::Expr`, so `evaluate` sees an
+/// ordinary expression-driven property and the picture moves.
+#[derive(Clone)]
+pub(crate) struct Binding {
+    pub(crate) output: Endpoint,
+    pub(crate) target: NodeId,
+    pub(crate) prop: PropKind,
+}
+
+/// One deferred edit to the driver list. Separate from [`NgOp`] because it
+/// touches `App::bindings`, not the graph model.
+pub(crate) enum BindingOp {
+    Add { output: Endpoint, target: NodeId, prop: PropKind },
+    SetOutput { index: usize, output: Endpoint },
+    SetTarget { index: usize, target: NodeId },
+    SetProp { index: usize, prop: PropKind },
+    Remove { index: usize },
 }
 
 #[derive(Default)]
 pub(crate) struct NgEdits {
     pub(crate) op: Option<NgOp>,
+    pub(crate) binding: Option<BindingOp>,
 }
 
 /// A core [`motion_core::Color`] as an egui colour. Socket dots and header tints
@@ -98,11 +124,14 @@ fn wire(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, color: egui::
     painter.add(shape);
 }
 
-/// The panel. Draws the palette, then the graph on a scrollable canvas.
+/// The panel. Palette + drivers + a selected-node inspector, then the graph on a
+/// scrollable canvas.
 pub(crate) fn nodegraph_ui(
     ui: &mut egui::Ui,
     graph: &NodeGraph,
     reg: &NodeRegistry,
+    layers: &[(u64, String)],
+    bindings: &[Binding],
     out: &mut NgEdits,
 ) {
     ui.add_space(6.0);
@@ -112,12 +141,173 @@ pub(crate) fn nodegraph_ui(
         palette_menu(ui, graph, reg, out);
     });
     ui.separator();
+    drivers_ui(ui, graph, reg, layers, bindings, out);
+    ui.separator();
+    inspector_ui(ui, graph, reg, out);
+    ui.separator();
     if graph.nodes.is_empty() {
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
     }
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         canvas(ui, graph, reg, out);
     });
+}
+
+/// Which graph node is selected for the inspector — ephemeral view state, so it
+/// lives in egui memory under a fixed id (the canvas writes it, the inspector,
+/// drawn in a different `Ui`, reads it, so a per-`Ui` id wouldn't match).
+fn read_selection(ctx: &egui::Context) -> Option<GraphNodeId> {
+    ctx.data(|d| d.get_temp::<Option<GraphNodeId>>(egui::Id::new("ng_sel"))).flatten()
+}
+
+fn write_selection(ctx: &egui::Context, sel: Option<GraphNodeId>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ng_sel"), sel));
+}
+
+/// Every output socket in the graph, labelled `node.socket` — the driver row's
+/// source picker, and reused to colour wires.
+fn graph_outputs(graph: &NodeGraph, reg: &NodeRegistry) -> Vec<(Endpoint, String)> {
+    let mut out = Vec::new();
+    for n in &graph.nodes {
+        if let Some(d) = reg.get(&n.kind) {
+            let title = n.title.clone().unwrap_or_else(|| d.label.clone());
+            for s in &d.outputs {
+                out.push((Endpoint::new(n.id, &s.id), format!("{title}.{}", s.label)));
+            }
+        }
+    }
+    out
+}
+
+/// The **Drivers**: each row binds one graph output to one layer's property.
+/// This is what makes the graph *do* something — `App` lowers each binding to an
+/// `Expr` and hands it to the property.
+fn drivers_ui(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    reg: &NodeRegistry,
+    layers: &[(u64, String)],
+    bindings: &[Binding],
+    out: &mut NgEdits,
+) {
+    let outputs = graph_outputs(graph, reg);
+    ui.horizontal(|ui| {
+        ui.strong("Drivers");
+        ui.weak(format!("{}", bindings.len()));
+        let can_add = !outputs.is_empty() && !layers.is_empty();
+        if ui
+            .add_enabled(can_add, egui::Button::new(format!("{} Add", icon::ADD)).small())
+            .on_disabled_hover_text("Add a node and a layer first")
+            .clicked()
+        {
+            out.binding = Some(BindingOp::Add {
+                output: outputs[0].0.clone(),
+                target: NodeId(layers[0].0),
+                prop: PropKind::Rotation,
+            });
+        }
+    });
+    if bindings.is_empty() {
+        ui.weak("None. Bind a graph output to a layer's property to drive it.");
+    }
+    for (i, b) in bindings.iter().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.small_button("x").on_hover_text("Remove (freezes the property)").clicked() {
+                out.binding = Some(BindingOp::Remove { index: i });
+            }
+            let cur_out = outputs
+                .iter()
+                .find(|(e, _)| e == &b.output)
+                .map(|(_, l)| l.clone())
+                .unwrap_or_else(|| "<gone>".into());
+            egui::ComboBox::from_id_salt(("drv_out", i)).width(110.0).selected_text(cur_out).show_ui(
+                ui,
+                |ui| {
+                    for (e, l) in &outputs {
+                        if ui.selectable_label(e == &b.output, l).clicked() && e != &b.output {
+                            out.binding =
+                                Some(BindingOp::SetOutput { index: i, output: e.clone() });
+                        }
+                    }
+                },
+            );
+            ui.label("→");
+            let cur_layer = layers
+                .iter()
+                .find(|(id, _)| *id == b.target.0)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| format!("#{}", b.target.0));
+            egui::ComboBox::from_id_salt(("drv_tgt", i)).width(90.0).selected_text(cur_layer).show_ui(
+                ui,
+                |ui| {
+                    for (id, name) in layers {
+                        if ui.selectable_label(*id == b.target.0, name).clicked()
+                            && *id != b.target.0
+                        {
+                            out.binding =
+                                Some(BindingOp::SetTarget { index: i, target: NodeId(*id) });
+                        }
+                    }
+                },
+            );
+            egui::ComboBox::from_id_salt(("drv_prop", i))
+                .width(80.0)
+                .selected_text(b.prop.label())
+                .show_ui(ui, |ui| {
+                    for k in PropKind::ALL {
+                        if ui.selectable_label(k == b.prop, k.label()).clicked() && k != b.prop {
+                            out.binding = Some(BindingOp::SetProp { index: i, prop: k });
+                        }
+                    }
+                });
+        });
+    }
+}
+
+/// The inspector for the selected node: drag editors for its `value` constant
+/// and any **unwired** numeric input, so a graph's literals are tunable without
+/// canvas widgets. A wired input has no field — its value comes down the wire.
+fn inspector_ui(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &mut NgEdits) {
+    let sel = read_selection(ui.ctx());
+    let Some((node, desc)) = sel.and_then(|id| {
+        let n = graph.node(id)?;
+        Some((n, reg.get(&n.kind)?))
+    }) else {
+        ui.weak("Select a node (click its header) to edit its values.");
+        return;
+    };
+    ui.strong(format!("Values — {}", node.title.clone().unwrap_or_else(|| desc.label.clone())));
+    let mut num_field = |ui: &mut egui::Ui, socket: &str, label: &str, cur: f64| {
+        let mut v = cur;
+        if ui.add(egui::DragValue::new(&mut v).speed(0.1).prefix(format!("{label}: "))).changed() {
+            out.op = Some(NgOp::SetValue {
+                id: node.id,
+                socket: socket.to_string(),
+                value: ExprValue::Num(v),
+            });
+        }
+    };
+    // A `value` node's constant lives under its output socket id.
+    if node.kind == "value" {
+        let cur = match node.value("value") {
+            Some(ExprValue::Num(n)) => n,
+            _ => 0.0,
+        };
+        num_field(ui, "value", "value", cur);
+    }
+    for s in &desc.inputs {
+        if !matches!(s.ty, SocketType::Number | SocketType::Time) {
+            continue;
+        }
+        if graph.incoming(&Endpoint::new(node.id, &s.id)).is_some() {
+            continue; // wired — no literal to edit
+        }
+        let cur = match node.value(&s.id).or(s.default) {
+            Some(ExprValue::Num(n)) => n,
+            _ => 0.0,
+        };
+        num_field(ui, &s.id, &s.label, cur);
+    }
 }
 
 /// The "Add" menu: every registered descriptor, grouped by category. A category
@@ -168,6 +358,7 @@ fn canvas(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &mut Ng
     let (area, _) =
         ui.allocate_exact_size(extent + egui::vec2(MARGIN, MARGIN), egui::Sense::hover());
     let origin = area.min;
+    let selected = read_selection(ui.ctx());
 
     // Pending wire (an in-flight connection drag): ephemeral view state, so it
     // lives in egui memory keyed to this panel, not in the model.
@@ -186,7 +377,12 @@ fn canvas(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &mut Ng
         // The header bar is the drag handle (like Blender); sockets sit below it
         // and take pointer priority in their own spots.
         let header = egui::Rect::from_min_size(rect.min, egui::vec2(NODE_W, HEADER_H));
-        let resp = ui.interact(header, ui.id().with(("ng_drag", n.id.0)), egui::Sense::drag());
+        let resp =
+            ui.interact(header, ui.id().with(("ng_drag", n.id.0)), egui::Sense::click_and_drag());
+        // A click (no drag) selects the node for the inspector.
+        if resp.clicked() {
+            write_selection(ui.ctx(), Some(n.id));
+        }
         let mut pos = base;
         if resp.dragged() {
             pos += resp.drag_delta();
@@ -233,7 +429,8 @@ fn canvas(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &mut Ng
         let desc = reg.get(&n.kind);
         let h = node_height(desc);
         let rect = egui::Rect::from_min_size(top, egui::vec2(NODE_W, h));
-        draw_node(ui, &painter, n, desc, rect, graph, out, &mut pending, &in_pos, &out_pos);
+        let is_sel = selected == Some(n.id);
+        draw_node(ui, &painter, n, desc, rect, is_sel, graph, out, &mut pending, &in_pos, &out_pos);
     }
 
     // A pending wire follows the pointer until it's dropped.
@@ -273,6 +470,7 @@ fn draw_node(
     node: &GraphNode,
     desc: Option<&NodeDescriptor>,
     rect: egui::Rect,
+    selected: bool,
     graph: &NodeGraph,
     out: &mut NgEdits,
     pending: &mut Option<Endpoint>,
@@ -292,12 +490,12 @@ fn draw_node(
         0.0,
         tint,
     );
-    painter.rect_stroke(
-        rect,
-        rounding,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-        egui::StrokeKind::Inside,
-    );
+    let border = if selected {
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 160, 60))
+    } else {
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+    };
+    painter.rect_stroke(rect, rounding, border, egui::StrokeKind::Inside);
 
     // Title, and a delete button at the header's right.
     let title = node.title.clone().unwrap_or_else(|| {

@@ -1755,10 +1755,17 @@ the object-scope case. *Started:* `core/src/lower.rs` — `lower_output(graph, r
 endpoint)` compiles the value / math / generator subset to an `Expr` (a pure
 tree-walk, cycle-guarded, defaults from the descriptor so a fresh `osc` already
 oscillates); nodes carry sparse `values` (literal overrides / a `value` node's
-constant) and sockets a `default`. Still ahead in (3): `ref`/`param`/`use`/
-time-source/shape lowering (they need target-addressing the model doesn't carry
-yet), driving a *property* from a lowered graph, and persisting the graph in the
-`.pbc`. (4) The compositor stage — the real gate for effects/mattes/masks.
+constant) and sockets a `default`. **Driving a property now works**: a *driver*
+(`live::Binding`) binds a graph output to a scene layer's property; `App::
+recompile_graph` lowers each and hands the property a `Value::Expr` via the
+existing `prop_of_mut(...).set_expr(...)`, so `evaluate` runs it and the picture
+moves — dropping a driver bakes the property to a constant at its current value.
+The Nodes panel gained a **Drivers** section (bind output→layer→property) and a
+selected-node **inspector** (drag editors for a `value` constant and unwired
+numeric inputs), with node selection on the canvas. Still ahead in (3):
+`ref`/`param`/`use`/time-source/shape lowering (they need target-addressing the
+model doesn't carry yet), the property-graph fold, and persisting the graph in
+the `.pbc`. (4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.
