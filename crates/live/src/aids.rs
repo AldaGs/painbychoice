@@ -65,6 +65,11 @@ pub(crate) struct AidEdits {
     pub(crate) toggle_rulers: bool,
     pub(crate) toggle_guides: bool,
     pub(crate) toggle_snap: bool,
+    pub(crate) toggle_onion: bool,
+    /// New (before, after) ghost counts.
+    pub(crate) set_onion_counts: Option<(u32, u32)>,
+    pub(crate) set_onion_step: Option<i64>,
+    pub(crate) set_onion_opacity: Option<f64>,
     pub(crate) set_grid_spacing: Option<f64>,
     pub(crate) set_grid_subdivisions: Option<u32>,
     /// Delete every guide at once — the escape hatch for when dragging them

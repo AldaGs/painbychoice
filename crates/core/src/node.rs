@@ -562,6 +562,8 @@ pub struct ViewAids {
     /// anything is shown.
     #[serde(default = "ViewAids::default_snap")]
     pub snap: bool,
+    #[serde(default)]
+    pub onion: Onion,
 }
 
 impl ViewAids {
@@ -577,7 +579,67 @@ impl Default for ViewAids {
             rulers: false,
             guides: Guides::default(),
             snap: Self::default_snap(),
+            onion: Onion::default(),
         }
+    }
+}
+
+/// Onion skins: ghosts of the frame either side of the playhead, so you can see
+/// where the animation came from and where it is going without scrubbing.
+///
+/// This is the whole-layer answer to every property a motion path can't draw.
+/// A path works for position because position *is* a spatial curve; rotation,
+/// scale, opacity, colour and shape have no such geometry, but a ghost of the
+/// rendered layer shows all of them at once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Onion {
+    pub visible: bool,
+    /// Ghosts drawn before and after the playhead.
+    pub before: u32,
+    pub after: u32,
+    /// Frames between consecutive ghosts. At 60fps neighbouring frames are
+    /// nearly identical, so a step of 1 would draw six copies of the same
+    /// picture; spacing them out is what makes the motion legible.
+    pub step: i64,
+    /// Opacity of the nearest ghost. Further ones fade from here.
+    pub opacity: f64,
+}
+
+impl Default for Onion {
+    fn default() -> Self {
+        // Off by default, like the grid: ghosts over someone's artwork when
+        // they didn't ask is worse than one click away.
+        Self { visible: false, before: 3, after: 3, step: 2, opacity: 0.35 }
+    }
+}
+
+impl Onion {
+    /// Ghosts are capped because each one costs a full scene evaluation — this
+    /// stops a typo in a `.pbc` from turning one repaint into thousands.
+    pub const MAX_GHOSTS: u32 = 20;
+
+    /// Frame offsets to draw, nearest first, paired with how far through the
+    /// fade each one is (`0.0` nearest, `1.0` furthest).
+    ///
+    /// Returns nothing when hidden, so callers need no second check. A `step`
+    /// of zero or less would stack every ghost on the playhead, so it clamps.
+    pub fn offsets(&self) -> Vec<(i64, f64)> {
+        if !self.visible {
+            return Vec::new();
+        }
+        let step = self.step.max(1);
+        let mut out = Vec::new();
+        for (n, sign) in [(self.before, -1i64), (self.after, 1i64)] {
+            let n = n.min(Self::MAX_GHOSTS);
+            for i in 1..=n {
+                // Fade across the count, not across the frame distance, so the
+                // nearest ghost is always the most solid whatever the step is.
+                let t = if n > 1 { (i - 1) as f64 / (n - 1) as f64 } else { 0.0 };
+                out.push((sign * step * i as i64, t));
+            }
+        }
+        out
     }
 }
 
@@ -979,6 +1041,51 @@ mod tests {
         assert_eq!(grid.minor_step(), None);
         grid.subdivisions = 4;
         assert_eq!(grid.minor_step(), Some(25.0));
+    }
+
+    /// Ghost offsets are symmetrical, spaced by `step`, and fade with their
+    /// *index* rather than their frame distance - so the nearest ghost is
+    /// always the most solid whatever the spacing is.
+    #[test]
+    fn onion_offsets_are_spaced_and_faded_from_the_playhead() {
+        let o = Onion { visible: true, before: 3, after: 2, step: 2, opacity: 0.5 };
+        let offs = o.offsets();
+        let frames: Vec<i64> = offs.iter().map(|(f, _)| *f).collect();
+        assert_eq!(frames, vec![-2, -4, -6, 2, 4]);
+        assert_eq!(offs[0].1, 0.0, "nearest past is solid");
+        assert_eq!(offs[2].1, 1.0, "furthest past is fully faded");
+        assert_eq!(offs[3].1, 0.0, "nearest future is solid");
+        assert_eq!(offs[4].1, 1.0, "furthest future is fully faded");
+    }
+
+    /// Hidden means no work at all, so callers need no second check.
+    #[test]
+    fn hidden_onion_skins_schedule_nothing() {
+        let o = Onion { visible: false, before: 5, after: 5, step: 1, opacity: 0.5 };
+        assert!(o.offsets().is_empty());
+    }
+
+    /// A zero or negative step would stack every ghost on the playhead, and the
+    /// count is capped so a hand-edited `.pbc` cannot turn one repaint into
+    /// thousands of scene evaluations.
+    #[test]
+    fn a_degenerate_onion_setting_cannot_stack_or_explode() {
+        let o = Onion { visible: true, before: 2, after: 0, step: 0, opacity: 0.5 };
+        let frames: Vec<i64> = o.offsets().iter().map(|(f, _)| *f).collect();
+        assert_eq!(frames, vec![-1, -2], "step clamps to 1 rather than stacking at 0");
+
+        let o = Onion { visible: true, before: 9_999, after: 9_999, step: 1, opacity: 0.5 };
+        assert_eq!(o.offsets().len() as u32, Onion::MAX_GHOSTS * 2);
+    }
+
+    /// A single ghost on a side must be solid, not accidentally faded away by a
+    /// divide-by-zero in the fade ramp.
+    #[test]
+    fn a_lone_ghost_is_fully_solid() {
+        let o = Onion { visible: true, before: 1, after: 1, step: 3, opacity: 0.5 };
+        for (_, t) in o.offsets() {
+            assert_eq!(t, 0.0);
+        }
     }
 
     /// Same contract for the passepartout: it round-trips, and a file written

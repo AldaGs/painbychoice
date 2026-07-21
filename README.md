@@ -429,6 +429,52 @@ Not yet: snapping a layer's **bounding-box edges** rather than its pivot. That
 is what you want for laying out a title against a margin, and it needs per-frame
 bounds for the dragged layer plus a candidate set from its siblings.
 
+### Onion skins (2026-07-21)
+
+`live/src/onion.rs`, `Comp::aids.onion`. Ghosts of the frame either side of the
+playhead, so you can see where the animation came from and where it is going
+without scrubbing. Tool strip: **Onion**; right-click for counts, spacing and
+opacity.
+
+**This is the whole-layer answer to every property a motion path can't draw.** A
+path works for position because position *is* a spatial curve in the same space
+as the canvas. Nothing else has that property — there is no natural geometry for
+"rotation over time", and inventing one per property would mean a new
+visualisation for every property ever added. A ghost of the *rendered* layer
+sidesteps that: rotation, scale, opacity, fill, shape parameters and text all
+show at once, because it is the actual picture rather than a plot of one channel.
+
+**Drawn by vello, unlike every other overlay.** The gizmo, motion path and aids
+are egui overlays; ghosts are geometry — filled and stroked paths — and vello
+already draws exactly that. Same rasteriser means a ghost looks like a faded
+version of the frame rather than an approximation of it, and it sits *under* the
+live frame in one scene rather than on a layer above it. The frame you are
+editing must never be the faint one.
+
+Four decisions worth keeping:
+
+- **Cached exactly like the motion path**, keyed on selection, playhead,
+  settings and `App::doc_rev` — each ghost is a full `evaluate_comp`. Six ghosts
+  is six evaluations per rebuild, cheaper than the path's 121, but each retains
+  its *geometry*, so ghosts cost memory where the path costs only points. The
+  cache must be filled **before** `to_vello`, or ghosts lag the playhead by a
+  frame and visibly drift out of step on a fast scrub.
+- **Ghosts outside the comp are skipped, not clamped.** Clamping would pile
+  duplicates of frame 0 on each other and read as the animation stalling there
+  rather than as running out of frames.
+- **Fade follows the ghost's index, not its frame distance**, so the nearest is
+  always the most solid whatever the spacing is. A lone ghost is fully solid
+  rather than divided by zero into invisibility.
+- **The tint keeps some of the layer's own colour** (past warm, future cool, the
+  Maya/Blender convention). Fully tinting would flatten a multi-coloured scene
+  into two silhouettes and lose which layer is which.
+
+Ghosts the selection, or the whole comp when nothing is selected — the "review
+the animation" case. Same cost either way: the evaluation is whole-comp
+regardless and only the filter differs. `step` defaults to 2 because at 60fps
+neighbouring frames are nearly identical, so a step of 1 draws six copies of the
+same picture.
+
 ### The motion path (2026-07-20)
 
 `live/src/motionpath.rs`. An animated layer's pivot trajectory, drawn on the
@@ -1093,12 +1139,12 @@ done** (see *The transform gizmo*). Still open, in this order:
    per-frame bounds for the dragged layer and a candidate set from its siblings.
 3. ~~**Anchor-point handle + selection bbox**~~ ✅ Done — see *The anchor handle
    and the selection box*.
-4. **Onion skinning** — ghosts of the rendered layer at ±N frames, tinted by
-   direction (past warm, future cool). This is the answer for every property a
-   motion path *can't* show; see *The motion path*. Will want the same caching
-   discipline, and is strictly more expensive (each ghost is a whole scene).
+4. ~~**Onion skinning**~~ ✅ Done — see *Onion skins*.
 
-The **motion path** from this track is done — see *The motion path* below.
+That completes the canvas-gizmos track as agreed. What remains from it is
+**bounding-box snapping** (edges, and to other layers' bounds), which wants the
+bounds computed in `core` beside `Scene::places` so sibling bounds come out of
+the same pass.
 
 > **Graph-UI progress (2026-07-20):** module bodies now have a real editing
 > surface — you open a module from the graph panel and edit its body + knobs on

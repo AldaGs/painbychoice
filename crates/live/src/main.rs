@@ -20,7 +20,8 @@ use std::time::Instant;
 
 use kurbo::{Affine, BezPath, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, Guides, ViewAids, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
+    demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, Guides, Onion, ViewAids,
+    eval::RenderItem as MRenderItem, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
     Comp, Document, EvalCtx, Expr, Project as MProject,
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
@@ -48,6 +49,7 @@ mod graph;
 mod icon;
 mod layers;
 mod motionpath;
+mod onion;
 mod props;
 mod scene;
 mod theme;
@@ -62,6 +64,7 @@ use gizmo::*;
 use graph::*;
 use layers::*;
 use motionpath::*;
+use onion::*;
 use props::*;
 use scene::*;
 use timeline::*;

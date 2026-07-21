@@ -146,6 +146,9 @@ pub(crate) struct App {
     /// the selection or the frame window moves — each sample is a full scene
     /// evaluation, so this must never be recomputed per UI frame.
     pub(crate) motion_path: MotionPath,
+    /// Cached onion-skin ghosts. Each is a full scene evaluation, so this obeys
+    /// the same rebuild-only-on-change rule as `motion_path`.
+    pub(crate) onion: OnionSkins,
     /// Bumped whenever the document changes. The motion-path cache keys off it;
     /// without it the path would keep drawing the pre-edit trajectory.
     pub(crate) doc_rev: u64,
@@ -287,6 +290,7 @@ impl App {
             gizmo_drag: None,
             gizmo_hot: false,
             motion_path: MotionPath::default(),
+            onion: OnionSkins::default(),
             doc_rev: 0,
             guide_drag: None,
             aids_hot: false,
@@ -311,6 +315,20 @@ impl App {
         }
         if e.toggle_snap {
             self.doc_mut().aids.snap ^= true;
+        }
+        if e.toggle_onion {
+            self.doc_mut().aids.onion.visible ^= true;
+        }
+        if let Some((b, a)) = e.set_onion_counts {
+            let o = &mut self.doc_mut().aids.onion;
+            o.before = b.min(Onion::MAX_GHOSTS);
+            o.after = a.min(Onion::MAX_GHOSTS);
+        }
+        if let Some(st) = e.set_onion_step {
+            self.doc_mut().aids.onion.step = st.max(1);
+        }
+        if let Some(op) = e.set_onion_opacity {
+            self.doc_mut().aids.onion.opacity = op.clamp(0.0, 1.0);
         }
         if let Some(sp) = e.set_grid_spacing {
             self.doc_mut().aids.grid.spacing = sp.clamp(Grid::MIN_SPACING, Grid::MAX_SPACING);
@@ -1264,10 +1282,33 @@ impl App {
             }
         }
 
+        // Ghosts are baked into the vello scene, so they must be cached *before*
+        // it is built or they lag a frame behind the playhead — which on a fast
+        // scrub reads as them drifting out of step with the artwork. Cached on
+        // the same terms as the motion path: rebuilt only when something they
+        // depend on moves.
+        if self.doc().aids.onion.visible {
+            let onion = self.doc().aids.onion.clone();
+            let (comp, sel, rev) = (self.current, self.selected, self.doc_rev);
+            let now = self.current_frame();
+            self.onion.cache(&self.project, comp, sel, now, &onion, rev);
+        } else {
+            self.onion.clear();
+        }
+
         let bg = self.doc().bg;
         let pp = self.doc().passepartout;
         self.vscene =
-            to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, pp, canvas, self.selected);
+            to_vello(
+                &scene,
+                fit,
+                (self.doc().width, self.doc().height),
+                bg,
+                pp,
+                canvas,
+                &self.onion.ghosts,
+                self.selected,
+            );
 
         // Motion path: only for a layer whose *position* is actually animated —
         // a constant position has no trajectory, and drawing one dot under the
@@ -1861,7 +1902,16 @@ impl App {
             let bg = self.doc().bg;
             let pp = self.doc().passepartout;
         self.vscene =
-            to_vello(&scene, fit, (self.doc().width, self.doc().height), bg, pp, canvas, self.selected);
+            to_vello(
+                &scene,
+                fit,
+                (self.doc().width, self.doc().height),
+                bg,
+                pp,
+                canvas,
+                &self.onion.ghosts,
+                self.selected,
+            );
         }
 
         self.egui_state

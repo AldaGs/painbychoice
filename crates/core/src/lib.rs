@@ -23,8 +23,8 @@ pub use expr::{
     PropPath, ToExpr, Waveform,
 };
 pub use node::{
-    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Project, Shape, Stroke,
-    Transform, ViewAids,
+    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project, Shape,
+    Stroke, Transform, ViewAids,
 };
 pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;

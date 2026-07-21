@@ -119,6 +119,59 @@ pub(crate) fn canvas_toolbar(
                 {
                     aid_out.toggle_snap = true;
                 }
+                let onion = ui
+                    .selectable_label(aids.onion.visible, "Onion")
+                    .on_hover_text("Ghost the frames either side of the playhead - right-click for counts");
+                if onion.clicked() {
+                    aid_out.toggle_onion = true;
+                }
+                onion.context_menu(|ui| {
+                    ui.label("Onion skins");
+                    let (mut before, mut after) = (aids.onion.before, aids.onion.after);
+                    let b = ui.add(
+                        egui::DragValue::new(&mut before)
+                            .speed(0.1)
+                            .range(0..=Onion::MAX_GHOSTS)
+                            .prefix("before "),
+                    );
+                    let a = ui.add(
+                        egui::DragValue::new(&mut after)
+                            .speed(0.1)
+                            .range(0..=Onion::MAX_GHOSTS)
+                            .prefix("after "),
+                    );
+                    if b.changed() || a.changed() {
+                        aid_out.set_onion_counts = Some((before, after));
+                    }
+                    let mut step = aids.onion.step;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut step)
+                                .speed(0.2)
+                                .range(1..=240)
+                                .prefix("every ")
+                                .suffix(" f"),
+                        )
+                        .on_hover_text("Frames between ghosts")
+                        .changed()
+                    {
+                        aid_out.set_onion_step = Some(step);
+                    }
+                    let mut pct = aids.onion.opacity * 100.0;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut pct)
+                                .speed(1.0)
+                                .range(1.0..=100.0)
+                                .prefix("opacity ")
+                                .suffix("%"),
+                        )
+                        .changed()
+                    {
+                        aid_out.set_onion_opacity = Some(pct / 100.0);
+                    }
+                    ui.weak("Ghosts the selection, or the whole comp if nothing is selected.");
+                });
                 let guides = ui
                     .selectable_label(aids.guides.visible, "Guides")
                     .on_hover_text("Show guides — drag one back to a ruler to remove it");
@@ -147,7 +200,8 @@ pub(crate) fn to_peniko(c: MColor, opacity: f64) -> Color {
 /// Convert an evaluated engine `Scene` into a `vello::Scene`, prepending a
 /// global transform that fits the composition into the window.
 ///
-/// Draw order is load-bearing: composition background, then the shapes, then
+/// Draw order is load-bearing: composition background, then the **onion skin**
+/// ghosts, then the shapes, then
 /// the **passepartout** dimming everything outside the frame, then the frame
 /// border, then the selection outline. The passepartout has to come after the
 /// shapes (it dims the parts of them that hang outside the frame, which is the
@@ -155,6 +209,7 @@ pub(crate) fn to_peniko(c: MColor, opacity: f64) -> Color {
 ///
 /// `canvas` is the preview area in **physical pixels** — the passepartout needs
 /// to know how far to reach, and it is the only thing here that does.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn to_vello(
     scene: &MScene,
     fit: Affine,
@@ -162,6 +217,7 @@ pub(crate) fn to_vello(
     bg: MColor,
     passepartout: f64,
     canvas: kurbo::Rect,
+    ghosts: &[Ghost],
     selected: Option<NodeId>,
 ) -> VScene {
     let mut vs = VScene::new();
@@ -171,6 +227,28 @@ pub(crate) fn to_vello(
     let comp_rect = kurbo::Rect::new(0.0, 0.0, comp.0, comp.1);
     vs.fill(Fill::NonZero, fit, to_peniko(bg, 1.0), None, &comp_rect);
     let scale = fit.as_coeffs()[0].abs().max(1e-6);
+
+    // Onion skins go under the live frame: they are context, and the frame you
+    // are actually editing must never be the faint one.
+    for ghost in ghosts {
+        for item in &ghost.items {
+            let xf = fit * item.transform;
+            if let Some(fill) = item.fill {
+                let c = tinted(fill, ghost.tint, TINT_AMOUNT);
+                vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity * ghost.opacity), None, &item.path);
+            }
+            if let Some((color, width)) = item.stroke {
+                let c = tinted(color, ghost.tint, TINT_AMOUNT);
+                vs.stroke(
+                    &KurboStroke::new(width),
+                    xf,
+                    to_peniko(c, item.opacity * ghost.opacity),
+                    None,
+                    &item.path,
+                );
+            }
+        }
+    }
 
     for item in &scene.items {
         let xf = fit * item.transform;

@@ -2558,6 +2558,7 @@ fn aids_with(grid: bool, guides: Vec<Guide>) -> ViewAids {
         rulers: false,
         guides: Guides { visible: true, items: guides },
         snap: true,
+        onion: Onion::default(),
     }
 }
 
@@ -2910,4 +2911,129 @@ fn a_layer_that_draws_nothing_has_no_selection_box() {
     let scene = evaluate_comp(&project, comp, 0.0);
     let root = project.comps[&comp].root.find(node).unwrap();
     assert!(selection_boxes(&scene, root).is_empty());
+}
+
+// --- Onion skins -----------------------------------------------------------
+
+/// Like `moving_project`, but the layer actually draws something — ghosts are
+/// geometry, so a bare group would produce none.
+fn boxed_project() -> (MProject, NodeId, CompId) {
+    use motion_core::value::{Keyframe, Track};
+    let mut layer = MNode::group(1, "mover");
+    layer.transform.position = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+        Keyframe::linear(200, Vec2::new(400.0, 400.0)),
+    ]));
+    layer.shape = Some(MShape::Rect {
+        size: Value::constant(Vec2::new(50.0, 50.0)),
+        radius: Value::constant(0.0),
+    });
+    layer.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+    let comp = Comp::new(640.0, 480.0, MNode::group(0, "root").with_child(layer));
+    let project = MProject::single(comp);
+    let root = project.root;
+    (project, NodeId(1), root)
+}
+
+/// Ghosts are cached like the motion path, because each one is a full scene
+/// evaluation. An unchanged key must not rebuild; a document change must.
+#[test]
+fn onion_skins_rebuild_only_when_their_key_changes() {
+    let (project, node, comp) = boxed_project();
+    let onion = Onion { visible: true, before: 2, after: 2, step: 2, opacity: 0.5 };
+    let mut skins = OnionSkins::default();
+
+    assert!(skins.cache(&project, comp, Some(node), 50, &onion, 0), "first build");
+    assert!(!skins.cache(&project, comp, Some(node), 50, &onion, 0), "identical key reuses");
+    assert!(skins.cache(&project, comp, Some(node), 51, &onion, 0), "playhead moved");
+    assert!(skins.cache(&project, comp, None, 51, &onion, 0), "selection changed");
+    assert!(skins.cache(&project, comp, None, 51, &onion, 1), "document changed");
+    assert!(!skins.cache(&project, comp, None, 51, &onion, 1), "and settles again");
+
+    // The settings are part of the key too, floats included.
+    let dimmer = Onion { opacity: 0.9, ..onion.clone() };
+    assert!(skins.cache(&project, comp, None, 51, &dimmer, 1), "opacity changed");
+}
+
+/// Ghosts outside the composition are **skipped, not clamped**. Clamping would
+/// pile duplicates of frame 0 on top of each other, which reads as the
+/// animation stalling there rather than as running out of frames.
+#[test]
+fn ghosts_outside_the_comp_are_skipped_rather_than_clamped() {
+    let (project, node, comp) = boxed_project();
+    let onion = Onion { visible: true, before: 3, after: 3, step: 10, opacity: 0.5 };
+    let mut skins = OnionSkins::default();
+
+    // At frame 0 every "before" ghost is off the start of the comp.
+    skins.cache(&project, comp, Some(node), 0, &onion, 0);
+    assert_eq!(skins.ghosts.len(), 3, "only the three future ghosts survive");
+    for g in &skins.ghosts {
+        assert!(g.tint.b > g.tint.r, "all cool-tinted, none from the past");
+    }
+}
+
+/// Past ghosts run warm and future ghosts cool, so the direction of time is
+/// readable without counting. The nearest is the most opaque.
+#[test]
+fn ghosts_are_tinted_by_direction_and_fade_with_distance() {
+    let (project, node, comp) = boxed_project();
+    let onion = Onion { visible: true, before: 2, after: 2, step: 2, opacity: 0.6 };
+    let mut skins = OnionSkins::default();
+    skins.cache(&project, comp, Some(node), 100, &onion, 0);
+
+    assert_eq!(skins.ghosts.len(), 4);
+    // Order is nearest-past, further-past, nearest-future, further-future.
+    assert!(skins.ghosts[0].tint.r > skins.ghosts[0].tint.b, "past is warm");
+    assert!(skins.ghosts[2].tint.b > skins.ghosts[2].tint.r, "future is cool");
+    assert!(
+        skins.ghosts[0].opacity > skins.ghosts[1].opacity,
+        "the nearer past ghost is more solid"
+    );
+    assert!(
+        skins.ghosts[0].opacity <= 0.6 + 1e-9,
+        "and none exceeds the configured opacity"
+    );
+}
+
+/// Hiding onion skins produces no ghosts, so nothing is evaluated or drawn.
+#[test]
+fn hidden_onion_skins_produce_no_ghosts() {
+    let (project, node, comp) = boxed_project();
+    let off = Onion { visible: false, before: 3, after: 3, step: 2, opacity: 0.5 };
+    let mut skins = OnionSkins::default();
+    skins.cache(&project, comp, Some(node), 100, &off, 0);
+    assert!(skins.ghosts.is_empty());
+}
+
+/// With nothing selected the whole comp is ghosted — the "review the animation"
+/// case. It costs the same, since the evaluation is whole-comp either way and
+/// only the filter differs.
+#[test]
+fn with_no_selection_the_whole_comp_is_ghosted() {
+    let (project, node, comp) = boxed_project();
+    let onion = Onion { visible: true, before: 1, after: 1, step: 2, opacity: 0.5 };
+
+    let mut selected = OnionSkins::default();
+    selected.cache(&project, comp, Some(node), 100, &onion, 0);
+    let mut all = OnionSkins::default();
+    all.cache(&project, comp, None, 100, &onion, 0);
+
+    assert!(!all.ghosts.is_empty());
+    assert_eq!(all.ghosts.len(), selected.ghosts.len());
+    assert_eq!(all.ghosts[0].items.len(), selected.ghosts[0].items.len());
+}
+
+/// The tint blends toward the direction colour but keeps some of the layer's
+/// own — fully tinting would flatten a multi-coloured scene into two
+/// silhouettes and lose which layer is which.
+#[test]
+fn a_ghost_keeps_some_of_its_own_colour() {
+    let own = MColor::rgb(0.0, 1.0, 0.0);
+    let tint = MColor::rgb(1.0, 0.0, 0.0);
+    let out = tinted(own, tint, TINT_AMOUNT);
+    assert!(out.r > 0.0 && out.r < 1.0, "pulled toward the tint: {}", out.r);
+    assert!(out.g > 0.0 && out.g < 1.0, "but still recognisably green: {}", out.g);
+    // Zero blend is a no-op; full blend is the tint.
+    assert_eq!(tinted(own, tint, 0.0).g, 1.0);
+    assert_eq!(tinted(own, tint, 1.0).r, 1.0);
 }
