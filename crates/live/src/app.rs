@@ -1237,14 +1237,14 @@ impl App {
         let sel_info = sel_node.map(|node| NodeInfo::resolve(node, self.doc(), t));
         // The gizmo needs the selected layer's *world* matrix, which only the
         // evaluated scene knows (it is the whole parent chain multiplied out).
-        // A selected group with no drawable geometry produces no scene item, so
-        // it simply gets no gizmo rather than one at the wrong place.
+        // Taken from `Scene::places`, not from a `RenderItem`: a group or null
+        // draws nothing and so has no item, but it is exactly the sort of layer
+        // you parent things to and want handles on. `None` here now means only
+        // "the layer isn't live on this frame".
         let gizmo_target = match (self.selected, &sel_info) {
             (Some(id), Some(info)) => scene
-                .items
-                .iter()
-                .find(|i| i.source == id)
-                .map(|i| GizmoTarget::new(id.0, i.transform, info)),
+                .place(id)
+                .map(|place| GizmoTarget::new(id.0, place.world, info)),
             _ => None,
         };
         let rows = sel_node.map(dope_rows).unwrap_or_default();

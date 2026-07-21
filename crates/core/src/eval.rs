@@ -27,26 +27,48 @@ pub struct RenderItem {
 pub struct Scene {
     pub items: Vec<RenderItem>,
     pub warnings: Vec<(NodeId, String)>,
-    /// Every *live* node's pivot — its anchor point in composition space —
-    /// recorded as the walk passes through it.
+    /// Where every *live* node ended up, recorded as the walk passes through.
     ///
     /// Separate from `items` because a node need not draw anything: a group or
     /// a null has no shape and so no [`RenderItem`], but it still has a place,
-    /// and editor overlays (the motion path) need that place. Reading it here
-    /// rather than re-deriving the parent chain outside is what keeps those
-    /// overlays from drifting away from what the walk actually did with
-    /// `LayerTiming`, pre-comps and expression-driven transforms.
+    /// and it is exactly the sort of layer you parent things to and animate.
+    /// Editor overlays — the motion path, the transform gizmo — need that
+    /// place. Reading it here rather than re-deriving the parent chain outside
+    /// is what keeps those overlays from drifting away from what the walk
+    /// actually did with `LayerTiming`, pre-comps and expression-driven
+    /// transforms.
     ///
     /// Nodes outside their time window are absent, not zeroed — the walk
     /// returns before reaching them, which is exactly the "layer isn't here on
-    /// this frame" signal a path needs to break itself on.
-    pub pivots: Vec<(NodeId, kurbo::Point)>,
+    /// this frame" signal a motion path breaks its polyline on.
+    pub places: Vec<(NodeId, Placement)>,
+}
+
+/// Where one node sits in composition space on this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    /// Local → composition space: the node's own matrix with every ancestor's
+    /// already applied. An overlay that needs to know which way the layer's
+    /// axes point (not merely where it is) needs this, not just [`Self::pivot`].
+    pub world: Affine,
+    /// The node's anchor point in composition space.
+    ///
+    /// The *anchor*, not the local origin: the local matrix maps the anchor to
+    /// `position` by construction, so this is the point the layer rotates and
+    /// scales about. An overlay drawn anywhere else sits away from where the
+    /// layer visibly turns.
+    pub pivot: kurbo::Point,
 }
 
 impl Scene {
-    /// Where `node`'s anchor sits in composition space, if it was live.
+    /// Where `node` ended up, if it was live on this frame.
+    pub fn place(&self, node: NodeId) -> Option<Placement> {
+        self.places.iter().find(|(id, _)| *id == node).map(|(_, p)| *p)
+    }
+
+    /// Shorthand for [`Placement::pivot`].
     pub fn pivot(&self, node: NodeId) -> Option<kurbo::Point> {
-        self.pivots.iter().find(|(id, _)| *id == node).map(|(_, p)| *p)
+        self.place(node).map(|p| p.pivot)
     }
 }
 
@@ -150,11 +172,12 @@ fn walk(
     let xf = parent_xf * local_xf;
     let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
 
-    // `local_xf` maps the anchor point to `position` by construction, so this
-    // is the point the layer rotates and scales about — and the point an
-    // on-canvas gizmo centres on. Recorded for every node, drawable or not.
+    // Recorded for every node, drawable or not — see `Scene::places`.
     let anchor = node.transform.anchor.resolve(ctx);
-    scene.pivots.push((node.id, xf * kurbo::Point::new(anchor.x, anchor.y)));
+    scene.places.push((
+        node.id,
+        Placement { world: xf, pivot: xf * kurbo::Point::new(anchor.x, anchor.y) },
+    ));
 
     if let Some(shape) = &node.shape {
         let path = shape.to_path(ctx);
@@ -245,6 +268,37 @@ mod tests {
         let scene = evaluate(&doc, 0.0);
         assert!(scene.items.is_empty(), "a bare group renders nothing");
         assert_eq!(scene.pivot(NodeId(1)), Some(kurbo::Point::new(30.0, 40.0)));
+    }
+
+    /// A group's `world` matrix must carry the whole parent chain, not just its
+    /// own transform — an on-canvas gizmo reads it to work out which way the
+    /// layer's axes point, so a missing ancestor rotation would draw the
+    /// handles pointing the wrong way while the pivot still looked right.
+    #[test]
+    fn a_groups_world_matrix_carries_the_parent_chain() {
+        let mut child = Node::group(2, "child");
+        child.transform.position = Value::constant(Vec2::new(10.0, 0.0));
+
+        let mut parent = Node::group(1, "parent");
+        parent.transform.position = Value::constant(Vec2::new(100.0, 0.0));
+        parent.transform.rotation_deg = Value::constant(90.0);
+
+        let doc = Document::new(
+            500.0,
+            500.0,
+            Node::group(0, "root").with_child(parent.with_child(child)),
+        );
+        let scene = evaluate(&doc, 0.0);
+        assert!(scene.items.is_empty(), "still nothing drawable");
+
+        let world = scene.place(NodeId(2)).expect("a group has a place").world;
+        // The parent turns a quarter turn, so the child's local +X points along
+        // comp +Y. Its origin lands at (100,0) + rot90*(10,0) = (100,10).
+        let origin = world * kurbo::Point::ZERO;
+        assert!((origin.x - 100.0).abs() < 1e-9, "x {}", origin.x);
+        assert!((origin.y - 10.0).abs() < 1e-9, "y {}", origin.y);
+        let x_axis = (world * kurbo::Point::new(1.0, 0.0)) - origin;
+        assert!(x_axis.x.abs() < 1e-9 && (x_axis.y - 1.0).abs() < 1e-9, "{x_axis:?}");
     }
 
     /// The pivot is the *anchor* in comp space, not the local origin, and it

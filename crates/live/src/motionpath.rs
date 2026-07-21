@@ -14,8 +14,8 @@
 //! ## Why it samples the real evaluator
 //!
 //! Each sample is a full [`evaluate_comp`], and the point is read out of the
-//! resulting scene item. That is not the cheap way — the cheap way would walk
-//! the ancestor transforms directly — but it is the only way the path cannot
+//! resulting scene's `places` table. That is not the cheap way — the cheap way
+//! would walk the ancestor transforms directly — but it is the only way the path cannot
 //! disagree with the canvas. Parent chains, expressions, pre-comp instancing
 //! and `LayerTiming`'s local-frame shift all bend where a layer actually is,
 //! and re-deriving that here would be a second implementation of `eval.rs`'s
@@ -138,7 +138,7 @@ impl MotionPath {
 
 /// Where the layer's **pivot** is at `frame`, in comp space.
 ///
-/// Read straight out of the evaluated scene's pivot table rather than from a
+/// Read straight out of the evaluated scene's `places` table rather than from a
 /// `RenderItem`: a group or a null draws nothing and so has no item, but it is
 /// exactly the kind of layer you animate and want a path for. `None` means the
 /// walk never reached the node — it is outside its time window on this frame —

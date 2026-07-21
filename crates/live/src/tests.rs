@@ -2421,3 +2421,48 @@ fn the_motion_path_breaks_where_the_layer_is_absent() {
     assert_eq!(segs[0].len(), 2);
     assert_eq!(segs[1].len(), 3);
 }
+
+/// End-to-end: a bare **group** now gets a gizmo. It draws nothing, so it has
+/// no `RenderItem` and used to be skipped entirely — but a null you parent
+/// things to is exactly what you want handles on. The target is built from
+/// `Scene::places`, and its pivot must land on the same point the scene
+/// reports, or the handles would sit away from the layer.
+#[test]
+fn a_bare_group_gets_a_gizmo_target_from_its_place() {
+    let (project, node, comp) = moving_project();
+    let scene = evaluate_comp(&project, comp, 50.0);
+    assert!(scene.items.is_empty(), "the fixture is a bare group");
+
+    let c = project.comps.get(&comp).expect("the comp");
+    let n = c.root.find(node).expect("the group");
+    let info = NodeInfo::resolve(n, c, 50.0);
+    let place = scene.place(node).expect("a group has a place");
+
+    let target = GizmoTarget::new(node.0, place.world, &info);
+    let origin = target.parent * Point::new(target.pos.x, target.pos.y);
+    let pivot = scene.pivot(node).expect("and a pivot");
+    assert!(
+        (origin - pivot).hypot() < 1e-6,
+        "gizmo origin {origin:?} should sit on the pivot {pivot:?}"
+    );
+    // Halfway along the linear move, so both agree with the animation too.
+    assert!((pivot.x - 50.0).abs() < 1e-6 && (pivot.y - 100.0).abs() < 1e-6, "{pivot:?}");
+}
+
+/// A layer outside its time window has no place, so it gets no gizmo — the
+/// handles must not linger over a layer that isn't on screen.
+#[test]
+fn a_layer_outside_its_window_has_no_place_to_hang_a_gizmo_on() {
+    use motion_core::node::LayerTiming;
+    let (mut project, node, comp) = moving_project();
+    project
+        .comp_mut(comp)
+        .expect("the comp")
+        .root
+        .find_mut(node)
+        .expect("the group")
+        .timing = Some(LayerTiming { start: 0, in_: 10, out: 20 });
+
+    assert!(evaluate_comp(&project, comp, 15.0).place(node).is_some(), "inside");
+    assert!(evaluate_comp(&project, comp, 50.0).place(node).is_none(), "outside");
+}

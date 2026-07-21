@@ -282,7 +282,8 @@ Three gotchas worth keeping:
   `translate(position) · rotate · scale · translate(-anchor)`, so the anchor
   point *maps to* `position` in parent space. Rotation and scale hang off there.
 - **The parent matrix is recovered, not looked up.** `GizmoTarget::new` computes
-  `parent = world · local⁻¹` from the scene item's world matrix. That is why
+  `parent = world · local⁻¹` from the node's world matrix (`Scene::places`,
+  so a bare group gets handles too). That is why
   `anchor` had to join `NodeInfo`: leave it out of `local` and the recovered
   parent is wrong, so the gizmo tracks the cursor at an offset. A zero scale
   makes `local` singular, so the recovery substitutes a scale of 1 (an
@@ -334,23 +335,29 @@ optimise if it ever feels slow. `Comp::motion_path_range` (default 60, capped at
 Display-only for now: dragging a keyframe along the path needs per-key
 hit-testing and a spatial-tangent story, and wants the path proven correct first.
 
-### `Scene::pivots` — why a node's place is separate from its drawing
+### `Scene::places` — why a node's place is separate from its drawing
 
-`eval.rs`'s walk records every live node's anchor point in comp space, alongside
-the draw list. A node need not draw anything — a group or a null has no shape
-and so no `RenderItem` — but it still has a place, and it is exactly the sort of
-layer you parent things to and animate. Editor overlays need that place.
+`eval.rs`'s walk records a `Placement { world, pivot }` for every live node,
+alongside the draw list. A node need not draw anything — a group or a null has
+no shape and so no `RenderItem` — but it still has a place, and it is exactly
+the sort of layer you parent things to and animate. **Both** editor overlays
+read it: the motion path takes `pivot`, the transform gizmo takes `world`, and
+so both work on a bare group.
 
-Two properties are load-bearing:
+Three properties are load-bearing:
 
-- It is the **anchor**, not the local origin. `local` maps the anchor point to
-  `position` by construction, so this is the point the layer rotates and scales
-  about, and the point the gizmo centres on. An overlay drawn anywhere else sits
-  away from where the layer visibly turns.
+- `pivot` is the **anchor**, not the local origin. `local` maps the anchor point
+  to `position` by construction, so this is the point the layer rotates and
+  scales about, and the point the gizmo centres on. An overlay drawn anywhere
+  else sits away from where the layer visibly turns.
+- `world` is the whole **parent chain** multiplied out, which is what an overlay
+  needs to know which way the layer's axes point — not merely where it is. A
+  pivot alone would place the gizmo correctly but aim its arrows wrong.
 - A node outside its time window is **absent, not zeroed**. The walk returns
   before reaching it, so "the layer isn't here on this frame" is expressible —
   which is what lets the motion path break its polyline instead of drawing a
-  line to the origin.
+  line to the origin, and what stops the gizmo lingering over an off-screen
+  layer.
 
 ### Colours
 

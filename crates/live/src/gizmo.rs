@@ -64,8 +64,8 @@ pub(crate) struct GizmoDrag {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GizmoTarget {
     pub(crate) node: u64,
-    /// Parent space → comp space. Built from the scene item's world matrix with
-    /// the layer's *own* local matrix divided back out.
+    /// Parent space → comp space. Built from the node's world matrix (from
+    /// `Scene::places`) with the layer's *own* local matrix divided back out.
     pub(crate) parent: Affine,
     pub(crate) pos: Vec2,
     pub(crate) rot_deg: f64,
@@ -83,8 +83,8 @@ impl GizmoTarget {
             * Affine::translate(-anchor)
     }
 
-    /// Build a target from a scene item's world transform and the layer's
-    /// resolved values. `world = parent · local`, so `parent = world · local⁻¹`
+    /// Build a target from a node's world transform and the layer's resolved
+    /// values. `world = parent · local`, so `parent = world · local⁻¹`
     /// — which is why the anchor has to be in [`NodeInfo`]: leave it out and
     /// `local` is wrong, so the recovered parent is wrong, and the gizmo
     /// tracks the cursor at an offset.
