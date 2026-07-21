@@ -34,6 +34,7 @@ pub(crate) fn prop_path_label(p: PropPath) -> &'static str {
         PropPath::ShapeSize => "Size",
         PropPath::ShapeRadius => "Radius",
         PropPath::TextSize => "Font Size",
+        PropPath::TextContent => "Content",
     }
 }
 
@@ -45,6 +46,7 @@ pub(crate) enum ParamKind {
     Num,
     Vec,
     Color,
+    Str,
 }
 
 impl ParamKind {
@@ -56,6 +58,10 @@ impl ParamKind {
             ParamKind::Color => {
                 ParamValue::Color(Value::constant(MColor::rgba(1.0, 1.0, 1.0, 1.0)))
             }
+            // Seeded empty, unlike the text *node*'s placeholder: a knob is
+            // filled in per link, and a default of "Text" would silently ship
+            // placeholder copy anywhere the caller forgot to set it.
+            ParamKind::Str => ParamValue::Str(Value::constant(String::new())),
         }
     }
 }
@@ -685,7 +691,12 @@ fn knobs_ui(
         let taken = knobs.iter().any(|k| k.name == pending.trim());
         let ok = !pending.trim().is_empty() && !taken;
         for (label, kind) in
-            [("num", ParamKind::Num), ("vec", ParamKind::Vec), ("col", ParamKind::Color)]
+        [
+            ("num", ParamKind::Num),
+            ("vec", ParamKind::Vec),
+            ("col", ParamKind::Color),
+            ("txt", ParamKind::Str),
+        ]
         {
             if ui
                 .add_enabled(ok, egui::Button::new(format!("{} {label}", icon::ADD)).small())
@@ -715,7 +726,7 @@ fn knobs_ui(
                 out.knob = Some(NgKnobOp::Remove { owner, name: k.name.clone() });
             }
             ui.label(&k.name);
-            match k.value {
+            match k.value.clone() {
                 Some(v) => {
                     if let Some(v) = literal_field(ui, ("knobv", owner, &k.name), v) {
                         out.knob =
@@ -744,6 +755,15 @@ fn literal_field(
         ExprValue::Num(n) => {
             let mut v = n;
             ui.add(egui::DragValue::new(&mut v).speed(0.1)).changed().then_some(ExprValue::Num(v))
+        }
+        // Single-line: a knob row is one line tall, and the multi-line editor
+        // belongs to the text node's own content field where the extra height
+        // is affordable.
+        ExprValue::Str(t) => {
+            let mut v = t;
+            ui.add(egui::TextEdit::singleline(&mut v).desired_width(140.0))
+                .changed()
+                .then_some(ExprValue::Str(v))
         }
         ExprValue::Vec2(p) => {
             let (mut x, mut y) = (p.x, p.y);
@@ -1011,11 +1031,29 @@ fn inspector_ui(
                 });
         });
     }
-    // A text node's typography isn't a socket — `ExprValue` has no string, so
-    // only the font size wires. The rest is edited here and lowered straight
-    // into `Shape::Text`. Falls through afterwards so the size field still shows.
+    // A text node's *typography* isn't a socket: `family` names a system font
+    // (a lookup key, not a value) and align/wrap are enum-ish settings with
+    // nothing to wire. Its `content` is no longer here — that became a real
+    // `Text` input socket, so it draws through the ordinary unwired-literal
+    // loop below and can be driven by a wire instead. Falls through afterwards
+    // so the socket fields still show.
     if node.kind == "text" {
         text_editor(ui, node, out);
+    }
+    // A `string` node's constant, like `value`'s, lives under its output socket
+    // id. Multi-line: a caption is the common case and a one-line field makes
+    // an embedded newline invisible.
+    if node.kind == "string" {
+        let mut cur = match node.value("value") {
+            Some(ExprValue::Str(t)) => t,
+            _ => String::new(),
+        };
+        if ui
+            .add(egui::TextEdit::multiline(&mut cur).hint_text("text").desired_rows(2))
+            .changed()
+        {
+            out.op = Some(set_value(node.id, "value", ExprValue::Str(cur)));
+        }
     }
     // A `value` node's constant lives under its output socket id.
     if node.kind == "value" {
@@ -1031,7 +1069,7 @@ fn inspector_ui(
         if graph.incoming(&Endpoint::new(node.id, &s.id)).is_some() {
             continue; // wired — no literal to edit
         }
-        match (s.ty, node.value(&s.id).or(s.default)) {
+        match (s.ty, node.value(&s.id).or_else(|| s.default.clone())) {
             (SocketType::Number | SocketType::Time, cur) => {
                 let cur = match cur {
                     Some(ExprValue::Num(n)) => n,
@@ -1152,17 +1190,16 @@ fn set_value(id: GraphNodeId, socket: &str, value: ExprValue) -> NgOp {
     NgOp::SetValue { id, socket: socket.to_string(), value }
 }
 
-/// The editor for a `text` node's plain data: the string, the family, the
-/// alignment, and the wrap width. These aren't sockets because [`ExprValue`]
-/// has no string variant (the same reason `Shape::Text` keeps them as plain
-/// fields), so the node carries them in its config and lowering copies them
-/// through.
+/// The editor for a `text` node's **typography**: the family, the alignment,
+/// and the wrap width. Not the string — `content` is a `Text` input socket now,
+/// so it is wirable and lives with the other socket literals.
+///
+/// These three stay config because none of them is a value: `family` is a
+/// system-font lookup key, and align/wrap select a shaping mode. Lowering copies
+/// them straight into `Shape::Text`.
 fn text_editor(ui: &mut egui::Ui, node: &GraphNode, out: &mut NgEdits) {
     let mut t = node.config.text.clone();
     let mut changed = false;
-    changed |= ui
-        .add(egui::TextEdit::multiline(&mut t.content).hint_text("text").desired_rows(2))
-        .changed();
     ui.horizontal(|ui| {
         changed |= ui
             .add(

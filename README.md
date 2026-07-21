@@ -52,10 +52,13 @@ on — expressions and (later) a node graph are two front-ends that lower to the
 same `Expr` IR (the EBN "IR + dumb-printer" split: the IR is data, evaluation is
 a pure tree-walk).
 
-- **Dynamic↔typed edge.** An expression works in `ExprValue { Num, Vec2, Color }`
-  and pins the type down only at the property, via `FromExpr`/`ToExpr` (impl'd
-  for exactly the scriptable types — never `BezPath`). A kind mismatch resolves
-  to `T::fallback()` (a neutral zero), never a failed frame.
+- **Dynamic↔typed edge.** An expression works in
+  `ExprValue { Num, Vec2, Color, Str }` and pins the type down only at the
+  property, via `FromExpr`/`ToExpr` (impl'd for exactly the scriptable types —
+  never `BezPath`). A kind mismatch resolves to `T::fallback()` (a neutral zero,
+  or the empty string), never a failed frame. Every conversion is **strict**,
+  including text: mixing kinds is something you ask for with `Add`, not
+  something the property edge does behind you.
 - **The IR** is deliberately tiny: `Lit`, `Ref { node, prop, time_offset }`, and
   `Add`/`Mul`/`Neg` (`a - b` lowers to `Add(a, Neg(b))`). `Ref`'s `time_offset`
   is the `valueAtTime(t')` case — sampling another property at a *shifted* frame.
@@ -1004,7 +1007,7 @@ order past #5* below (pre-comps first). The stages of each item:
      a bare frame (see *The core idea* above).
    - ~~**`Value::Expr` + the IR.**~~ ✅ Done — the headless engine now evaluates
      expressions. See *Expressions* below. In short: a `crate::expr` module with
-     the dynamic `ExprValue { Num, Vec2, Color }` and its `From`/`ToExpr` edge, a
+     the dynamic `ExprValue { Num, Vec2, Color, Str }` and its `From`/`ToExpr` edge, a
      tiny IR (`Lit`, `Ref { node, prop, time_offset }`, `Add`/`Mul`/`Neg`), and a
      `ResolveCache` on `EvalCtx` doing per-frame memoization + cycle detection (a
      cycle → a `scene.warnings` entry + a neutral fallback, never a hang).
@@ -1105,16 +1108,70 @@ another machine still draws. The tests in `text.rs` therefore assert *structure*
 (non-empty path, bigger size ⇒ bigger box, wrapping ⇒ taller and narrower,
 unknown family still draws) and never exact coordinates.
 
-Only `size` is a `Value`, so it's the only keyframable/expression-drivable text
-channel (`PropKind::TextSize`, `PropPath::TextSize` → `text_size` in scripts).
-`content` is a plain `String` because [`Value`] carries only interpolatable,
-expression-typed values (`f64`/`Vec2`/`Color`) — there's no string in
-`ExprValue`, so **a keyframed or scripted string (a typewriter effect) needs a
-wider value model** and is the obvious next step for this primitive.
+`size` **and `content`** are both `Value`s, so both keyframe and take
+expressions (`PropKind::TextSize`/`TextContent`, `PropPath::TextSize`/
+`TextContent` → `text_size` / `content` in scripts). `content` became one when
+`ExprValue` grew `Str` — see *The string value type* below, which is what makes
+the typewriter effect an expression rather than a built-in.
 
 Shaping contexts (parley's `FontContext`/`LayoutContext`) are `thread_local` and
 reused, like `expr.rs`'s script engine — enumerating system fonts is far too
 expensive to redo per frame.
+
+### The string value type
+
+Added 2026-07-21. `ExprValue` gained a fourth kind, `Str(String)`, so text is a
+*value* like every other — keyframable, scriptable, wirable — rather than a
+plain field bolted to the side of a text layer. The typewriter effect falls out
+of it as an expression; nothing in the engine knows the word "typewriter".
+
+- **`ExprValue` is no longer `Copy`.** One heap variant demotes the whole enum.
+  Interning the strings to keep `Copy` was considered and rejected: `Expr::Lit`
+  is *serialized into the `.pbc`*, so an interner would have to round-trip
+  through the document format too. The ripple was 8 call sites, all mechanical.
+- **A string track holds, it doesn't interpolate.** `impl Animatable for String`
+  returns the starting key until the segment ends — there is no halfway point
+  between two strings, and inventing one (a cross-fade through character codes,
+  a progressive reveal) would be an *effect* masquerading as interpolation. So a
+  text track is a step sequence, which is exactly what titles and subtitles
+  want. Easing handles are still stored and are simply inert, so the dopesheet
+  needs no special case.
+- **`Add` concatenates, and it's contagious**: if either operand is text the sum
+  is text, so `"take " + n` reads the way it does in any scripting language.
+  This lives in `eval_expr`, not in `ExprValue::zip` — `zip` only knows how to
+  combine two numbers component-wise. `Mul`/`Neg` pass text through untouched.
+- **Conversion at the property edge stays strict.** A lenient `FromExpr for
+  String` (stringify whatever arrives) was tried and reverted: a script that
+  errors resolves to `Num(0.0)` as its universal "nothing", and a lenient
+  conversion renders that as the text **"0"** — a broken expression putting a
+  plausible-looking zero on the canvas instead of reading as broken. Empty +
+  the existing warning is honest. Mixing is still available, just *explicit*,
+  through `Add`.
+- **`SocketType::Text` interchanges with `Number` in `feeds`.** Note the
+  asymmetry with the rule above: wire legality is not a promise the value
+  converts. The math nodes' sockets are declared `Number` but are really "any
+  scalar value" — a `value` node's output is `Number` whatever literal it holds,
+  which is how a `Vec2` already flows through an `add` today. Refusing text
+  there would make concatenation unbuildable on the canvas even between two
+  strings.
+- **Rhai needed almost nothing**: it has a native string type, so text crosses
+  the bridge as itself and the whole Rhai string library (`sub_string`, `+`,
+  `len`) is available to a text property for free. A script returning a string
+  used to be an *error*; that assertion was inverted.
+- **A `string` input node** joins `value`, rather than `value` growing a text
+  mode: the socket type is what the canvas colours a wire by, and one node that
+  changed its output type under you would make a graph unreadable. `raise` picks
+  it for a `Str` literal, so `lower(raise(e)) == e` still holds.
+- **`content` left `TextConfig`** and became a real `Text` input socket on the
+  text node — that is what makes a typewriter *a wire from a script node*
+  instead of a built-in. `family` stayed config: it names a system font, so it's
+  a lookup key, not a value. Knobs gained `ParamValue::Str` / `ParamKind::Str`
+  to match.
+- **Old `.pbc` files still open.** `content` was a bare JSON string before this
+  and is a tagged `Value` now, so `de_text_content` accepts either. Resolvable
+  on the spot (a plain string *is* a `Value::Const`), so unlike the frames
+  migration there's no deferred `migrate()` step — and the next save rewrites it
+  in the current form.
 
 ### Picking a font, and when one is missing
 
@@ -1368,7 +1425,7 @@ to the **same IR** (the EBN IR + dumb-printer discipline).
   EvalCtx)` carrying `{ frame, doc, cache, warnings }`. A single-`t` "bake first"
   pre-pass can't work because `valueAtTime(t')` samples at *other* times, which
   is the whole reason the context — not a bare frame — is threaded.
-- **Dynamic↔typed boundary:** ✅ `ExprValue { Num, Vec2, Color }` + `FromExpr` /
+- **Dynamic↔typed boundary:** ✅ `ExprValue { Num, Vec2, Color, Str }` + `FromExpr` /
   `ToExpr`, implemented only for scriptable `T` (not `BezPath` — enforced by the
   trait bound). Mismatch → `fallback()`.
 - **Dependency graph is implicit** in pull-based DFS (a dependency resolves
@@ -1690,8 +1747,8 @@ hand-written in `graph.rs`** (`expr_box`, `ref_editor`, `wave_editor`, …). Tha
 is the *opposite* of auto-integration: a new type means editing the enum, the
 `apply_graph_op` arms, and the UI. The fix is a metadata layer — headless,
 `core`, unit-tested, in the grain of the crate's discipline:
-- **`SocketType`** — the port type system. The three `ExprValue` kinds (Number /
-  Vec2 / Color) plus the scene-graph kinds (Geometry/Path, Layer/Render,
+- **`SocketType`** — the port type system. The four `ExprValue` kinds (Number /
+  Vec2 / Color / Text) plus the scene-graph kinds (Geometry/Path, Layer/Render,
   Matte/Alpha, Time). **Each type carries a colour** — that *is* Blender's
   colour-coded dots, defined in one place instead of scattered through the UI.
 - **`NodeDescriptor`** — per node kind: id, category, label, input sockets
@@ -1827,9 +1884,9 @@ binds such an output to a layer and replaces its `Shape` on every recompile;
 removing one bakes the params to constants, like a value driver. Drivers run
 **shapes first, properties second**, so a geometry driver decides the shape
 *kind* and a value driver on `size`/`radius` can still override that one param.
-Text's non-animatable half (content / family / align / wrap) rides in
-`NodeConfig::text` (a `TextConfig`) because `ExprValue` has no string — the same
-reason `Shape::Text` keeps them as plain fields. The Nodes panel gained a
+Text's non-animatable half (family / align / wrap) rides in `NodeConfig::text`
+(a `TextConfig`); `content` **left** that struct when `ExprValue` grew `Str` and
+is now an ordinary wirable `Text` input socket. The Nodes panel gained a
 **Geometry** driver section and vector + text inspector fields; the driver
 pickers are now type-filtered, so a geometry output is never offered to a
 property driver. `App::recompile_graph`'s body moved to the free fn

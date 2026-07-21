@@ -265,6 +265,7 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
     // own seed values, so lowering a fresh node reproduces `Expr::seed`.
     let num = crate::expr::ExprValue::Num;
     let vec2 = |x, y| crate::expr::ExprValue::Vec2(kurbo::Vec2::new(x, y));
+    let text = |s: &str| crate::expr::ExprValue::Str(s.to_string());
     vec![
         // ── Geometry: a shape's params are inputs; it outputs its geometry and
         //    echoes its resolved params so math can chain off them. An echo
@@ -283,9 +284,15 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .input_def("size", "Size", Vector, vec2(200.0, 200.0))
             .output("geometry", "Geometry", Geometry)
             .output("size", "Size", Vector),
+        // `content` is a wirable input like any other param — that is what makes
+        // a typewriter a wire from a script node rather than a built-in effect.
+        // Its default is the same visible placeholder the add-text button uses:
+        // an empty string shapes to an empty path and reads as a broken node.
         NodeDescriptor::new("text", Cat::Geometry, "Text")
+            .input_def("content", "Content", Text, text("Text"))
             .input_def("size", "Font Size", Number, num(96.0))
             .output("geometry", "Geometry", Geometry)
+            .output("content", "Content", Text)
             .output("size", "Font Size", Number),
         // ── Math: an input (or two) and a result. ────────────────────────────
         NodeDescriptor::new("add", Cat::Math, "Add")
@@ -301,6 +308,10 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .output("result", "Result", Number),
         // ── Inputs: leaves that read a value in. ─────────────────────────────
         NodeDescriptor::new("value", Cat::Input, "Value").output("value", "Value", Number),
+        // A text literal. Separate from `value` rather than a mode of it: the
+        // socket type is what the canvas colours a wire by, and one node that
+        // changed its output type under you would make a graph unreadable.
+        NodeDescriptor::new("string", Cat::Input, "String").output("value", "Value", Text),
         NodeDescriptor::new("ref", Cat::Input, "Reference").output("value", "Value", Number),
         NodeDescriptor::new("param", Cat::Input, "Parameter").output("value", "Value", Number),
         // A leaf holding Rhai source — pulls from `frame`, not wired inputs.

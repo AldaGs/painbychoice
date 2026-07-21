@@ -24,6 +24,29 @@ impl Animatable for kurbo::Vec2 {
     }
 }
 
+/// Text **holds** rather than interpolating: there is no halfway point between
+/// two strings, and inventing one (a cross-fade through character codes, or a
+/// progressive reveal) would be an effect masquerading as interpolation. A key
+/// stays put until the next one takes over, so a string track is a step
+/// sequence — which is exactly what titles and subtitles want.
+///
+/// The easing handles on a string key are therefore inert. They're still stored
+/// (a `Keyframe<T>` has them for every `T`) so the dopesheet needs no special
+/// case, and so a track that later feeds something interpolatable keeps them.
+impl Animatable for String {
+    fn lerp(a: &Self, b: &Self, t: f64) -> Self {
+        // `>= 1.0` and not `> 0.5`: the segment belongs to its starting key
+        // right up to the instant the next one begins. `t` reaching exactly 1
+        // only happens when the playhead lands on `b`'s own frame, which
+        // `sample` already handles — this is the boundary, kept explicit.
+        if t >= 1.0 {
+            b.clone()
+        } else {
+            a.clone()
+        }
+    }
+}
+
 /// Straight RGBA in [0,1]. Interpolated per channel (naive but predictable;
 /// perceptual/gamma-correct blending is a later refinement).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -639,6 +662,39 @@ mod tests {
     /// tracks, so a document-less context (the frame alone) is all they need.
     fn at(frame: f64) -> EvalCtx<'static> {
         EvalCtx::at(frame)
+    }
+
+    /// A string track **steps**: each key holds until the next one begins,
+    /// with no halfway state. This is the whole reason a subtitle track works —
+    /// interpolating text would have to invent a value that doesn't exist.
+    #[test]
+    fn a_string_track_holds_each_key_until_the_next() {
+        let v = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, "first".to_string()),
+            Keyframe::linear(10, "second".to_string()),
+        ]));
+        assert_eq!(v.resolve(&mut at(0.0)), "first");
+        // Deep inside the segment, and right up against the next key: still the
+        // first. A lerping type would be showing a blend by now.
+        assert_eq!(v.resolve(&mut at(5.0)), "first");
+        assert_eq!(v.resolve(&mut at(9.99)), "first");
+        assert_eq!(v.resolve(&mut at(10.0)), "second");
+        // Clamped outside, like every other track.
+        assert_eq!(v.resolve(&mut at(-5.0)), "first");
+        assert_eq!(v.resolve(&mut at(99.0)), "second");
+    }
+
+    /// Easing is stored on a string key but must not change *when* it flips —
+    /// a smooth handle would otherwise reach `t >= 1` at a different frame and
+    /// silently retime the cut.
+    #[test]
+    fn easing_does_not_move_a_string_keys_cut() {
+        let v = Value::Keyframed(Track::new(vec![
+            Keyframe::smooth(0, "a".to_string()),
+            Keyframe::smooth(10, "b".to_string()),
+        ]));
+        assert_eq!(v.resolve(&mut at(9.99)), "a");
+        assert_eq!(v.resolve(&mut at(10.0)), "b");
     }
 
     #[test]

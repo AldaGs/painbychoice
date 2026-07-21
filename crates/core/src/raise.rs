@@ -17,7 +17,7 @@
 
 use kurbo::Vec2;
 
-use crate::expr::{Expr, Generator, TimeSource};
+use crate::expr::{Expr, ExprValue, Generator, TimeSource};
 use crate::graph::{Endpoint, GraphCtx, NodeGraph};
 
 /// Column width and row height for the auto-layout — children sit one column to
@@ -51,8 +51,16 @@ fn raise_rec(
 
     match expr {
         Expr::Lit(v) => {
-            let (id, y) = leaf(graph, "value");
-            graph.node_mut(id).unwrap().set_value("value", *v);
+            // A text literal raises to the `string` node, not `value`: they
+            // lower identically but carry different socket types, and a text
+            // literal on a Number output would draw the wrong wire colour and
+            // refuse a legal connection.
+            let kind = match v {
+                ExprValue::Str(_) => "string",
+                _ => "value",
+            };
+            let (id, y) = leaf(graph, kind);
+            graph.node_mut(id).unwrap().set_value("value", v.clone());
             (Endpoint::new(id, "value"), y)
         }
         Expr::Ref { node, prop, time_offset } => {
@@ -217,6 +225,34 @@ mod tests {
             Box::new(Expr::Neg(Box::new(Expr::Lit(ExprValue::Num(2.0))))),
         );
         round_trips(expr);
+    }
+
+    /// A text literal must survive the fold like a numeric one — and land on a
+    /// `string` node, not a `value` node. The kind matters beyond aesthetics:
+    /// the two carry different socket types, so raising text onto a `value`
+    /// would paint the wrong wire colour and refuse a legal connection into a
+    /// text input.
+    #[test]
+    fn a_string_literal_round_trips_through_its_own_node() {
+        let expr = Expr::Lit(ExprValue::Str("hello".into()));
+        round_trips(expr.clone());
+
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let ep = raise(&mut g, ctx, &expr, Vec2::ZERO);
+        assert_eq!(g.node(ep.node).unwrap().kind, "string");
+    }
+
+    /// Concatenation is an ordinary `Add`, so a mixed text/number sum folds with
+    /// no special case — the property that lets `"take " + n` be built on the
+    /// canvas out of parts that already exist.
+    #[test]
+    fn a_concatenation_round_trips() {
+        round_trips(Expr::Add(
+            Box::new(Expr::Lit(ExprValue::Str("take ".into()))),
+            Box::new(Expr::Lit(ExprValue::Num(3.0))),
+        ));
     }
 
     #[test]

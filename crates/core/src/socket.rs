@@ -33,6 +33,11 @@ pub enum SocketType {
     Vector,
     /// An RGBA colour. Mirrors `ExprValue::Color`.
     Color,
+    /// Text. Mirrors `ExprValue::Str`. The one value type with no arithmetic,
+    /// so it deliberately does **not** interchange with `Number` the way `Time`
+    /// does — a number feeding a text input would silently stringify, which is
+    /// fine as an explicit `Add` (concatenation) but not as a wire.
+    Text,
     /// Vector geometry — a shape's outline (a rectangle node's `geometry`
     /// output). Has no `ExprValue`: geometry isn't an interpolatable scalar,
     /// which is the same reason a `Shape::Path` isn't a `Value`.
@@ -53,10 +58,11 @@ pub enum SocketType {
 impl SocketType {
     /// Every socket type, in a stable order — for a legend, and so a test can
     /// assert each has a distinct colour and a label.
-    pub const ALL: [SocketType; 7] = [
+    pub const ALL: [SocketType; 8] = [
         SocketType::Number,
         SocketType::Vector,
         SocketType::Color,
+        SocketType::Text,
         SocketType::Geometry,
         SocketType::Layer,
         SocketType::Matte,
@@ -72,6 +78,7 @@ impl SocketType {
             SocketType::Number => "Number",
             SocketType::Vector => "Vector",
             SocketType::Color => "Color",
+            SocketType::Text => "Text",
             SocketType::Geometry => "Geometry",
             SocketType::Layer => "Layer",
             SocketType::Matte => "Matte",
@@ -80,13 +87,27 @@ impl SocketType {
     }
 
     /// Whether an output of `self` may feed an input of `other`. Equal types
-    /// always connect; additionally **`Time` and `Number` are interchangeable**,
-    /// because a layer-clock reading *is* a number (`localTime` into a `mul`, a
-    /// literal frame into a ramp's `start`). Everything else must match exactly —
-    /// a `Vector` can't feed a `Number`.
+    /// always connect; beyond that, two pairs interchange:
+    ///
+    /// - **`Time` and `Number`**, because a layer-clock reading *is* a number
+    ///   (`localTime` into a `mul`, a literal frame into a ramp's `start`).
+    /// - **`Text` and `Number`**, because the math nodes' sockets are declared
+    ///   `Number` but are really "any scalar value" — a `value` node's output is
+    ///   `Number` whatever literal it holds, which is how a `Vec2` already flows
+    ///   through an `add` today. Refusing text there would make `Add`'s
+    ///   concatenation unbuildable on the canvas even between two strings.
+    ///
+    /// Everything else must match exactly. Note the asymmetry with
+    /// [`crate::expr::FromExpr`]: a wire being *legal* is not a promise the
+    /// value converts at the far end — a number reaching a text **property**
+    /// still falls back to empty, and `Add` is how you ask for it in words.
     pub fn feeds(self, other: SocketType) -> bool {
-        use SocketType::{Number, Time};
-        self == other || matches!((self, other), (Time, Number) | (Number, Time))
+        use SocketType::{Number, Text, Time};
+        self == other
+            || matches!(
+                (self, other),
+                (Time, Number) | (Number, Time) | (Text, Number) | (Number, Text)
+            )
     }
 
     /// The colour of this type's socket dot — the whole point of a *typed* port
@@ -102,6 +123,8 @@ impl SocketType {
             SocketType::Vector => Color::rgb(0.39, 0.35, 0.78),
             // Blender's colour yellow.
             SocketType::Color => Color::rgb(0.86, 0.74, 0.20),
+            // A warm red, well clear of the colour yellow beside it.
+            SocketType::Text => Color::rgb(0.78, 0.31, 0.31),
             // Blender's geometry green.
             SocketType::Geometry => Color::rgb(0.0, 0.62, 0.35),
             // A render/image blue — distinct from the vector purple.
@@ -194,7 +217,7 @@ mod tests {
     /// fails here rather than silently.
     #[test]
     fn all_lists_every_variant() {
-        assert_eq!(SocketType::ALL.len(), 7);
+        assert_eq!(SocketType::ALL.len(), 8);
         // Labels are unique too, so the legend can't show two "Number"s.
         let mut labels: Vec<_> = SocketType::ALL.iter().map(|t| t.label()).collect();
         labels.sort_unstable();

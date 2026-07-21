@@ -70,6 +70,34 @@ impl Transform {
     }
 }
 
+/// Accept either spelling of a text layer's `content`: the tagged `Value` form
+/// written today, or the bare JSON string written before `content` became a
+/// [`Value`].
+///
+/// Same spirit as [`crate::value::Keyframe::legacy_seconds`], but resolvable on
+/// the spot — a plain string *is* a `Value::Const`, with nothing extra needed to
+/// interpret it — so there's no deferred `migrate()` step and the next save
+/// rewrites it in the new form.
+fn de_text_content<'de, D>(d: D) -> Result<Value<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        // Ordered deliberately: `Value` first so a well-formed new document
+        // never even attempts the legacy arm. `untagged` tries in order and
+        // takes the first that fits, and the two forms are unambiguous anyway
+        // (an object vs. a string).
+        Value(Value<String>),
+        Legacy(String),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::Value(v) => v,
+        Either::Legacy(s) => Value::Const(s),
+    })
+}
+
 /// A drawable shape. Parametric variants resolve their geometry at time `t`,
 /// so a rectangle's size can itself be keyframed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,12 +116,20 @@ pub enum Shape {
     /// It resolves to glyph **outlines** (see [`crate::text`]), so it fills,
     /// strokes, transforms, and animates through exactly the same path as a rect
     /// — no renderer knows text exists. `size` is animatable (the channel you'd
-    /// keyframe); `content` and `family` are plain data because
-    /// [`Value`] only carries interpolatable, expression-typed values
-    /// (`f64`/`Vec2`/`Color`) — there is no string in `ExprValue`, so a
-    /// keyframed or scripted string would need a wider value model.
+    /// keyframe), and so is `content` since [`crate::expr::ExprValue::Str`]
+    /// landed — a text layer can be keyframed (a step track, see
+    /// `impl Animatable for String`) or driven by a script, which is what makes
+    /// the typewriter effect an expression rather than a built-in.
+    ///
+    /// `family` stays plain data: it selects a *system* font by name, so it is
+    /// a lookup key rather than a value, and animating it would mean animating
+    /// which shaper runs.
     Text {
-        content: String,
+        /// Accepts a bare JSON string as well as the tagged `Value` form, so a
+        /// `.pbc` saved while `content` was a plain `String` still opens. See
+        /// [`de_text_content`].
+        #[serde(deserialize_with = "de_text_content")]
+        content: Value<String>,
         /// System font family name. Empty (or not installed) → sans-serif.
         family: String,
         /// Font size in pixels.
@@ -128,7 +164,11 @@ impl Shape {
                         family.trim()
                     ));
                 }
-                crate::text::text_to_path(content, family, size.resolve(ctx), *align, *max_width)
+                // Resolved, not read: `content` is a recipe like every other
+                // param, so this is where a keyframed title or a typewriter
+                // script becomes the string this frame actually shapes.
+                let content = content.resolve(ctx);
+                crate::text::text_to_path(&content, family, size.resolve(ctx), *align, *max_width)
             }
         }
     }
@@ -141,7 +181,10 @@ impl Shape {
                 radius.migrate_frames(fps);
             }
             Shape::Ellipse { size } => size.migrate_frames(fps),
-            Shape::Text { size, .. } => size.migrate_frames(fps),
+            Shape::Text { content, size, .. } => {
+                content.migrate_frames(fps);
+                size.migrate_frames(fps);
+            }
         }
     }
 
@@ -153,7 +196,10 @@ impl Shape {
                 radius.retime(ratio);
             }
             Shape::Ellipse { size } => size.retime(ratio),
-            Shape::Text { size, .. } => size.retime(ratio),
+            Shape::Text { content, size, .. } => {
+                content.retime(ratio);
+                size.retime(ratio);
+            }
         }
     }
 }
@@ -181,13 +227,17 @@ pub struct Param {
     pub value: ParamValue,
 }
 
-/// A parameter's type. Mirrors the three `ExprValue` kinds, so a parameter can
-/// drive any property an expression can.
+/// A parameter's type. Mirrors the `ExprValue` kinds, so a parameter can drive
+/// any property an expression can — including a text one.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ParamValue {
     Num(Value<f64>),
     Vec(Value<Vec2>),
     Color(Value<Color>),
+    /// A text knob. Its `Value<String>` keyframes as a step track like any
+    /// other string, so a module can expose "the caption" and each link supply
+    /// its own.
+    Str(Value<String>),
 }
 
 impl ParamValue {
@@ -199,6 +249,7 @@ impl ParamValue {
             ParamValue::Num(v) => v.resolve(ctx).to_expr(),
             ParamValue::Vec(v) => v.resolve(ctx).to_expr(),
             ParamValue::Color(v) => v.resolve(ctx).to_expr(),
+            ParamValue::Str(v) => v.resolve(ctx).to_expr(),
         }
     }
 
@@ -215,6 +266,7 @@ impl ParamValue {
             ParamValue::Num(Value::Const(v)) => Some(v.to_expr()),
             ParamValue::Vec(Value::Const(v)) => Some(v.to_expr()),
             ParamValue::Color(Value::Const(v)) => Some(v.to_expr()),
+            ParamValue::Str(Value::Const(v)) => Some(v.to_expr()),
             _ => None,
         }
     }
@@ -229,6 +281,7 @@ impl ParamValue {
             (ParamValue::Num(slot), E::Num(n)) => *slot = Value::constant(n),
             (ParamValue::Vec(slot), E::Vec2(p)) => *slot = Value::constant(p),
             (ParamValue::Color(slot), E::Color(c)) => *slot = Value::constant(c),
+            (ParamValue::Str(slot), E::Str(s)) => *slot = Value::constant(s),
             _ => {}
         }
     }
@@ -239,6 +292,7 @@ impl ParamValue {
             ParamValue::Num(_) => "number",
             ParamValue::Vec(_) => "vector",
             ParamValue::Color(_) => "color",
+            ParamValue::Str(_) => "text",
         }
     }
 }

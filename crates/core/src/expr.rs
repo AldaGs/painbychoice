@@ -18,11 +18,23 @@ use crate::value::Color;
 /// A value flowing through an expression, before it's converted back to a
 /// property's concrete `T`. Dynamic on purpose: an expression mixes scalars,
 /// positions, and colours, and only pins the type down at the property edge.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// **Not `Copy`** — `Str` owns its bytes. Every other variant would still be a
+/// register move, but one heap variant demotes the whole enum, so an
+/// `ExprValue` is cloned explicitly at the few sites that need two copies.
+/// Interning the strings to keep `Copy` was considered and rejected: `Expr::Lit`
+/// is *serialized* into the `.pbc`, so an interner would have to round-trip
+/// through the document format too.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ExprValue {
     Num(f64),
     Vec2(kurbo::Vec2),
     Color(Color),
+    /// Text. The odd one out: it has no arithmetic, so `Mul`/`Neg` pass it
+    /// through untouched and only `Add` means anything (concatenation, handled
+    /// in [`eval_expr`] rather than in [`ExprValue::zip`], which only knows how
+    /// to combine numbers). It exists so a string can be keyframed and scripted
+    /// like any other property — the typewriter effect and everything past it.
+    Str(String),
 }
 
 impl ExprValue {
@@ -46,13 +58,29 @@ impl ExprValue {
         }
     }
 
-    /// Map every component through `f` (used by `Neg`).
+    /// Map every component through `f` (used by `Neg`). A `Str` has no
+    /// components, so it maps to itself — negating text is meaningless, and
+    /// passing it through is the same "never fail a frame" rule a kind mismatch
+    /// follows.
     fn map(self, f: impl Fn(f64) -> f64) -> ExprValue {
         use ExprValue::*;
         match self {
             Num(a) => Num(f(a)),
             Vec2(v) => Vec2(kurbo::Vec2::new(f(v.x), f(v.y))),
             Color(c) => Color(self::Color::rgba(f(c.r), f(c.g), f(c.b), f(c.a))),
+            Str(s) => Str(s),
+        }
+    }
+
+    /// Render as text for concatenation. Numbers and compound values get a
+    /// readable spelling so `"frame " + frame` works in a graph the way it does
+    /// in a script, rather than silently dropping the right operand.
+    fn to_str(&self) -> String {
+        match self {
+            ExprValue::Str(s) => s.clone(),
+            ExprValue::Num(n) => format!("{n}"),
+            ExprValue::Vec2(v) => format!("[{}, {}]", v.x, v.y),
+            ExprValue::Color(c) => format!("[{}, {}, {}, {}]", c.r, c.g, c.b, c.a),
         }
     }
 }
@@ -124,6 +152,35 @@ impl FromExpr for Color {
     }
 }
 
+impl ToExpr for String {
+    fn to_expr(&self) -> ExprValue {
+        ExprValue::Str(self.clone())
+    }
+}
+impl FromExpr for String {
+    /// **Strict**, like every other type here: only a `Str` converts.
+    ///
+    /// Stringifying whatever arrived was tried and reverted. The failure case
+    /// decides it: a script that errors resolves to `Num(0.0)` as its universal
+    /// "nothing", and a lenient conversion renders that as the text **"0"** —
+    /// so a broken expression puts a plausible-looking `0` on the canvas
+    /// instead of reading as broken. Falling back to empty (plus the warning
+    /// the error already raises) is honest.
+    ///
+    /// Mixing kinds is still available, just **explicit**: `Add` concatenates
+    /// when either side is text, so `"take " + n` is a counter and the user
+    /// asked for the conversion by writing the `+`.
+    fn from_expr(v: ExprValue) -> Option<Self> {
+        match v {
+            ExprValue::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn fallback() -> Self {
+        String::new()
+    }
+}
+
 /// Which animatable property of a node an expression can reference.
 ///
 /// Mirrors the editor's own `PropKind` row list: the transform channels, fill,
@@ -146,6 +203,10 @@ pub enum PropPath {
     ShapeRadius,
     /// A `Text` shape's font size, in pixels. Only a text layer has one.
     TextSize,
+    /// A `Text` shape's string. The only non-numeric property here — it resolves
+    /// to an `ExprValue::Str`, which is what a typewriter script reads and
+    /// writes.
+    TextContent,
 }
 
 impl PropPath {
@@ -165,12 +226,13 @@ impl PropPath {
             PropPath::ShapeSize => "size",
             PropPath::ShapeRadius => "radius",
             PropPath::TextSize => "text_size",
+            PropPath::TextContent => "content",
         }
     }
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 11] = [
+    pub const ALL: [PropPath; 12] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -182,6 +244,7 @@ impl PropPath {
         PropPath::ShapeSize,
         PropPath::ShapeRadius,
         PropPath::TextSize,
+        PropPath::TextContent,
     ];
 
     /// Parse a script-facing property name, case-insensitively.
@@ -205,6 +268,7 @@ impl PropPath {
             PropPath::Fill | PropPath::StrokeColor => {
                 ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
             }
+            PropPath::TextContent => ExprValue::Str(String::new()),
         }
     }
 }
@@ -536,6 +600,10 @@ fn eval_num(expr: &Expr, ctx: &mut EvalCtx) -> f64 {
         ExprValue::Num(n) => n,
         ExprValue::Vec2(v) => v.x,
         ExprValue::Color(c) => c.r,
+        // Text has no scalar reading. Parsing it would be a hidden cast that
+        // silently turns a typo into a number, so a knob fed a string is 0 —
+        // the same neutral answer a kind mismatch gets everywhere else.
+        ExprValue::Str(_) => 0.0,
     }
 }
 
@@ -752,6 +820,9 @@ impl fmt::Display for ExprValue {
             ExprValue::Num(n) => write!(f, "{n}"),
             ExprValue::Vec2(v) => write!(f, "[{}, {}]", v.x, v.y),
             ExprValue::Color(c) => write!(f, "rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a),
+            // Quoted and escaped, so a printed expression round-trips visually
+            // and an empty string is visible rather than a gap.
+            ExprValue::Str(s) => write!(f, "{:?}", s),
         }
     }
 }
@@ -987,6 +1058,10 @@ fn hash_to_unit(i: f64, seed: f64) -> f64 {
 fn expr_value_to_dynamic(v: ExprValue) -> rhai::Dynamic {
     match v {
         ExprValue::Num(n) => rhai::Dynamic::from_float(n),
+        // Rhai has a native string type, so text crosses the bridge as itself —
+        // which is what makes the whole Rhai string library (`sub_string`, `+`,
+        // `len`) available to a text property for free.
+        ExprValue::Str(s) => rhai::Dynamic::from(s),
         ExprValue::Vec2(v) => rhai::Dynamic::from_array(vec![
             rhai::Dynamic::from_float(v.x),
             rhai::Dynamic::from_float(v.y),
@@ -1042,6 +1117,12 @@ fn dynamic_to_expr_value(d: &rhai::Dynamic) -> Result<ExprValue, String> {
     if let Ok(i) = d.as_int() {
         return Ok(ExprValue::Num(i as f64));
     }
+    // Checked before the array branch but after the numeric ones: Rhai reports
+    // a string as neither float nor int, so ordering only matters against
+    // `is_array` (a string is not one) — kept here for readability.
+    if d.is_string() {
+        return Ok(ExprValue::Str(d.clone().into_string().unwrap_or_default()));
+    }
     if d.is_array() {
         let arr = d.clone().into_array().map_err(|_| "expected an array".to_string())?;
         let nums = arr.iter().map(dynamic_to_num).collect::<Result<Vec<f64>, String>>()?;
@@ -1052,7 +1133,7 @@ fn dynamic_to_expr_value(d: &rhai::Dynamic) -> Result<ExprValue, String> {
             _ => Err("array must have 2 (vec), 3 or 4 (color) numbers".into()),
         };
     }
-    Err("script must return a number or an array".into())
+    Err("script must return a number, a string, or an array".into())
 }
 
 fn dynamic_to_num(d: &rhai::Dynamic) -> Result<f64, String> {
@@ -1296,7 +1377,7 @@ impl<'a> EvalCtx<'a> {
         };
         let key = (node, target.clone(), frame.to_bits());
         if let Some(v) = self.cache.memo.get(&key) {
-            return *v;
+            return v.clone();
         }
         if self.cache.visiting.contains(&key) {
             let what = match &target {
@@ -1331,7 +1412,7 @@ impl<'a> EvalCtx<'a> {
         self.exit_node(prev);
         self.frame = saved;
         self.cache.visiting.remove(&key);
-        self.cache.memo.insert(key, value);
+        self.cache.memo.insert(key, value.clone());
         value
     }
 
@@ -1374,6 +1455,10 @@ impl<'a> EvalCtx<'a> {
                 Some(Shape::Text { size, .. }) => size.resolve(self).to_expr(),
                 _ => prop.zero(),
             },
+            PropPath::TextContent => match &node.shape {
+                Some(Shape::Text { content, .. }) => content.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
         }
     }
 }
@@ -1393,14 +1478,23 @@ fn collect_named(node: &crate::node::Node, name: &str, out: &mut Vec<NodeId>) {
 /// property's `resolve` converts the result back to its concrete `T`.
 pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
     match expr {
-        Expr::Lit(v) => *v,
+        Expr::Lit(v) => v.clone(),
         Expr::Ref { node, prop, time_offset } => {
             let frame = ctx.frame + time_offset;
             ctx.resolve_prop(*node, *prop, frame)
         }
         Expr::Add(a, b) => {
             let (a, b) = (eval_expr(a, ctx), eval_expr(b, ctx));
-            a.zip(b, |x, y| x + y)
+            // `+` on text is concatenation, and it's contagious: if *either*
+            // side is a string the whole sum is one, so `"take " + n` reads the
+            // way it does in every scripting language. `zip` can't express this
+            // — it only knows how to combine two numbers component-wise.
+            match (&a, &b) {
+                (ExprValue::Str(_), _) | (_, ExprValue::Str(_)) => {
+                    ExprValue::Str(format!("{}{}", a.to_str(), b.to_str()))
+                }
+                _ => a.zip(b, |x, y| x + y),
+            }
         }
         Expr::Mul(a, b) => {
             let (a, b) = (eval_expr(a, ctx), eval_expr(b, ctx));
@@ -1416,7 +1510,7 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
             if node.is_none() {
                 if let Some(scope) = ctx.module_scope.last() {
                     return match scope.iter().find(|(n, _)| n == name) {
-                        Some((_, v)) => *v,
+                        Some((_, v)) => v.clone(),
                         None => {
                             ctx.warn_here(format!("module has no parameter named '{name}'"));
                             ExprValue::Num(0.0)
@@ -1714,8 +1808,14 @@ mod tests {
         let v: Value<f64> = Value::expr(Expr::Script("this is not rhai".into()));
         let mut ctx = EvalCtx::at(0.0);
         assert_eq!(v.resolve(&mut ctx), 0.0);
-        // A wrong return type (string) is also an error.
-        assert!(eval_script("\"hello\"", 0.0).is_err());
+        // A string is *not* an error any more — it's `ExprValue::Str`, which is
+        // what a typewriter script returns. It only becomes neutral at the
+        // property edge, where a scalar can't accept it.
+        assert_eq!(eval_script("\"hello\"", 0.0).unwrap(), ExprValue::Str("hello".into()));
+        let v: Value<f64> = Value::expr(Expr::Script("\"hello\"".into()));
+        assert_eq!(v.resolve(&mut ctx), 0.0, "a string feeding a scalar falls back");
+        // A type with no reading at all still errors.
+        assert!(eval_script("true", 0.0).is_err());
     }
 
     #[test]

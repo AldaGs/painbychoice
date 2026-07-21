@@ -95,8 +95,8 @@ impl<'a> GraphCtx<'a> {
     }
 }
 
-/// The socket type a module knob presents. [`ParamValue`] mirrors the three
-/// `ExprValue` kinds, so this is total and exact.
+/// The socket type a module knob presents. [`ParamValue`] mirrors the
+/// `ExprValue` kinds one for one, so this is total and exact.
 ///
 /// [`ParamValue`]: crate::node::ParamValue
 fn param_socket_type(v: &crate::node::ParamValue) -> crate::socket::SocketType {
@@ -106,6 +106,7 @@ fn param_socket_type(v: &crate::node::ParamValue) -> crate::socket::SocketType {
         ParamValue::Num(_) => SocketType::Number,
         ParamValue::Vec(_) => SocketType::Vector,
         ParamValue::Color(_) => SocketType::Color,
+        ParamValue::Str(_) => SocketType::Text,
     }
 }
 
@@ -192,11 +193,12 @@ pub struct NodeConfig {
 /// loose text fields, and so lowering can hand the whole group over at once.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextConfig {
-    /// The string to shape. Seeded with visible placeholder text for the same
-    /// reason the layers panel's add-text button is: an empty text node would
-    /// shape to an empty path and look like the node does nothing.
-    pub content: String,
     /// System font family name. Empty (or not installed) → sans-serif.
+    ///
+    /// `content` used to live here beside it and no longer does — it became a
+    /// real `Text` **input socket** once `ExprValue` grew a string, so it can be
+    /// wired, keyframed, and scripted like every other param. `family` stays
+    /// config because it names a *system* font: a lookup key, not a value.
     pub family: String,
     pub align: TextAlign,
     /// Wrap width; `None` keeps the text on one line.
@@ -205,7 +207,7 @@ pub struct TextConfig {
 
 impl Default for TextConfig {
     fn default() -> Self {
-        Self { content: "Text".into(), family: String::new(), align: TextAlign::Left, max_width: None }
+        Self { family: String::new(), align: TextAlign::Left, max_width: None }
     }
 }
 
@@ -228,7 +230,7 @@ pub struct ShapeBinding {
 impl GraphNode {
     /// The literal set on socket `id`, if the user has overridden it.
     pub fn value(&self, id: &str) -> Option<crate::expr::ExprValue> {
-        self.values.get(id).copied()
+        self.values.get(id).cloned()
     }
 
     /// Override socket `id`'s literal (an unwired input, or a `value` constant).
@@ -619,10 +621,13 @@ mod tests {
             target: NodeId(0),
             prop: PropPath::Rotation,
         });
-        // A geometry driver and a text node's plain-data config ride along too —
-        // both are document data, so both must survive the trip.
+        // A geometry driver, a text node's typography config, and a string
+        // socket literal ride along too — all three are document data, so all
+        // three must survive the trip.
         let text = project.graph.add_node("text", Vec2::new(20.0, 120.0));
-        project.graph.node_mut(text).unwrap().config.text.content = "hello".into();
+        let tn = project.graph.node_mut(text).unwrap();
+        tn.config.text.family = "Georgia".into();
+        tn.set_value("content", crate::expr::ExprValue::Str("hello".into()));
         project
             .shape_bindings
             .push(ShapeBinding { output: Endpoint::new(text, "geometry"), target: NodeId(0) });

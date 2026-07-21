@@ -58,6 +58,12 @@ fn lower_out(
         // A constant. Its literal is stored under the output socket's id (the
         // one place a source node keeps a value); absent means zero.
         "value" => Expr::Lit(node.value(&output.socket).unwrap_or(ExprValue::Num(0.0))),
+        // Same shape as `value`, but its resting literal is the empty string —
+        // so an unset string node lowers to `""`, not to the number 0 wearing a
+        // text socket.
+        "string" => Expr::Lit(
+            node.value(&output.socket).unwrap_or_else(|| ExprValue::Str(String::new())),
+        ),
         "add" => Expr::Add(
             b(lower_in(graph, ctx, output.node, "a", visiting)),
             b(lower_in(graph, ctx, output.node, "b", visiting)),
@@ -196,7 +202,7 @@ pub fn lower_geometry(graph: &NodeGraph, ctx: &GraphCtx, output: &Endpoint) -> O
         "text" => {
             let t = &node.config.text;
             Shape::Text {
-                content: t.content.clone(),
+                content: Value::expr(param("content", &mut visiting)),
                 family: t.family.clone(),
                 size: Value::expr(param("size", &mut visiting)),
                 align: t.align,
@@ -290,6 +296,7 @@ fn neutral_for(ty: SocketType) -> ExprValue {
         SocketType::Number | SocketType::Time => ExprValue::Num(0.0),
         SocketType::Vector => ExprValue::Vec2(kurbo::Vec2::ZERO),
         SocketType::Color => ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0)),
+        SocketType::Text => ExprValue::Str(String::new()),
         // No scalar literal — these inputs are meant to be wired. Degenerate
         // zero keeps lowering total.
         SocketType::Geometry | SocketType::Layer | SocketType::Matte => ExprValue::Num(0.0),
@@ -517,11 +524,13 @@ mod tests {
         ));
 
         let t = g.add_node("text", Vec2::new(0.0, 120.0));
-        g.node_mut(t).unwrap().config.text.content = "hi".into();
+        g.node_mut(t).unwrap().set_value("content", ExprValue::Str("hi".into()));
         g.node_mut(t).unwrap().set_value("size", ExprValue::Num(48.0));
         let shape = lower_geometry(&g, ctx, &Endpoint::new(t, "geometry")).unwrap();
         let crate::node::Shape::Text { content, size, .. } = &shape else { panic!("{shape:?}") };
-        assert_eq!(content, "hi");
+        // `content` lowers to an *expression* over the socket, like every other
+        // graph-authored param — so it's resolved, not read.
+        assert_eq!(content.resolve(&mut EvalCtx::at(0.0)), "hi");
         assert_eq!(size.resolve(&mut EvalCtx::at(0.0)), 48.0);
     }
 

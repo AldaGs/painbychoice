@@ -1207,7 +1207,7 @@ mod tests {
                     1,
                     "caption",
                     Shape::Text {
-                        content: "Hi".into(),
+                        content: Value::constant("Hi".to_string()),
                         family: String::new(),
                         size: Value::constant(48.0),
                         align: crate::text::TextAlign::Left,
@@ -1236,7 +1236,7 @@ mod tests {
                 1,
                 "caption",
                 Shape::Text {
-                    content: "Hi".into(),
+                    content: Value::constant("Hi".to_string()),
                     family: String::new(),
                     size: Value::Keyframed(Track::new(vec![
                         Keyframe::linear(0, 20.0),
@@ -1260,7 +1260,7 @@ mod tests {
     #[test]
     fn a_missing_font_warns_but_still_draws() {
         let text = |family: &str| Shape::Text {
-            content: "Hi".into(),
+            content: Value::constant("Hi".to_string()),
             family: family.into(),
             size: Value::constant(32.0),
             align: crate::text::TextAlign::Left,
@@ -1296,7 +1296,7 @@ mod tests {
                 1,
                 "caption",
                 Shape::Text {
-                    content: "two\nlines".into(),
+                    content: Value::constant("two\nlines".to_string()),
                     family: "Georgia".into(),
                     size: Value::constant(31.0),
                     align: crate::text::TextAlign::Center,
@@ -1308,13 +1308,75 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
         match back.root.children[0].shape.as_ref().unwrap() {
             Shape::Text { content, family, align, max_width, .. } => {
-                assert_eq!(content, "two\nlines");
+                assert_eq!(content.resolve(&mut EvalCtx::new(&back, 0.0)), "two\nlines");
                 assert_eq!(family, "Georgia");
                 assert_eq!(*align, crate::text::TextAlign::Center);
                 assert_eq!(*max_width, Some(250.0));
             }
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    /// A `.pbc` written while `content` was a plain `String` must still open.
+    /// The bare string is read as a `Value::Const`, so the document arrives
+    /// fully migrated with no separate `migrate()` pass — and the next save
+    /// writes it in the current form.
+    #[test]
+    fn a_legacy_bare_string_content_still_loads() {
+        // Hand-built rather than round-tripped: the point is a shape of JSON
+        // this crate can no longer *produce*, only read.
+        let json = r#"{"Text":{
+            "content": "old caption",
+            "family": "",
+            "size": {"Const": 42.0},
+            "align": "Left",
+            "max_width": null
+        }}"#;
+        let shape: Shape = serde_json::from_str(json).expect("legacy content must parse");
+        let Shape::Text { content, .. } = &shape else { panic!("expected text, got {shape:?}") };
+        assert_eq!(content.resolve(&mut EvalCtx::at(0.0)), "old caption");
+        assert!(!content.is_animated(), "a bare string is a constant, not a track");
+    }
+
+    /// The typewriter: the effect the whole string value model was built for.
+    /// A script slices the caption by the frame, so the text reveals itself
+    /// character by character — with no built-in "typewriter" anywhere in the
+    /// engine, just a string property driven by an expression.
+    #[test]
+    fn a_script_can_type_text_out_over_time() {
+        let doc = Document::new(
+            640.0,
+            480.0,
+            Node::group(0, "root").with_child(Node::shape(
+                1,
+                "caption",
+                Shape::Text {
+                    content: Value::expr(crate::expr::Expr::Script(
+                        // `to_int` matters: `frame` is a float and `len` an
+                        // int, and Rhai won't compare the two. `min` guards the
+                        // tail so the slice can't run off the end.
+                        r#"let s = "HELLO"; s.sub_string(0, min(frame.to_int(), s.len))"#.into(),
+                    )),
+                    family: String::new(),
+                    size: Value::constant(48.0),
+                    align: crate::text::TextAlign::Left,
+                    max_width: None,
+                },
+            )),
+        );
+        let at = |f: f64| {
+            let mut ctx = EvalCtx::new(&doc, f);
+            match doc.root.children[0].shape.as_ref().unwrap() {
+                Shape::Text { content, .. } => content.resolve(&mut ctx),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        assert_eq!(at(0.0), "");
+        assert_eq!(at(1.0), "H");
+        assert_eq!(at(3.0), "HEL");
+        assert_eq!(at(5.0), "HELLO");
+        // Held, not truncated or panicking, once the string runs out.
+        assert_eq!(at(50.0), "HELLO");
     }
 
     #[test]

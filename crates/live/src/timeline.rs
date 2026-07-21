@@ -196,6 +196,7 @@ pub(crate) enum ClipTrack {
     Vec2(Vec<Keyframe<Vec2>>),
     Num(Vec<Keyframe<f64>>),
     Color(Vec<Keyframe<MColor>>),
+    Str(Vec<Keyframe<String>>),
 }
 
 impl ClipTrack {
@@ -205,6 +206,7 @@ impl ClipTrack {
             ClipTrack::Vec2(k) => k.first().map(|k| k.frame),
             ClipTrack::Num(k) => k.first().map(|k| k.frame),
             ClipTrack::Color(k) => k.first().map(|k| k.frame),
+            ClipTrack::Str(k) => k.first().map(|k| k.frame),
         }
     }
 }

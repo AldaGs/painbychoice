@@ -760,6 +760,66 @@ fn optional_properties_are_absent_when_the_node_lacks_them() {
     assert!(prop_of(&p, PropKind::ShapeRadius).is_none());
 }
 
+/// A text layer's `content` is a `Value` like any other property, so it must
+/// reach the keyframe machinery: a dopesheet row, a stopwatch, retiming,
+/// copy/paste. Before the string value model it was a plain field and had none
+/// of that.
+#[test]
+fn a_text_layers_content_is_an_animatable_property() {
+    let t = text_node();
+    assert!(prop_of(&t, PropKind::TextContent).is_some(), "text has content");
+    assert!(prop_of(&t, PropKind::TextSize).is_some(), "and a font size");
+
+    // Only a text layer has one — the same rule radius follows on an ellipse.
+    let e = MNode::shape(2, "e", MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
+    assert!(prop_of(&e, PropKind::TextContent).is_none(), "an ellipse has no content");
+    assert!(prop_of(&MNode::group(1, "g"), PropKind::TextContent).is_none());
+}
+
+/// Copy/paste is typed: a clip is tagged at copy time and must only land on a
+/// property of the same type. A string clip pasted onto a scalar has to be
+/// ignored, not coerced — the guard that keeps a text track off a rotation row.
+#[test]
+fn a_string_key_clip_only_pastes_onto_a_string_property() {
+    let mut t = text_node();
+    // Give content two keys, then lift them onto a clipboard.
+    if let Some(PropRefMut::Str(v)) = prop_of_mut(&mut t, PropKind::TextContent) {
+        *v = Value::Keyframed(motion_core::Track::new(vec![
+            motion_core::Keyframe::linear(0, "one".to_string()),
+            motion_core::Keyframe::linear(10, "two".to_string()),
+        ]));
+    } else {
+        panic!("content should borrow as a string property");
+    }
+    let clip = prop_of(&t, PropKind::TextContent).unwrap().keys_at(&[0, 1]);
+
+    // Onto the same property: lands.
+    let mut ok = t.clone();
+    let landed = prop_of_mut(&mut ok, PropKind::TextContent).unwrap().insert_keys(&clip, 5);
+    assert_eq!(landed.len(), 2, "a string clip lands on a string property");
+
+    // Onto a scalar: refused, and the property is left alone.
+    let mut wrong = t.clone();
+    let landed = prop_of_mut(&mut wrong, PropKind::Rotation).unwrap().insert_keys(&clip, 5);
+    assert!(landed.is_empty(), "a string clip must not land on rotation");
+    assert!(!prop_of(&wrong, PropKind::Rotation).unwrap().is_animated());
+}
+
+/// A text layer for the property tests above.
+fn text_node() -> MNode {
+    MNode::shape(
+        7,
+        "caption",
+        MShape::Text {
+            content: Value::constant("hello".to_string()),
+            family: String::new(),
+            size: Value::constant(48.0),
+            align: motion_core::text::TextAlign::Left,
+            max_width: None,
+        },
+    )
+}
+
 /// Each layer kind gets its own icon: the bug was an ellipse borrowing the
 /// rectangle's square because the row only distinguished group/precomp/rect.
 #[test]

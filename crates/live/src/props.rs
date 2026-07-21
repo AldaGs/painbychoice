@@ -59,10 +59,13 @@ pub(crate) struct NodeInfo {
     pub(crate) text: Option<TextInfo>,
 }
 
-/// The text-specific half of a selected node. Only the font `size` is a
-/// `Value` (and so keyframable); content, family, alignment, and wrap width are
+/// The text-specific half of a selected node. `content` and `size` are `Value`s
+/// (and so keyframable and scriptable); family, alignment, and wrap width are
 /// plain data, edited directly.
 pub(crate) struct TextInfo {
+    /// The string **as resolved this frame**, not the recipe — so a keyframed
+    /// or scripted content shows what is actually on screen, the same way
+    /// `size` does.
     pub(crate) content: String,
     pub(crate) family: String,
     pub(crate) size: f64,
@@ -70,6 +73,7 @@ pub(crate) struct TextInfo {
     /// `None` = one line, no wrapping.
     pub(crate) max_width: Option<f64>,
     pub(crate) size_anim: bool,
+    pub(crate) content_anim: bool,
     /// The named family isn't installed, so the frame is drawing a substitute.
     /// Blank is never "missing" — that's the default on purpose.
     pub(crate) family_missing: bool,
@@ -230,12 +234,13 @@ impl NodeInfo {
             stroke_width_anim: is_anim(node, PropKind::StrokeWidth),
             text: match node.shape.as_ref() {
                 Some(MShape::Text { content, family, size, align, max_width }) => Some(TextInfo {
-                    content: content.clone(),
+                    content: content.resolve(ctx),
                     family: family.clone(),
                     size: size.resolve(ctx),
                     align: *align,
                     max_width: *max_width,
                     size_anim: is_anim(node, PropKind::TextSize),
+                    content_anim: is_anim(node, PropKind::TextContent),
                     family_missing: !motion_core::text::font_exists(family),
                 }),
                 _ => None,
@@ -591,9 +596,12 @@ pub(crate) fn properties_ui(
             ui.end_row();
         }
 
-        // --- Text. Only the font size is a `Value`, so it's the only row here
-        // with a stopwatch; the rest are plain data (there is no string in
-        // `ExprValue`, so content can't be keyframed or scripted yet). ---
+        // --- Text. Content and font size are `Value`s and carry stopwatches;
+        // font/align/wrap are plain data. The content field shows the string
+        // *resolved this frame*, so a keyframed or scripted title reads back
+        // what is actually on screen — and typing into it while the property is
+        // animated writes a key at the playhead rather than replacing the
+        // track. ---
         if let Some(t) = &n.text {
             ui.label("Text");
             let mut content = t.content.clone();
@@ -607,7 +615,9 @@ pub(crate) fn properties_ui(
             {
                 edits.text_content = Some(content);
             }
-            ui.label("");
+            if key_button(ui, t.content_anim) {
+                edits.key.insert(PropKind::TextContent);
+            }
             ui.end_row();
 
             ui.label("Font");
@@ -731,11 +741,12 @@ pub(crate) enum PropKind {
     ShapeSize,
     ShapeRadius,
     TextSize,
+    TextContent,
 }
 
 impl PropKind {
     /// Every property that can be animated, in row order.
-    pub(crate) const ALL: [PropKind; 11] = [
+    pub(crate) const ALL: [PropKind; 12] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -747,6 +758,7 @@ impl PropKind {
         PropKind::ShapeSize,
         PropKind::ShapeRadius,
         PropKind::TextSize,
+        PropKind::TextContent,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -762,6 +774,7 @@ impl PropKind {
             PropKind::ShapeSize => "Size",
             PropKind::ShapeRadius => "Radius",
             PropKind::TextSize => "Font Size",
+            PropKind::TextContent => "Content",
         }
     }
 
@@ -783,6 +796,7 @@ impl PropKind {
             PropPath::ShapeSize => PropKind::ShapeSize,
             PropPath::ShapeRadius => PropKind::ShapeRadius,
             PropPath::TextSize => PropKind::TextSize,
+            PropPath::TextContent => PropKind::TextContent,
         }
     }
 }
@@ -799,12 +813,18 @@ pub(crate) enum PropRef<'a> {
     Vec2(&'a Value<Vec2>),
     Num(&'a Value<f64>),
     Color(&'a Value<MColor>),
+    /// Text. Its track holds rather than interpolates (see `Animatable for
+    /// String`), so its easing handles are inert — but it goes through the same
+    /// machinery regardless, which is what gives a text layer's content a
+    /// dopesheet row, marquee-select, retiming, and copy/paste for free.
+    Str(&'a Value<String>),
 }
 
 pub(crate) enum PropRefMut<'a> {
     Vec2(&'a mut Value<Vec2>),
     Num(&'a mut Value<f64>),
     Color(&'a mut Value<MColor>),
+    Str(&'a mut Value<String>),
 }
 
 /// Call the same method on whichever `Value<T>` a `PropRef`/`PropRefMut` holds.
@@ -816,6 +836,7 @@ macro_rules! on_prop {
             PropRef::Vec2($v) => $body,
             PropRef::Num($v) => $body,
             PropRef::Color($v) => $body,
+            PropRef::Str($v) => $body,
         }
     };
 }
@@ -826,6 +847,7 @@ macro_rules! on_prop_mut {
             PropRefMut::Vec2($v) => $body,
             PropRefMut::Num($v) => $body,
             PropRefMut::Color($v) => $body,
+            PropRefMut::Str($v) => $body,
         }
     };
 }
@@ -853,6 +875,7 @@ impl PropRef<'_> {
             PropRef::Vec2(v) => ClipTrack::Vec2(v.keys_at(idxs)),
             PropRef::Num(v) => ClipTrack::Num(v.keys_at(idxs)),
             PropRef::Color(v) => ClipTrack::Color(v.keys_at(idxs)),
+            PropRef::Str(v) => ClipTrack::Str(v.keys_at(idxs)),
         }
     }
 }
@@ -890,6 +913,7 @@ impl PropRefMut<'_> {
             (PropRefMut::Vec2(v), ClipTrack::Vec2(k)) => v.insert_keys(k, offset),
             (PropRefMut::Num(v), ClipTrack::Num(k)) => v.insert_keys(k, offset),
             (PropRefMut::Color(v), ClipTrack::Color(k)) => v.insert_keys(k, offset),
+            (PropRefMut::Str(v), ClipTrack::Str(k)) => v.insert_keys(k, offset),
             _ => Vec::new(),
         }
     }
@@ -921,6 +945,10 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { size, .. } => PropRef::Num(size),
             _ => return None,
         },
+        PropKind::TextContent => match node.shape.as_ref()? {
+            MShape::Text { content, .. } => PropRef::Str(content),
+            _ => return None,
+        },
     })
 }
 
@@ -947,6 +975,10 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         },
         PropKind::TextSize => match node.shape.as_mut()? {
             MShape::Text { size, .. } => PropRefMut::Num(size),
+            _ => return None,
+        },
+        PropKind::TextContent => match node.shape.as_mut()? {
+            MShape::Text { content, .. } => PropRefMut::Str(content),
             _ => return None,
         },
     })

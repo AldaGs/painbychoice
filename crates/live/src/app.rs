@@ -1269,13 +1269,14 @@ impl App {
             }
         }
 
-        // Text. Only `size` goes through `set_at` (it's the one `Value` here and
-        // so the one that can auto-key); the rest are plain fields assigned
-        // outright.
+        // Text. `content` and `size` are `Value`s and so go through `set_at`,
+        // which auto-keys them exactly like a DragValue drag — that is what
+        // makes retyping the string on a later frame produce a second key
+        // rather than rewriting the first. The rest are plain fields.
         if let Some(MShape::Text { content, family, size, align, max_width }) = node.shape.as_mut()
         {
             if let Some(v) = e.text_content.clone() {
-                *content = v;
+                content.set_at(frame, v);
                 changed = true;
             }
             if let Some(v) = e.text_family.clone() {
@@ -1516,7 +1517,7 @@ impl App {
                 id,
                 format!("Text {id}"),
                 MShape::Text {
-                    content: "Text".to_string(),
+                    content: Value::constant("Text".to_string()),
                     family: String::new(),
                     size: Value::constant(96.0),
                     align: TextAlign::Left,
