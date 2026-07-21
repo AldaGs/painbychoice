@@ -159,6 +159,13 @@ pub(crate) struct App {
     /// Whether last frame's UI pass had the pointer over a ruler or a guide.
     /// Gates click-picking for the same reason as `gizmo_hot` — see its docs.
     pub(crate) aids_hot: bool,
+    /// Every node type the composition graph can place, built once at startup.
+    /// Built-ins today; the seam a plugin registers through later.
+    pub(crate) node_registry: NodeRegistry,
+    /// The composition node graph being authored. Session/authoring state for
+    /// now — step 2 builds the model and its panel; lowering it to the `Node`/
+    /// `Expr` IR and saving it with the document is step 3.
+    pub(crate) node_graph: NodeGraph,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -294,6 +301,34 @@ impl App {
             doc_rev: 0,
             guide_drag: None,
             aids_hot: false,
+            node_registry: NodeRegistry::with_builtins(),
+            node_graph: NodeGraph::new(),
+        }
+    }
+
+    /// Apply one node-graph edit after the UI pass. A free-standing method, like
+    /// the other post-pass appliers, so the panel stays a pure snapshot→intent
+    /// function. A connection is validated against the registry inside
+    /// [`NodeGraph::connect`]; a rejected drop simply doesn't wire.
+    pub(crate) fn apply_ng_op(&mut self, op: NgOp) {
+        match op {
+            NgOp::Add { kind, pos } => {
+                self.node_graph.add_node(kind, pos);
+            }
+            NgOp::Move { id, pos } => {
+                if let Some(n) = self.node_graph.node_mut(id) {
+                    n.pos = pos;
+                }
+            }
+            NgOp::Remove { id } => {
+                self.node_graph.remove_node(id);
+            }
+            NgOp::Connect { from, to } => {
+                let _ = self.node_graph.connect(&self.node_registry, from, to);
+            }
+            NgOp::Disconnect { edge } => {
+                self.node_graph.disconnect(&edge);
+            }
         }
     }
 
@@ -1477,6 +1512,12 @@ impl App {
         // frame; applied to the tree after the UI pass, never during it.
         let mut dock_cmd: Option<DockCmd> = None;
         let mut graph_edits = GraphEdits::default();
+        // The composition node graph + its registry, borrowed read-only for the
+        // panel; its edits (at most one) applied after the pass. Disjoint fields
+        // from `dock`, so these coexist with the mutable dock borrow.
+        let node_registry = &self.node_registry;
+        let node_graph = &self.node_graph;
+        let mut ng_edits = NgEdits::default();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
             let mut path = Vec::new();
@@ -1539,6 +1580,7 @@ impl App {
                         )
                     }
                     Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
+                    Editor::NodeGraph => nodegraph_ui(ui, node_graph, node_registry, &mut ng_edits),
                     // vello paints the frame here; egui only measures the hole
                     // and floats the zoom toolbar over it. `max_rect` is the
                     // whole window (egui doesn't shrink it for the sibling
@@ -1652,6 +1694,12 @@ impl App {
                 }
             }
             apply_graph_op(&mut self.project, self.current, self.selected, op, frame);
+            window.request_redraw();
+        }
+        // Apply a composition node-graph edit (add/move/remove/connect/
+        // disconnect). Connection validity is enforced inside the model.
+        if let Some(op) = ng_edits.op.take() {
+            self.apply_ng_op(op);
             window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area

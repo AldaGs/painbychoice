@@ -1741,12 +1741,20 @@ gate.
 tree re-derived each frame. Same `*Edits`-struct discipline every panel follows
 (the egui closure never borrows `App`; report ops, apply after).
 
-**Build order.** (1) `SocketType` + `NodeDescriptor` + registry, headless and
-tested. (2) The generic graph model + descriptor-driven panel. (3) Lowering to
-the `Node`/`Expr` IR, and folding today's property graph in as the object-scope
-case. (4) The compositor stage — the real gate for effects/mattes/masks. (5)
-Effect nodes + their properties-panel show, then plugins registering descriptors
-like built-ins. Steps 1–3 need no new engine; step 4 is the large separate track.
+**Build order.** (1) ✅ `SocketType` + `NodeDescriptor` + registry, headless and
+tested (`core/src/socket.rs`, `core/src/registry.rs`). (2) ✅ The generic graph
+model + descriptor-driven panel — `NodeGraph { nodes, edges }` in
+`core/src/graph.rs` (registry-validated: output→input, socket types match, DAG
+kept by a forward-reachability check, one wire per input, serde), and the
+Blender-style `Editor::NodeGraph` panel in `live/src/nodegraph.rs` (rounded
+boxes, category-tinted headers, type-coloured socket dots, bezier wires,
+drag-to-wire with the model rejecting an illegal drop, palette grouped by
+category). It's authoring state on `App` for now — not yet lowered or saved.
+(3) Lowering to the `Node`/`Expr` IR, and folding today's property graph in as
+the object-scope case. (4) The compositor stage — the real gate for
+effects/mattes/masks. (5) Effect nodes + their properties-panel show, then
+plugins registering descriptors like built-ins. Steps 1–3 need no new engine;
+step 4 is the large separate track.
 
 **Invariants to protect.** `evaluate` stays the one pure entry point; the closed
 IR enums stay the evaluation substrate (descriptors are metadata, not a rival
