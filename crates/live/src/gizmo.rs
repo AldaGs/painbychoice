@@ -380,12 +380,14 @@ fn axis_of(rot_deg: f64, axis: GizmoAxis) -> Vec2 {
 /// handler consults, is **area-based, not widget-based** — over the canvas hole
 /// it answers "is the pointer outside the root Ui's available rect", and an
 /// interactive rect painted inside that hole doesn't change the answer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gizmo_ui(
     ui: &mut egui::Ui,
     canvas: egui::Rect,
     target: &GizmoTarget,
     fit: Affine,
     ppp: f64,
+    snap_ctx: SnapCtx<'_>,
     drag: &mut Option<GizmoDrag>,
     out: &mut PropEdits,
 ) -> bool {
@@ -440,8 +442,18 @@ pub(crate) fn gizmo_ui(
         }
     }
 
+    let mut snap = Snap::default();
     if let (Some(d), Some(p)) = (*drag, pointer) {
-        let (pos, rot, scale) = resolve_drag(&d, to_parent(target, fit, ppp, p));
+        let (mut pos, rot, scale) = resolve_drag(&d, to_parent(target, fit, ppp, p));
+        // Snapping applies to moves only. Rotating or scaling *to* a guide is a
+        // different question with a different answer (an angle, not a point),
+        // and pretending a position snap covers it would just make the handles
+        // stick for no visible reason.
+        if matches!(d.handle, GizmoHandle::Move | GizmoHandle::MoveAxis(_)) {
+            let (snapped, s) = snap_move(target, &d, pos, snap_ctx, fit, ppp);
+            pos = snapped;
+            snap = s;
+        }
         match d.handle {
             GizmoHandle::Move | GizmoHandle::MoveAxis(_) => {
                 out.pos_x = Some(pos.x);
@@ -459,6 +471,67 @@ pub(crate) fn gizmo_ui(
     if hot.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
-    paint(&ui.painter_at(canvas), &l, hot);
+    let painter = ui.painter_at(canvas);
+    draw_snap(&painter, canvas, &snap, fit, ppp);
+    paint(&painter, &l, hot);
     hot.is_some()
+}
+
+/// Apply snapping to a move, in composition space, and report what was hit.
+///
+/// The layer's values live in **parent** space but guides and the grid live in
+/// **composition** space, so the point is taken up to comp space, snapped
+/// there, and brought back. Snapping in parent space would silently mean
+/// something different for every nested layer.
+///
+/// An axis-constrained move keeps its constraint: the correction is projected
+/// onto the axis, so an arrow drag can slide *along* its axis onto a guide but
+/// can never be pulled off it. Applying the raw 2D offset would quietly break
+/// the one promise the arrow makes.
+pub(crate) fn snap_move(
+    target: &GizmoTarget,
+    drag: &GizmoDrag,
+    pos: Vec2,
+    ctx: SnapCtx<'_>,
+    fit: Affine,
+    ppp: f64,
+) -> (Vec2, Snap) {
+    if !ctx.enabled {
+        return (pos, Snap::default());
+    }
+    let pivot = target.parent * Point::new(pos.x, pos.y);
+    let snap = snap_point(pivot, ctx.aids, ctx.comp, snap_tolerance(fit, ppp));
+    let mut offset = snap.offset();
+    if offset == Vec2::ZERO {
+        return (pos, snap);
+    }
+    if let GizmoHandle::MoveAxis(axis) = drag.handle {
+        // The axis in *comp* space — the parent may rotate it.
+        let a = axis_of(drag.start_rot, axis);
+        let o = target.parent * Point::ZERO;
+        let dir = (target.parent * Point::new(a.x, a.y)) - o;
+        let len = dir.hypot();
+        if len < 1e-9 {
+            return (pos, Snap::default());
+        }
+        let unit = dir / len;
+        offset = unit * offset.dot(unit);
+    }
+    // Back down to parent space as a *vector*: a difference of two mapped
+    // points, so the parent's translation cancels and only its rotation and
+    // scale apply.
+    let inv = target.parent.inverse();
+    let moved = inv * (pivot + offset);
+    let base = inv * pivot;
+    (pos + (moved - base), snap)
+}
+
+/// What a drag is allowed to snap to this frame.
+#[derive(Clone, Copy)]
+pub(crate) struct SnapCtx<'a> {
+    pub(crate) aids: &'a ViewAids,
+    pub(crate) comp: (f64, f64),
+    /// Cleared while the bypass modifier is held, so precise placement is
+    /// always one key away rather than a trip to a toggle.
+    pub(crate) enabled: bool,
 }

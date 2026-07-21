@@ -64,6 +64,7 @@ pub(crate) struct AidEdits {
     pub(crate) toggle_grid: bool,
     pub(crate) toggle_rulers: bool,
     pub(crate) toggle_guides: bool,
+    pub(crate) toggle_snap: bool,
     pub(crate) set_grid_spacing: Option<f64>,
     pub(crate) set_grid_subdivisions: Option<u32>,
     /// Delete every guide at once — the escape hatch for when dragging them
@@ -426,6 +427,138 @@ fn draw_guide(painter: &egui::Painter, canvas: egui::Rect, axis: GuideAxis, at: 
                     stroke,
                 );
             }
+        }
+    }
+}
+
+// --- Snapping --------------------------------------------------------------
+
+/// How close (in **logical points on screen**) a drag must come to a target
+/// before it snaps.
+///
+/// Screen-relative, not composition-relative, for the same reason the guide
+/// grab band is: a tolerance in comp units would grow as you zoom out until
+/// everything snapped, and shrink as you zoom in until nothing did. In screen
+/// terms the pull always feels the same, and zooming in is how you *escape* a
+/// snap to place something precisely — which is the behaviour people expect.
+pub(crate) const SNAP_PX: f64 = 8.0;
+
+/// One axis's snap decision: how far to move, and the coordinate that was hit
+/// (so the line can be drawn as feedback).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SnapAxis {
+    pub(crate) offset: f64,
+    pub(crate) target: f64,
+}
+
+/// The result of snapping a point: an independent decision per axis, because a
+/// drag can perfectly well land on a vertical guide while its Y stays free.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Snap {
+    pub(crate) x: Option<SnapAxis>,
+    pub(crate) y: Option<SnapAxis>,
+}
+
+impl Snap {
+    /// The correction to add to the dragged point, in composition units.
+    pub(crate) fn offset(&self) -> Vec2 {
+        Vec2::new(
+            self.x.map(|s| s.offset).unwrap_or(0.0),
+            self.y.map(|s| s.offset).unwrap_or(0.0),
+        )
+    }
+}
+
+/// The nearest snap coordinate to `v` on one axis, within `tol`.
+///
+/// `extent` is the composition's size along this axis, `guides` the guide
+/// coordinates that cross it. Grid lines are *not* enumerated — the nearest
+/// multiple is computed directly, so a 1px grid on a huge comp costs the same
+/// as a 500px one instead of building a million candidates.
+fn snap_axis(
+    v: f64,
+    extent: f64,
+    guides: &[f64],
+    grid: Option<&Grid>,
+    tol: f64,
+) -> Option<SnapAxis> {
+    let mut best: Option<SnapAxis> = None;
+    let mut consider = |target: f64| {
+        let offset = target - v;
+        if offset.abs() <= tol && best.is_none_or(|b| offset.abs() < b.offset.abs()) {
+            best = Some(SnapAxis { offset, target });
+        }
+    };
+
+    // The composition's own edges and centre, always live: they exist whether
+    // or not any aid is switched on, and are what you align to most.
+    consider(0.0);
+    consider(extent / 2.0);
+    consider(extent);
+
+    for g in guides {
+        consider(*g);
+    }
+
+    if let Some(grid) = grid.filter(|g| g.visible) {
+        for step in [Some(grid.step()), grid.minor_step()].into_iter().flatten() {
+            consider((v / step).round() * step);
+        }
+    }
+    best
+}
+
+/// Snap a point in **composition space** to whatever aids are currently armed.
+///
+/// `tol` is in composition units — convert from [`SNAP_PX`] with
+/// [`snap_tolerance`] so the feel stays constant across zoom levels.
+pub(crate) fn snap_point(p: Point, aids: &ViewAids, comp: (f64, f64), tol: f64) -> Snap {
+    if !aids.snap {
+        return Snap::default();
+    }
+    // Only *visible* guides are targets. Snapping to a line you can't see reads
+    // as the drag sticking for no reason — see the note on `ViewAids::snap`.
+    let (mut vs, mut hs) = (Vec::new(), Vec::new());
+    if aids.guides.visible {
+        for g in &aids.guides.items {
+            match g.axis {
+                GuideAxis::Vertical => vs.push(g.at),
+                GuideAxis::Horizontal => hs.push(g.at),
+            }
+        }
+    }
+    Snap {
+        x: snap_axis(p.x, comp.0, &vs, Some(&aids.grid), tol),
+        y: snap_axis(p.y, comp.1, &hs, Some(&aids.grid), tol),
+    }
+}
+
+/// [`SNAP_PX`] expressed in composition units at the current zoom.
+pub(crate) fn snap_tolerance(fit: Affine, ppp: f64) -> f64 {
+    let scale = fit.as_coeffs()[0].abs() / ppp;
+    if scale > 1e-9 {
+        SNAP_PX / scale
+    } else {
+        f64::INFINITY
+    }
+}
+
+const SNAP_COL: egui::Color32 = egui::Color32::from_rgb(255, 90, 190);
+
+/// Draw the lines a drag is currently snapped to, so it is obvious *why* it
+/// stuck. Without this a snap is indistinguishable from a stuck cursor.
+pub(crate) fn draw_snap(painter: &egui::Painter, canvas: egui::Rect, snap: &Snap, fit: Affine, ppp: f64) {
+    let stroke = egui::Stroke::new(1.0, SNAP_COL);
+    if let Some(s) = snap.x {
+        let x = screen_coord(GuideAxis::Vertical, fit, ppp, s.target);
+        if x >= canvas.min.x && x <= canvas.max.x {
+            painter.line_segment([egui::pos2(x, canvas.min.y), egui::pos2(x, canvas.max.y)], stroke);
+        }
+    }
+    if let Some(s) = snap.y {
+        let y = screen_coord(GuideAxis::Horizontal, fit, ppp, s.target);
+        if y >= canvas.min.y && y <= canvas.max.y {
+            painter.line_segment([egui::pos2(canvas.min.x, y), egui::pos2(canvas.max.x, y)], stroke);
         }
     }
 }

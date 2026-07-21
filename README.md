@@ -340,6 +340,47 @@ click-picking on it (`App::aids_hot`) — `is_pointer_over_egui` is area-based a
 stays false inside the canvas hole, so an interactive overlay there cannot
 suppress picking on its own. See the gotcha of that name below.
 
+### Snapping (2026-07-21)
+
+A gizmo **move** snaps to the composition edges and centre, to visible guides,
+and to visible grid lines. `Comp::aids.snap` toggles it (tool strip: **Snap**);
+holding **Ctrl** bypasses it for one drag, as in Blender and Figma, so precise
+placement is a key away rather than a trip to a toggle and back. The line you
+snapped to is drawn in pink, because otherwise a snap is indistinguishable from
+a stuck cursor.
+
+**You snap to what you can see.** One flag, not one per target: showing the grid
+arms grid snapping and hiding it disarms it. That is one less thing to keep
+consistent, and the screen already tells you what is armed. Composition edges
+and centre are the exception — they exist whether or not anything is shown, and
+are what you align to most.
+
+Four decisions worth keeping:
+
+- **The tolerance is in screen points** (`SNAP_PX`), converted to comp units per
+  frame by `snap_tolerance`. In comp units it would grow as you zoom out until
+  everything snapped and shrink as you zoom in until nothing did. In screen
+  terms the pull feels constant, and *zooming in is how you escape a snap* —
+  which is what people already expect. Same lesson as the guide grab band.
+- **Snapping happens in composition space**, then converts back to the layer's
+  parent space. Guides and the grid are comp-space objects; snapping in parent
+  space would silently mean something different at every nesting depth.
+- **An axis drag keeps its constraint.** The correction is projected onto the
+  arrow's axis (in comp space, since the parent may rotate it), so a drag slides
+  *along* the arrow onto a guide and can never be pulled sideways off it.
+  Applying the raw 2D offset would break the one promise the arrow makes.
+- **Grid lines are never enumerated.** The nearest multiple is computed
+  directly, so a 1px grid on a 100,000px comp costs the same as a 500px grid
+  instead of building a million candidates.
+
+Moves only: rotating or scaling *to* a guide is a different question with a
+different answer (an angle, not a point), and pretending a position snap covers
+it would just make those handles stick for no visible reason.
+
+Not yet: snapping a layer's **bounding-box edges** rather than its pivot. That
+is what you want for laying out a title against a margin, and it needs per-frame
+bounds for the dragged layer plus a candidate set from its siblings.
+
 ### The motion path (2026-07-20)
 
 `live/src/motionpath.rs`. An animated layer's pivot trajectory, drawn on the
@@ -999,8 +1040,9 @@ done** (see *The transform gizmo*). Still open, in this order:
 
 1. ~~**Grid + rulers + guides**~~ ✅ Done — see *Grid, rulers and guides*.
    Per-comp state saved in the `.pbc`, alongside `Comp::bg`.
-2. **Snapping** — drags snap to the grid, guides, comp edges/centre, and other
-   layers' bounds. Depends on (1), and on the gizmo for the drag path. **Next.**
+2. ~~**Snapping**~~ ✅ Done for the pivot — see *Snapping*. Still open: snapping
+   a layer's **bounding-box edges** and to *other layers'* bounds, which needs
+   per-frame bounds for the dragged layer and a candidate set from its siblings.
 3. **Anchor-point handle + selection bbox** — the gizmo pivots on the anchor but
    can't yet *move* it, and there is no bounding box drawn.
 4. **Onion skinning** — ghosts of the rendered layer at ±N frames, tinted by

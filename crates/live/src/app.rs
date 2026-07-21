@@ -309,6 +309,9 @@ impl App {
         if e.toggle_guides {
             self.doc_mut().aids.guides.visible ^= true;
         }
+        if e.toggle_snap {
+            self.doc_mut().aids.snap ^= true;
+        }
         if let Some(sp) = e.set_grid_spacing {
             self.doc_mut().aids.grid.spacing = sp.clamp(Grid::MIN_SPACING, Grid::MAX_SPACING);
         }
@@ -1363,6 +1366,10 @@ impl App {
         let mut aids_hot = false;
         // Cloned for the UI closure, which must not borrow `self`.
         let aids = self.doc().aids.clone();
+        // Ctrl temporarily disables snapping, the way it does in Blender and
+        // Figma — precise placement is one key away rather than a trip to a
+        // toggle and back.
+        let snap_bypass = self.egui_ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
         // Recomputed every frame: with no selection there is no gizmo, so the
         // flag must fall back to false rather than latch on from a stale frame.
         let mut gizmo_hot = false;
@@ -1532,7 +1539,20 @@ impl App {
                         // exactly like a DragValue drag does.
                         if let (Some(t), Some(rect)) = (&gizmo_target, canvas_pts) {
                             gizmo_hot =
-                                gizmo_ui(ui, rect, t, fit, ppp, &mut gizmo_drag, &mut edits);
+                                gizmo_ui(
+                                    ui,
+                                    rect,
+                                    t,
+                                    fit,
+                                    ppp,
+                                    SnapCtx {
+                                        aids: &aids,
+                                        comp: (doc_w, doc_h),
+                                        enabled: !snap_bypass,
+                                    },
+                                    &mut gizmo_drag,
+                                    &mut edits,
+                                );
                         }
                     }
                 },

@@ -112,6 +112,13 @@ pub(crate) fn canvas_toolbar(
                 {
                     aid_out.toggle_rulers = true;
                 }
+                if ui
+                    .selectable_label(aids.snap, "Snap")
+                    .on_hover_text("Snap drags to the comp edges and to whatever aids are shown (hold Ctrl to bypass)")
+                    .clicked()
+                {
+                    aid_out.toggle_snap = true;
+                }
                 let guides = ui
                     .selectable_label(aids.guides.visible, "Guides")
                     .on_hover_text("Show guides — drag one back to a ruler to remove it");

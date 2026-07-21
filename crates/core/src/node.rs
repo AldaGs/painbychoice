@@ -545,7 +545,7 @@ pub struct Comp {
 /// The preview's alignment aids. Grouped rather than five loose fields on
 /// [`Comp`] because they are one feature to the user — the thing you toggle
 /// when you're positioning something — and they are read together everywhere.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewAids {
     pub grid: Grid,
@@ -554,6 +554,31 @@ pub struct ViewAids {
     /// drawing area.
     pub rulers: bool,
     pub guides: Guides,
+    /// Whether a canvas drag snaps to the aids. Deliberately one flag rather
+    /// than one per target: **you snap to what you can see**, so showing the
+    /// grid arms grid snapping and hiding it disarms it. One less thing to keep
+    /// consistent, and it matches what the screen is already telling you.
+    /// Composition edges and centre always snap — they exist whether or not
+    /// anything is shown.
+    #[serde(default = "ViewAids::default_snap")]
+    pub snap: bool,
+}
+
+impl ViewAids {
+    fn default_snap() -> bool {
+        true
+    }
+}
+
+impl Default for ViewAids {
+    fn default() -> Self {
+        Self {
+            grid: Grid::default(),
+            rulers: false,
+            guides: Guides::default(),
+            snap: Self::default_snap(),
+        }
+    }
 }
 
 /// A regular grid drawn inside the composition bounds.

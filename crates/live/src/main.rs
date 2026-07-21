@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use kurbo::{Affine, BezPath, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, ViewAids, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
+    demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, Guides, ViewAids, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
     Comp, Document, EvalCtx, Expr, Project as MProject,
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,

@@ -2548,3 +2548,223 @@ fn the_guide_grab_band_follows_the_screen_not_the_composition() {
     assert_eq!(guide_under(&guides, inn, 1.0, egui::pos2(800.0, 0.0)), Some(0));
     assert_eq!(guide_under(&guides, inn, 1.0, egui::pos2(816.0, 0.0)), None);
 }
+
+// --- Snapping --------------------------------------------------------------
+
+fn aids_with(grid: bool, guides: Vec<Guide>) -> ViewAids {
+    ViewAids {
+        grid: Grid { visible: grid, spacing: 100.0, subdivisions: 4 },
+        rulers: false,
+        guides: Guides { visible: true, items: guides },
+        snap: true,
+    }
+}
+
+/// The composition's edges and centre always snap, whether or not any aid is
+/// switched on — they exist regardless, and are what you align to most.
+#[test]
+fn the_comp_edges_and_centre_always_snap() {
+    let aids = aids_with(false, Vec::new());
+    let comp = (1920.0, 1080.0);
+
+    let s = snap_point(Point::new(4.0, 540.0 - 3.0), &aids, comp, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(0.0), "left edge");
+    assert_eq!(s.y.map(|a| a.target), Some(540.0), "vertical centre");
+
+    let s = snap_point(Point::new(1918.0, 1078.0), &aids, comp, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(1920.0), "right edge");
+    assert_eq!(s.y.map(|a| a.target), Some(1080.0), "bottom edge");
+
+    // Well away from anything: no pull at all.
+    let s = snap_point(Point::new(700.0, 300.0), &aids, comp, 8.0);
+    assert_eq!(s, Snap::default());
+}
+
+/// Each axis decides independently: a drag can land on a vertical guide while
+/// its Y stays exactly where the pointer put it.
+#[test]
+fn the_two_axes_snap_independently() {
+    let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
+    let s = snap_point(Point::new(302.0, 777.0), &aids, (1920.0, 1080.0), 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(300.0));
+    assert!(s.y.is_none(), "y had nothing near it and must stay free");
+    assert_eq!(s.offset(), Vec2::new(-2.0, 0.0));
+}
+
+/// You snap to what you can see: a hidden grid or hidden guides must not pull a
+/// drag, or it reads as the cursor sticking for no reason.
+#[test]
+fn hidden_aids_do_not_snap() {
+    let comp = (1000.0, 1000.0);
+    let at = Point::new(402.0, 402.0);
+
+    let shown = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 400.0 }]);
+    assert!(snap_point(at, &shown, comp, 8.0).x.is_some(), "shown guide pulls");
+
+    let mut hidden = shown.clone();
+    hidden.guides.visible = false;
+    hidden.grid.visible = false;
+    assert_eq!(snap_point(at, &hidden, comp, 8.0), Snap::default());
+
+    // And the master switch beats everything, including the comp edges.
+    let mut off = shown.clone();
+    off.snap = false;
+    assert_eq!(snap_point(Point::new(2.0, 2.0), &off, comp, 8.0), Snap::default());
+}
+
+/// Grid snapping computes the nearest multiple rather than enumerating lines,
+/// so it must work far from the origin and pick minor lines too.
+#[test]
+fn the_grid_snaps_to_the_nearest_line_at_any_distance() {
+    let aids = aids_with(true, Vec::new());
+    let comp = (100_000.0, 100_000.0);
+
+    // 100px majors: a long way out, still exact.
+    let s = snap_point(Point::new(49_998.0, 3.0), &aids, comp, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(50_000.0));
+
+    // 4 subdivisions of 100 = minor lines every 25.
+    let s = snap_point(Point::new(74.0, 5_000.0), &aids, comp, 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(75.0), "nearest minor line");
+}
+
+/// The nearest target wins when several are in range — a guide sitting between
+/// two grid lines must not be overruled by one of them.
+#[test]
+fn the_nearest_snap_target_wins() {
+    let aids = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 103.0 }]);
+    let s = snap_point(Point::new(102.0, 500.0), &aids, (1920.0, 1080.0), 8.0);
+    assert_eq!(s.x.map(|a| a.target), Some(103.0), "the guide is 1 away, the grid 2");
+}
+
+/// The tolerance is in screen points, so the same 8px pull covers a wide comp
+/// range when zoomed out and a narrow one when zoomed in — zooming in is how
+/// you escape a snap.
+#[test]
+fn the_snap_tolerance_shrinks_as_you_zoom_in() {
+    let out = snap_tolerance(Affine::scale(0.1), 1.0);
+    let one = snap_tolerance(Affine::scale(1.0), 1.0);
+    let inn = snap_tolerance(Affine::scale(8.0), 1.0);
+    assert!(out > one && one > inn, "{out} > {one} > {inn}");
+    assert!((one - SNAP_PX).abs() < 1e-9, "1:1 zoom is exactly the pixel budget");
+    // A degenerate transform must not produce a NaN tolerance that snaps
+    // everything (or nothing) unpredictably.
+    assert!(snap_tolerance(Affine::scale(0.0), 1.0).is_infinite());
+}
+
+/// An axis arrow keeps its constraint even when snapping. The correction is
+/// projected onto the axis, so a drag can slide *along* the arrow onto a guide
+/// but can never be pulled sideways off it — applying the raw 2D offset would
+/// quietly break the one promise the arrow makes.
+#[test]
+fn an_axis_constrained_drag_only_snaps_along_its_axis() {
+    let target = GizmoTarget {
+        node: 1,
+        parent: Affine::IDENTITY,
+        pos: Vec2::new(0.0, 0.0),
+        rot_deg: 0.0,
+        scale: (1.0, 1.0),
+    };
+    // A vertical guide at x=300 and a horizontal one at y=300: an unconstrained
+    // move near their crossing would be pulled on both axes.
+    let aids = aids_with(
+        false,
+        vec![
+            Guide { axis: GuideAxis::Vertical, at: 300.0 },
+            Guide { axis: GuideAxis::Horizontal, at: 300.0 },
+        ],
+    );
+    let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: true };
+    let fit = Affine::IDENTITY;
+    let at = Vec2::new(302.0, 302.0);
+
+    // Free move: both axes snap.
+    let free = GizmoDrag {
+        handle: GizmoHandle::Move,
+        node: 1,
+        start_pos: at,
+        start_rot: 0.0,
+        start_scale: (1.0, 1.0),
+        grab_parent: Point::new(302.0, 302.0),
+    };
+    let (pos, snap) = snap_move(&target, &free, at, ctx, fit, 1.0);
+    assert_eq!((pos.x, pos.y), (300.0, 300.0));
+    assert!(snap.x.is_some() && snap.y.is_some());
+
+    // Along X: x snaps, y must be left exactly where it was.
+    let axis = GizmoDrag { handle: GizmoHandle::MoveAxis(GizmoAxis::X), ..free };
+    let (pos, _) = snap_move(&target, &axis, at, ctx, fit, 1.0);
+    assert!((pos.x - 300.0).abs() < 1e-9, "x snapped: {}", pos.x);
+    assert!((pos.y - 302.0).abs() < 1e-9, "y stayed off the guide: {}", pos.y);
+
+    // Along Y: the mirror image.
+    let axis = GizmoDrag { handle: GizmoHandle::MoveAxis(GizmoAxis::Y), ..free };
+    let (pos, _) = snap_move(&target, &axis, at, ctx, fit, 1.0);
+    assert!((pos.x - 302.0).abs() < 1e-9, "x stayed off the guide: {}", pos.x);
+    assert!((pos.y - 300.0).abs() < 1e-9, "y snapped: {}", pos.y);
+}
+
+/// Snapping happens in *composition* space but the layer's values are in its
+/// parent's, so a nested layer under a scaled parent must still land exactly on
+/// the guide. Snapping in parent space would mean something different at every
+/// nesting depth.
+#[test]
+fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
+    // Parent is offset and scaled 2x, so 1 parent unit is 2 comp units.
+    let parent = Affine::translate((100.0, 40.0)) * Affine::scale(2.0);
+    let target = GizmoTarget {
+        node: 1,
+        parent,
+        pos: Vec2::ZERO,
+        rot_deg: 0.0,
+        scale: (1.0, 1.0),
+    };
+    let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
+    let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: true };
+
+    // Parent-space x=101 maps to comp 100 + 2*101 = 302, two from the guide.
+    let at = Vec2::new(101.0, 200.0);
+    let drag = GizmoDrag {
+        handle: GizmoHandle::Move,
+        node: 1,
+        start_pos: at,
+        start_rot: 0.0,
+        start_scale: (1.0, 1.0),
+        grab_parent: Point::new(101.0, 200.0),
+    };
+    let (pos, snap) = snap_move(&target, &drag, at, ctx, Affine::IDENTITY, 1.0);
+
+    assert_eq!(snap.x.map(|a| a.target), Some(300.0));
+    // Landing on comp x=300 means parent x=100, not 300 — the parent's scale
+    // and offset have to be undone for the value written to the document.
+    assert!((pos.x - 100.0).abs() < 1e-9, "parent-space x: {}", pos.x);
+    let comp_x = (parent * Point::new(pos.x, pos.y)).x;
+    assert!((comp_x - 300.0).abs() < 1e-9, "lands on the guide in comp space");
+}
+
+/// Holding the bypass modifier must defeat snapping entirely, including the
+/// always-on composition edges.
+#[test]
+fn the_bypass_modifier_defeats_every_snap_target() {
+    let target = GizmoTarget {
+        node: 1,
+        parent: Affine::IDENTITY,
+        pos: Vec2::ZERO,
+        rot_deg: 0.0,
+        scale: (1.0, 1.0),
+    };
+    let aids = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
+    let at = Vec2::new(301.0, 2.0);
+    let drag = GizmoDrag {
+        handle: GizmoHandle::Move,
+        node: 1,
+        start_pos: at,
+        start_rot: 0.0,
+        start_scale: (1.0, 1.0),
+        grab_parent: Point::new(301.0, 2.0),
+    };
+    let ctx = SnapCtx { aids: &aids, comp: (1920.0, 1080.0), enabled: false };
+    let (pos, snap) = snap_move(&target, &drag, at, ctx, Affine::IDENTITY, 1.0);
+    assert_eq!(pos, at, "the drag lands exactly where the pointer put it");
+    assert_eq!(snap, Snap::default(), "and nothing is drawn as snapped");
+}
