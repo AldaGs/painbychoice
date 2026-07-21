@@ -321,6 +321,7 @@ pub(crate) fn nodegraph_ui(
 ) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::NODES).size(16.0));
         ui.heading("Nodes");
         ui.weak(format!("{} nodes", graph.nodes.len()));
         palette_menu(ui, graph, ctx.reg, out);
@@ -411,6 +412,7 @@ fn drivers_ui(
 ) {
     let outputs = graph_outputs(graph, ctx, is_value_type);
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::LINK));
         ui.strong("Drivers");
         ui.weak(format!("{}", bindings.len()));
         let can_add = !outputs.is_empty() && !layers.is_empty();
@@ -431,7 +433,7 @@ fn drivers_ui(
     }
     for (i, b) in bindings.iter().enumerate() {
         ui.horizontal(|ui| {
-            if ui.small_button("x").on_hover_text("Remove (freezes the property)").clicked() {
+            if icon::button(ui, icon::CLOSE, "Remove (freezes the property)").clicked() {
                 out.binding = Some(BindingOp::Remove { index: i });
             }
             let cur_out = outputs
@@ -499,6 +501,7 @@ fn shape_drivers_ui(
 ) {
     let outputs = graph_outputs(graph, ctx, |t| t == SocketType::Geometry);
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::SHAPE));
         ui.strong("Geometry");
         ui.weak(format!("{}", bindings.len()));
         let can_add = !outputs.is_empty() && !layers.is_empty();
@@ -518,7 +521,7 @@ fn shape_drivers_ui(
     }
     for (i, b) in bindings.iter().enumerate() {
         ui.horizontal(|ui| {
-            if ui.small_button("x").on_hover_text("Remove (freezes the shape)").clicked() {
+            if icon::button(ui, icon::CLOSE, "Remove (freezes the shape)").clicked() {
                 out.shape_binding = Some(ShapeBindingOp::Remove { index: i });
             }
             let cur_out = outputs
@@ -565,6 +568,7 @@ fn shape_drivers_ui(
 /// the document scope's front door.
 fn modules_ui(ui: &mut egui::Ui, modules: &[(ModuleId, String)], out: &mut NgEdits) {
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::MODULE));
         ui.strong("Modules");
         ui.weak(format!("{}", modules.len()));
         if ui
@@ -580,7 +584,7 @@ fn modules_ui(ui: &mut egui::Ui, modules: &[(ModuleId, String)], out: &mut NgEdi
     }
     for (id, name) in modules {
         ui.horizontal(|ui| {
-            if ui.small_button("edit").on_hover_text("Open this module's body").clicked() {
+            if icon::button(ui, icon::ENTER, "Open this module's body").clicked() {
                 out.scope = Some(NgScope::Module(*id));
             }
             ui.label(name);
@@ -603,19 +607,21 @@ fn module_scope_ui(
     out: &mut NgEdits,
 ) {
     ui.horizontal(|ui| {
-        if ui.small_button("← project").on_hover_text("Back to the layer-driving graph").clicked()
-        {
+        if icon::button(ui, icon::BACK, "Back to the layer-driving graph").clicked() {
             out.scope = Some(NgScope::Project);
         }
+        ui.label(icon::text(icon::MODULE));
         ui.strong("Editing module");
         let mut n = name.to_string();
         if ui.add(egui::TextEdit::singleline(&mut n).desired_width(120.0)).changed() {
             out.module_op = Some(NgModuleOp::Rename { module: id, name: n });
         }
-        if ui
-            .small_button("delete")
-            .on_hover_text("Delete this module. Links to it warn and fall back, like any dangling reference.")
-            .clicked()
+        if icon::button(
+            ui,
+            icon::DELETE,
+            "Delete this module. Links to it warn and fall back, like any dangling reference.",
+        )
+        .clicked()
         {
             out.module_op = Some(NgModuleOp::Delete { module: id });
         }
@@ -625,6 +631,7 @@ fn module_scope_ui(
     // isn't graph-authored and the canvas drives nothing.
     let outputs = graph_outputs(graph, ctx, is_value_type);
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::OUTPUT));
         ui.strong("Output");
         let cur = output
             .and_then(|e| outputs.iter().find(|(o, _)| o == e))
@@ -667,6 +674,7 @@ fn knobs_ui(
     out: &mut NgEdits,
 ) {
     ui.horizontal_wrapped(|ui| {
+        ui.label(icon::text(icon::KNOB));
         ui.strong("Knobs");
         ui.weak(format!("{}", knobs.len()));
         // The pending name lives in egui memory, salted by owner so two owners'
@@ -703,7 +711,7 @@ fn knobs_ui(
     }
     for k in knobs {
         ui.horizontal(|ui| {
-            if ui.small_button("x").on_hover_text("Remove this knob").clicked() {
+            if icon::button(ui, icon::CLOSE, "Remove this knob").clicked() {
                 out.knob = Some(NgKnobOp::Remove { owner, name: k.name.clone() });
             }
             ui.label(&k.name);
@@ -825,6 +833,7 @@ fn layer_knobs_ui(ui: &mut egui::Ui, layers: &[LayerInfo], out: &mut NgEdits) {
         sel = layers[0].id;
     }
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::KNOB));
         ui.strong("Layer knobs");
         let cur = layers
             .iter()
@@ -861,6 +870,7 @@ fn import_ui(ui: &mut egui::Ui, layers: &[LayerInfo], out: &mut NgEdits) {
     let mut sel: (u64, PropPath) =
         ui.ctx().data(|d| d.get_temp(mem)).unwrap_or((layers[0].id, PropPath::Rotation));
     ui.horizontal(|ui| {
+        ui.label(icon::text(icon::IMPORT));
         ui.strong("Import");
         let cur_layer = layers
             .iter()
@@ -887,9 +897,7 @@ fn import_ui(ui: &mut egui::Ui, layers: &[LayerInfo], out: &mut NgEdits) {
                 }
             },
         );
-        if ui
-            .button("→ nodes")
-            .on_hover_text("Raise this property's expression onto the canvas")
+        if icon::button(ui, icon::IMPORT, "Raise this property's expression onto the canvas")
             .clicked()
         {
             out.import = Some((NodeId(sel.0), sel.1));
@@ -989,16 +997,19 @@ fn inspector_ui(
     // knob fields still show below it.
     if node.kind == "osc" {
         let cur = node.config.wave;
-        egui::ComboBox::from_id_salt(("osc_wave", node.id.0))
-            .width(90.0)
-            .selected_text(cur.label())
-            .show_ui(ui, |ui| {
-                for w in Waveform::ALL {
-                    if ui.selectable_label(w == cur, w.label()).clicked() && w != cur {
-                        out.op = Some(NgOp::SetWaveform { id: node.id, wave: w });
+        ui.horizontal(|ui| {
+            ui.label(icon::text(icon::WAVE));
+            egui::ComboBox::from_id_salt(("osc_wave", node.id.0))
+                .width(90.0)
+                .selected_text(cur.label())
+                .show_ui(ui, |ui| {
+                    for w in Waveform::ALL {
+                        if ui.selectable_label(w == cur, w.label()).clicked() && w != cur {
+                            out.op = Some(NgOp::SetWaveform { id: node.id, wave: w });
+                        }
                     }
-                }
-            });
+                });
+        });
     }
     // A text node's typography isn't a socket — `ExprValue` has no string, so
     // only the font size wires. The rest is edited here and lowered straight
@@ -1090,7 +1101,7 @@ fn knob_rows(
                     if let Some(v) = num_field(ui, "override", n) {
                         out.op = Some(set_value(node.id, &s.id, ExprValue::Num(v)));
                     }
-                    if ui.small_button("x").on_hover_text("Back to inheriting").clicked() {
+                    if icon::button(ui, icon::BACK, "Back to inheriting").clicked() {
                         out.op = Some(NgOp::ClearValue { id: node.id, socket: s.id.clone() });
                     }
                 }
@@ -1098,15 +1109,13 @@ fn knob_rows(
                 // into it); only the scalar case gets an inline field.
                 Some(_) => {
                     ui.weak("overridden");
-                    if ui.small_button("x").on_hover_text("Back to inheriting").clicked() {
+                    if icon::button(ui, icon::BACK, "Back to inheriting").clicked() {
                         out.op = Some(NgOp::ClearValue { id: node.id, socket: s.id.clone() });
                     }
                 }
                 None => {
                     ui.weak("inherit");
-                    if ui
-                        .small_button("override")
-                        .on_hover_text("Replace the module's default for this link")
+                    if icon::button(ui, icon::EDIT, "Replace the module's default for this link")
                         .clicked()
                     {
                         out.op = Some(set_value(node.id, &s.id, neutral_literal(s.ty)));
@@ -1394,7 +1403,16 @@ fn draw_node(
     );
     let del_resp = ui.interact(del, ui.id().with(("ng_del", node.id.0)), egui::Sense::click());
     let del_col = if del_resp.hovered() { egui::Color32::from_gray(255) } else { egui::Color32::from_gray(200) };
-    painter.text(del.center(), egui::Align2::CENTER_CENTER, "✕", egui::FontId::proportional(12.0), del_col);
+    // The icon family, not the proportional one: `✕` is a text character that
+    // happens to look like a close button, and it sits differently from every
+    // other control in the UI.
+    painter.text(
+        del.center(),
+        egui::Align2::CENTER_CENTER,
+        icon::CLOSE,
+        egui::FontId::new(12.0, egui::FontFamily::Name(icon::FAMILY.into())),
+        del_col,
+    );
     if del_resp.clicked() {
         out.op = Some(NgOp::Remove { id: node.id });
     }

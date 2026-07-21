@@ -55,10 +55,35 @@ pub(crate) const OPEN: &str = "\u{ea99}";
 pub(crate) const PRECOMPOSE: &str = "\u{eef7}";
 pub(crate) const TRIM: &str = "\u{eb1b}";
 
-// Keyframes. (The retired expression panel's module/link/expr/bake glyphs went
-// with it; the subsetted font still carries them until it is next regenerated,
-// which is harmless -- an unused glyph costs bytes, a missing one renders tofu.)
+// Keyframes.
 pub(crate) const KEYFRAME: &str = "\u{f576}";
+
+// The Nodes panel. Each section header carries one, so the panel's parts are
+// distinguishable at a glance rather than by reading five bold words.
+/// Tabler `sitemap` — the panel itself: a network of wired nodes.
+pub(crate) const NODES: &str = "\u{eb9d}";
+/// Tabler `puzzle` — a shared module: a reusable piece that slots in.
+pub(crate) const MODULE: &str = "\u{eb10}";
+/// Tabler `link` — a driver, binding a graph output to a layer's property.
+pub(crate) const LINK: &str = "\u{eade}";
+/// Tabler `shape` — a geometry driver, authoring a layer's shape.
+pub(crate) const SHAPE: &str = "\u{eb9c}";
+/// Tabler `file-import` — pulling a property's expression onto the canvas.
+pub(crate) const IMPORT: &str = "\u{edea}";
+/// Tabler `adjustments` (sliders) — exposed knobs, on a layer or a module.
+pub(crate) const KNOB: &str = "\u{ea03}";
+/// Tabler `arrow-narrow-right` — which output carries a module's value out.
+pub(crate) const OUTPUT: &str = "\u{ea1c}";
+/// Tabler `door-enter` — open a module's body. A module is a group you *enter*,
+/// which is the metaphor the whole scope model is built on.
+pub(crate) const ENTER: &str = "\u{ef4c}";
+/// Tabler `arrow-back-up` — leave a module's body, and reset an overridden knob
+/// to inheriting. Both are "go back to where this came from".
+pub(crate) const BACK: &str = "\u{eb77}";
+/// Tabler `pencil` — override a knob that is currently inheriting.
+pub(crate) const EDIT: &str = "\u{eb04}";
+/// Tabler `wave-sine` — an oscillator's waveform.
+pub(crate) const WAVE: &str = "\u{ecd4}";
 
 // Layout and status.
 pub(crate) const SPLIT_V: &str = "\u{ead4}";
