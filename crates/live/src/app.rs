@@ -335,6 +335,16 @@ impl App {
                     n.set_value(socket, value);
                 }
             }
+            NgOp::SetRef { id, target } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.ref_target = target;
+                }
+            }
+            NgOp::SetParam { id, name } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.param = name;
+                }
+            }
         }
     }
 
@@ -1815,7 +1825,12 @@ impl App {
         if let Some(op) = ng_edits.op.take() {
             ng_changed = matches!(
                 op,
-                NgOp::Connect { .. } | NgOp::Disconnect { .. } | NgOp::Remove { .. } | NgOp::SetValue { .. }
+                NgOp::Connect { .. }
+                    | NgOp::Disconnect { .. }
+                    | NgOp::Remove { .. }
+                    | NgOp::SetValue { .. }
+                    | NgOp::SetRef { .. }
+                    | NgOp::SetParam { .. }
             );
             self.apply_ng_op(op);
             window.request_redraw();

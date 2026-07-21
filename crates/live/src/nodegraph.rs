@@ -42,6 +42,10 @@ pub(crate) enum NgOp {
     /// Set a node's stored literal for a socket — a `value` node's constant, or
     /// an unwired input's resting value. Re-lowers any driver reading it.
     SetValue { id: GraphNodeId, socket: String, value: ExprValue },
+    /// Set a `ref` node's target — which layer's which property, at what offset.
+    SetRef { id: GraphNodeId, target: Option<(NodeId, PropPath, f64)> },
+    /// Set a `param` node's knob name.
+    SetParam { id: GraphNodeId, name: String },
 }
 
 /// One deferred edit to the driver list ([`motion_core::Binding`]). Separate
@@ -131,7 +135,7 @@ pub(crate) fn nodegraph_ui(
     ui.separator();
     drivers_ui(ui, graph, reg, layers, bindings, out);
     ui.separator();
-    inspector_ui(ui, graph, reg, out);
+    inspector_ui(ui, graph, reg, layers, out);
     ui.separator();
     if graph.nodes.is_empty() {
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
@@ -257,7 +261,13 @@ fn drivers_ui(
 /// The inspector for the selected node: drag editors for its `value` constant
 /// and any **unwired** numeric input, so a graph's literals are tunable without
 /// canvas widgets. A wired input has no field — its value comes down the wire.
-fn inspector_ui(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &mut NgEdits) {
+fn inspector_ui(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    reg: &NodeRegistry,
+    layers: &[(u64, String)],
+    out: &mut NgEdits,
+) {
     let sel = read_selection(ui.ctx());
     let Some((node, desc)) = sel.and_then(|id| {
         let n = graph.node(id)?;
@@ -267,6 +277,23 @@ fn inspector_ui(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &
         return;
     };
     ui.strong(format!("Values — {}", node.title.clone().unwrap_or_else(|| desc.label.clone())));
+    // A `ref` reads another layer's property; a `param` reads the driven layer's
+    // own knob. Both carry addressing rather than a socket value.
+    if node.kind == "ref" {
+        ref_editor(ui, node, layers, out);
+        return;
+    }
+    if node.kind == "param" {
+        let mut name = node.config.param.clone();
+        if ui
+            .add(egui::TextEdit::singleline(&mut name).hint_text("knob name").desired_width(140.0))
+            .on_hover_text("Reads this knob on whichever layer a driver points at")
+            .changed()
+        {
+            out.op = Some(NgOp::SetParam { id: node.id, name });
+        }
+        return;
+    }
     let mut num_field = |ui: &mut egui::Ui, socket: &str, label: &str, cur: f64| {
         let mut v = cur;
         if ui.add(egui::DragValue::new(&mut v).speed(0.1).prefix(format!("{label}: "))).changed() {
@@ -551,6 +578,59 @@ fn draw_node(
         if resp.drag_started() {
             *pending = Some(ep);
         }
+    }
+}
+
+/// The editor for a `ref` node: which layer, which property, at what frame
+/// offset. A fresh ref has no target, so the first pick seeds one (frame 0's
+/// first layer, Position, offset 0), and each combo edits one field of it.
+fn ref_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[(u64, String)], out: &mut NgEdits) {
+    if layers.is_empty() {
+        ui.weak("No layers to reference.");
+        return;
+    }
+    let (cur_node, cur_prop, cur_off) =
+        node.config.ref_target.unwrap_or((NodeId(layers[0].0), PropPath::Position, 0.0));
+    let mut node_id = cur_node;
+    let mut prop = cur_prop;
+    let mut off = cur_off;
+    // Nothing emits until the user actually picks a field — selecting a ref node
+    // shouldn't silently mutate the document. The first pick seeds the whole
+    // target from the shown defaults.
+    let mut changed = false;
+
+    let cur_name = layers
+        .iter()
+        .find(|(id, _)| *id == cur_node.0)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| format!("#{}", cur_node.0));
+    egui::ComboBox::from_id_salt(("ref_node", node.id.0)).selected_text(cur_name).show_ui(ui, |ui| {
+        for (id, name) in layers {
+            if ui.selectable_label(*id == cur_node.0, name).clicked() && *id != cur_node.0 {
+                node_id = NodeId(*id);
+                changed = true;
+            }
+        }
+    });
+    egui::ComboBox::from_id_salt(("ref_prop", node.id.0))
+        .selected_text(prop_path_label(cur_prop))
+        .show_ui(ui, |ui| {
+            for p in PROP_PATHS {
+                if ui.selectable_label(p == cur_prop, prop_path_label(p)).clicked() && p != cur_prop {
+                    prop = p;
+                    changed = true;
+                }
+            }
+        });
+    if ui
+        .add(egui::DragValue::new(&mut off).speed(0.5).prefix("offset "))
+        .on_hover_text("Frame offset — read the target this many frames away")
+        .changed()
+    {
+        changed = true;
+    }
+    if changed {
+        out.op = Some(NgOp::SetRef { id: node.id, target: Some((node_id, prop, off)) });
     }
 }
 

@@ -17,7 +17,7 @@
 
 use std::collections::HashSet;
 
-use crate::expr::{Expr, ExprValue, Generator, Waveform};
+use crate::expr::{Expr, ExprValue, Generator, TimeSource, Waveform};
 use crate::graph::{Endpoint, GraphNodeId, NodeGraph};
 use crate::registry::NodeRegistry;
 use crate::socket::SocketType;
@@ -85,8 +85,28 @@ fn lower_out(
             freq: b(lower_in(graph, reg, output.node, "freq", visiting)),
             decay: b(lower_in(graph, reg, output.node, "decay", visiting)),
         }),
-        // ref / param / use / time sources / geometry — not lowered in this
-        // pass. Neutral rather than a panic, so a graph mixing them still lowers.
+        // A reference to another layer's property, at a frame offset. Neutral
+        // until a target is picked, so an unconfigured `ref` never breaks a frame.
+        "ref" => match node.config.ref_target {
+            Some((n, prop, time_offset)) => Expr::Ref { node: n, prop, time_offset },
+            None => neutral(),
+        },
+        // An exposed-knob read. `node: None` → the *driven* layer's own knob, so
+        // one graph output fits each layer a driver points it at.
+        "param" => {
+            if node.config.param.is_empty() {
+                neutral()
+            } else {
+                Expr::Param { node: None, name: node.config.param.clone() }
+            }
+        }
+        // Layer-clock leaves — no config, no children.
+        "localTime" => Expr::Time(TimeSource::Local),
+        "inPoint" => Expr::Time(TimeSource::In),
+        "outPoint" => Expr::Time(TimeSource::Out),
+        "t01" => Expr::Time(TimeSource::T01),
+        // use / geometry — not lowered in this pass. Neutral rather than a panic,
+        // so a graph mixing them still lowers.
         _ => neutral(),
     };
     visiting.remove(&output.node);
@@ -231,13 +251,58 @@ mod tests {
         assert!((v - 1.0).abs() < 1e-6, "sine peak at a quarter period, got {v}");
     }
 
-    /// An as-yet-unlowered kind (a `ref`) lowers to a neutral zero rather than
-    /// panicking, so a mixed graph still compiles.
+    /// A `ref` lowers to `Expr::Ref` once a target is set, and to neutral before
+    /// — a configured ref feeding math proves the reference reaches the IR.
     #[test]
-    fn an_unsupported_kind_lowers_to_neutral() {
+    fn a_ref_lowers_to_an_expr_ref() {
+        use crate::expr::PropPath;
+        use crate::node::NodeId;
         let reg = reg();
         let mut g = NodeGraph::new();
         let r = g.add_node("ref", Vec2::ZERO);
-        assert_eq!(eval0(&lower_output(&g, &reg, &Endpoint::new(r, "value"))), 0.0);
+        // Unconfigured → neutral.
+        assert_eq!(lower_output(&g, &reg, &Endpoint::new(r, "value")).to_string(), "0");
+        // Point it at node #7's rotation, offset -5.
+        g.node_mut(r).unwrap().config.ref_target = Some((NodeId(7), PropPath::Rotation, -5.0));
+        let expr = lower_output(&g, &reg, &Endpoint::new(r, "value"));
+        assert!(
+            matches!(&expr, Expr::Ref { node, prop, time_offset }
+                if *node == NodeId(7) && *prop == PropPath::Rotation && *time_offset == -5.0),
+            "got {expr:?}"
+        );
+    }
+
+    /// A `param` lowers to a node-relative `Expr::Param` (reads the driven
+    /// layer's own knob), and to neutral while its name is empty.
+    #[test]
+    fn a_param_lowers_to_a_node_relative_param() {
+        let reg = reg();
+        let mut g = NodeGraph::new();
+        let p = g.add_node("param", Vec2::ZERO);
+        assert_eq!(lower_output(&g, &reg, &Endpoint::new(p, "value")).to_string(), "0");
+        g.node_mut(p).unwrap().config.param = "speed".into();
+        let expr = lower_output(&g, &reg, &Endpoint::new(p, "value"));
+        assert!(
+            matches!(&expr, Expr::Param { node: None, name } if name == "speed"),
+            "got {expr:?}"
+        );
+    }
+
+    /// The layer-clock leaves lower to their `Expr::Time` readings.
+    #[test]
+    fn the_time_sources_lower_to_time_readings() {
+        use crate::expr::TimeSource;
+        let reg = reg();
+        let mut g = NodeGraph::new();
+        for (kind, want) in [
+            ("localTime", TimeSource::Local),
+            ("inPoint", TimeSource::In),
+            ("outPoint", TimeSource::Out),
+            ("t01", TimeSource::T01),
+        ] {
+            let n = g.add_node(kind, Vec2::ZERO);
+            let expr = lower_output(&g, &reg, &Endpoint::new(n, "time"));
+            assert!(matches!(&expr, Expr::Time(t) if *t == want), "{kind}: got {expr:?}");
+        }
     }
 }

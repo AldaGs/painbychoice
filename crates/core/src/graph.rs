@@ -54,6 +54,27 @@ pub struct GraphNode {
     /// field writes here.
     #[serde(default)]
     pub values: std::collections::BTreeMap<String, crate::expr::ExprValue>,
+    /// Kind-specific configuration that isn't a socket value — a `ref`'s target,
+    /// a `param`'s name. Sparse, like `values`: most nodes leave it default.
+    #[serde(default)]
+    pub config: NodeConfig,
+}
+
+/// A graph node's non-scalar settings — the addressing that a `ref` or `param`
+/// node needs and a socket value can't carry. Kind-specific by design: a node
+/// reads only the field its kind uses, the rest stay at their defaults.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// A `ref` node's target: which scene node, which property, at what frame
+    /// offset. `None` until the user picks one — lowers to a neutral value
+    /// meanwhile, so an unconfigured `ref` never breaks the frame.
+    #[serde(default)]
+    pub ref_target: Option<(NodeId, PropPath, f64)>,
+    /// A `param` node's knob name. Empty until set. Lowered as
+    /// `Expr::Param { node: None, .. }`, so it reads whichever layer a driver
+    /// points the graph at — the layer's *own* exposed knob.
+    #[serde(default)]
+    pub param: String,
 }
 
 impl GraphNode {
@@ -173,6 +194,7 @@ impl NodeGraph {
             pos,
             title: None,
             values: std::collections::BTreeMap::new(),
+            config: NodeConfig::default(),
         });
         id
     }

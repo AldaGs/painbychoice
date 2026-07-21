@@ -1766,9 +1766,15 @@ numeric inputs), with node selection on the canvas. **The graph now persists**:
 `NodeGraph` and its drivers (`Vec<Binding>`, keyed by core `PropPath`) are
 project-level fields on `motion_core::Project`, so they ride in the `.pbc`
 serialization already used for the document, with `#[serde(default)]` so older
-files load with an empty graph; load re-syncs the driven properties. Still ahead
-in (3): `ref`/`param`/`use`/time-source/shape lowering (they need
-target-addressing the model doesn't carry yet) and the property-graph fold. (4) The compositor stage — the real gate for effects/mattes/masks.
+files load with an empty graph; load re-syncs the driven properties. **`ref` /
+`param` / time-source lowering now works**: a `GraphNode` carries a sparse
+`config` (a `ref`'s `(NodeId, PropPath, offset)` target, a `param`'s knob name);
+`ref` lowers to `Expr::Ref`, `param` to a node-relative `Expr::Param { node:
+None, .. }` (so it reads whichever layer a driver points at), and
+`localTime`/`inPoint`/`outPoint`/`t01` to `Expr::Time`. The inspector gained a
+ref target picker (layer / property / frame offset) and a param name field.
+Still ahead in (3): `use` (module link — its overrides are wired children) and
+shape/geometry lowering, then the property-graph fold. (4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large
 separate track.
