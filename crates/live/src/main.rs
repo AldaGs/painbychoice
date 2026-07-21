@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use kurbo::{Affine, BezPath, Point, Shape as _, Stroke as KurboStroke, Vec2};
 use motion_core::{
-    demo::demo_document, evaluate_comp, node::ParamValue, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
+    demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, ViewAids, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
     Comp, Document, EvalCtx, Expr, Project as MProject,
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
@@ -40,6 +40,7 @@ use winit::window::{Window, WindowId};
 // The editor split by concern. Each module is a plain move out of this file;
 // they glob-import `crate::*` (which re-exports these `use`s and every sibling
 // below) so no module needs its own import bookkeeping.
+mod aids;
 mod app;
 mod dock;
 mod gizmo;
@@ -54,6 +55,7 @@ mod timeline;
 #[cfg(test)]
 mod tests;
 
+use aids::*;
 use app::*;
 use dock::*;
 use gizmo::*;

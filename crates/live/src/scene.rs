@@ -29,12 +29,15 @@ pub(crate) const CANVAS_BAR_H: f32 = 30.0;
 /// canvas: `[-] [ Fit / 100% ▼ ] [+]`, controls left-aligned. Painted with the
 /// panel fill so it reads as chrome, not a floating card. `zoom_pct` is the
 /// live zoom read-out; `is_fit` picks the menu's checked row and button label.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn canvas_toolbar(
     ui: &mut egui::Ui,
     bar: egui::Rect,
     zoom_pct: i32,
     is_fit: bool,
+    aids: &ViewAids,
     out: &mut CanvasEdits,
+    aid_out: &mut AidEdits,
 ) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar));
     egui::Frame::new()
@@ -62,6 +65,69 @@ pub(crate) fn canvas_toolbar(
                 if ui.small_button("+").on_hover_text("Zoom in").clicked() {
                     out.zoom_by = Some(1.25);
                 }
+                ui.separator();
+                // Alignment aids. `selectable_label` rather than plain buttons
+                // so the strip shows what is currently on at a glance.
+                let grid = ui
+                    .selectable_label(aids.grid.visible, "Grid")
+                    .on_hover_text("Show the composition grid — right-click to set spacing");
+                if grid.clicked() {
+                    aid_out.toggle_grid = true;
+                }
+                // Spacing and subdivisions hang off the toggle rather than
+                // taking two more slots in an already crowded composition bar.
+                grid.context_menu(|ui| {
+                    ui.label("Grid");
+                    let mut spacing = aids.grid.spacing;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut spacing)
+                                .speed(1.0)
+                                .range(Grid::MIN_SPACING..=Grid::MAX_SPACING)
+                                .prefix("spacing ")
+                                .suffix(" px"),
+                        )
+                        .changed()
+                    {
+                        aid_out.set_grid_spacing = Some(spacing);
+                    }
+                    let mut subs = aids.grid.subdivisions;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut subs)
+                                .speed(0.1)
+                                .range(1..=100)
+                                .prefix("subdivisions "),
+                        )
+                        .on_hover_text("1 = no minor lines")
+                        .changed()
+                    {
+                        aid_out.set_grid_subdivisions = Some(subs);
+                    }
+                });
+                if ui
+                    .selectable_label(aids.rulers, "Rulers")
+                    .on_hover_text("Show rulers — drag from one to make a guide")
+                    .clicked()
+                {
+                    aid_out.toggle_rulers = true;
+                }
+                let guides = ui
+                    .selectable_label(aids.guides.visible, "Guides")
+                    .on_hover_text("Show guides — drag one back to a ruler to remove it");
+                if guides.clicked() {
+                    aid_out.toggle_guides = true;
+                }
+                guides.context_menu(|ui| {
+                    let n = aids.guides.items.len();
+                    if ui
+                        .add_enabled(n > 0, egui::Button::new(format!("Clear {n} guides")))
+                        .clicked()
+                    {
+                        aid_out.clear_guides = true;
+                        ui.close();
+                    }
+                });
             });
         });
 }

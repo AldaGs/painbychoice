@@ -533,7 +533,104 @@ pub struct Comp {
     /// covers. Preview-only, like `passepartout`.
     #[serde(default = "Comp::default_motion_path_range")]
     pub motion_path_range: i64,
+    /// Grid, rulers and guides. Preview-only like the two above, but *saved*:
+    /// a guide you dropped to line up a title is part of how the composition is
+    /// built, and losing it on reopen would make guides useless for the one job
+    /// they exist to do.
+    #[serde(default)]
+    pub aids: ViewAids,
     pub root: Node,
+}
+
+/// The preview's alignment aids. Grouped rather than five loose fields on
+/// [`Comp`] because they are one feature to the user — the thing you toggle
+/// when you're positioning something — and they are read together everywhere.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewAids {
+    pub grid: Grid,
+    /// Rulers along the preview's top and left edges. They take space from the
+    /// canvas rather than floating over it, so toggling this resizes the
+    /// drawing area.
+    pub rulers: bool,
+    pub guides: Guides,
+}
+
+/// A regular grid drawn inside the composition bounds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Grid {
+    pub visible: bool,
+    /// Distance between major lines, in **composition pixels** — so the grid
+    /// describes the composition, not the screen, and stays put as you zoom.
+    pub spacing: f64,
+    /// Minor lines between each pair of major ones. `1` means none.
+    pub subdivisions: u32,
+}
+
+impl Default for Grid {
+    fn default() -> Self {
+        // Off by default: an unasked-for grid over someone's artwork is worse
+        // than one keystroke away. 100px with quarters suits the 1920×1080
+        // default without dividing it awkwardly.
+        Self { visible: false, spacing: Self::DEFAULT_SPACING, subdivisions: 4 }
+    }
+}
+
+impl Grid {
+    /// Spacing clamped to something drawable. A zero or negative spacing would
+    /// make the line loop in the renderer never terminate.
+    pub const MIN_SPACING: f64 = 1.0;
+    pub const MAX_SPACING: f64 = 10_000.0;
+    pub const DEFAULT_SPACING: f64 = 100.0;
+
+    pub fn step(&self) -> f64 {
+        // The NaN check is load-bearing, not defensive noise: `f64::clamp`
+        // *propagates* NaN, and the renderer advances its line loop by `v +=
+        // step`. A NaN step never advances, so the loop never terminates and
+        // the editor hangs. A hand-edited `.pbc` is all it takes.
+        if !self.spacing.is_finite() {
+            return Self::DEFAULT_SPACING;
+        }
+        self.spacing.clamp(Self::MIN_SPACING, Self::MAX_SPACING)
+    }
+
+    /// Distance between minor lines, or `None` when there are no subdivisions.
+    pub fn minor_step(&self) -> Option<f64> {
+        (self.subdivisions > 1).then(|| self.step() / self.subdivisions as f64)
+    }
+}
+
+/// Draggable alignment lines, in composition coordinates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Guides {
+    /// Hiding guides keeps them in the document — this is a view toggle, not a
+    /// delete. Dragging one back onto its ruler is how you remove it.
+    pub visible: bool,
+    pub items: Vec<Guide>,
+}
+
+impl Default for Guides {
+    fn default() -> Self {
+        // Visible, unlike the grid: a guide only exists because the user made
+        // one, so hiding it by default would hide their own work.
+        Self { visible: true, items: Vec::new() }
+    }
+}
+
+/// One alignment line. `at` is the coordinate on the axis it *crosses*: a
+/// [`GuideAxis::Vertical`] guide is a vertical line at `x == at`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Guide {
+    pub axis: GuideAxis,
+    pub at: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuideAxis {
+    Vertical,
+    Horizontal,
 }
 
 impl Comp {
@@ -571,6 +668,7 @@ impl Comp {
             bg: Self::DEFAULT_BG,
             passepartout: Self::DEFAULT_PASSEPARTOUT,
             motion_path_range: Self::DEFAULT_MOTION_PATH_RANGE,
+            aids: ViewAids::default(),
             root,
         }
     }
@@ -812,6 +910,50 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("bg");
         let old: Comp = serde_json::from_value(legacy).unwrap();
         assert_eq!(old.bg, Comp::DEFAULT_BG);
+    }
+
+    /// Aids are saved, and a file written before they existed must load with
+    /// them rather than fail — the usual `#[serde(default)]` contract. A guide
+    /// is part of how a composition was built, so losing it on reopen would
+    /// defeat the point of having guides at all.
+    #[test]
+    fn a_comp_without_aids_loads_the_defaults_and_guides_round_trip() {
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root"));
+        comp.aids.grid.visible = true;
+        comp.aids.grid.spacing = 25.0;
+        comp.aids.guides.items.push(Guide { axis: GuideAxis::Vertical, at: 12.5 });
+        let json = serde_json::to_string(&comp).unwrap();
+        let back: Comp = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.aids, comp.aids, "aids survive a round trip");
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("aids");
+        let old: Comp = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.aids, ViewAids::default());
+        assert!(!old.aids.grid.visible, "an unasked-for grid stays off");
+        assert!(old.aids.guides.visible, "but guides you made are shown");
+    }
+
+    /// The grid's spacing is clamped where it is *read*, not where it is
+    /// written: a zero or negative step would make the renderer's line loop
+    /// never terminate, and a hand-edited `.pbc` can carry any number at all.
+    #[test]
+    fn a_degenerate_grid_spacing_cannot_hang_the_renderer() {
+        for spacing in [0.0, -50.0, f64::NAN] {
+            let grid = Grid { visible: true, spacing, subdivisions: 4 };
+            assert!(grid.step() >= Grid::MIN_SPACING, "step was {}", grid.step());
+            assert!(grid.minor_step().is_some_and(|m| m > 0.0));
+        }
+    }
+
+    /// One subdivision means "no minor lines", not "a minor line on top of
+    /// every major one".
+    #[test]
+    fn a_single_subdivision_means_no_minor_grid_lines() {
+        let mut grid = Grid { visible: true, spacing: 100.0, subdivisions: 1 };
+        assert_eq!(grid.minor_step(), None);
+        grid.subdivisions = 4;
+        assert_eq!(grid.minor_step(), Some(25.0));
     }
 
     /// Same contract for the passepartout: it round-trips, and a file written

@@ -298,6 +298,48 @@ Handle sizes are constants in **logical points**, not comp units, so the gizmo
 stays the same size on screen at every zoom — a gizmo that scaled with the comp
 would vanish exactly when you zoomed out to grab it.
 
+### Grid, rulers and guides (2026-07-20)
+
+`live/src/aids.rs`, driven by `Comp::aids` (`ViewAids { grid, rulers, guides }`).
+Toggles live in the preview's tool strip; right-click **Grid** for spacing and
+subdivisions, right-click **Guides** to clear them all.
+
+All three are **saved in the `.pbc`**, unlike the zoom/pan camera which is
+session state. A guide you dropped to line up a title is part of how the
+composition was built; losing it on reopen would defeat the only job guides
+have. Grid spacing and guide positions are in **composition pixels**, never
+screen pixels, so they stay put under zoom and mean the same thing at any
+magnification.
+
+**Rulers take space; the grid and guides float.** The ruler band is subtracted
+from the canvas leaf's rect exactly as the zoom strip already subtracts
+`CANVAS_BAR_H`. That is not cosmetic: the remaining rect *is* the canvas rect,
+so it feeds `canvas_transform` and therefore `pick`. Paint rulers over the
+canvas instead and every click under one selects geometry the user can't see.
+`ruler_inset()` is the single authority on the size, used by both `App` and this
+module so they cannot disagree about where the canvas is. Toggling rulers
+therefore resizes the drawing area and re-fits the comp.
+
+Guides are dragged out of a ruler, moved by dragging, and deleted by dragging
+back onto a ruler (the standard gesture, and the only delete besides *Clear*).
+The in-flight drag lives on `App`, not in the document, so a half-finished drag
+can't be saved or bump `doc_rev`. Hiding guides is a view toggle that keeps them
+— a hidden guide is also un-grabbable, so it can't intercept a click meant for
+the artwork beneath it.
+
+Two loops here are driven by a step value, and **a non-finite or zero step never
+terminates**, hanging the editor. Both are guarded, and both guards are tested:
+`Grid::step()` special-cases non-finite *before* clamping, because `f64::clamp`
+propagates NaN rather than rejecting it — a hand-edited `.pbc` is all it takes.
+`ruler_step()` does the same for a degenerate zoom. Grid levels are also skipped
+once their lines fall within 5px on screen, or a zoomed-out comp would draw
+thousands of overlapping lines into a solid wash.
+
+Like the gizmo, `aids_ui` returns whether it owns the pointer, and `App` gates
+click-picking on it (`App::aids_hot`) — `is_pointer_over_egui` is area-based and
+stays false inside the canvas hole, so an interactive overlay there cannot
+suppress picking on its own. See the gotcha of that name below.
+
 ### The motion path (2026-07-20)
 
 `live/src/motionpath.rs`. An animated layer's pivot trajectory, drawn on the
@@ -943,12 +985,10 @@ different machines.
 above — it came in sideways as a preview-panel need. The **transform gizmo is
 done** (see *The transform gizmo*). Still open, in this order:
 
-1. **Grid + rulers + guides** — a comp-space grid at a configurable spacing,
-   rulers on the preview edges, draggable guides. Decided: this is **per-comp
-   state saved in the `.pbc`**, alongside `Comp::bg`, not session-only view
-   state — same reasoning, it describes the composition rather than the window.
+1. ~~**Grid + rulers + guides**~~ ✅ Done — see *Grid, rulers and guides*.
+   Per-comp state saved in the `.pbc`, alongside `Comp::bg`.
 2. **Snapping** — drags snap to the grid, guides, comp edges/centre, and other
-   layers' bounds. Depends on (1), and on the gizmo for the drag path.
+   layers' bounds. Depends on (1), and on the gizmo for the drag path. **Next.**
 3. **Anchor-point handle + selection bbox** — the gizmo pivots on the anchor but
    can't yet *move* it, and there is no bounding box drawn.
 4. **Onion skinning** — ghosts of the rendered layer at ±N frames, tinted by

@@ -149,6 +149,13 @@ pub(crate) struct App {
     /// Bumped whenever the document changes. The motion-path cache keys off it;
     /// without it the path would keep drawing the pre-edit trajectory.
     pub(crate) doc_rev: u64,
+    /// A guide being dragged — out of a ruler, or along the canvas. Lives here
+    /// rather than in the document so an in-flight drag isn't a document edit
+    /// (and so can't be saved, keyed, or bump `doc_rev`) until it's released.
+    pub(crate) guide_drag: Option<GuideDrag>,
+    /// Whether last frame's UI pass had the pointer over a ruler or a guide.
+    /// Gates click-picking for the same reason as `gizmo_hot` — see its docs.
+    pub(crate) aids_hot: bool,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -281,6 +288,52 @@ impl App {
             gizmo_hot: false,
             motion_path: MotionPath::default(),
             doc_rev: 0,
+            guide_drag: None,
+            aids_hot: false,
+        }
+    }
+
+    /// Apply one frame's worth of alignment-aid intent to the open comp.
+    ///
+    /// Guides live in the document, so adding, moving or removing one is a real
+    /// edit — but a *visibility* toggle is one too, deliberately: `Comp::aids`
+    /// is saved, so reopening a file restores the aids you had up. None of it
+    /// touches the rendered frame, so nothing here marks the scene dirty.
+    pub(crate) fn apply_aid_edits(&mut self, e: &AidEdits) {
+        if e.toggle_grid {
+            self.doc_mut().aids.grid.visible ^= true;
+        }
+        if e.toggle_rulers {
+            self.doc_mut().aids.rulers ^= true;
+        }
+        if e.toggle_guides {
+            self.doc_mut().aids.guides.visible ^= true;
+        }
+        if let Some(sp) = e.set_grid_spacing {
+            self.doc_mut().aids.grid.spacing = sp.clamp(Grid::MIN_SPACING, Grid::MAX_SPACING);
+        }
+        if let Some(n) = e.set_grid_subdivisions {
+            self.doc_mut().aids.grid.subdivisions = n.max(1);
+        }
+        if e.clear_guides {
+            self.doc_mut().aids.guides.items.clear();
+        }
+        if let Some(g) = e.add_guide {
+            self.doc_mut().aids.guides.items.push(g);
+        }
+        // Indices come from the frame that drew them, so re-check rather than
+        // index blindly: a `Retype`/undo between drawing and applying could
+        // have shortened the list.
+        if let Some((i, at)) = e.move_guide {
+            if let Some(g) = self.doc_mut().aids.guides.items.get_mut(i) {
+                g.at = at;
+            }
+        }
+        if let Some(i) = e.remove_guide {
+            let items = &mut self.doc_mut().aids.guides.items;
+            if i < items.len() {
+                items.remove(i);
+            }
         }
     }
 
@@ -537,6 +590,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. }
                 if !over_ui
                     && !self.gizmo_hot
+                    && !self.aids_hot
                     && state == ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
@@ -1304,6 +1358,11 @@ impl App {
         // Moved out of `self` for the UI pass and put back after it, like the
         // keyframe selection — the closure must not borrow `App`.
         let mut gizmo_drag = self.gizmo_drag.take();
+        let mut guide_drag = self.guide_drag.take();
+        let mut aid_edits = AidEdits::default();
+        let mut aids_hot = false;
+        // Cloned for the UI closure, which must not borrow `self`.
+        let aids = self.doc().aids.clone();
         // Recomputed every frame: with no selection there is no gizmo, so the
         // flag must fall back to false rather than latch on from a stale frame.
         let mut gizmo_hot = false;
@@ -1420,17 +1479,45 @@ impl App {
                         // so it sits below the frame instead of floating over it.
                         let full = ui.available_rect_before_wrap();
                         let split = (full.max.y - CANVAS_BAR_H).max(full.min.y);
+                        // Rulers claim a band off the top and left. It comes out
+                        // *here*, so the rect published as `canvas_pts` is the
+                        // real drawing area — it feeds `fit` and therefore
+                        // `pick`, and a click under a ruler must not select
+                        // geometry hidden behind it.
+                        let (rl, rt) = ruler_inset(aids.rulers);
                         canvas_pts = Some(egui::Rect::from_min_max(
-                            full.min,
+                            egui::pos2(full.min.x + rl, full.min.y + rt),
                             egui::pos2(full.max.x, split),
                         ));
                         let bar = egui::Rect::from_min_max(
                             egui::pos2(full.min.x, split),
                             full.max,
                         );
-                        canvas_toolbar(ui, bar, zoom_pct, is_fit, &mut canvas_edits);
-                        // Path first, gizmo second: the gizmo is what you grab,
-                        // so it must never be obscured by the trajectory.
+                        canvas_toolbar(
+                            ui,
+                            bar,
+                            zoom_pct,
+                            is_fit,
+                            &aids,
+                            &mut canvas_edits,
+                            &mut aid_edits,
+                        );
+                        // Aids underneath everything: they orient the frame, and
+                        // must never sit over the things you grab.
+                        if let Some(rect) = canvas_pts {
+                            aids_hot = aids_ui(
+                                ui,
+                                rect,
+                                &aids,
+                                (doc_w, doc_h),
+                                fit,
+                                ppp,
+                                &mut guide_drag,
+                                &mut aid_edits,
+                            );
+                        }
+                        // Path next, gizmo last: the gizmo is what you grab, so
+                        // it must never be obscured by the trajectory.
                         if let Some(rect) = canvas_pts {
                             motionpath::draw(
                                 &ui.painter_at(rect),
@@ -1641,6 +1728,9 @@ impl App {
         // re-evaluate so the change is visible on this very frame.
         self.gizmo_drag = gizmo_drag;
         self.gizmo_hot = gizmo_hot;
+        self.guide_drag = guide_drag;
+        self.aids_hot = aids_hot;
+        self.apply_aid_edits(&aid_edits);
         // The hovered font, straight from this frame's picker: `None` (nothing
         // hovered, or the picker closed) is what *ends* a preview, so this is a
         // plain assignment rather than a conditional one. A repaint is due

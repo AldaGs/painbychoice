@@ -2466,3 +2466,48 @@ fn a_layer_outside_its_window_has_no_place_to_hang_a_gizmo_on() {
     assert!(evaluate_comp(&project, comp, 15.0).place(node).is_some(), "inside");
     assert!(evaluate_comp(&project, comp, 50.0).place(node).is_none(), "outside");
 }
+
+// --- Alignment aids --------------------------------------------------------
+
+/// Ruler ticks land on round numbers at any zoom — the same contract the
+/// timeline ruler has. The step is the smallest 1/2/5×10ⁿ whose on-screen gap
+/// clears the minimum, so labels never drift into 37s and 74s.
+#[test]
+fn ruler_ticks_land_on_round_numbers_at_every_zoom() {
+    for scale in [0.05, 0.1, 0.37, 1.0, 2.5, 8.0, 64.0] {
+        let step = ruler_step(scale, 60.0);
+        assert!(step > 0.0 && step.is_finite(), "scale {scale} gave {step}");
+        assert!(
+            step * scale >= 60.0,
+            "scale {scale}: step {step} is denser than the 60px minimum"
+        );
+        // The mantissa must be one of 1, 2, 5 (or 10, which is 1 of the next
+        // decade) — never an arbitrary value.
+        let mantissa = step / 10f64.powf(step.log10().floor());
+        assert!(
+            [1.0, 2.0, 5.0].iter().any(|m| (mantissa - m).abs() < 1e-9),
+            "scale {scale}: step {step} has mantissa {mantissa}"
+        );
+    }
+}
+
+/// A degenerate scale must not produce a zero or non-finite step: the ruler
+/// advances its tick loop by it, so either would hang the editor.
+#[test]
+fn a_degenerate_scale_cannot_hang_the_ruler() {
+    for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let step = ruler_step(scale, 60.0);
+        assert!(step > 0.0 && step.is_finite(), "scale {scale} gave {step}");
+    }
+}
+
+/// Rulers take their band out of the canvas rect, because that rect feeds the
+/// fit transform and therefore click-picking. If the inset were applied only
+/// when painting, every click under a ruler would select geometry hidden
+/// behind it.
+#[test]
+fn rulers_only_claim_space_when_they_are_shown() {
+    assert_eq!(ruler_inset(false), (0.0, 0.0));
+    let (l, t) = ruler_inset(true);
+    assert!(l > 0.0 && t > 0.0, "rulers must claim space on both axes");
+}

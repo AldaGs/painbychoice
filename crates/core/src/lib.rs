@@ -22,7 +22,10 @@ pub use expr::{
     eval_script, eval_script_ctx, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
     PropPath, ToExpr, Waveform,
 };
-pub use node::{Comp, CompId, Document, Node, NodeId, Project, Shape, Stroke, Transform};
+pub use node::{
+    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Project, Shape, Stroke,
+    Transform, ViewAids,
+};
 pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;
 pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};
