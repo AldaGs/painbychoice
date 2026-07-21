@@ -14,6 +14,7 @@ pub(crate) enum RowKind {
     Rect,
     Ellipse,
     Path,
+    Text,
 }
 
 impl RowKind {
@@ -25,6 +26,7 @@ impl RowKind {
             Some(MShape::Rect { .. }) => RowKind::Rect,
             Some(MShape::Ellipse { .. }) => RowKind::Ellipse,
             Some(MShape::Path(_)) => RowKind::Path,
+            Some(MShape::Text { .. }) => RowKind::Text,
         }
     }
 }
@@ -53,6 +55,7 @@ pub(crate) fn row_glyph(row: &TreeRow) -> &'static str {
         RowKind::Group => icon::GROUP,
         RowKind::Rect | RowKind::Path => icon::RECT,
         RowKind::Ellipse => icon::ELLIPSE,
+        RowKind::Text => icon::TEXT,
     }
 }
 
@@ -75,6 +78,7 @@ pub(crate) fn tree_rows(node: &motion_core::Node, depth: usize, out: &mut Vec<Tr
 pub(crate) enum NewShape {
     Rect,
     Ellipse,
+    Text,
     Group,
 }
 
@@ -114,6 +118,9 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
         if icon::button(ui, icon::ELLIPSE, "Add an ellipse").clicked() {
             out.add = Some(NewShape::Ellipse);
+        }
+        if icon::button(ui, icon::TEXT, "Add a text layer").clicked() {
+            out.add = Some(NewShape::Text);
         }
         if icon::button(ui, icon::GROUP, "Add a group").clicked() {
             out.add = Some(NewShape::Group);

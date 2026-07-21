@@ -144,6 +144,8 @@ pub enum PropPath {
     ShapeSize,
     /// `Rect` corner radius. Neither `Ellipse` nor `Path` has one.
     ShapeRadius,
+    /// A `Text` shape's font size, in pixels. Only a text layer has one.
+    TextSize,
 }
 
 impl PropPath {
@@ -162,12 +164,13 @@ impl PropPath {
             PropPath::StrokeWidth => "stroke_width",
             PropPath::ShapeSize => "size",
             PropPath::ShapeRadius => "radius",
+            PropPath::TextSize => "text_size",
         }
     }
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 10] = [
+    pub const ALL: [PropPath; 11] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -178,6 +181,7 @@ impl PropPath {
         PropPath::StrokeWidth,
         PropPath::ShapeSize,
         PropPath::ShapeRadius,
+        PropPath::TextSize,
     ];
 
     /// Parse a script-facing property name, case-insensitively.
@@ -196,7 +200,8 @@ impl PropPath {
             PropPath::Rotation
             | PropPath::Opacity
             | PropPath::StrokeWidth
-            | PropPath::ShapeRadius => ExprValue::Num(0.0),
+            | PropPath::ShapeRadius
+            | PropPath::TextSize => ExprValue::Num(0.0),
             PropPath::Fill | PropPath::StrokeColor => {
                 ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
             }
@@ -1247,7 +1252,12 @@ impl<'a> EvalCtx<'a> {
 
     /// Warn against whichever node is being resolved. Falls back to the root
     /// (id 0) outside a walk — a warning with no home is still worth surfacing.
-    fn warn_here(&mut self, msg: impl Into<String>) {
+    ///
+    /// `pub(crate)` so a *shape* can warn too, not just an expression: a text
+    /// layer naming a font this machine hasn't got resolves to the default and
+    /// says so here, which is the same "fall back to something drawable, but
+    /// make it visible" rule a dangling `Ref` follows.
+    pub(crate) fn warn_here(&mut self, msg: impl Into<String>) {
         let node = self.current.unwrap_or(NodeId(0));
         self.warn(node, msg);
     }
@@ -1354,6 +1364,10 @@ impl<'a> EvalCtx<'a> {
             },
             PropPath::ShapeRadius => match &node.shape {
                 Some(Shape::Rect { radius, .. }) => radius.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::TextSize => match &node.shape {
+                Some(Shape::Text { size, .. }) => size.resolve(self).to_expr(),
                 _ => prop.zero(),
             },
         }

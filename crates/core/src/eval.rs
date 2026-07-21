@@ -1027,6 +1027,130 @@ mod tests {
         assert_eq!(back.root.timing, Some(LayerTiming { start: 3, in_: 5, out: 9 }));
     }
 
+    /// A text layer draws through the ordinary shape pipeline: `evaluate` must
+    /// hand back real outline geometry, with the fill and transform every other
+    /// shape gets. This is the whole payoff of resolving text to a `BezPath` —
+    /// no renderer had to learn about text.
+    #[test]
+    fn a_text_layer_evaluates_to_outline_geometry() {
+        let doc = Document::new(
+            640.0,
+            480.0,
+            Node::group(0, "root").with_child(
+                Node::shape(
+                    1,
+                    "caption",
+                    Shape::Text {
+                        content: "Hi".into(),
+                        family: String::new(),
+                        size: Value::constant(48.0),
+                        align: crate::text::TextAlign::Left,
+                        max_width: None,
+                    },
+                )
+                .with_fill(Color::rgb(1.0, 0.0, 0.0)),
+            ),
+        );
+        let scene = evaluate(&doc, 0.0);
+        assert!(scene.warnings.is_empty(), "{:?}", scene.warnings);
+        assert_eq!(scene.items.len(), 1);
+        assert!(!scene.items[0].path.is_empty(), "glyph outlines reached the draw list");
+        assert!(scene.items[0].fill.is_some(), "text fills like any other shape");
+    }
+
+    /// The font size is a `Value`, so it animates — the reason it's a `Value`
+    /// at all. Bigger size at a later frame ⇒ a bigger outline.
+    #[test]
+    fn a_text_layers_font_size_animates() {
+        use crate::value::{Keyframe, Track};
+        let doc = Document::new(
+            640.0,
+            480.0,
+            Node::group(0, "root").with_child(Node::shape(
+                1,
+                "caption",
+                Shape::Text {
+                    content: "Hi".into(),
+                    family: String::new(),
+                    size: Value::Keyframed(Track::new(vec![
+                        Keyframe::linear(0, 20.0),
+                        Keyframe::linear(10, 80.0),
+                    ])),
+                    align: crate::text::TextAlign::Left,
+                    max_width: None,
+                },
+            )),
+        );
+        let width_at = |f: f64| {
+            kurbo::Shape::bounding_box(&evaluate(&doc, f).items[0].path).width()
+        };
+        assert!(width_at(10.0) > width_at(0.0), "the keyframed size drives the glyphs");
+    }
+
+    /// A missing font still draws (parley substitutes), so the *only* signal
+    /// that the wrong typeface is on screen is this warning. It rides the same
+    /// `scene.warnings` channel as a broken script, which is what puts it behind
+    /// the comp bar's yellow indicator for free.
+    #[test]
+    fn a_missing_font_warns_but_still_draws() {
+        let text = |family: &str| Shape::Text {
+            content: "Hi".into(),
+            family: family.into(),
+            size: Value::constant(32.0),
+            align: crate::text::TextAlign::Left,
+            max_width: None,
+        };
+        let doc_with = |family: &str| {
+            Document::new(
+                640.0,
+                480.0,
+                Node::group(0, "root").with_child(Node::shape(1, "caption", text(family))),
+            )
+        };
+
+        let scene = evaluate(&doc_with("NoSuchFontFamily-XYZZY"), 0.0);
+        assert_eq!(scene.warnings.len(), 1, "the substitution is reported");
+        assert_eq!(scene.warnings[0].0, NodeId(1), "blamed on the text layer");
+        assert!(scene.warnings[0].1.contains("isn't installed"), "{}", scene.warnings[0].1);
+        assert!(!scene.items[0].path.is_empty(), "and it still drew something");
+
+        // The deliberate default must stay silent, or every new text layer
+        // would ship with a warning on it.
+        assert!(evaluate(&doc_with(""), 0.0).warnings.is_empty(), "blank family is silent");
+    }
+
+    /// Text must survive a save/load like any other shape — including the fields
+    /// that aren't `Value`s.
+    #[test]
+    fn a_text_layer_round_trips_through_json() {
+        let doc = Document::new(
+            640.0,
+            480.0,
+            Node::group(0, "root").with_child(Node::shape(
+                1,
+                "caption",
+                Shape::Text {
+                    content: "two\nlines".into(),
+                    family: "Georgia".into(),
+                    size: Value::constant(31.0),
+                    align: crate::text::TextAlign::Center,
+                    max_width: Some(250.0),
+                },
+            )),
+        );
+        let back: Document =
+            serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        match back.root.children[0].shape.as_ref().unwrap() {
+            Shape::Text { content, family, align, max_width, .. } => {
+                assert_eq!(content, "two\nlines");
+                assert_eq!(family, "Georgia");
+                assert_eq!(*align, crate::text::TextAlign::Center);
+                assert_eq!(*max_width, Some(250.0));
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
     #[test]
     fn document_round_trips_through_json() {
         let doc = Document::new(

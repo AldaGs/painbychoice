@@ -6,6 +6,7 @@ use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::expr::EvalCtx;
+use crate::text::TextAlign;
 use crate::value::{Color, Value};
 
 /// Stable identity for a node, used for selection and for tracing an evaluated
@@ -82,6 +83,25 @@ pub enum Shape {
     },
     /// Ellipse centered on the origin, animatable size (width/height).
     Ellipse { size: Value<Vec2> },
+    /// Shaped text, centred on the origin like the other primitives.
+    ///
+    /// It resolves to glyph **outlines** (see [`crate::text`]), so it fills,
+    /// strokes, transforms, and animates through exactly the same path as a rect
+    /// — no renderer knows text exists. `size` is animatable (the channel you'd
+    /// keyframe); `content` and `family` are plain data because
+    /// [`Value`] only carries interpolatable, expression-typed values
+    /// (`f64`/`Vec2`/`Color`) — there is no string in `ExprValue`, so a
+    /// keyframed or scripted string would need a wider value model.
+    Text {
+        content: String,
+        /// System font family name. Empty (or not installed) → sans-serif.
+        family: String,
+        /// Font size in pixels.
+        size: Value<f64>,
+        align: TextAlign,
+        /// Wrap width; `None` keeps the text on one line.
+        max_width: Option<f64>,
+    },
 }
 
 impl Shape {
@@ -98,6 +118,18 @@ impl Shape {
                 let s = size.resolve(ctx);
                 kurbo::Ellipse::new((0.0, 0.0), (s.x / 2.0, s.y / 2.0), 0.0).to_path(0.1)
             }
+            Shape::Text { content, family, size, align, max_width } => {
+                // The substitution is silent by construction — parley falls back
+                // and draws something perfectly good — so it has to be reported
+                // explicitly or the frame just quietly uses the wrong typeface.
+                if !crate::text::font_exists(family) {
+                    ctx.warn_here(format!(
+                        "font '{}' isn't installed here; drawing with the system default",
+                        family.trim()
+                    ));
+                }
+                crate::text::text_to_path(content, family, size.resolve(ctx), *align, *max_width)
+            }
         }
     }
 
@@ -109,6 +141,7 @@ impl Shape {
                 radius.migrate_frames(fps);
             }
             Shape::Ellipse { size } => size.migrate_frames(fps),
+            Shape::Text { size, .. } => size.migrate_frames(fps),
         }
     }
 
@@ -120,6 +153,7 @@ impl Shape {
                 radius.retime(ratio);
             }
             Shape::Ellipse { size } => size.retime(ratio),
+            Shape::Text { size, .. } => size.retime(ratio),
         }
     }
 }
@@ -490,6 +524,11 @@ pub struct Comp {
     /// load with [`Comp::DEFAULT_BG`] rather than transparent.
     #[serde(default = "Comp::default_bg")]
     pub bg: Color,
+    /// How strongly the preview dims everything *outside* the comp bounds —
+    /// Blender's camera passepartout, applied to the composition frame. `0.0`
+    /// is off, `1.0` is opaque black. Preview-only: it never reaches a render.
+    #[serde(default = "Comp::default_passepartout")]
+    pub passepartout: f64,
     pub root: Node,
 }
 
@@ -501,6 +540,15 @@ impl Comp {
         Self::DEFAULT_BG
     }
 
+    /// Blender's own default is 0.5, and it reads well here for the same
+    /// reason: enough to push the surroundings back without hiding what a
+    /// layer is doing as it moves out of frame.
+    pub const DEFAULT_PASSEPARTOUT: f64 = 0.5;
+
+    fn default_passepartout() -> f64 {
+        Self::DEFAULT_PASSEPARTOUT
+    }
+
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
             name: String::new(),
@@ -509,6 +557,7 @@ impl Comp {
             fps: 60.0,
             duration: 5.0,
             bg: Self::DEFAULT_BG,
+            passepartout: Self::DEFAULT_PASSEPARTOUT,
             root,
         }
     }
@@ -750,6 +799,24 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("bg");
         let old: Comp = serde_json::from_value(legacy).unwrap();
         assert_eq!(old.bg, Comp::DEFAULT_BG);
+    }
+
+    /// Same contract for the passepartout: it round-trips, and a file written
+    /// before it existed loads at the default rather than at 0 (which would
+    /// silently *disable* the feature on every pre-existing project).
+    #[test]
+    fn a_comp_without_a_passepartout_loads_the_default_one() {
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root"));
+        comp.passepartout = 0.25;
+        let json = serde_json::to_string(&comp).unwrap();
+        let back: Comp = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.passepartout, 0.25);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("passepartout");
+        let old: Comp = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.passepartout, Comp::DEFAULT_PASSEPARTOUT);
+        assert_eq!(old.passepartout, 0.5, "Blender's default, and ours");
     }
 
     #[test]

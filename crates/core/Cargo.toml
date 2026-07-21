@@ -10,6 +10,8 @@ kurbo.workspace = true
 glam.workspace = true
 serde.workspace = true
 rhai.workspace = true
+parley = "0.11"
+skrifa = "0.43"
 
 [dev-dependencies]
 serde_json.workspace = true

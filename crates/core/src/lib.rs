@@ -13,6 +13,7 @@ pub mod demo;
 pub mod eval;
 pub mod expr;
 pub mod node;
+pub mod text;
 pub mod timebase;
 pub mod value;
 
@@ -22,5 +23,6 @@ pub use expr::{
     PropPath, ToExpr, Waveform,
 };
 pub use node::{Comp, CompId, Document, Node, NodeId, Project, Shape, Stroke, Transform};
+pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;
 pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};

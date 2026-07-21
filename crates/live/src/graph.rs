@@ -22,6 +22,7 @@ pub(crate) fn prop_path_label(p: PropPath) -> &'static str {
         PropPath::StrokeWidth => "Stroke Width",
         PropPath::ShapeSize => "Size",
         PropPath::ShapeRadius => "Radius",
+        PropPath::TextSize => "Font Size",
     }
 }
 

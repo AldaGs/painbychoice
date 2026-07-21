@@ -40,6 +40,8 @@ pub(crate) const SAVE: &str = "\u{eb62}";
 pub(crate) const LOAD: &str = "\u{faf7}";
 pub(crate) const RECT: &str = "\u{eb2c}";
 pub(crate) const ELLIPSE: &str = "\u{ea6b}";
+/// Tabler `typography` — the text-layer row and the "add text" button.
+pub(crate) const TEXT: &str = "\u{ebc5}";
 pub(crate) const GROUP: &str = "\u{eaad}";
 pub(crate) const ADD: &str = "\u{eb0b}";
 pub(crate) const DELETE: &str = "\u{eb41}";

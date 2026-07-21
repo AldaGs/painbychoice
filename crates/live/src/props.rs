@@ -54,11 +54,118 @@ pub(crate) struct NodeInfo {
     pub(crate) radius_anim: bool,
     pub(crate) stroke_color_anim: bool,
     pub(crate) stroke_width_anim: bool,
+    /// Text-layer fields, `Some` only for a `Shape::Text`.
+    pub(crate) text: Option<TextInfo>,
+}
+
+/// The text-specific half of a selected node. Only the font `size` is a
+/// `Value` (and so keyframable); content, family, alignment, and wrap width are
+/// plain data, edited directly.
+pub(crate) struct TextInfo {
+    pub(crate) content: String,
+    pub(crate) family: String,
+    pub(crate) size: f64,
+    pub(crate) align: TextAlign,
+    /// `None` = one line, no wrapping.
+    pub(crate) max_width: Option<f64>,
+    pub(crate) size_anim: bool,
+    /// The named family isn't installed, so the frame is drawing a substitute.
+    /// Blank is never "missing" — that's the default on purpose.
+    pub(crate) family_missing: bool,
 }
 
 /// egui's color buttons speak `[f32; 3]`; the document speaks `Color`.
 pub(crate) fn rgb_color(rgb: [f32; 3]) -> MColor {
     MColor::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64)
+}
+
+/// The amber used for "this still works, but not the way you asked" — the same
+/// hue the comp bar's warning count uses, so one colour means one thing.
+pub(crate) const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 160, 60);
+
+/// What the font picker draws from: every installed family, and the ones
+/// applied this session. Borrowed from `App`, which enumerates the system once.
+pub(crate) struct FontList<'a> {
+    pub(crate) all: &'a [String],
+    pub(crate) recent: &'a [String],
+}
+
+/// The label shown for a family, so "no family chosen" reads as a real choice
+/// rather than an empty box.
+fn family_label(family: &str) -> &str {
+    if family.trim().is_empty() {
+        "(system default)"
+    } else {
+        family
+    }
+}
+
+/// A font picker in the shape modern editors use: a searchable list of every
+/// installed family, the ones you've used recently pinned at the top, and
+/// **hover to preview, click to apply**.
+///
+/// Hovering only reports [`PropEdits::text_family_preview`]; the document is
+/// untouched until a click. That's what makes browsing 300 fonts non-destructive
+/// — `App` renders the hovered family for that frame and drops it the moment the
+/// pointer leaves (see `App::preview_project`).
+fn font_picker(ui: &mut egui::Ui, t: &TextInfo, fonts: &FontList<'_>, edits: &mut PropEdits) {
+    egui::ComboBox::from_id_salt("font_family")
+        .width(150.0)
+        .selected_text(family_label(&t.family))
+        .show_ui(ui, |ui| {
+            // The search box keeps its text across frames in egui memory, the
+            // same way the graph panel's "new parameter" field does — the panel
+            // stays a pure function of the document.
+            let filter_id = egui::Id::new("font_filter");
+            let mut filter: String = ui.data_mut(|d| d.get_temp(filter_id).unwrap_or_default());
+            ui.add(
+                egui::TextEdit::singleline(&mut filter)
+                    .hint_text("search fonts")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+            let needle = filter.trim().to_lowercase();
+            let matches = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
+
+            // One row: hover previews, click commits. Both report through
+            // `edits`; neither writes the document here.
+            let row = |ui: &mut egui::Ui, name: &str, edits: &mut PropEdits| {
+                let resp = ui.selectable_label(name == t.family, family_label(name));
+                if resp.hovered() {
+                    edits.text_family_preview = Some(name.to_string());
+                }
+                if resp.clicked() {
+                    edits.text_family = Some(name.to_string());
+                }
+            };
+
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                // The deliberate default, always reachable and never filtered
+                // away — it's how you get *back* from a named family.
+                row(ui, "", edits);
+
+                let recent: Vec<&String> =
+                    fonts.recent.iter().filter(|n| matches(n)).collect();
+                if !recent.is_empty() {
+                    ui.separator();
+                    ui.weak("Recent");
+                    for name in recent {
+                        row(ui, name, edits);
+                    }
+                }
+
+                ui.separator();
+                ui.weak("All fonts");
+                let mut any = false;
+                for name in fonts.all.iter().filter(|n| matches(n)) {
+                    any = true;
+                    row(ui, name, edits);
+                }
+                if !any {
+                    ui.weak("no match");
+                }
+            });
+        });
 }
 
 /// Whether `kind` exists on this node *and* is keyframed.
@@ -119,6 +226,18 @@ impl NodeInfo {
             radius_anim: is_anim(node, PropKind::ShapeRadius),
             stroke_color_anim: is_anim(node, PropKind::StrokeColor),
             stroke_width_anim: is_anim(node, PropKind::StrokeWidth),
+            text: match node.shape.as_ref() {
+                Some(MShape::Text { content, family, size, align, max_width }) => Some(TextInfo {
+                    content: content.clone(),
+                    family: family.clone(),
+                    size: size.resolve(ctx),
+                    align: *align,
+                    max_width: *max_width,
+                    size_anim: is_anim(node, PropKind::TextSize),
+                    family_missing: !motion_core::text::font_exists(family),
+                }),
+                _ => None,
+            },
         }
     }
 }
@@ -142,6 +261,19 @@ pub(crate) struct PropEdits {
     /// Add a default stroke to a node that has none / drop the one it has.
     pub(crate) add_stroke: bool,
     pub(crate) remove_stroke: bool,
+    // Text-layer edits. `text_max_width` is a double option on purpose: the
+    // outer says "the user changed it this frame", the inner is the value —
+    // `Some(None)` is "stop wrapping", which a flat `Option` couldn't express.
+    pub(crate) text_content: Option<String>,
+    pub(crate) text_family: Option<String>,
+    /// The family hovered in the picker this frame — previewed on the canvas,
+    /// never written to the document. `None` (the default) means "nothing
+    /// hovered", which is what ends a preview.
+    pub(crate) text_family_preview: Option<String>,
+    pub(crate) text_size: Option<f64>,
+    pub(crate) text_align: Option<TextAlign>,
+    #[allow(clippy::option_option)]
+    pub(crate) text_max_width: Option<Option<f64>>,
     // Insert-keyframe-at-playhead requests (the "stopwatch"). Keyed by
     // `PropKind` rather than one bool per property, so adding an animatable
     // property doesn't grow this struct.
@@ -260,6 +392,7 @@ pub(crate) fn properties_ui(
     edits: &mut PropEdits,
     ease: &Option<EaseInfo>,
     ease_out: &mut Option<((f32, f32), (f32, f32))>,
+    fonts: &FontList<'_>,
 ) {
     ui.add_space(8.0);
     ui.heading("Properties");
@@ -433,6 +566,98 @@ pub(crate) fn properties_ui(
             }
             ui.end_row();
         }
+
+        // --- Text. Only the font size is a `Value`, so it's the only row here
+        // with a stopwatch; the rest are plain data (there is no string in
+        // `ExprValue`, so content can't be keyframed or scripted yet). ---
+        if let Some(t) = &n.text {
+            ui.label("Text");
+            let mut content = t.content.clone();
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut content)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                )
+                .changed()
+            {
+                edits.text_content = Some(content);
+            }
+            ui.label("");
+            ui.end_row();
+
+            ui.label("Font");
+            ui.horizontal(|ui| {
+                // The substitution is invisible on the canvas — the text draws
+                // perfectly well in the wrong face — so the missing font gets a
+                // marker right beside the control that caused it.
+                if t.family_missing {
+                    ui.colored_label(WARN_COLOR, icon::text(icon::WARNING)).on_hover_text(
+                        format!(
+                            "'{}' isn't installed on this machine.\n\
+                             Drawing with the system default instead.\n\
+                             The project still names '{}', so it will look right \
+                             on a machine that has it.",
+                            t.family.trim(),
+                            t.family.trim()
+                        ),
+                    );
+                }
+                font_picker(ui, t, fonts, edits);
+            });
+            ui.label("");
+            ui.end_row();
+
+            ui.label("Font Size");
+            let mut size = t.size;
+            if ui
+                .add(egui::DragValue::new(&mut size).speed(0.5).range(0.0..=f64::MAX))
+                .changed()
+            {
+                edits.text_size = Some(size);
+            }
+            if key_button(ui, t.size_anim) {
+                edits.key.insert(PropKind::TextSize);
+            }
+            ui.end_row();
+
+            ui.label("Align");
+            ui.horizontal(|ui| {
+                for a in TextAlign::ALL {
+                    if ui.selectable_label(a == t.align, a.label()).clicked() && a != t.align {
+                        edits.text_align = Some(a);
+                    }
+                }
+            });
+            ui.label("");
+            ui.end_row();
+
+            // Wrapping is off until asked for, so a caption stays on one line
+            // unless you give it a width to break against.
+            ui.label("Wrap");
+            ui.horizontal(|ui| match t.max_width {
+                Some(w) => {
+                    let mut w = w;
+                    if ui
+                        .add(egui::DragValue::new(&mut w).speed(1.0).range(1.0..=f64::MAX))
+                        .changed()
+                    {
+                        edits.text_max_width = Some(Some(w));
+                    }
+                    if ui.small_button("✕").on_hover_text("Stop wrapping").clicked() {
+                        edits.text_max_width = Some(None);
+                    }
+                }
+                None => {
+                    ui.weak("off");
+                    if ui.small_button("+ wrap").clicked() {
+                        edits.text_max_width = Some(Some(400.0));
+                    }
+                }
+            });
+            ui.label("");
+            ui.end_row();
+        }
     });
 
     ui.add_space(6.0);
@@ -480,11 +705,12 @@ pub(crate) enum PropKind {
     StrokeWidth,
     ShapeSize,
     ShapeRadius,
+    TextSize,
 }
 
 impl PropKind {
     /// Every property that can be animated, in row order.
-    pub(crate) const ALL: [PropKind; 9] = [
+    pub(crate) const ALL: [PropKind; 10] = [
         PropKind::Position,
         PropKind::Rotation,
         PropKind::Scale,
@@ -494,6 +720,7 @@ impl PropKind {
         PropKind::StrokeWidth,
         PropKind::ShapeSize,
         PropKind::ShapeRadius,
+        PropKind::TextSize,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -507,6 +734,7 @@ impl PropKind {
             PropKind::StrokeWidth => "Stroke W",
             PropKind::ShapeSize => "Size",
             PropKind::ShapeRadius => "Radius",
+            PropKind::TextSize => "Font Size",
         }
     }
 }
@@ -644,10 +872,14 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
         PropKind::StrokeWidth => PropRef::Num(&node.stroke.as_ref()?.width),
         PropKind::ShapeSize => match node.shape.as_ref()? {
             MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRef::Vec2(size),
-            MShape::Path(_) => return None,
+            MShape::Path(_) | MShape::Text { .. } => return None,
         },
         PropKind::ShapeRadius => match node.shape.as_ref()? {
             MShape::Rect { radius, .. } => PropRef::Num(radius),
+            _ => return None,
+        },
+        PropKind::TextSize => match node.shape.as_ref()? {
+            MShape::Text { size, .. } => PropRef::Num(size),
             _ => return None,
         },
     })
@@ -667,10 +899,14 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         PropKind::StrokeWidth => PropRefMut::Num(&mut node.stroke.as_mut()?.width),
         PropKind::ShapeSize => match node.shape.as_mut()? {
             MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRefMut::Vec2(size),
-            MShape::Path(_) => return None,
+            MShape::Path(_) | MShape::Text { .. } => return None,
         },
         PropKind::ShapeRadius => match node.shape.as_mut()? {
             MShape::Rect { radius, .. } => PropRefMut::Num(radius),
+            _ => return None,
+        },
+        PropKind::TextSize => match node.shape.as_mut()? {
+            MShape::Text { size, .. } => PropRefMut::Num(size),
             _ => return None,
         },
     })
