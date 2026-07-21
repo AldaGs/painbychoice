@@ -29,6 +29,11 @@ pub(crate) enum Editor {
     /// node's properties. Not in the default layout — summon it into any content
     /// area with the area-header picker.
     Graph,
+    /// The composition node-graph editor: a Blender-style canvas of typed nodes
+    /// wired output→input, drawn from the `NodeRegistry`. Like `Graph`, it runs
+    /// its own scroll area and isn't in the default layout — summon it with the
+    /// area-header picker.
+    NodeGraph,
 }
 
 /// The editors a user may freely place, split, and close in a dockable area.
@@ -39,8 +44,8 @@ pub(crate) enum Editor {
 /// and **Transport** are fixed chrome. So those three carry no area header:
 /// they can't be swapped away, split, or closed, which is exactly what keeps
 /// the canvas invariants intact while the content panels rearrange around them.
-pub(crate) const SWAPPABLE: [Editor; 4] =
-    [Editor::Layers, Editor::Properties, Editor::Dopesheet, Editor::Graph];
+pub(crate) const SWAPPABLE: [Editor; 5] =
+    [Editor::Layers, Editor::Properties, Editor::Dopesheet, Editor::Graph, Editor::NodeGraph];
 
 impl Editor {
     /// Human name shown in the area-header picker.
@@ -53,6 +58,7 @@ impl Editor {
             Editor::Transport => "Transport",
             Editor::Dopesheet => "Dopesheet",
             Editor::Graph => "Graph",
+            Editor::NodeGraph => "Nodes",
         }
     }
 
@@ -65,8 +71,8 @@ impl Editor {
     /// so its content can't resize the panel it lives in. See the note on
     /// `show_dock` for why that matters.
     ///
-    /// Excluded: **Graph** runs its own `ScrollArea::both` (nesting two would
-    /// fight over the scroll delta); **Canvas** must measure an exact rect for
+    /// Excluded: **Graph** and **NodeGraph** run their own `ScrollArea::both`
+    /// (nesting two would fight over the scroll delta); **Canvas** must measure an exact rect for
     /// the vello target; **Comp** and **Transport** are single fixed-height
     /// bars in non-resizable panels, so they have nothing to overflow.
     pub(crate) fn scroll_wrapped(self) -> bool {

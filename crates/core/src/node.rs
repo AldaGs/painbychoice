@@ -902,6 +902,15 @@ pub struct Project {
     /// `.pbc` written before modules existed still loads.
     #[serde(default)]
     pub modules: std::collections::BTreeMap<ModuleId, Module>,
+    /// The composition node graph and its drivers — the Blender-style node
+    /// canvas that drives layer properties (see `crate::graph`). Project-level,
+    /// like `modules`: one graph for the project. `#[serde(default)]` so a `.pbc`
+    /// written before the node graph existed still loads.
+    #[serde(default)]
+    pub graph: crate::graph::NodeGraph,
+    /// Drivers: each binds a `graph` output to a scene layer's property.
+    #[serde(default)]
+    pub bindings: Vec<crate::graph::Binding>,
 }
 
 impl Project {
@@ -913,6 +922,8 @@ impl Project {
             comps: [(root, comp)].into_iter().collect(),
             root,
             modules: Default::default(),
+            graph: crate::graph::NodeGraph::new(),
+            bindings: Vec::new(),
         }
     }
 

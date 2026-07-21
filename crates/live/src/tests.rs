@@ -709,6 +709,7 @@ fn only_content_areas_carry_a_header() {
     assert!(Editor::Properties.is_swappable());
     assert!(Editor::Dopesheet.is_swappable());
     assert!(Editor::Graph.is_swappable());
+    assert!(Editor::NodeGraph.is_swappable());
     assert!(!Editor::Canvas.is_swappable());
     assert!(!Editor::Comp.is_swappable());
     assert!(!Editor::Transport.is_swappable());
@@ -2205,8 +2206,8 @@ fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
 fn every_content_leaf_is_kept_from_resizing_its_own_panel() {
     for editor in SWAPPABLE {
         let wrapped = editor.scroll_wrapped();
-        if editor == Editor::Graph {
-            assert!(!wrapped, "Graph scrolls itself; nesting a second area fights it");
+        if editor == Editor::Graph || editor == Editor::NodeGraph {
+            assert!(!wrapped, "{editor:?} scrolls itself; nesting a second area fights it");
         } else {
             assert!(wrapped, "{editor:?} would resize its panel as its content changes");
         }

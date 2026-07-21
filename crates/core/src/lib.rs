@@ -12,7 +12,12 @@
 pub mod demo;
 pub mod eval;
 pub mod expr;
+pub mod graph;
+pub mod lower;
 pub mod node;
+pub mod raise;
+pub mod registry;
+pub mod socket;
 pub mod text;
 pub mod timebase;
 pub mod value;
@@ -26,6 +31,15 @@ pub use node::{
     Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project, Shape,
     Stroke, Transform, ViewAids,
 };
+pub use graph::{
+    Binding, ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
+};
+pub use lower::lower_output;
+pub use raise::raise;
+pub use registry::{
+    builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
+};
+pub use socket::{Socket, SocketType};
 pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;
 pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};

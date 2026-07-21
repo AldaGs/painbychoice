@@ -764,6 +764,27 @@ impl PropKind {
             PropKind::TextSize => "Font Size",
         }
     }
+
+    /// The editor `PropKind` for a core [`PropPath`]. The two enumerate the same
+    /// properties from opposite sides of the crate boundary — core names the
+    /// referenceable property, the editor keys its keyframe/expression machinery
+    /// — so a node-graph driver (stored as a `PropPath`) maps here to reach
+    /// [`prop_of_mut`].
+    pub(crate) fn from_path(p: PropPath) -> PropKind {
+        match p {
+            PropPath::Anchor => PropKind::Anchor,
+            PropPath::Position => PropKind::Position,
+            PropPath::Rotation => PropKind::Rotation,
+            PropPath::Scale => PropKind::Scale,
+            PropPath::Opacity => PropKind::Opacity,
+            PropPath::Fill => PropKind::Fill,
+            PropPath::StrokeColor => PropKind::StrokeColor,
+            PropPath::StrokeWidth => PropKind::StrokeWidth,
+            PropPath::ShapeSize => PropKind::ShapeSize,
+            PropPath::ShapeRadius => PropKind::ShapeRadius,
+            PropPath::TextSize => PropKind::TextSize,
+        }
+    }
 }
 
 /// A borrowed animatable property, with its value type erased down to the three

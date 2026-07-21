@@ -159,6 +159,11 @@ pub(crate) struct App {
     /// Whether last frame's UI pass had the pointer over a ruler or a guide.
     /// Gates click-picking for the same reason as `gizmo_hot` — see its docs.
     pub(crate) aids_hot: bool,
+    /// Every node type the composition graph can place, built once at startup.
+    /// Built-ins today; the seam a plugin registers through later. Runtime state,
+    /// not saved — the graph *itself* (`Project::graph`) and its drivers
+    /// (`Project::bindings`) are document data now and ride in the `.pbc`.
+    pub(crate) node_registry: NodeRegistry,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -294,7 +299,171 @@ impl App {
             doc_rev: 0,
             guide_drag: None,
             aids_hot: false,
+            node_registry: NodeRegistry::with_builtins(),
         }
+    }
+
+    /// Apply one node-graph edit after the UI pass. A free-standing method, like
+    /// the other post-pass appliers, so the panel stays a pure snapshot→intent
+    /// function. A connection is validated against the registry inside
+    /// [`NodeGraph::connect`]; a rejected drop simply doesn't wire.
+    pub(crate) fn apply_ng_op(&mut self, op: NgOp) {
+        // The registry is a disjoint field from the project, so `connect` can
+        // borrow it immutably while the graph is borrowed mutably.
+        let reg = &self.node_registry;
+        let graph = &mut self.project.graph;
+        match op {
+            NgOp::Add { kind, pos } => {
+                graph.add_node(kind, pos);
+            }
+            NgOp::Move { id, pos } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.pos = pos;
+                }
+            }
+            NgOp::Remove { id } => {
+                graph.remove_node(id);
+            }
+            NgOp::Connect { from, to } => {
+                let _ = graph.connect(reg, from, to);
+            }
+            NgOp::Disconnect { edge } => {
+                graph.disconnect(&edge);
+            }
+            NgOp::SetValue { id, socket, value } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.set_value(socket, value);
+                }
+            }
+            NgOp::SetRef { id, target } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.ref_target = target;
+                }
+            }
+            NgOp::SetParam { id, name } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.param = name;
+                }
+            }
+            NgOp::SetScript { id, src } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.script = src;
+                }
+            }
+            NgOp::SetModule { id, module } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.module = module;
+                }
+            }
+        }
+    }
+
+    /// Apply one driver-list edit. `Remove` **bakes** the property to a constant
+    /// at its current value first, so dropping a driver leaves the layer where it
+    /// was and hands it back to hand-editing rather than stranding it on a stale
+    /// expression.
+    pub(crate) fn apply_binding_op(&mut self, op: BindingOp, frame: i64) {
+        let bindings = &mut self.project.bindings;
+        match op {
+            BindingOp::Add { output, target, prop } => {
+                bindings.push(Binding { output, target, prop });
+            }
+            BindingOp::SetOutput { index, output } => {
+                if let Some(b) = bindings.get_mut(index) {
+                    b.output = output;
+                }
+            }
+            BindingOp::SetTarget { index, target } => {
+                if let Some(b) = bindings.get_mut(index) {
+                    b.target = target;
+                }
+            }
+            BindingOp::SetProp { index, prop } => {
+                if let Some(b) = bindings.get_mut(index) {
+                    b.prop = prop;
+                }
+            }
+            BindingOp::Remove { index } => {
+                if index < bindings.len() {
+                    let b = bindings.remove(index);
+                    self.bake_binding(&b, frame);
+                }
+            }
+        }
+    }
+
+    /// Raise a scene property's expression onto the node canvas and bind it back
+    /// — the **property-graph fold**. Reads the property's current `Expr`, raises
+    /// it into the project graph as nodes, and adds a driver from the raised
+    /// output to the same property, so the recipe is now edited on the canvas and
+    /// still drives the layer. A no-op if the property isn't expression-driven —
+    /// promote it first (the old panel's `= fx`).
+    pub(crate) fn import_property(&mut self, target: NodeId, prop: PropPath) {
+        let kind = PropKind::from_path(prop);
+        let expr = self
+            .project
+            .comp(self.current)
+            .and_then(|c| c.root.find(target))
+            .and_then(|n| prop_of(n, kind).and_then(|p| p.expr().cloned()));
+        let Some(expr) = expr else {
+            eprintln!("import: that property isn't expression-driven — promote it first");
+            return;
+        };
+        // Raise (mutates the graph) using the registry — disjoint fields, so both
+        // borrows coexist. Place the root clear of the usual spawn corner.
+        let at = kurbo::Vec2::new(360.0, 40.0);
+        let output = motion_core::raise(&mut self.project.graph, &self.node_registry, &expr, at);
+        self.project.bindings.push(Binding { output, target, prop });
+        self.recompile_graph();
+    }
+
+    /// Recompile every driver: lower its graph output to an `Expr` and set the
+    /// target property to `Value::Expr`, so `evaluate` runs it. Lowering is
+    /// frame-independent (it builds the recipe, doesn't sample it), so this needn't
+    /// know the frame. Run only when the graph or a driver changed — never per
+    /// frame — since it writes the document and bumps `doc_rev`.
+    pub(crate) fn recompile_graph(&mut self) {
+        // Lower first (borrows the graph + registry), then write (borrows the
+        // doc) — two passes, so the immutable and mutable borrows don't overlap.
+        // A driver's `prop` is a core `PropPath`; map it to the editor's
+        // `PropKind` to reach `prop_of_mut`.
+        let compiled: Vec<(NodeId, PropKind, Expr)> = self
+            .project
+            .bindings
+            .iter()
+            .map(|b| {
+                let expr = lower_output(&self.project.graph, &self.node_registry, &b.output);
+                (b.target, PropKind::from_path(b.prop), expr)
+            })
+            .collect();
+        let id = self.current;
+        if let Some(comp) = self.project.comp_mut(id) {
+            for (target, prop, expr) in compiled {
+                if let Some(node) = comp.root.find_mut(target) {
+                    if let Some(mut p) = prop_of_mut(node, prop) {
+                        p.set_expr(expr);
+                    }
+                }
+            }
+        }
+        self.doc_rev += 1;
+    }
+
+    /// Freeze a driven property to a constant at `frame` — what a driver's
+    /// removal leaves behind. Resolves against a clone so the read context can't
+    /// alias the node being mutated (same guard as `GraphOp::Bake`).
+    fn bake_binding(&mut self, b: &Binding, frame: i64) {
+        let snapshot = self.doc().clone();
+        let mut ctx = EvalCtx::new(&snapshot, frame as f64);
+        let id = self.current;
+        if let Some(comp) = self.project.comp_mut(id) {
+            if let Some(node) = comp.root.find_mut(b.target) {
+                if let Some(mut p) = prop_of_mut(node, PropKind::from_path(b.prop)) {
+                    p.bake_to_const(&mut ctx);
+                }
+            }
+        }
+        self.doc_rev += 1;
     }
 
     /// Apply one frame's worth of alignment-aid intent to the open comp.
@@ -1205,6 +1374,13 @@ impl App {
             }
             None => Dock::default_layout(),
         };
+        // Re-sync the driven properties from the loaded graph. The saved doc
+        // already carries the lowered expressions (recompile ran before save), so
+        // this is belt-and-braces — it keeps a hand-edited graph and its
+        // properties consistent rather than trusting the file to be in sync.
+        if !self.project.bindings.is_empty() {
+            self.recompile_graph();
+        }
         self.seek_frame(0);
         true
     }
@@ -1477,6 +1653,28 @@ impl App {
         // frame; applied to the tree after the UI pass, never during it.
         let mut dock_cmd: Option<DockCmd> = None;
         let mut graph_edits = GraphEdits::default();
+        // The composition node graph + its registry, borrowed read-only for the
+        // panel; its edits (at most one) applied after the pass. Disjoint fields
+        // from `dock`, so these coexist with the mutable dock borrow.
+        let node_registry = &self.node_registry;
+        let node_graph = &self.project.graph;
+        let mut ng_edits = NgEdits::default();
+        // Snapshots for the node panel's driver rows: the scene's layers (for the
+        // target picker) and the current drivers (for display). Owned/cloned, so
+        // they don't borrow `self` into the closure.
+        let ng_layers = {
+            let mut v = Vec::new();
+            // Field access, not `self.doc()`: the method borrows all of `self`,
+            // which would collide with the `&mut self.dock` borrow above.
+            if let Some(comp) = self.project.comp(self.current) {
+                collect_nodes(&comp.root, &mut v);
+            }
+            v
+        };
+        let ng_bindings = self.project.bindings.clone();
+        // Modules for a `use` node's picker: id + display name.
+        let ng_modules: Vec<(ModuleId, String)> =
+            self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut next_id = 0;
             let mut path = Vec::new();
@@ -1539,6 +1737,15 @@ impl App {
                         )
                     }
                     Editor::Graph => graph_ui(ui, &graph_info, t, &mut graph_edits),
+                    Editor::NodeGraph => nodegraph_ui(
+                        ui,
+                        node_graph,
+                        node_registry,
+                        &ng_layers,
+                        &ng_modules,
+                        &ng_bindings,
+                        &mut ng_edits,
+                    ),
                     // vello paints the frame here; egui only measures the hole
                     // and floats the zoom toolbar over it. `max_rect` is the
                     // whole window (egui doesn't shrink it for the sibling
@@ -1652,6 +1859,41 @@ impl App {
                 }
             }
             apply_graph_op(&mut self.project, self.current, self.selected, op, frame);
+            window.request_redraw();
+        }
+        // Apply a composition node-graph edit (add/move/remove/connect/
+        // disconnect/set-value). Connection validity is enforced inside the model.
+        // A driver recompiles only when the *lowered result* could have changed —
+        // a plain move can't, so it skips the document write a recompile does.
+        let mut ng_changed = false;
+        if let Some(op) = ng_edits.op.take() {
+            ng_changed = matches!(
+                op,
+                NgOp::Connect { .. }
+                    | NgOp::Disconnect { .. }
+                    | NgOp::Remove { .. }
+                    | NgOp::SetValue { .. }
+                    | NgOp::SetRef { .. }
+                    | NgOp::SetParam { .. }
+                    | NgOp::SetScript { .. }
+                    | NgOp::SetModule { .. }
+            );
+            self.apply_ng_op(op);
+            window.request_redraw();
+        }
+        if let Some(bop) = ng_edits.binding.take() {
+            self.apply_binding_op(bop, frame);
+            ng_changed = true;
+            window.request_redraw();
+        }
+        if ng_changed && !self.project.bindings.is_empty() {
+            self.recompile_graph();
+            window.request_redraw();
+        }
+        // Import raises + binds + recompiles on its own, so it's handled apart
+        // from the `ng_changed` recompile above.
+        if let Some((target, prop)) = ng_edits.import.take() {
+            self.import_property(target, prop);
             window.request_redraw();
         }
         // Now that egui has finished, restructure the layout tree if an area

@@ -26,6 +26,8 @@ use motion_core::{
     ExprKind, ExprValue, Generator, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
     Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
+    lower_output, Binding, Edge, Endpoint, GraphNode, GraphNodeId, NodeCategory, NodeDescriptor,
+    NodeGraph, NodeRegistry, SocketType,
 };
 use serde::{Deserialize, Serialize};
 use vello::peniko::{Color, Fill};
@@ -49,6 +51,7 @@ mod graph;
 mod icon;
 mod layers;
 mod motionpath;
+mod nodegraph;
 mod onion;
 mod props;
 mod scene;
@@ -64,6 +67,7 @@ use gizmo::*;
 use graph::*;
 use layers::*;
 use motionpath::*;
+use nodegraph::*;
 use onion::*;
 use props::*;
 use scene::*;
