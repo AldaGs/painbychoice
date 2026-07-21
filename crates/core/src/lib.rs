@@ -12,6 +12,7 @@
 pub mod demo;
 pub mod eval;
 pub mod expr;
+pub mod graph;
 pub mod node;
 pub mod registry;
 pub mod socket;
@@ -27,6 +28,9 @@ pub use expr::{
 pub use node::{
     Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project, Shape,
     Stroke, Transform, ViewAids,
+};
+pub use graph::{
+    ConnectError, Edge, Endpoint, GraphError, GraphNode, GraphNodeId, NodeGraph,
 };
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
