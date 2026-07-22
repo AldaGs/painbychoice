@@ -5,6 +5,7 @@
 use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
+use crate::asset::{Asset, AssetId, ImagePaint};
 use crate::expr::EvalCtx;
 use crate::text::TextAlign;
 use crate::value::{Color, Value};
@@ -138,6 +139,35 @@ pub enum Shape {
         /// Wrap width; `None` keeps the text on one line.
         max_width: Option<f64>,
     },
+    /// Footage — a still or a clip — drawn into a rectangle centred on the
+    /// origin, exactly like [`Shape::Rect`].
+    ///
+    /// **A raster layer is a rect with pixels in it.** That is the whole trick
+    /// of how this fits: `to_path` returns the frame rectangle, so hit-testing,
+    /// bounding boxes, snapping, the transform gizmo and the motion path all
+    /// keep working with no change at all — they consume `path`, and footage
+    /// has one. The pixels ride alongside as [`ImagePaint`] on the render item,
+    /// which only a backend that actually makes pixels ever looks at.
+    Image {
+        asset: AssetId,
+        /// The rectangle the footage is drawn into, seeded at import from the
+        /// asset's native size (so footage lands at 100%) and animatable from
+        /// then on. Independent of the source's real size on purpose: scaling
+        /// footage non-uniformly is an ordinary thing to want, and forcing it
+        /// through `Transform::scale` would fight the anchor.
+        size: Value<Vec2>,
+        /// Which source frame to show, in **source** frames, when the footage
+        /// should not simply play at its natural rate.
+        ///
+        /// `None` is natural playback: the layer's local time is converted to
+        /// the source's rate and clamped (see [`Asset::source_frame`]), which
+        /// is what a freshly imported clip does. `Some` is AE's "enable time
+        /// remapping" — a `Value` like everything else, so freezing,
+        /// reversing, or ramping a clip is keyframing one curve rather than a
+        /// dedicated feature.
+        #[serde(default)]
+        time_remap: Option<Value<f64>>,
+    },
 }
 
 impl Shape {
@@ -170,7 +200,48 @@ impl Shape {
                 let content = content.resolve(ctx);
                 crate::text::text_to_path(&content, family, size.resolve(ctx), *align, *max_width)
             }
+            // The frame rectangle — the same geometry a `Rect` of this size
+            // would produce, which is exactly the point: every overlay and
+            // hit-test in the editor reads this and needs to know nothing
+            // about footage.
+            Shape::Image { size, .. } => {
+                let s = size.resolve(ctx);
+                Rect::new(-s.x / 2.0, -s.y / 2.0, s.x / 2.0, s.y / 2.0).to_path(0.1)
+            }
         }
+    }
+
+    /// The footage this shape shows on `ctx`'s frame, if it is footage at all.
+    ///
+    /// Separate from [`Shape::to_path`] because the two answer different
+    /// questions — "what shape is this" and "what pixels go in it" — and only
+    /// the second needs the asset registry. Resolving them together would put
+    /// a footage lookup in the path of every rectangle.
+    pub fn image_paint(&self, ctx: &mut EvalCtx) -> Option<ImagePaint> {
+        let Shape::Image { asset, time_remap, .. } = self else {
+            return None;
+        };
+        // Time remapping is authored in source frames, so it bypasses the rate
+        // conversion but not the clamp: a curve that runs past the end of the
+        // clip holds the last frame, exactly as natural playback does.
+        let requested = time_remap.as_ref().map(|v| v.resolve(ctx));
+        let Some(a) = ctx.asset(*asset) else {
+            // No registry behind this evaluation, or the asset was deleted
+            // while a layer still pointed at it. Warned rather than silently
+            // dropped, like a dangling precomp — and the paint is still
+            // emitted so the backend can draw its own "missing footage"
+            // placeholder in the right place.
+            ctx.warn_here(format!("footage {} is not in this project", asset.0));
+            return Some(ImagePaint {
+                asset: *asset,
+                source_frame: requested.unwrap_or(0.0).max(0.0) as i64,
+            });
+        };
+        let source_frame = match requested {
+            Some(f) => a.clamp_frame(f),
+            None => a.source_frame(ctx.frame, ctx.comp_fps()),
+        };
+        Some(ImagePaint { asset: *asset, source_frame })
     }
 
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
@@ -184,6 +255,12 @@ impl Shape {
             Shape::Text { content, size, .. } => {
                 content.migrate_frames(fps);
                 size.migrate_frames(fps);
+            }
+            Shape::Image { size, time_remap, .. } => {
+                size.migrate_frames(fps);
+                if let Some(t) = time_remap {
+                    t.migrate_frames(fps);
+                }
             }
         }
     }
@@ -199,6 +276,18 @@ impl Shape {
             Shape::Text { content, size, .. } => {
                 content.retime(ratio);
                 size.retime(ratio);
+            }
+            Shape::Image { size, time_remap, .. } => {
+                size.retime(ratio);
+                // Only the *keys* move. A remap curve's values are source
+                // frames — a property of the footage, not of the comp's rate —
+                // so re-gridding the comp must slide when each remap key
+                // happens without changing which frame of the clip it picks.
+                // `retime` moves keys and leaves values alone, which is exactly
+                // that.
+                if let Some(t) = time_remap {
+                    t.retime(ratio);
+                }
             }
         }
     }
@@ -1025,6 +1114,13 @@ pub struct Project {
     /// file written before the library existed still loads.
     #[serde(default)]
     pub eases: Vec<crate::value::EasePreset>,
+    /// Imported footage, addressable from any comp — project-level for the
+    /// same reason `modules` is: one import, usable everywhere, and a relink
+    /// fixes every layer that shows it at once. Holds *references* only; see
+    /// [`crate::asset`]. `#[serde(default)]` so a `.pbc` written before footage
+    /// existed still loads.
+    #[serde(default)]
+    pub assets: std::collections::BTreeMap<AssetId, Asset>,
     /// Drivers as they were stored **before they became nodes**: a list beside
     /// the graph rather than `out` nodes in it.
     ///
@@ -1052,6 +1148,7 @@ impl Project {
             modules: Default::default(),
             graph: crate::graph::NodeGraph::new(),
             eases: Vec::new(),
+            assets: std::collections::BTreeMap::new(),
             legacy_bindings: Vec::new(),
             legacy_shape_bindings: Vec::new(),
         }
@@ -1063,6 +1160,37 @@ impl Project {
 
     pub fn comp_mut(&mut self, id: CompId) -> Option<&mut Comp> {
         self.comps.get_mut(&id)
+    }
+
+    pub fn asset(&self, id: AssetId) -> Option<&Asset> {
+        self.assets.get(&id)
+    }
+
+    pub fn asset_mut(&mut self, id: AssetId) -> Option<&mut Asset> {
+        self.assets.get_mut(&id)
+    }
+
+    /// Import footage under a fresh id, returning it.
+    ///
+    /// Takes an [`Asset`] whose `id` is ignored — the same shape as
+    /// [`Project::insert`] — so the caller builds metadata from a decoder
+    /// without having to know what ids are taken.
+    pub fn add_asset(&mut self, mut asset: Asset) -> AssetId {
+        let id = AssetId(self.assets.keys().map(|k| k.0 + 1).max().unwrap_or(0));
+        asset.id = id;
+        self.assets.insert(id, asset);
+        id
+    }
+
+    /// Forget a piece of footage.
+    ///
+    /// Layers pointing at it are **left alone**, and warn at render time like a
+    /// dangling precomp does. Silently deleting them would turn "I removed the
+    /// wrong item from the project panel" into lost work, and repointing them
+    /// at nothing would lose the size and timing the user set up around the
+    /// footage — a relink is meant to be recoverable.
+    pub fn remove_asset(&mut self, id: AssetId) -> Option<Asset> {
+        self.assets.remove(&id)
     }
 
     /// The comp a fresh open shows.

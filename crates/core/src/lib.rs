@@ -9,6 +9,7 @@
 //! This crate has no GPU and no windowing dependency on purpose: the engine
 //! must be testable by rendering a frame in a `cargo test`, not a window.
 
+pub mod asset;
 pub mod demo;
 pub mod eval;
 pub mod expr;
@@ -22,6 +23,9 @@ pub mod text;
 pub mod timebase;
 pub mod value;
 
+pub use asset::{
+    Asset, AssetId, AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, ImagePaint,
+};
 pub use eval::{evaluate, evaluate_comp, evaluate_project, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,

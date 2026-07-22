@@ -5,10 +5,20 @@
 //! real-time GPU backend (vello on wgpu) slots in behind the same `Scene`
 //! input later without touching `motion-core`.
 
-use motion_core::{Color, Scene};
+use kurbo::Shape as _;
+use motion_core::{Asset, Color, Scene};
 
 /// Serialize an evaluated scene to an SVG string sized to the composition.
-pub fn scene_to_svg(scene: &Scene, width: f64, height: f64, background: Color) -> String {
+///
+/// Footage-free scenes can pass an empty `assets` slice; a raster item whose
+/// asset isn't listed degrades to its plain rectangle rather than failing.
+pub fn scene_to_svg(
+    scene: &Scene,
+    width: f64,
+    height: f64,
+    background: Color,
+    assets: &[Asset],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
@@ -40,6 +50,43 @@ pub fn scene_to_svg(scene: &Scene, width: f64, height: f64, background: Color) -
             ),
             None => String::new(),
         };
+
+        // Footage: the frame rectangle becomes a clip path and the source is
+        // referenced by *path*, not embedded. Consistent with how the document
+        // stores footage — references, never pixels — and it keeps this
+        // backend free of decoders. `preserveAspectRatio="none"` because the
+        // item's rect is already the size the layer says to draw at; letting
+        // SVG letterbox would disagree with every other renderer's geometry.
+        //
+        // Only the *first* frame of a clip is addressable this way, so this is
+        // honest for stills and approximate for video — an SVG has no notion of
+        // a source frame. The GPU backend is where video actually plays.
+        if let Some(paint) = item.image {
+            let href = assets
+                .iter()
+                .find(|a| a.id == paint.asset)
+                .map(|a| a.path.to_string_lossy().replace('&', "&amp;"));
+            match href {
+                Some(href) => {
+                    let b = item.path.bounding_box();
+                    out.push_str(&format!(
+                        "  <image transform=\"{matrix}\" x=\"{}\" y=\"{}\" width=\"{}\" \
+                         height=\"{}\" preserveAspectRatio=\"none\" opacity=\"{:.3}\" \
+                         href=\"{href}\"/>\n",
+                        b.x0,
+                        b.y0,
+                        b.width(),
+                        b.height(),
+                        item.opacity.clamp(0.0, 1.0),
+                    ));
+                    continue;
+                }
+                // Footage the project no longer has. `evaluate` already warned;
+                // fall through and draw the plain rectangle so the layer's
+                // place on screen is still visible.
+                None => {}
+            }
+        }
 
         out.push_str(&format!(
             "  <path transform=\"{matrix}\" d=\"{d}\" fill=\"{fill}\"{stroke}/>\n"

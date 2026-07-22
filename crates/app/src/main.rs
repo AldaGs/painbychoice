@@ -30,7 +30,9 @@ fn main() {
         for (id, msg) in &scene.warnings {
             eprintln!("warning [node {}]: {msg}", id.0);
         }
-        let svg = scene_to_svg(&scene, doc.width, doc.height, bg);
+        // The demo document is a bare comp with no project behind it, so it has
+        // no footage library to hand over.
+        let svg = scene_to_svg(&scene, doc.width, doc.height, bg, &[]);
         let path = out_dir.join(format!("frame_{i:02}.svg"));
         fs::write(&path, svg).expect("write svg");
         println!(

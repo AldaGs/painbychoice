@@ -15,6 +15,7 @@ pub(crate) enum RowKind {
     Ellipse,
     Path,
     Text,
+    Footage,
 }
 
 impl RowKind {
@@ -27,6 +28,7 @@ impl RowKind {
             Some(MShape::Ellipse { .. }) => RowKind::Ellipse,
             Some(MShape::Path(_)) => RowKind::Path,
             Some(MShape::Text { .. }) => RowKind::Text,
+            Some(MShape::Image { .. }) => RowKind::Footage,
         }
     }
 }
@@ -56,6 +58,10 @@ pub(crate) fn row_glyph(row: &TreeRow) -> &'static str {
         RowKind::Rect | RowKind::Path => icon::RECT,
         RowKind::Ellipse => icon::ELLIPSE,
         RowKind::Text => icon::TEXT,
+        // Borrowed rather than its own glyph: a photo/film icon would mean
+        // regenerating the subsetted icon font, and a missed regen renders
+        // tofu. Footage is the one thing you *import*, so this reads.
+        RowKind::Footage => icon::IMPORT,
     }
 }
 

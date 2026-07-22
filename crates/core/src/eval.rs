@@ -4,6 +4,7 @@
 
 use kurbo::{Affine, BezPath, Shape as _};
 
+use crate::asset::ImagePaint;
 use crate::expr::EvalCtx;
 use crate::node::{CompId, Document, Node, NodeId, Project};
 use crate::value::Color;
@@ -17,6 +18,13 @@ pub struct RenderItem {
     pub path: BezPath,
     pub fill: Option<Color>,
     pub stroke: Option<(Color, f64)>,
+    /// The footage painted inside `path`, for a raster layer.
+    ///
+    /// `None` for every vector item, which is why adding footage cost the
+    /// renderers a branch rather than a second draw list: an image layer is a
+    /// rectangle that happens to name some pixels. A backend that can't draw
+    /// images can ignore this field and still place the layer correctly.
+    pub image: Option<ImagePaint>,
     /// Effective opacity after multiplying down the ancestor chain.
     pub opacity: f64,
 }
@@ -143,6 +151,8 @@ fn eval_comp(
     let mut ctx = EvalCtx::new(comp, frame);
     // Modules are project-wide: the same definition resolves from any comp.
     ctx.modules = Some(&project.modules);
+    // So is footage — one import, shown from any comp.
+    ctx.assets = Some(&project.assets);
     stack.push(id);
     walk(&comp.root, xf, opacity, &mut ctx, Some(project), stack, scene);
     stack.pop();
@@ -203,6 +213,7 @@ fn walk(
 
     if let Some(shape) = &node.shape {
         let path = shape.to_path(ctx);
+        let image = shape.image_paint(ctx);
         let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
         let stroke = node
             .stroke
@@ -223,6 +234,7 @@ fn walk(
                 path,
                 fill,
                 stroke,
+                image,
                 opacity,
             });
         }
@@ -284,6 +296,93 @@ mod tests {
     use crate::node::{Node, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
+
+    /// Footage is a rectangle that names some pixels: it produces an ordinary
+    /// render item with a path, so every overlay and hit-test in the editor
+    /// keeps working, and the pixels ride alongside in `image`.
+    #[test]
+    fn a_footage_layer_is_a_rect_that_names_its_source_frame() {
+        use crate::asset::{Asset, AssetId};
+        use crate::node::{Comp, Project};
+
+        let mut layer = Node::group(1, "clip");
+        layer.shape = Some(Shape::Image {
+            asset: AssetId(0),
+            size: Value::constant(Vec2::new(320.0, 180.0)),
+            time_remap: None,
+        });
+        layer.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        let mut comp = Comp::new(640.0, 360.0, Node::group(0, "root").with_child(layer));
+        // Set directly, not through `set_fps`: this comp has no keys to re-grid.
+        comp.fps = 24.0;
+        let mut project = Project::single(comp);
+        // 24fps footage in a 24fps comp: source frame == local frame.
+        project.add_asset(Asset::video(AssetId(9), "clip.mp4", 320.0, 180.0, 48, 24.0));
+
+        let scene = evaluate_project(&project, 7.0);
+        let item = scene.items.first().expect("footage draws");
+        assert_eq!(
+            item.path.bounding_box().size(),
+            kurbo::Size::new(320.0, 180.0),
+            "the frame rectangle is what the gizmo and hit-test read"
+        );
+        assert_eq!(item.image.map(|i| i.source_frame), Some(7));
+        assert!(scene.warnings.is_empty());
+    }
+
+    /// A layer pointing at footage that was removed still draws its rectangle,
+    /// and warns — the same treatment a dangling precomp gets. Dropping the
+    /// item instead would make a deleted import look like a broken renderer.
+    #[test]
+    fn footage_missing_from_the_project_warns_rather_than_vanishing() {
+        use crate::asset::AssetId;
+        use crate::node::{Comp, Project};
+
+        let mut layer = Node::group(1, "clip");
+        layer.shape = Some(Shape::Image {
+            asset: AssetId(42),
+            size: Value::constant(Vec2::new(100.0, 100.0)),
+            time_remap: None,
+        });
+        layer.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        let mut comp = Comp::new(640.0, 360.0, Node::group(0, "root").with_child(layer));
+        // Set directly, not through `set_fps`: this comp has no keys to re-grid.
+        comp.fps = 24.0;
+        let project = Project::single(comp);
+
+        let scene = evaluate_project(&project, 0.0);
+        assert_eq!(scene.items.len(), 1, "the layer still has a place on screen");
+        assert!(scene.warnings.iter().any(|(id, m)| *id == NodeId(1) && m.contains("footage")));
+    }
+
+    /// Time remapping is authored in *source* frames, so it picks the frame
+    /// directly rather than going through the rate conversion — but it is held
+    /// to the same bounds, so a curve running past the end holds the last
+    /// frame instead of asking for one that isn't there.
+    #[test]
+    fn time_remapping_picks_a_source_frame_directly_and_still_clamps() {
+        use crate::asset::{Asset, AssetId};
+        use crate::node::{Comp, Project};
+
+        let mut layer = Node::group(1, "clip");
+        layer.shape = Some(Shape::Image {
+            asset: AssetId(0),
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            // Freeze on source frame 3 regardless of the comp's clock.
+            time_remap: Some(Value::constant(3.0)),
+        });
+        layer.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        let mut comp = Comp::new(640.0, 360.0, Node::group(0, "root").with_child(layer));
+        // Set directly, not through `set_fps`: this comp has no keys to re-grid.
+        comp.fps = 48.0;
+        let mut project = Project::single(comp);
+        project.add_asset(Asset::video(AssetId(9), "clip.mp4", 10.0, 10.0, 5, 24.0));
+
+        for frame in [0.0, 30.0, 200.0] {
+            let scene = evaluate_project(&project, frame);
+            assert_eq!(scene.items[0].image.map(|i| i.source_frame), Some(3));
+        }
+    }
 
     /// A group draws nothing, so it produces no `RenderItem` — but it is
     /// exactly the sort of layer you parent things to and animate, so it must

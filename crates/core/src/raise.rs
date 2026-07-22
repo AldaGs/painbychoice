@@ -221,6 +221,13 @@ pub enum RaiseShapeError {
     /// A hand-drawn [`Shape::Path`] has no node form — its geometry isn't
     /// parametric, which is the same reason it has no `ShapeSize`.
     Unsupported,
+    /// Footage has no node form *yet*. A [`crate::Shape::Image`] names a source
+    /// and a source frame, and there is no image node on this canvas to raise
+    /// it onto — that's the image-graph stage, not the property graph this fold
+    /// belongs to. Named separately from [`RaiseShapeError::Unsupported`]
+    /// because it is a "not built yet", not a "can't exist": a hand-drawn path
+    /// will never be parametric, whereas a footage node is on the way.
+    Footage,
 }
 
 impl std::fmt::Display for RaiseShapeError {
@@ -234,6 +241,9 @@ impl std::fmt::Display for RaiseShapeError {
             RaiseShapeError::Unsupported => {
                 f.write_str("a hand-drawn path has no node form — its geometry isn't parametric")
             }
+            RaiseShapeError::Footage => f.write_str(
+                "a footage layer has no node form yet — that's the image graph, not this one",
+            ),
         }
     }
 }
@@ -260,6 +270,7 @@ pub fn raise_geometry(
     // orphaned nodes behind, and the checks are cheap.
     let params: Vec<(&str, &'static str, ShapeParam<'_>)> = match shape {
         Shape::Path(_) => return Err(RaiseShapeError::Unsupported),
+        Shape::Image { .. } => return Err(RaiseShapeError::Footage),
         Shape::Rect { size, radius } => vec![
             ("size", "Size", ShapeParam::Vec2(size)),
             ("radius", "Radius", ShapeParam::Num(radius)),
@@ -280,7 +291,7 @@ pub fn raise_geometry(
         Shape::Rect { .. } => "rect",
         Shape::Ellipse { .. } => "ellipse",
         Shape::Text { .. } => "text",
-        Shape::Path(_) => unreachable!("refused above"),
+        Shape::Path(_) | Shape::Image { .. } => unreachable!("refused above"),
     };
     // Expression params are raised into the column to the left, sharing one row
     // cursor so two raised subtrees can't land on top of each other — the same

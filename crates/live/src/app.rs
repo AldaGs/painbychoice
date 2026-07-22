@@ -366,6 +366,10 @@ pub(crate) fn bake_unbound(
                     size.bake_to_const(&mut ctx);
                     baked = true;
                 }
+                Some(MShape::Image { size, .. }) => {
+                    size.bake_to_const(&mut ctx);
+                    baked = true;
+                }
                 // A `Path` has no `Value` params, and a group has no shape.
                 Some(MShape::Path(_)) | None => {}
             }
@@ -424,7 +428,7 @@ pub(crate) fn create_layer_from_geometry(
 /// Transform is deliberately absent: it stays on the parent, where it goes on
 /// governing the whole subtree. Moving it would change what the *other*
 /// children do, which a restack has no business doing.
-const ARTWORK_PROPS: [PropPath; 7] = [
+const ARTWORK_PROPS: [PropPath; 8] = [
     PropPath::Fill,
     PropPath::StrokeColor,
     PropPath::StrokeWidth,
@@ -432,6 +436,7 @@ const ARTWORK_PROPS: [PropPath; 7] = [
     PropPath::ShapeRadius,
     PropPath::TextSize,
     PropPath::TextContent,
+    PropPath::TimeRemap,
 ];
 
 /// Move a node's own shape into a new child layer, leaving the node a pure

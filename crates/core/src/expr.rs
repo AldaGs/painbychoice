@@ -207,6 +207,10 @@ pub enum PropPath {
     /// to an `ExprValue::Str`, which is what a typewriter script reads and
     /// writes.
     TextContent,
+    /// A footage layer's source frame, when it is time-remapped. Only a
+    /// `Shape::Image` whose `time_remap` is set has one — an unremapped clip
+    /// plays at its natural rate and has no curve to read.
+    TimeRemap,
 }
 
 impl PropPath {
@@ -227,12 +231,13 @@ impl PropPath {
             PropPath::ShapeRadius => "radius",
             PropPath::TextSize => "text_size",
             PropPath::TextContent => "content",
+            PropPath::TimeRemap => "time_remap",
         }
     }
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 12] = [
+    pub const ALL: [PropPath; 13] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -245,6 +250,7 @@ impl PropPath {
         PropPath::ShapeRadius,
         PropPath::TextSize,
         PropPath::TextContent,
+        PropPath::TimeRemap,
     ];
 
     /// Parse a script-facing property name, case-insensitively.
@@ -264,7 +270,8 @@ impl PropPath {
             | PropPath::Opacity
             | PropPath::StrokeWidth
             | PropPath::ShapeRadius
-            | PropPath::TextSize => ExprValue::Num(0.0),
+            | PropPath::TextSize
+            | PropPath::TimeRemap => ExprValue::Num(0.0),
             PropPath::Fill | PropPath::StrokeColor => {
                 ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
             }
@@ -1450,6 +1457,11 @@ pub struct EvalCtx<'a> {
     /// Project-wide modules, if this evaluation has a project behind it. `None`
     /// for a bare single-comp evaluate, where a link warns like a precomp does.
     pub modules: Option<&'a std::collections::BTreeMap<ModuleId, Module>>,
+    /// Project-wide footage, when this evaluation has a project behind it.
+    /// `None` for a bare single-comp evaluate, where an image layer warns like
+    /// a precomp does rather than pretending to resolve.
+    pub assets:
+        Option<&'a std::collections::BTreeMap<crate::asset::AssetId, crate::asset::Asset>>,
     /// Modules currently being resolved further up, so a module that links
     /// itself warns instead of recursing forever — the same discipline as the
     /// property cycle guard and the comp one.
@@ -1483,6 +1495,7 @@ impl<'a> EvalCtx<'a> {
             comp_frame: frame,
             timing: None,
             modules: None,
+            assets: None,
             module_stack: Vec::new(),
             module_scope: Vec::new(),
             doc: Some(doc),
@@ -1501,6 +1514,7 @@ impl<'a> EvalCtx<'a> {
             comp_frame: frame,
             timing: None,
             modules: None,
+            assets: None,
             module_stack: Vec::new(),
             module_scope: Vec::new(),
             doc: None,
@@ -1508,6 +1522,22 @@ impl<'a> EvalCtx<'a> {
             warnings: Vec::new(),
             current: None,
         }
+    }
+
+    /// Look up a piece of footage. `None` when this evaluation has no project
+    /// behind it, or when the asset was removed while a layer still showed it.
+    pub fn asset(&self, id: crate::asset::AssetId) -> Option<&crate::asset::Asset> {
+        self.assets?.get(&id)
+    }
+
+    /// The rate of the comp being evaluated — what a source frame rate is
+    /// converted *against*.
+    ///
+    /// Falls back to the source's own rate meaning "no conversion" by
+    /// returning `0.0`, which every caller reads as "unknown"; guessing a rate
+    /// here would silently retime footage in a document-less context.
+    pub fn comp_fps(&self) -> f64 {
+        self.doc.map(|d| d.fps).unwrap_or(0.0)
     }
 
     /// The current layer's `[in, out)` window **in local frames** — the domain
@@ -1718,6 +1748,10 @@ impl<'a> EvalCtx<'a> {
             },
             PropPath::TextContent => match &node.shape {
                 Some(Shape::Text { content, .. }) => content.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::TimeRemap => match &node.shape {
+                Some(Shape::Image { time_remap: Some(t), .. }) => t.resolve(self).to_expr(),
                 _ => prop.zero(),
             },
         }

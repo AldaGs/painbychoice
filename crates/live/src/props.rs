@@ -876,11 +876,12 @@ pub(crate) enum PropKind {
     ShapeRadius,
     TextSize,
     TextContent,
+    TimeRemap,
 }
 
 impl PropKind {
     /// Every property that can be animated, in row order.
-    pub(crate) const ALL: [PropKind; 12] = [
+    pub(crate) const ALL: [PropKind; 13] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -893,6 +894,7 @@ impl PropKind {
         PropKind::ShapeRadius,
         PropKind::TextSize,
         PropKind::TextContent,
+        PropKind::TimeRemap,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -909,6 +911,7 @@ impl PropKind {
             PropKind::ShapeRadius => "Radius",
             PropKind::TextSize => "Font Size",
             PropKind::TextContent => "Content",
+            PropKind::TimeRemap => "Time Remap",
         }
     }
 
@@ -931,6 +934,7 @@ impl PropKind {
             PropPath::ShapeRadius => PropKind::ShapeRadius,
             PropPath::TextSize => PropKind::TextSize,
             PropPath::TextContent => PropKind::TextContent,
+            PropPath::TimeRemap => PropKind::TimeRemap,
         }
     }
 }
@@ -1181,8 +1185,19 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
         PropKind::StrokeColor => PropRef::Color(&node.stroke.as_ref()?.color),
         PropKind::StrokeWidth => PropRef::Num(&node.stroke.as_ref()?.width),
         PropKind::ShapeSize => match node.shape.as_ref()? {
-            MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRef::Vec2(size),
+            MShape::Rect { size, .. }
+            | MShape::Ellipse { size }
+            // Footage's frame rectangle is its size, so scaling a clip goes
+            // through the same property (and the same gizmo handles) a
+            // rectangle uses.
+            | MShape::Image { size, .. } => PropRef::Vec2(size),
             MShape::Path(_) | MShape::Text { .. } => return None,
+        },
+        // Only a *remapped* clip has this: an unremapped one plays at its
+        // natural rate and has no curve to key.
+        PropKind::TimeRemap => match node.shape.as_ref()? {
+            MShape::Image { time_remap, .. } => PropRef::Num(time_remap.as_ref()?),
+            _ => return None,
         },
         PropKind::ShapeRadius => match node.shape.as_ref()? {
             MShape::Rect { radius, .. } => PropRef::Num(radius),
@@ -1213,8 +1228,14 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         PropKind::StrokeColor => PropRefMut::Color(&mut node.stroke.as_mut()?.color),
         PropKind::StrokeWidth => PropRefMut::Num(&mut node.stroke.as_mut()?.width),
         PropKind::ShapeSize => match node.shape.as_mut()? {
-            MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRefMut::Vec2(size),
+            MShape::Rect { size, .. }
+            | MShape::Ellipse { size }
+            | MShape::Image { size, .. } => PropRefMut::Vec2(size),
             MShape::Path(_) | MShape::Text { .. } => return None,
+        },
+        PropKind::TimeRemap => match node.shape.as_mut()? {
+            MShape::Image { time_remap, .. } => PropRefMut::Num(time_remap.as_mut()?),
+            _ => return None,
         },
         PropKind::ShapeRadius => match node.shape.as_mut()? {
             MShape::Rect { radius, .. } => PropRefMut::Num(radius),
