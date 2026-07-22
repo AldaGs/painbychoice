@@ -44,4 +44,4 @@ pub use registry::{
 pub use socket::{Socket, SocketType};
 pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;
-pub use value::{Animatable, Color, Handle, Keyframe, Track, Value};
+pub use value::{mirror_handle, Animatable, Color, EasePreset, Handle, Interp, Keyframe, Track, Value};

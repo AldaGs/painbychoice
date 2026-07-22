@@ -252,6 +252,31 @@ pub(crate) struct DopeEdits {
     /// The column splitter was dragged: the label column's new width. Already
     /// clamped against the panel, so it is safe to store as-is.
     pub(crate) set_label_w: Option<f32>,
+    /// The dopesheet/curves selector was clicked.
+    pub(crate) set_mode: Option<TimelineMode>,
+    /// A key was dragged vertically in the curve editor: property, key index,
+    /// channel, new value.
+    pub(crate) set_channel_value: Option<(PropKind, usize, usize, f64)>,
+    /// Tangent edits: property, segment index, and that segment's two handles.
+    /// A list, not one: a tool applies to every selected key, and one drag of a
+    /// *locked* tangent moves the segments on both sides of its key. Applied in
+    /// order, so a later edit to the same segment wins.
+    pub(crate) set_handles: Vec<(PropKind, usize, Handle, Handle)>,
+    /// How the segment leaving a key interpolates. A list, for the same reason.
+    pub(crate) set_interp: Vec<(PropKind, usize, Interp)>,
+    /// Keys whose tangents were locked or unlocked.
+    pub(crate) set_broken: Vec<(PropKind, usize, bool)>,
+    /// The curve editor's vertical window changed (zoom, pan, or frame-all).
+    pub(crate) set_value_view: Option<ValueView>,
+    /// The curve editor's property column was clicked: the new set of plotted
+    /// properties (empty = all of them).
+    pub(crate) set_shown_props: Option<PropSelection>,
+    /// A layer strip was clicked: select that layer.
+    pub(crate) select_layer: Option<NodeId>,
+    /// A named layer's time range was edited or cleared. Distinct from
+    /// `set_timing`, which always means *the selected layer* — the strips view
+    /// edits any row, selected or not.
+    pub(crate) set_layer_timing: Option<(NodeId, Option<LayerTiming>)>,
 }
 
 /// What the clip bar needs to draw the selected layer's time range.
@@ -562,6 +587,11 @@ pub(crate) fn label_text(ui: &mut egui::Ui, cell: egui::Rect, text: &str, weak: 
     );
 }
 
+pub(crate) const ROW_H: f32 = 22.0;
+/// Gap between the label column and the track, where the splitter is drawn and
+/// grabbed. Module scope because the curve editor splits its panel on the same
+/// boundary — one number, so the two views can't disagree about where it is.
+pub(crate) const SPLIT_W: f32 = 5.0;
 pub(crate) const DOPESHEET_H: f32 = 178.0;
 pub(crate) const RULER_H: f32 = 20.0;
 /// What one press of the zoom buttons multiplies the visible span by. Matches
@@ -570,6 +600,182 @@ pub(crate) const RULER_H: f32 = 20.0;
 pub(crate) const ZOOM_STEP: f64 = 0.7;
 /// Width of the auto-pan zone at each end of the track, in points.
 pub(crate) const EDGE_PAN_W: f32 = 36.0;
+
+/// Which view the timeline panel is showing. The dopesheet and the curve editor
+/// are two readings of the same keyframes — same rows, same selection, same time
+/// axis — so they share one panel and one dock slot rather than competing for
+/// screen space as separate editors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TimelineMode {
+    #[default]
+    Dopesheet,
+    Curves,
+    /// One bar per layer: when each layer is alive, rather than what its keys
+    /// do. The comp's structure in time.
+    Strips,
+}
+
+impl TimelineMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TimelineMode::Dopesheet => "Dopesheet",
+            TimelineMode::Curves => "Curve Editor",
+            TimelineMode::Strips => "Layer Strips",
+        }
+    }
+}
+
+/// The timeline panel's header: its name, the dopesheet/curves selector, and
+/// the zoom controls. Shared by both views so the two never drift apart in
+/// wording or in where the buttons sit — switching mode should change the
+/// picture, not the furniture.
+pub(crate) fn timeline_header(
+    ui: &mut egui::Ui,
+    mode: TimelineMode,
+    frame: f64,
+    last_frame: i64,
+    view: TimelineView,
+    out: &mut DopeEdits,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.strong("Timeline");
+        for m in [TimelineMode::Strips, TimelineMode::Dopesheet, TimelineMode::Curves] {
+            if ui.selectable_label(mode == m, m.label()).clicked() && mode != m {
+                out.set_mode = Some(m);
+            }
+        }
+
+        // Zoom controls, right-aligned so they sit clear of the hint text and
+        // stay put as the panel resizes. Buttons anchor at the playhead rather
+        // than the view centre: the playhead is what you are looking at, and
+        // zooming it off-screen is the classic annoyance here.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            if icon::button(ui, icon::ZOOM_FIT, "Fit the whole comp (Home)").clicked() {
+                out.set_view = Some(TimelineView::full(last_frame));
+            }
+            if icon::button(ui, icon::ZOOM_OUT, "Zoom out").clicked() {
+                out.set_view = Some(zoomed(view, 1.0 / ZOOM_STEP, frame).clamped(last_frame));
+            }
+            if icon::button(ui, icon::ZOOM_IN, "Zoom in").clicked() {
+                out.set_view = Some(zoomed(view, ZOOM_STEP, frame).clamped(last_frame));
+            }
+            ui.weak(match mode {
+                TimelineMode::Dopesheet => {
+                    "— ctrl+click or drag a box to multi-select, drag to move them                      together, ctrl+C/V copies, Del removes, B/N set the preview range"
+                }
+                TimelineMode::Curves => {
+                    "— drag a key to move it in time and value, drag a tangent to                      reshape, or pick a tool for the selected keys"
+                }
+                TimelineMode::Strips => {
+                    "— drag a bar's end to trim, its body to slide, alt+drag to                      slip (the content moves, the window stays)"
+                }
+            });
+        });
+    });
+    ui.separator();
+}
+
+/// The time ruler: work-area band, ticks, timecode, playhead — and scrubbing.
+///
+/// Shared by the dopesheet and the curve editor rather than written twice: the
+/// ruler *is* the panel's time axis made visible, and two implementations would
+/// eventually disagree about where a frame is. The caller allocates the rect
+/// (the two views lay out differently) and passes its response; this draws into
+/// it and reports whether a scrub drag is live.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn time_ruler(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    axis: &Axis,
+    resp: &egui::Response,
+    frame: f64,
+    last_frame: i64,
+    tb: motion_core::Timebase,
+    view: TimelineView,
+    work_area: Option<WorkArea>,
+    out: &mut DopeEdits,
+) -> bool {
+    let playhead_col = egui::Color32::from_rgb(240, 90, 90);
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+
+    // Work-area band: a translucent strip over the previewed range, with a
+    // brighter tick at each edge. Drawn under the ticks/playhead so it reads
+    // as a background wash, not a foreground marker. Only when one is set —
+    // no work area means "the whole comp", which needs no band.
+    if let Some(wa) = work_area {
+        let (lo, hi) = loop_bounds(Some(wa), last_frame + 1);
+        let (x0, x1) = (axis.frame_to_x(lo as f64), axis.frame_to_x(hi as f64));
+        let band =
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom()))
+                .intersect(rect);
+        painter.rect_filled(band, 0.0, egui::Color32::from_rgba_unmultiplied(80, 150, 235, 46));
+        let edge = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 245));
+        for x in [x0, x1] {
+            if rect.x_range().contains(x) {
+                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], edge);
+            }
+        }
+    }
+
+    // Ticks. Minor ticks appear only once frames are far enough apart to be
+    // legible as individual frames.
+    let step = tick_step(axis.px_per_frame(), tb.fps(), 58.0);
+    let minor = if axis.px_per_frame() >= 6.0 { 1 } else { 0 };
+    let first = view.start.floor() as i64;
+    let last = (view.start + view.visible).ceil() as i64;
+
+    if minor > 0 {
+        let mut f = first;
+        while f <= last {
+            if f % step != 0 {
+                let x = axis.frame_to_x(f as f64);
+                painter.line_segment(
+                    [egui::pos2(x, rect.bottom() - 4.0), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
+                );
+            }
+            f += 1;
+        }
+    }
+
+    let mut f = first.div_euclid(step) * step;
+    while f <= last {
+        if f >= 0 {
+            let x = axis.frame_to_x(f as f64);
+            painter.line_segment(
+                [egui::pos2(x, rect.top() + 3.0), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+            );
+            painter.text(
+                egui::pos2(x + 3.0, rect.top() + 1.0),
+                egui::Align2::LEFT_TOP,
+                tb.timecode(f as f64),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_gray(165),
+            );
+        }
+        f += step;
+    }
+
+    // Playhead marker on the ruler.
+    let px = axis.frame_to_x(frame);
+    painter.line_segment(
+        [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+        egui::Stroke::new(1.5, playhead_col),
+    );
+
+    // Dragging or clicking the ruler scrubs.
+    if resp.clicked() || resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            out.seek_to = Some(axis.x_to_frame(p.x).clamp(0, last_frame));
+        }
+    }
+    resp.dragged()
+}
 
 /// Bottom dopesheet: one row per animated property, keyframes drawn as diamonds
 /// along a shared time axis with a playhead line. Click a row's track to seek;
@@ -593,37 +799,8 @@ pub(crate) fn dopesheet_ui(
     // on every pass, not only when dragged.
     let label_w = clamp_label_w(label_w, ui.max_rect().width());
 
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.strong("Timeline");
+    timeline_header(ui, TimelineMode::Dopesheet, frame, last_frame, view, out);
 
-        // Zoom controls, right-aligned so they sit clear of the hint text and
-        // stay put as the panel resizes. Buttons anchor at the playhead rather
-        // than the view centre: the playhead is what you are looking at, and
-        // zooming it off-screen is the classic annoyance here.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(8.0);
-            if icon::button(ui, icon::ZOOM_FIT, "Fit the whole comp (Home)").clicked() {
-                out.set_view = Some(TimelineView::full(last_frame));
-            }
-            if icon::button(ui, icon::ZOOM_OUT, "Zoom out").clicked() {
-                out.set_view = Some(zoomed(view, 1.0 / ZOOM_STEP, frame).clamped(last_frame));
-            }
-            if icon::button(ui, icon::ZOOM_IN, "Zoom in").clicked() {
-                out.set_view = Some(zoomed(view, ZOOM_STEP, frame).clamped(last_frame));
-            }
-            ui.weak(
-                "— ctrl+click or drag a box to multi-select, drag to move them \
-                 together, ctrl+C/V copies, Del removes, B/N set the preview range",
-            );
-        });
-    });
-    ui.separator();
-
-    pub(crate) const ROW_H: f32 = 22.0;
-    // Gap between the two columns, where the splitter is drawn and grabbed.
-    pub(crate) const SPLIT_W: f32 = 5.0;
     let accent = egui::Color32::from_rgb(255, 216, 51);
     let playhead_col = egui::Color32::from_rgb(240, 90, 90);
     // Set by any drag on the timeline (ruler scrub or keyframe drag).
@@ -647,90 +824,7 @@ pub(crate) fn dopesheet_ui(
         );
         let a = Axis::new(rect, view);
         axis = Some(a);
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
-
-        // Work-area band: a translucent strip over the previewed range, with a
-        // brighter tick at each edge. Drawn under the ticks/playhead so it reads
-        // as a background wash, not a foreground marker. Only when one is set —
-        // no work area means "the whole comp", which needs no band.
-        if let Some(wa) = work_area {
-            let (lo, hi) = loop_bounds(Some(wa), last_frame + 1);
-            let (x0, x1) = (a.frame_to_x(lo as f64), a.frame_to_x(hi as f64));
-            let band = egui::Rect::from_min_max(
-                egui::pos2(x0, rect.top()),
-                egui::pos2(x1, rect.bottom()),
-            )
-            .intersect(rect);
-            painter.rect_filled(band, 0.0, egui::Color32::from_rgba_unmultiplied(80, 150, 235, 46));
-            let edge = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 245));
-            for x in [x0, x1] {
-                if rect.x_range().contains(x) {
-                    painter.line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        edge,
-                    );
-                }
-            }
-        }
-
-        // Ticks. Minor ticks appear only once frames are far enough
-        // apart to be legible as individual frames.
-        let step = tick_step(a.px_per_frame(), tb.fps(), 58.0);
-        let minor = if a.px_per_frame() >= 6.0 { 1 } else { 0 };
-        let first = view.start.floor() as i64;
-        let last = (view.start + view.visible).ceil() as i64;
-
-        if minor > 0 {
-            let mut f = first;
-            while f <= last {
-                if f % step != 0 {
-                    let x = a.frame_to_x(f as f64);
-                    painter.line_segment(
-                        [
-                            egui::pos2(x, rect.bottom() - 4.0),
-                            egui::pos2(x, rect.bottom()),
-                        ],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
-                    );
-                }
-                f += 1;
-            }
-        }
-
-        let mut f = (first.div_euclid(step)) * step;
-        while f <= last {
-            if f >= 0 {
-                let x = a.frame_to_x(f as f64);
-                painter.line_segment(
-                    [egui::pos2(x, rect.top() + 3.0), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
-                );
-                painter.text(
-                    egui::pos2(x + 3.0, rect.top() + 1.0),
-                    egui::Align2::LEFT_TOP,
-                    tb.timecode(f as f64),
-                    egui::FontId::monospace(9.0),
-                    egui::Color32::from_gray(165),
-                );
-            }
-            f += step;
-        }
-
-        // Playhead marker on the ruler.
-        let px = a.frame_to_x(frame);
-        painter.line_segment(
-            [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
-            egui::Stroke::new(1.5, playhead_col),
-        );
-
-        // Dragging or clicking the ruler scrubs.
-        if resp.clicked() || resp.dragged() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                out.seek_to = Some(a.x_to_frame(p.x).clamp(0, last_frame));
-            }
-        }
-        dragging |= resp.dragged();
+        dragging |= time_ruler(ui, rect, &a, &resp, frame, last_frame, tb, view, work_area, out);
     });
 
     let axis = axis.expect("ruler always allocates the axis");

@@ -867,6 +867,93 @@ Two rules keep this safe:
   with, say, a layout that has no way back to the comp bar. User presets are
   filtered the same way.
 
+## The timeline panel: three views of one thing
+
+The timeline is **one** dockable editor (`Editor::Timeline`) with a mode
+selector, not three panels competing for the bottom of the window:
+
+| Mode | Answers |
+| --- | --- |
+| **Layer Strips** | *When is this layer alive?* One bar per layer, its `LayerTiming` window. |
+| **Dopesheet** | *When do its keys happen?* One row per animated property, keys as diamonds. |
+| **Curve Editor** | *How do they move?* Every channel plotted as value over time, tangents editable. |
+
+They share the row set, the keyframe selection, the time axis (`Axis` +
+`TimelineView`), the label column width, and one `time_ruler()` — the ruler *is*
+the panel's time axis made visible, and two implementations would eventually
+disagree about where a frame is. Switching mode should feel like turning a card
+over, not like opening a different tool.
+
+`Editor::Timeline` carries `#[serde(alias = "Dopesheet")]`: the dock layout is
+document data, and an unknown serde variant fails the **whole** `.pbc`, not just
+the layout.
+
+### Curves are sampled, never re-derived
+
+`PropRef::channels()` views a property as one `Track<f64>` per numeric channel —
+a `Vec2` becomes X and Y, a colour R/G/B, text none — each carrying the
+*original* keys' timing (`Keyframe::shaped`). The plot samples those tracks, so
+the drawn curve cannot drift from what plays back, and `Interp::Hold` renders
+for free despite having no bezier form.
+
+Every channel draws its own key knobs (a `Vec2` key has an X and a Y to grab),
+but **tangents draw on channel 0 only**: one keyframe has one pair of handles,
+and two sets of arms could be dragged into disagreeing.
+
+### Easing: `Interp`, broken tangents, and the ease library
+
+- `Interp::{Bezier, Hold}` sits on the **outgoing** side of a key. A hold is not
+  a timing curve — no control points make a bezier stay flat then jump — so
+  `Track::sample` checks it *before* solving the handles.
+- `Keyframe.broken` unlocks a key's two tangents. Presentation, not evaluation,
+  but it must survive a save. Re-locking mirrors the *outgoing* handle onto the
+  incoming one (`mirror_handle`, `(1-x, 1-y)`) rather than averaging, which
+  would move an arm nobody touched.
+- `EasePreset { name, out, into }` — `BUILT_IN` is a `const` table (never
+  serialized, so old files pick up new built-ins) and `Project.eases` is the
+  per-project library, beside `modules` and `graph`: an ease is a house style
+  and has to travel with the `.pbc`.
+
+## Stacking order
+
+**There is no z-index.** `eval::walk` pushes a node's own `RenderItem` and *then*
+recurses into `children` in order, so `scene.items` is depth-first document
+order and the renderer plays it back in order — **later in the list draws on
+top**. Everything else follows from that one rule:
+
+- A parent's own shape always draws **behind** its children.
+- A group occupies **one slot** in its parent's order; nothing interleaves into
+  a group and nothing leaves it.
+- A precomp folds inline (no isolated rasterization), which is also why there
+  are no blend modes yet.
+- `pick` iterates `.rev()`, so clicking agrees with drawing by construction.
+- `Node::replace` keeps a node's index, so pre-composing never restacks.
+
+The **panel lists layers front-most first** (`tree_rows` / `strip_rows` iterate
+`children.iter().rev()`), matching After Effects, Figma and Illustrator; a
+parent row still sits above its children, Figma-style. That is display only —
+the document is untouched — so the up/down buttons invert through
+**`reorder_delta(up) -> +1`**, since `Node::reorder_child` speaks document
+indices. The helper is named precisely so the sign flip doesn't get "fixed" back
+into a bug by someone reading one side of it.
+
+### Wanting a child in front of its parent
+
+It already is: children always draw in front of the parent's own shape. The
+inverse — artwork *behind* a child, or a child escaping its parent's slot — is
+impossible by design, because a PBC node may carry a shape **and** children
+(AE/Figma groups are pure containers, so the question never arises there).
+
+The fix is structural rather than a second ordering concept: **Split shape into
+child layer** (right-click a layers row) moves `shape`/`fill`/`stroke` into a
+new child at **index 0** with an identity transform, so the frame is unchanged
+and the artwork becomes an ordinary layer you can restack. The transform stays
+on the parent — it governs the whole subtree, and moving it would change what
+the other children do. Graph drivers on the moved properties are re-pointed at
+the new layer; transform drivers stay. **Limitation:** expression refs by *name*
+(`value("box", "size")`) still point at the parent, which no longer has those
+properties.
+
 ## Known issues / gotchas
 
 - ~~**egui default font lacks many glyphs**~~ — fixed by bundling an icon font

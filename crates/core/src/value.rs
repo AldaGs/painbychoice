@@ -98,6 +98,80 @@ impl Handle {
     pub const SMOOTH_IN: Handle = Handle::new(0.58, 1.0);
 }
 
+/// A named timing curve: the pair of handles that shape one segment.
+///
+/// The built-ins in [`EasePreset::BUILT_IN`] are compiled in; a project also
+/// carries its own list (see `Project::eases`) so a curve someone dialled in by
+/// hand can be reused on the next property instead of re-dragged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EasePreset {
+    pub name: String,
+    /// Handle leaving the earlier key.
+    pub out: Handle,
+    /// Handle arriving at the later key.
+    pub into: Handle,
+}
+
+impl EasePreset {
+    /// The curves every project starts with. Not serialized: they're code, so
+    /// an old `.pbc` picks up new built-ins rather than freezing the old set.
+    pub const BUILT_IN: &'static [(&'static str, Handle, Handle)] = &[
+        ("Linear", Handle::LINEAR_OUT, Handle::LINEAR_IN),
+        ("Smooth", Handle::SMOOTH_OUT, Handle::SMOOTH_IN),
+        ("Ease In", Handle::new(0.42, 0.0), Handle::new(1.0, 1.0)),
+        ("Ease Out", Handle::new(0.0, 0.0), Handle::new(0.58, 1.0)),
+        ("Quad", Handle::new(0.45, 0.0), Handle::new(0.55, 1.0)),
+        ("Cubic", Handle::new(0.65, 0.0), Handle::new(0.35, 1.0)),
+        ("Expo", Handle::new(0.87, 0.0), Handle::new(0.13, 1.0)),
+        ("Back", Handle::new(0.68, -0.25), Handle::new(0.32, 1.25)),
+    ];
+
+    pub fn new(name: impl Into<String>, out: Handle, into: Handle) -> Self {
+        Self { name: name.into(), out, into }
+    }
+
+    /// Does this preset describe the given segment? Compared with a tolerance
+    /// because the handles it is matched against came off a pixel drag.
+    pub fn matches(&self, out: Handle, into: Handle) -> bool {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        near(self.out.x, out.x)
+            && near(self.out.y, out.y)
+            && near(self.into.x, into.x)
+            && near(self.into.y, into.y)
+    }
+}
+
+/// How a segment gets from one key to the next.
+///
+/// This is *not* the same axis as the easing handles. Every eased segment is a
+/// cubic-bezier timing curve, but a **hold** is not a timing curve at all — no
+/// choice of control points makes a bezier stay flat and then jump — so it has
+/// to be its own case, checked before the handles are ever solved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Interp {
+    /// Ease across the segment using the two handles. The default, and what
+    /// every key written before this existed reads back as.
+    #[default]
+    Bezier,
+    /// Stay on this key's value for the whole segment, then jump at the next
+    /// key. A step, not a ramp.
+    Hold,
+}
+
+/// The partner of an out-handle across its key: point-symmetric about the
+/// key, which in this normalized space is the reflection through the centre.
+/// The stock pairs are exactly this — `LINEAR_OUT`/`LINEAR_IN` and
+/// `SMOOTH_OUT`/`SMOOTH_IN` both satisfy it.
+///
+/// Note this mirrors in *normalized segment space*, so two segments of
+/// different length end up with tangents that look kinked in a curve editor
+/// even though neither is "broken". Matching the on-screen slope would mean
+/// scaling by the frame span and value range, which is a curve-editor concern
+/// and belongs there, not in the data model.
+pub fn mirror_handle(h: Handle) -> Handle {
+    Handle::new(1.0 - h.x, 1.0 - h.y)
+}
+
 /// A key at an exact frame. Frames are integers on purpose: a keyframe that
 /// sits between frames can never be reached by playback, and float times
 /// forced every comparison through an epsilon fudge. The frame *grid* lives in
@@ -117,6 +191,17 @@ pub struct Keyframe<T> {
     pub out_handle: Handle,
     /// Timing handle arriving at this key from the previous.
     pub in_handle: Handle,
+    /// How the segment *leaving* this key behaves. Held on the earlier key
+    /// because that is where the choice reads from in a curve editor: you hold
+    /// a key, and the flat run to the right of it is the result.
+    #[serde(default)]
+    pub interp: Interp,
+    /// Whether this key's two tangents move independently. Presentation, not
+    /// evaluation — sampling only ever reads the handles — but it has to be
+    /// stored, because "the tangents are locked together" is a property of the
+    /// key that must survive a save, not a mode the editor is in.
+    #[serde(default)]
+    pub broken: bool,
 }
 
 impl<T> Keyframe<T> {
@@ -128,8 +213,27 @@ impl<T> Keyframe<T> {
             value,
             out_handle: Handle::LINEAR_OUT,
             in_handle: Handle::LINEAR_IN,
+            interp: Interp::Bezier,
+            broken: false,
         }
     }
+    /// A key with its timing given explicitly.
+    ///
+    /// This is what a curve editor builds when it views one channel of a vector
+    /// property as a scalar track of its own: the values are the channel's, but
+    /// the timing has to be the original key's or the view would not be showing
+    /// the same animation.
+    pub fn shaped(
+        frame: i64,
+        value: T,
+        out_handle: Handle,
+        in_handle: Handle,
+        interp: Interp,
+        broken: bool,
+    ) -> Self {
+        Self { frame, legacy_seconds: None, value, out_handle, in_handle, interp, broken }
+    }
+
     /// A smoothly-eased key.
     pub fn smooth(frame: i64, value: T) -> Self {
         Self {
@@ -138,6 +242,8 @@ impl<T> Keyframe<T> {
             value,
             out_handle: Handle::SMOOTH_OUT,
             in_handle: Handle::SMOOTH_IN,
+            interp: Interp::Bezier,
+            broken: false,
         }
     }
 }
@@ -367,6 +473,33 @@ impl<T: Animatable> Track<T> {
         }
     }
 
+    /// How the segment leaving keyframe `index` interpolates.
+    pub fn segment_interp(&self, index: usize) -> Option<Interp> {
+        self.keys.get(index).map(|k| k.interp)
+    }
+
+    pub fn set_segment_interp(&mut self, index: usize, interp: Interp) {
+        if let Some(k) = self.keys.get_mut(index) {
+            k.interp = interp;
+        }
+    }
+
+    /// Whether keyframe `index` has its two tangents unlocked.
+    pub fn key_broken(&self, index: usize) -> Option<bool> {
+        self.keys.get(index).map(|k| k.broken)
+    }
+
+    /// Unlock or re-lock keyframe `index`'s tangents. Re-locking mirrors the
+    /// *outgoing* handle onto the incoming one, so the two agree again — the
+    /// alternative, averaging them, moves a handle the user never touched.
+    pub fn set_key_broken(&mut self, index: usize, broken: bool) {
+        let Some(k) = self.keys.get_mut(index) else { return };
+        k.broken = broken;
+        if !broken {
+            k.in_handle = mirror_handle(k.out_handle);
+        }
+    }
+
     /// Insert or update a keyframe at `frame`. If a key already sits on that
     /// frame its value is replaced (handles preserved); otherwise a new
     /// smoothly-eased key is inserted in sorted order. This is the "auto-key"
@@ -380,6 +513,14 @@ impl<T: Animatable> Track<T> {
         } else {
             self.keys.push(Keyframe::smooth(frame, value));
             self.keys.sort_by_key(|k| k.frame);
+        }
+    }
+
+    /// Replace the value of keyframe `index`, leaving its timing alone.
+    /// Out-of-range is a no-op: the index came from a UI list.
+    pub fn set_key_value(&mut self, index: usize, value: T) {
+        if let Some(k) = self.keys.get_mut(index) {
+            k.value = value;
         }
     }
 
@@ -406,6 +547,12 @@ impl<T: Animatable> Track<T> {
                     Some(w) => [&w[0], &w[1]],
                     None => return keys[keys.len() - 1].value.clone(),
                 };
+                // A held segment never interpolates: it stays on `a` until the
+                // playhead actually reaches `b`. Checked before the timing
+                // bezier, which cannot express this shape.
+                if a.interp == Interp::Hold {
+                    return a.value.clone();
+                }
                 let span = (b.frame - a.frame) as f64;
                 let u = if span > 0.0 { (frame - a.frame as f64) / span } else { 0.0 };
                 // Temporal easing: solve the timing bezier for eased fraction.
@@ -583,10 +730,22 @@ impl<T: Animatable + FromExpr + ToExpr> Value<T> {
     }
 
     /// Remove keyframe `index` (no-op on a constant).
+    /// Remove keyframe `index`.
+    ///
+    /// Removing the **last** key doesn't leave an empty track — it demotes the
+    /// property back to a constant of that key's value, which is the honest
+    /// reading of "delete the only keyframe": stop animating, keep what's on
+    /// screen. [`Track::remove_key`] can't do this itself (a `Track` has no
+    /// constant form) and so refuses, which is why the case lives here. Without
+    /// it a property that has been keyed once can never stop being animated.
     pub fn remove_key(&mut self, index: usize) {
-        if let Value::Keyframed(track) = self {
-            track.remove_key(index);
+        let Value::Keyframed(track) = self else { return };
+        if track.len() == 1 && index == 0 {
+            let held = track.keys()[0].value.clone();
+            *self = Value::Const(held);
+            return;
         }
+        track.remove_key(index);
     }
 
     /// Insert a keyframe at `frame`, holding the value the property currently
@@ -615,6 +774,49 @@ impl<T: Animatable + FromExpr + ToExpr> Value<T> {
     pub fn set_segment_handles(&mut self, index: usize, out: Handle, next_in: Handle) {
         if let Value::Keyframed(track) = self {
             track.set_segment_handles(index, out, next_in);
+        }
+    }
+
+    /// Replace the value of keyframe `index` (no-op on a constant).
+    pub fn set_key_value(&mut self, index: usize, value: T) {
+        if let Value::Keyframed(track) = self {
+            track.set_key_value(index, value);
+        }
+    }
+
+    /// The keys of this value's track, or an empty slice if it has none.
+    pub fn keys(&self) -> &[Keyframe<T>] {
+        match self {
+            Value::Keyframed(track) => track.keys(),
+            _ => &[],
+        }
+    }
+
+    /// How the segment leaving keyframe `index` interpolates.
+    pub fn segment_interp(&self, index: usize) -> Option<Interp> {
+        match self {
+            Value::Const(_) | Value::Expr(_) => None,
+            Value::Keyframed(track) => track.segment_interp(index),
+        }
+    }
+
+    pub fn set_segment_interp(&mut self, index: usize, interp: Interp) {
+        if let Value::Keyframed(track) = self {
+            track.set_segment_interp(index, interp);
+        }
+    }
+
+    /// Whether keyframe `index` has unlocked tangents.
+    pub fn key_broken(&self, index: usize) -> Option<bool> {
+        match self {
+            Value::Const(_) | Value::Expr(_) => None,
+            Value::Keyframed(track) => track.key_broken(index),
+        }
+    }
+
+    pub fn set_key_broken(&mut self, index: usize, broken: bool) {
+        if let Value::Keyframed(track) = self {
+            track.set_key_broken(index, broken);
         }
     }
 }
@@ -990,5 +1192,105 @@ mod tests {
         let mut v: Value<f64> = serde_json::from_str(json).unwrap();
         v.migrate_frames(24.0);
         assert_eq!(v.key_frames(), vec![24], "collided keys collapse to one");
+    }
+
+    #[test]
+    fn preset_matches_its_own_handles_and_not_a_different_curve() {
+        let smooth = EasePreset::new("Smooth", Handle::SMOOTH_OUT, Handle::SMOOTH_IN);
+        assert!(smooth.matches(Handle::SMOOTH_OUT, Handle::SMOOTH_IN));
+        // A drag lands a hair off exact; that must still read as the preset.
+        assert!(smooth.matches(Handle::new(0.4203, 0.0002), Handle::new(0.5798, 0.9997)));
+        assert!(!smooth.matches(Handle::LINEAR_OUT, Handle::LINEAR_IN));
+    }
+
+    #[test]
+    fn built_in_presets_are_distinguishable() {
+        // Two built-ins sharing handles would make the picker's label ambiguous.
+        for (i, (na, oa, ia)) in EasePreset::BUILT_IN.iter().enumerate() {
+            for (nb, ob, ib) in &EasePreset::BUILT_IN[i + 1..] {
+                let a = EasePreset::new(*na, *oa, *ia);
+                assert!(!a.matches(*ob, *ib), "{na} and {nb} are the same curve");
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_segment_stays_flat_then_jumps() {
+        let mut track = Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 100.0)]);
+        track.set_segment_interp(0, Interp::Hold);
+        assert_eq!(track.sample(0.0), 0.0);
+        assert_eq!(track.sample(5.0), 0.0, "a hold does not ramp");
+        assert_eq!(track.sample(9.99), 0.0, "…right up to the next key");
+        assert_eq!(track.sample(10.0), 100.0, "and jumps on it");
+    }
+
+    #[test]
+    fn hold_applies_only_to_the_segment_it_is_set_on() {
+        let mut track = Track::new(vec![
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(10, 100.0),
+            Keyframe::linear(20, 200.0),
+        ]);
+        track.set_segment_interp(0, Interp::Hold);
+        assert_eq!(track.sample(5.0), 0.0, "held segment");
+        assert_eq!(track.sample(15.0), 150.0, "the next segment still eases");
+    }
+
+    #[test]
+    fn relocking_tangents_mirrors_the_out_handle() {
+        let mut track = Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 100.0)]);
+        track.set_key_broken(0, true);
+        track.set_segment_handles(0, Handle::new(0.9, 0.1), Handle::LINEAR_IN);
+        assert_eq!(track.key_broken(0), Some(true));
+        // Re-locking pulls the incoming handle onto the outgoing one's mirror
+        // rather than averaging, which would move a handle nobody touched.
+        track.set_key_broken(0, false);
+        let inn = track.keys()[0].in_handle;
+        assert!((inn.x - 0.1).abs() < 1e-9 && (inn.y - 0.9).abs() < 1e-9, "mirrored: {inn:?}");
+        assert_eq!(track.keys()[0].out_handle, Handle::new(0.9, 0.1), "the dragged one is kept");
+    }
+
+    #[test]
+    fn a_key_written_before_interp_existed_loads_as_bezier() {
+        let json = r#"{"frame":0,"value":1.0,
+            "out_handle":{"x":0.33,"y":0.33},"in_handle":{"x":0.67,"y":0.67}}"#;
+        let k: Keyframe<f64> = serde_json::from_str(json).unwrap();
+        assert_eq!(k.interp, Interp::Bezier);
+        assert!(!k.broken);
+    }
+
+    #[test]
+    fn deleting_the_only_key_stops_the_animation() {
+        // The bug this pins: `Track::remove_key` refuses to empty itself, so a
+        // property keyed exactly once could never stop being animated — the
+        // stopwatch was on with no way to turn it off.
+        let mut v = Value::Keyframed(Track::new(vec![Keyframe::linear(7, 42.0)]));
+        v.remove_key(0);
+        assert!(!v.is_animated(), "the track is gone");
+        assert_eq!(v.resolve(&mut at(0.0)), 42.0, "and it holds the value it had");
+    }
+
+    #[test]
+    fn deleting_a_key_from_a_pair_leaves_a_track() {
+        // Only the *last* key demotes; anything else is an ordinary removal and
+        // must not collapse an animation that still has one.
+        let mut v = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(10, 100.0),
+        ]));
+        v.remove_key(1);
+        assert!(v.is_animated(), "still a track");
+        assert_eq!(v.key_frames(), vec![0]);
+        // …and deleting the survivor demotes as above.
+        v.remove_key(0);
+        assert!(!v.is_animated());
+    }
+
+    #[test]
+    fn deleting_a_key_that_is_not_there_changes_nothing() {
+        let mut v = Value::Keyframed(Track::new(vec![Keyframe::linear(3, 1.0)]));
+        v.remove_key(5);
+        assert!(v.is_animated(), "a stale index must not demote the property");
+        assert_eq!(v.key_frames(), vec![3]);
     }
 }

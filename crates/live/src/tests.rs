@@ -369,7 +369,7 @@ fn the_default_layout_shows_every_editor_exactly_once() {
         Editor::Comp,
         Editor::Layers,
         Editor::Transport,
-        Editor::Dopesheet,
+        Editor::Timeline,
         Editor::Properties,
         Editor::Canvas,
     ] {
@@ -513,8 +513,8 @@ fn presets_offer_more_than_one_arrangement() {
     assert!(presets.iter().all(|p| p.builtin));
     let default = &presets.iter().find(|p| p.name == "Default").unwrap().dock;
     let design = &presets.iter().find(|p| p.name == "Design").unwrap().dock;
-    assert_eq!(count_editor(default, Editor::Dopesheet), 1);
-    assert_eq!(count_editor(design, Editor::Dopesheet), 0);
+    assert_eq!(count_editor(default, Editor::Timeline), 1);
+    assert_eq!(count_editor(design, Editor::Timeline), 0);
 }
 
 #[test]
@@ -689,7 +689,7 @@ fn only_content_areas_carry_a_header() {
     // canvas-rect and innermost-canvas invariants could be broken from the UI.
     assert!(Editor::Layers.is_swappable());
     assert!(Editor::Properties.is_swappable());
-    assert!(Editor::Dopesheet.is_swappable());
+    assert!(Editor::Timeline.is_swappable());
     assert!(Editor::NodeGraph.is_swappable());
     assert!(!Editor::Canvas.is_swappable());
     assert!(!Editor::Comp.is_swappable());
@@ -3323,4 +3323,464 @@ fn the_panel_lays_out_every_node_kind_without_an_id_clash() {
         );
     });
     assert!(edits.op.is_none(), "a pure layout pass must not record an edit");
+}
+
+
+// --- Curve editor ------------------------------------------------------
+
+/// A node with a keyframed position, for the channel/curve tests.
+fn node_with_position_keys() -> MNode {
+    let mut transform = Transform::default();
+    transform.position = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, Vec2::new(0.0, 10.0)),
+        Keyframe::linear(12, Vec2::new(100.0, 50.0)),
+    ]));
+    MNode::group(1, "layer").with_transform(transform)
+}
+
+#[test]
+fn a_vector_property_plots_one_curve_per_axis() {
+    let node = node_with_position_keys();
+    let chans = prop_of(&node, PropKind::Position).unwrap().channels();
+    assert_eq!(chans.len(), 2);
+    assert_eq!((chans[0].name, chans[1].name), ("X", "Y"));
+    // Each channel carries its own values...
+    assert_eq!(chans[0].track.keys()[1].value, 100.0);
+    assert_eq!(chans[1].track.keys()[1].value, 50.0);
+    // ...but the *original* timing, or the plotted curve would not be the
+    // animation that plays.
+    for ch in &chans {
+        assert_eq!(ch.track.frames(), vec![0, 12]);
+        assert_eq!(ch.track.keys()[0].out_handle, Handle::LINEAR_OUT);
+    }
+}
+
+#[test]
+fn dragging_a_key_writes_only_the_grabbed_axis() {
+    let mut node = node_with_position_keys();
+    prop_of_mut(&mut node, PropKind::Position).unwrap().set_channel_value(1, 1, 999.0);
+    let chans = prop_of(&node, PropKind::Position).unwrap().channels();
+    assert_eq!(chans[1].track.keys()[1].value, 999.0, "Y took the edit");
+    assert_eq!(chans[0].track.keys()[1].value, 100.0, "X is untouched");
+}
+
+#[test]
+fn a_stale_channel_index_edits_nothing() {
+    let mut node = node_with_position_keys();
+    // Channel 7 doesn't exist on a Vec2. Silently clamping onto X would edit an
+    // axis the user never grabbed.
+    prop_of_mut(&mut node, PropKind::Position).unwrap().set_channel_value(1, 7, 5.0);
+    let chans = prop_of(&node, PropKind::Position).unwrap().channels();
+    assert_eq!(chans[0].track.keys()[1].value, 100.0);
+    assert_eq!(chans[1].track.keys()[1].value, 50.0);
+}
+
+#[test]
+fn value_view_frames_every_curve_with_margin() {
+    let rows = curve_rows(&node_with_position_keys());
+    let vv = ValueView::fit(&rows, &PropSelection::new());
+    // Values run 0..100 across both axes, so the window is centred on 50 and
+    // wider than the range — a key at an extreme must not sit on the edge.
+    assert!((vv.center - 50.0).abs() < 1e-9, "centre: {}", vv.center);
+    assert!(vv.span > 100.0, "span should leave margin: {}", vv.span);
+}
+
+#[test]
+fn value_view_survives_having_nothing_to_frame() {
+    // No rows means no min/max; a zero or infinite span would divide by zero
+    // when mapping values to pixels.
+    let vv = ValueView::fit(&[], &PropSelection::new());
+    assert!(vv.span.is_finite() && vv.span > 0.0);
+}
+
+#[test]
+fn the_hold_tool_only_changes_interpolation() {
+    let mut out = DopeEdits::default();
+    apply_tool(CurveTool::Hold, PropKind::Opacity, 2, &mut out);
+    assert_eq!(out.set_interp, vec![(PropKind::Opacity, 2, Interp::Hold)]);
+    assert!(out.set_handles.is_empty(), "a hold leaves the handles alone");
+    assert!(out.set_broken.is_empty());
+}
+
+#[test]
+fn the_bezier_tool_relocks_after_setting_handles() {
+    // Order matters: re-locking mirrors whatever the handles are *now*, so it
+    // must be applied after them or it mirrors the ones being replaced.
+    let mut out = DopeEdits::default();
+    apply_tool(CurveTool::Bezier, PropKind::Rotation, 0, &mut out);
+    assert_eq!(out.set_handles.len(), 1);
+    assert_eq!(out.set_broken, vec![(PropKind::Rotation, 0, false)]);
+    assert_eq!(out.set_interp, vec![(PropKind::Rotation, 0, Interp::Bezier)]);
+}
+
+#[test]
+fn the_linear_tool_leaves_the_lock_alone() {
+    // Making a segment linear says nothing about whether the key's two arms
+    // move together, so it must not quietly re-lock a separated key.
+    let mut out = DopeEdits::default();
+    apply_tool(CurveTool::Linear, PropKind::Scale, 1, &mut out);
+    assert!(out.set_broken.is_empty());
+    assert_eq!(
+        out.set_handles,
+        vec![(PropKind::Scale, 1, Handle::LINEAR_OUT, Handle::LINEAR_IN)]
+    );
+}
+
+/// A plot rect and its axis, for the tangent tests: 400px wide over 20 frames,
+/// 200px tall over values 0..100.
+fn curve_axis() -> (Axis, egui::Rect) {
+    let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 200.0));
+    (Axis::new(rect, TimelineView { start: 0.0, visible: 20.0 }), rect)
+}
+
+#[test]
+fn a_held_segment_shows_no_tangent() {
+    // There is no curve to shape, so an arm would be a control that does
+    // nothing — worse than absent.
+    let (axis, rect) = curve_axis();
+    let mut track = Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 100.0)]);
+    track.set_segment_interp(0, Interp::Hold);
+    let to_y = |v: f64| rect.bottom() - (v / 100.0) as f32 * rect.height();
+    assert!(tangent_pos(track.keys(), 0, Side::Out, &axis, &to_y).is_none());
+}
+
+#[test]
+fn the_first_and_last_key_have_only_one_tangent() {
+    let (axis, rect) = curve_axis();
+    let track = Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 100.0)]);
+    let to_y = |v: f64| rect.bottom() - (v / 100.0) as f32 * rect.height();
+    assert!(tangent_pos(track.keys(), 0, Side::In, &axis, &to_y).is_none(), "no segment before");
+    assert!(tangent_pos(track.keys(), 1, Side::Out, &axis, &to_y).is_none(), "none after");
+    assert!(tangent_pos(track.keys(), 0, Side::Out, &axis, &to_y).is_some());
+}
+
+#[test]
+fn dragging_a_locked_tangent_moves_both_sides() {
+    let (axis, rect) = curve_axis();
+    let track = Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(10, 100.0),
+        Keyframe::linear(20, 0.0),
+    ]);
+    let to_value = |y: f32| ((rect.bottom() - y) / rect.height()) as f64 * 100.0;
+    let mut out = DopeEdits::default();
+    // Grab the middle key's outgoing arm and drag it into segment 1.
+    let p = egui::pos2(axis.frame_to_x(15.0), rect.center().y);
+    drag_tangent(track.keys(), 1, Side::Out, 1, p, PropKind::Position, &axis, &to_value, &mut out);
+    assert_eq!(out.set_handles.len(), 2, "the dragged segment and its neighbour");
+    let (_, seg_b, out_b, _) = out.set_handles[0];
+    let (_, seg_a, _, in_a) = out.set_handles[1];
+    assert_eq!((seg_b, seg_a), (1, 0), "segment 1 dragged, segment 0 mirrored");
+    assert_eq!(in_a, mirror_handle(out_b));
+}
+
+#[test]
+fn dragging_a_broken_tangent_leaves_the_other_side_put() {
+    let (axis, rect) = curve_axis();
+    let mut track = Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(10, 100.0),
+        Keyframe::linear(20, 0.0),
+    ]);
+    track.set_key_broken(1, true);
+    let to_value = |y: f32| ((rect.bottom() - y) / rect.height()) as f64 * 100.0;
+    let mut out = DopeEdits::default();
+    let p = egui::pos2(axis.frame_to_x(15.0), rect.center().y);
+    drag_tangent(track.keys(), 1, Side::Out, 1, p, PropKind::Position, &axis, &to_value, &mut out);
+    assert_eq!(out.set_handles.len(), 1, "only the arm under the cursor moves");
+}
+
+#[test]
+fn a_flat_segment_keeps_its_tangent_height() {
+    // With both keys on the same value there is no vertical scale to read a
+    // dragged y against; inventing one would divide by zero.
+    let (axis, rect) = curve_axis();
+    let track = Track::new(vec![Keyframe::linear(0, 50.0), Keyframe::linear(10, 50.0)]);
+    let to_value = |y: f32| ((rect.bottom() - y) / rect.height()) as f64 * 100.0;
+    let mut out = DopeEdits::default();
+    let p = egui::pos2(axis.frame_to_x(5.0), rect.top());
+    drag_tangent(track.keys(), 0, Side::Out, 0, p, PropKind::Opacity, &axis, &to_value, &mut out);
+    let (_, _, moved, _) = out.set_handles[0];
+    assert_eq!(moved.y, Handle::LINEAR_OUT.y, "y is unchanged");
+    assert!((moved.x - 0.5).abs() < 1e-6, "x still tracks the pointer: {}", moved.x);
+}
+
+#[test]
+fn an_empty_property_filter_shows_everything() {
+    // Empty is the untouched state, and it has to mean "all" — the alternative
+    // is a curve editor that starts blank.
+    let shown = PropSelection::new();
+    assert!(shown.shows(PropKind::Position));
+    assert!(shown.shows(PropKind::Opacity));
+}
+
+#[test]
+fn a_filter_hides_every_property_it_does_not_name() {
+    let shown: PropSelection = [PropKind::Position].into_iter().collect();
+    assert!(shown.shows(PropKind::Position));
+    assert!(!shown.shows(PropKind::Opacity));
+}
+
+#[test]
+fn framing_ignores_hidden_curves() {
+    // Position runs 0..100; framing while only Opacity is shown must not stretch
+    // the window to a curve that isn't drawn.
+    let mut transform = Transform::default();
+    transform.position = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, Vec2::new(0.0, 0.0)),
+        Keyframe::linear(10, Vec2::new(1000.0, 1000.0)),
+    ]));
+    transform.opacity = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(10, 1.0),
+    ]));
+    let node = MNode::group(1, "layer").with_transform(transform);
+    let rows = curve_rows(&node);
+    let only_opacity: PropSelection = [PropKind::Opacity].into_iter().collect();
+    let vv = ValueView::fit(&rows, &only_opacity);
+    assert!(vv.span < 10.0, "framed to opacity, not position: {}", vv.span);
+    assert!(ValueView::fit(&rows, &PropSelection::new()).span > 100.0, "unfiltered sees both");
+}
+
+
+// --- Layer strips ------------------------------------------------------
+
+/// A comp root holding a group with one child, both keyed, for the strip tests.
+fn root_with_nested_layers() -> MNode {
+    let mut transform = Transform::default();
+    transform.rotation_deg =
+        Value::Keyframed(Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(8, 90.0)]));
+    let mut child = MNode::group(2, "child").with_transform(transform);
+    child.timing = Some(LayerTiming::new(4, 20));
+    let group = MNode::group(1, "group").with_child(child);
+    MNode::group(0, "root").with_child(group)
+}
+
+#[test]
+fn strips_skip_the_comp_root() {
+    // The root IS the composition, not a layer in it; trimming the thing that
+    // defines the time axis has no coherent meaning.
+    let rows = strip_rows(&root_with_nested_layers());
+    assert_eq!(rows.len(), 2);
+    assert!(!rows.iter().any(|r| r.name == "root"));
+    assert_eq!(rows[0].name, "group");
+}
+
+#[test]
+fn strips_keep_the_tree_shape_as_depth() {
+    let rows = strip_rows(&root_with_nested_layers());
+    // A child of the first layer indents one step — a flat list of names would
+    // lose which layer is inside which group.
+    assert_eq!((rows[0].depth, rows[1].depth), (0, 1));
+}
+
+#[test]
+fn a_strip_carries_its_layers_window_and_keys() {
+    let rows = strip_rows(&root_with_nested_layers());
+    let child = &rows[1];
+    assert_eq!(child.timing, Some(LayerTiming::new(4, 20)));
+    assert_eq!(child.keys, vec![0, 8], "merged across the layer's properties");
+    // The parent group has no range and no keys of its own — "alive the whole
+    // comp" is a real state, not missing data.
+    assert!(rows[0].timing.is_none());
+    assert!(rows[0].keys.is_empty());
+}
+
+#[test]
+fn a_strips_keys_are_deduped_across_properties() {
+    // Position and rotation keyed on the same frames must not draw one tick per
+    // property stacked on itself.
+    let mut transform = Transform::default();
+    transform.position = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, Vec2::ZERO),
+        Keyframe::linear(5, Vec2::new(1.0, 1.0)),
+    ]));
+    transform.opacity =
+        Value::Keyframed(Track::new(vec![Keyframe::linear(0, 1.0), Keyframe::linear(5, 0.0)]));
+    let layer = MNode::group(1, "layer").with_transform(transform);
+    let rows = strip_rows(&MNode::group(0, "root").with_child(layer));
+    assert_eq!(rows[0].keys, vec![0, 5]);
+}
+
+
+// --- Stacking order ----------------------------------------------------
+
+/// Root with three layers in document order a, b, c — so `c` paints on top.
+fn root_with_three_layers() -> MNode {
+    MNode::group(0, "root")
+        .with_child(MNode::group(1, "a"))
+        .with_child(MNode::group(2, "b"))
+        .with_child(MNode::group(3, "c"))
+}
+
+#[test]
+fn the_layers_panel_lists_the_front_most_layer_first() {
+    // Draw order is document order (`eval::walk` emits siblings in sequence, so
+    // a later one paints over an earlier one), and every tool this is modelled
+    // on puts the front-most layer at the TOP of the list.
+    let mut rows = Vec::new();
+    tree_rows(&root_with_three_layers(), 0, &mut rows);
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, vec!["root", "c", "b", "a"]);
+}
+
+#[test]
+fn a_groups_children_are_listed_front_most_first_too() {
+    let group = MNode::group(1, "g")
+        .with_child(MNode::group(2, "inner_back"))
+        .with_child(MNode::group(3, "inner_front"));
+    let root = MNode::group(0, "root").with_child(group);
+    let mut rows = Vec::new();
+    tree_rows(&root, 0, &mut rows);
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    // The parent still sits above its children — it is their container, not
+    // their sibling — but the children themselves run front-first.
+    assert_eq!(names, vec!["root", "g", "inner_front", "inner_back"]);
+}
+
+#[test]
+fn the_strips_view_agrees_with_the_layers_panel() {
+    // Two lists of the same layers that disagreed about order would be worse
+    // than either order alone.
+    let root = root_with_three_layers();
+    let mut tree = Vec::new();
+    tree_rows(&root, 0, &mut tree);
+    let panel: Vec<NodeId> = tree.iter().skip(1).map(|r| r.id).collect();
+    let strips: Vec<NodeId> = strip_rows(&root).iter().map(|r| r.id).collect();
+    assert_eq!(panel, strips);
+}
+
+#[test]
+fn moving_a_row_up_the_list_moves_it_towards_the_front() {
+    // The panel is front-first but `reorder_child` is document-space, so "up"
+    // has to be +1. Getting this backwards is the bug the helper exists to
+    // prevent: the tooltips used to claim the opposite of what they did.
+    let mut root = root_with_three_layers();
+    root.reorder_child(NodeId(1), reorder_delta(true));
+    let order: Vec<u64> = root.children.iter().map(|c| c.id.0).collect();
+    assert_eq!(order, vec![2, 1, 3], "`a` swapped later in document order");
+
+    let mut rows = Vec::new();
+    tree_rows(&root, 0, &mut rows);
+    let names: Vec<&str> = rows.iter().skip(1).map(|r| r.name.as_str()).collect();
+    assert_eq!(names, vec!["c", "a", "b"], "and rose one row in the panel");
+}
+
+#[test]
+fn moving_a_row_down_the_list_moves_it_behind() {
+    let mut root = root_with_three_layers();
+    root.reorder_child(NodeId(3), reorder_delta(false));
+    let order: Vec<u64> = root.children.iter().map(|c| c.id.0).collect();
+    assert_eq!(order, vec![1, 3, 2], "`c` swapped earlier in document order");
+}
+
+
+// --- Split shape from group --------------------------------------------
+
+/// A project whose root holds one layer that carries BOTH a shape and a child —
+/// the hybrid that makes stacking ambiguous in the first place.
+fn project_with_hybrid_layer() -> MProject {
+    let hybrid = MNode::shape(
+        1,
+        "box",
+        MShape::Rect {
+            size: Value::constant(Vec2::new(100.0, 50.0)),
+            radius: Value::constant(4.0),
+        },
+    )
+    .with_fill(MColor::rgb(1.0, 0.0, 0.0))
+    .with_child(MNode::group(2, "kid"));
+    let comp = Comp::new(200.0, 200.0, MNode::group(0, "root").with_child(hybrid));
+    MProject::single(comp)
+}
+
+#[test]
+fn splitting_moves_the_artwork_into_a_child_and_leaves_a_group() {
+    let mut project = project_with_hybrid_layer();
+    let root_id = project.root;
+    let child = split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
+    let parent = project.root_comp().root.find(NodeId(1)).unwrap();
+    assert!(parent.shape.is_none(), "the parent is now a pure container");
+    assert!(parent.fill.is_none(), "and its paint went with the shape");
+    let new = project.root_comp().root.find(child).unwrap();
+    assert!(new.shape.is_some());
+    assert!(new.fill.is_some());
+    assert_eq!(new.name, "box shape");
+}
+
+#[test]
+fn the_new_layer_lands_where_the_shape_used_to_draw() {
+    // A parent's shape draws behind every child, so index 0 is the only
+    // insertion point that doesn't restack the layer this is meant to leave
+    // looking identical.
+    let mut project = project_with_hybrid_layer();
+    let root_id = project.root;
+    let child = split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
+    let parent = project.root_comp().root.find(NodeId(1)).unwrap();
+    let order: Vec<NodeId> = parent.children.iter().map(|c| c.id).collect();
+    assert_eq!(order, vec![child, NodeId(2)], "behind the existing child");
+}
+
+#[test]
+fn splitting_does_not_move_the_transform() {
+    // The parent's transform governs the whole subtree; moving it would change
+    // what the *other* children do, which a restack has no business doing.
+    let mut project = project_with_hybrid_layer();
+    let root_id = project.root;
+    let at = Vec2::new(30.0, 70.0);
+    project.comps.get_mut(&project.root).unwrap().root.find_mut(NodeId(1)).unwrap()
+        .transform
+        .position = Value::constant(at);
+    let child = split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
+    let root = &project.root_comp().root;
+    let comp = project.root_comp().clone();
+    let mut ctx = EvalCtx::new(&comp, 0.0);
+    assert_eq!(root.find(NodeId(1)).unwrap().transform.position.resolve(&mut ctx), at);
+    // The child is identity, so it resolves under exactly the parent matrix the
+    // shape was already drawn with — the frame is unchanged.
+    assert_eq!(
+        root.find(child).unwrap().transform.position.resolve(&mut ctx),
+        Vec2::ZERO
+    );
+}
+
+#[test]
+fn splitting_repoints_a_driver_at_the_moved_property() {
+    // A driver on a `size` that no longer exists on that node would quietly
+    // stop working — the failure mode this exists to prevent.
+    let mut project = project_with_hybrid_layer();
+    let root_id = project.root;
+    let value = project.graph.add_node("value", Vec2::ZERO);
+    project.graph.bind_output(Endpoint::new(value, "value"), NodeId(1), PropPath::ShapeSize);
+    let child = split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
+    let bindings = project.graph.bindings();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].target, child, "the driver followed the shape");
+    assert_eq!(bindings[0].prop, PropPath::ShapeSize);
+}
+
+#[test]
+fn splitting_leaves_a_transform_driver_on_the_parent() {
+    // Position is placement, not artwork: it stayed, so its driver must too.
+    let mut project = project_with_hybrid_layer();
+    let root_id = project.root;
+    let value = project.graph.add_node("value", Vec2::ZERO);
+    project.graph.bind_output(Endpoint::new(value, "value"), NodeId(1), PropPath::Position);
+    split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
+    assert_eq!(project.graph.bindings()[0].target, NodeId(1));
+}
+
+#[test]
+fn a_group_has_no_shape_to_split_and_says_so() {
+    // Refusals leave the project untouched — checked before anything is written.
+    let comp = Comp::new(
+        200.0,
+        200.0,
+        MNode::group(0, "root").with_child(MNode::group(1, "just a group")),
+    );
+    let mut project = MProject::single(comp);
+    let root_id = project.root;
+    let err = split_shape(&mut project, root_id, NodeId(1), 9).unwrap_err();
+    assert!(err.contains("no shape"), "{err}");
+    assert!(project.root_comp().root.find(NodeId(1)).unwrap().children.is_empty());
 }

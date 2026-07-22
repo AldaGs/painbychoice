@@ -114,6 +114,16 @@ pub(crate) struct App {
     /// like the panel split isn't part of the document. Re-clamped against the
     /// panel on every pass, so a stored width can't outlive a resize.
     pub(crate) dope_label_w: f32,
+    /// Which view the timeline panel shows. View state like `view`: how you
+    /// were last looking at the keys isn't part of the document.
+    pub(crate) timeline_mode: TimelineMode,
+    /// The curve editor's vertical window. Paired with `view` — one is the time
+    /// axis, this is the value axis — and reset by "Frame All".
+    pub(crate) value_view: ValueView,
+    /// Which properties the curve editor plots; empty = all of them. View
+    /// state, like the rest of the timeline's window — which curves you were
+    /// looking at isn't part of the document.
+    pub(crate) shown_props: PropSelection,
     /// The comp's state from before an in-progress FPS drag: `(fps, root, selection)`.
     ///
     /// Retiming is lossy — keys land on whole frames — so applying it once per
@@ -408,6 +418,85 @@ pub(crate) fn create_layer_from_geometry(
     Some(node)
 }
 
+/// The properties that live on a node's **artwork** rather than its placement,
+/// and so move with the shape when a layer is split.
+///
+/// Transform is deliberately absent: it stays on the parent, where it goes on
+/// governing the whole subtree. Moving it would change what the *other*
+/// children do, which a restack has no business doing.
+const ARTWORK_PROPS: [PropPath; 7] = [
+    PropPath::Fill,
+    PropPath::StrokeColor,
+    PropPath::StrokeWidth,
+    PropPath::ShapeSize,
+    PropPath::ShapeRadius,
+    PropPath::TextSize,
+    PropPath::TextContent,
+];
+
+/// Move a node's own shape into a new child layer, leaving the node a pure
+/// group — the structural answer to "I want this child in front of its parent".
+///
+/// Draw order is document order and a node's own shape is emitted *before* its
+/// children (`eval::walk`), so a parent's artwork is permanently behind them.
+/// Rather than inventing a second ordering concept for the one case where a
+/// node carries both, this splits the node into the shape-less container plus a
+/// real layer, which the existing reorder already handles.
+///
+/// **The frame does not change.** The new child is inserted at index 0, exactly
+/// where the parent's shape used to draw, and takes an identity transform, so
+/// it inherits the same world matrix the shape resolved under before.
+///
+/// Graph drivers pointing at the moved properties are **re-pointed** at the new
+/// layer, since a driver on a `size` that no longer exists would quietly stop
+/// working. `Err` carries the message for the panel's status line.
+pub(crate) fn split_shape(
+    project: &mut MProject,
+    comp: CompId,
+    id: NodeId,
+    new_id: u64,
+) -> Result<NodeId, String> {
+    // Everything that can refuse is checked before anything is written, so a
+    // refusal leaves the project untouched — the same discipline `import_shape`
+    // follows.
+    let Some(c) = project.comps.get_mut(&comp) else {
+        return Err("that composition is gone.".into());
+    };
+    let Some(node) = c.root.find_mut(id) else {
+        return Err("that layer is gone.".into());
+    };
+    if node.shape.is_none() {
+        return Err("that layer has no shape of its own to split out.".into());
+    }
+
+    let child_id = NodeId(new_id);
+    let mut child = MNode::group(new_id, format!("{} shape", node.name));
+    // The artwork moves; the placement stays. `Transform::default()` is
+    // identity, so the child resolves under exactly the parent matrix the shape
+    // was already drawn with.
+    child.shape = node.shape.take();
+    child.fill = node.fill.take();
+    child.stroke = node.stroke.take();
+    // Index 0: a parent's shape drew behind every child, and that is precisely
+    // where this must land or the split would restack the layer it is meant to
+    // leave alone.
+    node.children.insert(0, child);
+
+    // Re-point drivers. A `PropPath` names a property *on a node*, and the
+    // artwork properties now live on a different node.
+    for n in &mut project.graph.nodes {
+        if let Some((target, prop)) = n.config.out_target {
+            if target == id && ARTWORK_PROPS.contains(&prop) {
+                n.config.out_target = Some((child_id, prop));
+            }
+        }
+        if n.config.out_shape == Some(id) {
+            n.config.out_shape = Some(child_id);
+        }
+    }
+    Ok(child_id)
+}
+
 /// Raise the shape of whatever `sink` targets onto the canvas and wire it into
 /// that sink — the geometry half of the **fold**, run from the node that already
 /// names the layer. `Err` carries the message for the Nodes panel's status line.
@@ -591,6 +680,9 @@ impl App {
             next_id,
             work_area: None,
             dope_label_w: 80.0,
+            timeline_mode: TimelineMode::default(),
+            value_view: ValueView::default(),
+            shown_props: PropSelection::new(),
             fps_drag: None,
             gizmo_drag: None,
             gizmo_hot: false,
@@ -1486,6 +1578,62 @@ impl App {
     }
 
     /// Set the easing handles for the selected keyframe's outgoing segment.
+    /// Save the given handles into the project's ease library.
+    ///
+    /// Saving over a name replaces it: the field is how you *name* a curve, so
+    /// typing an existing name is a retune of that curve, not a second entry
+    /// with the same label that nothing could tell apart.
+    pub(crate) fn save_ease(&mut self, name: String, p1: (f32, f32), p2: (f32, f32)) -> bool {
+        let h = |p: (f32, f32)| Handle::new(p.0 as f64, p.1 as f64);
+        let preset = EasePreset::new(name, h(p1), h(p2));
+        match self.project.eases.iter_mut().find(|p| p.name == preset.name) {
+            Some(slot) => *slot = preset,
+            None => self.project.eases.push(preset),
+        }
+        true
+    }
+
+    /// Drop the project preset at `index`. Out-of-range is a no-op rather than
+    /// a panic: the index came from a UI list built a frame ago.
+    pub(crate) fn delete_ease(&mut self, index: usize) -> bool {
+        if index >= self.project.eases.len() {
+            return false;
+        }
+        self.project.eases.remove(index);
+        true
+    }
+
+    /// Run `f` against one property of the selected node. Every curve-editor
+    /// edit below is this same lookup with a different one-liner inside, and
+    /// each returns whether it changed the document.
+    fn with_prop(&mut self, kind: PropKind, f: impl FnOnce(PropRefMut<'_>)) -> bool {
+        let Some(id) = self.selected else { return false };
+        let Some(node) = self.doc_mut().root.find_mut(id) else { return false };
+        let Some(p) = prop_of_mut(node, kind) else { return false };
+        f(p);
+        true
+    }
+
+    /// Apply the curve editor's key/tangent edits. Ordered deliberately:
+    /// handles first, then interpolation, then the tangent lock — locking
+    /// mirrors whatever the handles are *now*, so it has to see the new ones.
+    fn apply_curve_edits(&mut self, dope: &DopeEdits) -> bool {
+        let mut dirty = false;
+        if let Some((kind, index, channel, value)) = dope.set_channel_value {
+            dirty |= self.with_prop(kind, |mut p| p.set_channel_value(index, channel, value));
+        }
+        for &(kind, seg, out, next_in) in &dope.set_handles {
+            dirty |= self.with_prop(kind, |mut p| p.set_segment_handles(seg, out, next_in));
+        }
+        for &(kind, index, interp) in &dope.set_interp {
+            dirty |= self.with_prop(kind, |mut p| p.set_segment_interp(index, interp));
+        }
+        for &(kind, index, broken) in &dope.set_broken {
+            dirty |= self.with_prop(kind, |mut p| p.set_key_broken(index, broken));
+        }
+        dirty
+    }
+
     pub(crate) fn set_ease(&mut self, kind: PropKind, index: usize, p1: (f32, f32), p2: (f32, f32)) -> bool {
         let Some(id) = self.selected else {
             return false;
@@ -1655,6 +1803,30 @@ impl App {
     /// Split out of [`Self::add_node`] so a layer created **from the node
     /// graph** is indistinguishable from one created with the toolbar — the
     /// alternative was a second, drifting copy of the seeding rules.
+    /// Split the selected layer's shape into a child layer (see
+    /// [`split_shape`]). Reports a refusal on the panel's status line rather
+    /// than failing silently.
+    fn split_shape_of(&mut self, id: NodeId) -> bool {
+        let new_id = self.next_id;
+        match split_shape(&mut self.project, self.current, id, new_id) {
+            Ok(child) => {
+                self.next_id += 1;
+                self.ng_status = None;
+                // Select the new layer: it is the thing the user now wants to
+                // reorder, and it did not exist a moment ago.
+                self.selected = Some(child);
+                self.selected_keys.clear();
+                self.shown_props.clear();
+                self.recompile_graph();
+                true
+            }
+            Err(msg) => {
+                self.ng_status = Some(msg);
+                false
+            }
+        }
+    }
+
     fn new_layer_look(&mut self) -> (u64, Transform, MColor) {
         let id = self.next_id;
         self.next_id += 1;
@@ -1687,6 +1859,7 @@ impl App {
         dest.children.push(node);
         self.selected = Some(id);
         self.selected_keys.clear();
+        self.shown_props.clear();
         id
     }
 
@@ -1799,6 +1972,7 @@ impl App {
         self.comp_name_buf = name;
         self.selected = None;
         self.selected_keys.clear();
+        self.shown_props.clear();
     }
 
     /// Move `id`'s subtree into a new composition and leave an instance in its
@@ -1812,6 +1986,7 @@ impl App {
         self.next_id += 1;
         self.selected = Some(instance);
         self.selected_keys.clear();
+        self.shown_props.clear();
     }
 
     /// Serialize the document *and the current UI layout* to a `.pbc` (JSON)
@@ -1903,6 +2078,7 @@ impl App {
         self.current = self.project.root;
         self.selected = None;
         self.selected_keys.clear();
+        self.shown_props.clear();
 
         // Restore the layout. Built-ins are always rebuilt from code; loaded user
         // presets (and the active dock) are validated, so a corrupt or edited
@@ -2006,6 +2182,10 @@ impl App {
             if picked != self.selected {
                 self.selected = picked;
                 self.selected_keys.clear();
+                // The filter names properties of the node that was open; the
+                // new one may not even have them, which would plot nothing and
+                // look broken. Back to showing all of the new node's curves.
+                self.shown_props.clear();
             }
         }
 
@@ -2097,6 +2277,13 @@ impl App {
             .filter_map(|(_, p)| p.bounds)
             .collect();
         let rows = sel_node.map(dope_rows).unwrap_or_default();
+        // The curve editor plots the same node the dopesheet rows come from,
+        // one scalar track per numeric channel.
+        let curve_rows = sel_node.map(curve_rows).unwrap_or_default();
+        // Strips are per *comp*, not per selection: the whole point is seeing
+        // every layer's window at once.
+        let strip_rows = strip_rows(&self.doc().root);
+
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
         // `neighbor_key` takes a nearest, not a position in a list.
@@ -2140,6 +2327,9 @@ impl App {
         let view = self.view;
         let work_area = self.work_area;
         let dope_label_w = self.dope_label_w;
+        let timeline_mode = self.timeline_mode;
+        let value_view = self.value_view;
+        let shown_props = self.shown_props.clone();
         let playing = self.playing;
         let mut transport = Transport::default();
         let mut edits = PropEdits::default();
@@ -2163,6 +2353,10 @@ impl App {
         let mut selected_keys = std::mem::take(&mut self.selected_keys);
         let selected_node = self.selected;
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
+        // The project's saved timing curves, shown beside the built-ins, plus
+        // the panel's reported intent to add or drop one.
+        let eases: &[motion_core::EasePreset] = &self.project.eases;
+        let mut ease_lib: Option<EaseLibEdit> = None;
         let mut comp = CompEdits::default();
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
@@ -2282,19 +2476,47 @@ impl App {
                         work_area,
                         &mut transport,
                     ),
-                    Editor::Dopesheet => dopesheet_ui(
-                        ui,
-                        &rows,
-                        t,
-                        last_frame,
-                        timebase,
-                        view,
-                        &selected_keys,
-                        clip,
-                        work_area,
-                        dope_label_w,
-                        &mut dope,
-                    ),
+                    Editor::Timeline => match timeline_mode {
+                        TimelineMode::Dopesheet => dopesheet_ui(
+                            ui,
+                            &rows,
+                            t,
+                            last_frame,
+                            timebase,
+                            view,
+                            &selected_keys,
+                            clip,
+                            work_area,
+                            dope_label_w,
+                            &mut dope,
+                        ),
+                        TimelineMode::Strips => strips_ui(
+                            ui,
+                            &strip_rows,
+                            t,
+                            last_frame,
+                            timebase,
+                            view,
+                            selected_node,
+                            work_area,
+                            dope_label_w,
+                            &mut dope,
+                        ),
+                        TimelineMode::Curves => curves_ui(
+                            ui,
+                            &curve_rows,
+                            t,
+                            last_frame,
+                            timebase,
+                            view,
+                            value_view,
+                            &selected_keys,
+                            &shown_props,
+                            work_area,
+                            dope_label_w,
+                            &mut dope,
+                        ),
+                    },
                     Editor::Properties => {
                         properties_ui(
                             ui,
@@ -2302,6 +2524,8 @@ impl App {
                             &mut edits,
                             &ease_info,
                             &mut ease_out,
+                            eases,
+                            &mut ease_lib,
                             &FontList { all: font_families, recent: recent_fonts },
                         )
                     }
@@ -2582,6 +2806,22 @@ impl App {
             }
         }
 
+        // Layer strips: the same edit as the clip bar, but naming its layer
+        // instead of implying the selected one.
+        if let Some((id, timing)) = dope.set_layer_timing {
+            if let Some(node) = self.doc_mut().root.find_mut(id) {
+                node.timing = timing;
+                window.request_redraw();
+            }
+        }
+        if let Some(id) = dope.select_layer {
+            if self.selected != Some(id) {
+                self.selected = Some(id);
+                self.selected_keys.clear();
+                self.shown_props.clear();
+            }
+        }
+
         // Clip bar: trim / slide / clear the selected layer's time range.
         if let Some(timing) = dope.set_timing {
             if let Some(node) = self.selected.and_then(|id| self.doc_mut().root.find_mut(id)) {
@@ -2599,7 +2839,7 @@ impl App {
         // of `self` before the UI ran (so the closure couldn't borrow `App`);
         // put it back, then apply this frame's changes to it.
         self.selected_keys = selected_keys;
-        if let Some(hits) = dope.box_select {
+        if let Some(hits) = dope.box_select.take() {
             // A live marquee owns the selection outright while it is being
             // dragged — shrinking the box has to deselect, so this replaces
             // rather than merges.
@@ -2643,6 +2883,21 @@ impl App {
         }
         if let Some(w) = dope.set_label_w {
             self.dope_label_w = w;
+        }
+        if let Some(mode) = dope.set_mode {
+            self.timeline_mode = mode;
+            // Entering the curve editor with a stale vertical window would show
+            // an empty plot and leave the user to hunt for their curves, so the
+            // first look is always a framed one.
+            if mode == TimelineMode::Curves {
+                self.value_view = ValueView::fit(&curve_rows, &self.shown_props);
+            }
+        }
+        if let Some(vv) = dope.set_value_view {
+            self.value_view = vv;
+        }
+        if let Some(props) = dope.set_shown_props.take() {
+            self.shown_props = props;
         }
 
         // Apply property edits + keyframe drags to the selected node, then
@@ -2691,6 +2946,7 @@ impl App {
         if let Some(delta) = dope.move_by {
             dirty |= self.move_selected_keys(delta);
         }
+        dirty |= self.apply_curve_edits(&dope);
 
         // Keyframe copy/paste. Read off egui's input rather than the winit
         // handler because that one never sees a modifier state, and suppressed
@@ -2717,8 +2973,21 @@ impl App {
         } else {
             None
         };
+        if let Some(edit) = ease_lib {
+            match edit {
+                EaseLibEdit::Save(name) => {
+                    if let Some(e) = &ease_info {
+                        dirty |= self.save_ease(name, e.p1, e.p2);
+                    }
+                }
+                EaseLibEdit::Delete(i) => dirty |= self.delete_ease(i),
+            }
+        }
         if let (Some((kind, idx)), Some((p1, p2))) = (single_key, ease_out) {
             dirty |= self.set_ease(kind, idx, p1, p2);
+        }
+        if let Some(id) = tree_edits.split_shape {
+            dirty |= self.split_shape_of(id);
         }
         if let Some((id, delta)) = tree_edits.reorder {
             dirty |= self.doc_mut().root.reorder_child(id, delta);

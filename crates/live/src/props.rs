@@ -340,25 +340,122 @@ pub(crate) struct EaseInfo {
     pub(crate) p2: (f32, f32),
 }
 
+/// What the ease library wants done to the *project's* saved curves. Reported
+/// out like every other edit here: this module never touches `App`.
+pub(crate) enum EaseLibEdit {
+    /// Save the selected key's current handles under this name.
+    Save(String),
+    /// Drop the project preset at this index.
+    Delete(usize),
+}
+
+/// The preset row above the curve: pick a built-in or a project curve, and save
+/// the current one into the project.
+///
+/// Built-ins and project presets share one dropdown because to the user they
+/// are the same thing — a named curve to apply. Only the project half can be
+/// deleted, which is also the only thing that marks the two apart.
+pub(crate) fn ease_library_ui(
+    ui: &mut egui::Ui,
+    ease: &EaseInfo,
+    eases: &[EasePreset],
+    out: &mut Option<((f32, f32), (f32, f32))>,
+    lib_out: &mut Option<EaseLibEdit>,
+) {
+    let cur = |h: (f32, f32)| Handle::new(h.0 as f64, h.1 as f64);
+    let (p1, p2) = (cur(ease.p1), cur(ease.p2));
+    // What the combo shows: the preset the handles currently *are*, if any.
+    let label = EasePreset::BUILT_IN
+        .iter()
+        .find(|(_, o, i)| EasePreset::new("", *o, *i).matches(p1, p2))
+        .map(|(n, _, _)| (*n).to_string())
+        .or_else(|| eases.iter().find(|p| p.matches(p1, p2)).map(|p| p.name.clone()))
+        .unwrap_or_else(|| "Custom".to_string());
+
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("ease_preset").selected_text(label).show_ui(ui, |ui| {
+            for (name, o, i) in EasePreset::BUILT_IN {
+                if ui.selectable_label(false, *name).clicked() {
+                    *out = Some(((o.x as f32, o.y as f32), (i.x as f32, i.y as f32)));
+                }
+            }
+            if !eases.is_empty() {
+                ui.separator();
+                ui.weak("Project");
+            }
+            for (idx, p) in eases.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(false, &p.name).clicked() {
+                        *out = Some((
+                            (p.out.x as f32, p.out.y as f32),
+                            (p.into.x as f32, p.into.y as f32),
+                        ));
+                    }
+                    if ui.small_button("✕").on_hover_text("Remove from project").clicked() {
+                        *lib_out = Some(EaseLibEdit::Delete(idx));
+                    }
+                });
+            }
+        });
+
+        // The name buffer lives in egui's temp store: it's scratch for one
+        // save, and parking it on `App` would make it a document-shaped thing
+        // that has to be cleared on every selection change.
+        let id = ui.id().with("ease_save_name");
+        let mut name = ui.data_mut(|d| d.get_temp::<String>(id).unwrap_or_default());
+        let edit = ui
+            .add(egui::TextEdit::singleline(&mut name).desired_width(96.0).hint_text("Save as…"));
+        let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let named = !name.trim().is_empty();
+        let clicked = ui
+            .add_enabled(named, egui::Button::new("＋"))
+            .on_hover_text("Save this curve to the project")
+            .clicked();
+        if named && (clicked || entered) {
+            *lib_out = Some(EaseLibEdit::Save(name.trim().to_string()));
+            name.clear();
+        }
+        ui.data_mut(|d| d.insert_temp(id, name));
+    });
+}
+
+/// How far outside [0,1] an ease handle's y may reach, as a fraction of the
+/// unit square. The editor reserves this much margin above and below so an
+/// overshooting handle — and a handle parked exactly on 0 or 1 — still draws
+/// whole instead of being clipped at the widget edge.
+const OVERSHOOT: f32 = 0.25;
+
 /// A CSS-style cubic-bezier editor. Draws the timing curve in a unit square and
 /// lets the two control points be dragged. New handles are reported in `out`.
 pub(crate) fn ease_editor(ui: &mut egui::Ui, ease: &EaseInfo, out: &mut Option<((f32, f32), (f32, f32))>) {
     let sz = (ui.available_width() - 8.0).clamp(80.0, 180.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::hover());
+    // The unit square is inset inside the widget so a handle parked at y=0 or
+    // y=1 — and the overshoot beyond them that back/anticipation eases need —
+    // still draws entirely inside the box instead of being clipped at the edge.
+    let pad = sz * OVERSHOOT;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(sz, sz + 2.0 * pad), egui::Sense::hover());
     let painter = ui.painter_at(rect);
+    let unit = rect.shrink2(egui::vec2(0.0, pad));
 
     // value (x right, y up) in [0,1] → screen (y is down).
     let map = |v: (f32, f32)| {
-        egui::pos2(rect.left() + v.0 * rect.width(), rect.bottom() - v.1 * rect.height())
+        egui::pos2(unit.left() + v.0 * unit.width(), unit.bottom() - v.1 * unit.height())
     };
     let unmap = |p: egui::Pos2| {
         (
-            ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
-            ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0),
+            ((p.x - unit.left()) / unit.width()).clamp(0.0, 1.0),
+            ((unit.bottom() - p.y) / unit.height()).clamp(-OVERSHOOT, 1.0 + OVERSHOOT),
         )
     };
 
     painter.rect_filled(rect, 3.0, egui::Color32::from_gray(28));
+    // Mark where the unit square's 0 and 1 sit, now that they're inset.
+    for y in [unit.top(), unit.bottom()] {
+        painter.line_segment(
+            [egui::pos2(unit.left(), y), egui::pos2(unit.right(), y)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(46)),
+        );
+    }
     // Reference diagonal (linear).
     painter.line_segment(
         [map((0.0, 0.0)), map((1.0, 1.0))],
@@ -406,6 +503,29 @@ pub(crate) fn ease_editor(ui: &mut egui::Ui, ease: &EaseInfo, out: &mut Option<(
     for hp in [p1, p2] {
         painter.circle_filled(map(hp), 4.0, accent);
     }
+
+    // Numeric readout, also editable: dragging a knob is fast but imprecise,
+    // and this is the only way to type an exact `cubic-bezier(...)`.
+    let mut typed = false;
+    ui.horizontal(|ui| {
+        for (v, lo, hi) in [
+            (&mut p1.0, 0.0, 1.0),
+            (&mut p1.1, -OVERSHOOT, 1.0 + OVERSHOOT),
+            (&mut p2.0, 0.0, 1.0),
+            (&mut p2.1, -OVERSHOOT, 1.0 + OVERSHOOT),
+        ] {
+            let r = ui.add(
+                egui::DragValue::new(v)
+                    .speed(0.005)
+                    .range(lo..=hi)
+                    .max_decimals(3),
+            );
+            typed |= r.changed();
+        }
+    });
+    if typed {
+        *out = Some((p1, p2));
+    }
 }
 
 /// Right-hand properties panel. Reads a resolved `NodeInfo` and writes any user
@@ -417,6 +537,8 @@ pub(crate) fn properties_ui(
     edits: &mut PropEdits,
     ease: &Option<EaseInfo>,
     ease_out: &mut Option<((f32, f32), (f32, f32))>,
+    eases: &[EasePreset],
+    lib_out: &mut Option<EaseLibEdit>,
     fonts: &FontList<'_>,
 ) {
     ui.add_space(8.0);
@@ -719,20 +841,7 @@ pub(crate) fn properties_ui(
         ui.separator();
         ui.strong("Easing");
         ui.weak("Timing of the selected key's outgoing segment.");
-        ui.horizontal(|ui| {
-            if ui.small_button("Linear").clicked() {
-                *ease_out = Some(((1.0 / 3.0, 1.0 / 3.0), (2.0 / 3.0, 2.0 / 3.0)));
-            }
-            if ui.small_button("Smooth").clicked() {
-                *ease_out = Some(((0.42, 0.0), (0.58, 1.0)));
-            }
-            if ui.small_button("Ease In").clicked() {
-                *ease_out = Some(((0.42, 0.0), (1.0, 1.0)));
-            }
-            if ui.small_button("Ease Out").clicked() {
-                *ease_out = Some(((0.0, 0.0), (0.58, 1.0)));
-            }
-        });
+        ease_library_ui(ui, e, eases, ease_out, lib_out);
         ease_editor(ui, e, ease_out);
     }
 
@@ -845,6 +954,47 @@ pub(crate) enum PropRef<'a> {
     Str(&'a Value<String>),
 }
 
+/// Per-channel curve colours. X/R warm, Y/G green, B blue — the axis colours
+/// the canvas gizmo already uses, so "red is X" means one thing in the app.
+pub(crate) const CH_X: egui::Color32 = egui::Color32::from_rgb(232, 96, 96);
+pub(crate) const CH_Y: egui::Color32 = egui::Color32::from_rgb(120, 210, 120);
+pub(crate) const CH_R: egui::Color32 = CH_X;
+pub(crate) const CH_G: egui::Color32 = CH_Y;
+pub(crate) const CH_B: egui::Color32 = egui::Color32::from_rgb(110, 160, 240);
+
+/// One numeric channel of an animated property, as its own scalar track.
+pub(crate) struct Channel {
+    /// "X", "Y", "R"… Empty for a property that has only one channel, where a
+    /// suffix would be noise.
+    pub(crate) name: &'static str,
+    pub(crate) color: egui::Color32,
+    pub(crate) track: Track<f64>,
+}
+
+impl Channel {
+    fn from<T: Clone>(
+        keys: &[Keyframe<T>],
+        name: &'static str,
+        color: egui::Color32,
+        get: impl Fn(&T) -> f64,
+    ) -> Self {
+        let keys = keys
+            .iter()
+            .map(|k| {
+                Keyframe::shaped(
+                    k.frame,
+                    get(&k.value),
+                    k.out_handle,
+                    k.in_handle,
+                    k.interp,
+                    k.broken,
+                )
+            })
+            .collect();
+        Self { name, color, track: Track::new(keys) }
+    }
+}
+
 pub(crate) enum PropRefMut<'a> {
     Vec2(&'a mut Value<Vec2>),
     Num(&'a mut Value<f64>),
@@ -894,6 +1044,28 @@ impl PropRef<'_> {
     pub(crate) fn segment_handles(&self, index: usize) -> Option<(Handle, Handle)> {
         on_prop!(self, v => v.segment_handles(index))
     }
+    /// This property as one scalar track per numeric channel — what a curve
+    /// editor plots. A `Vec2` becomes X and Y, a colour becomes R/G/B; text has
+    /// no numeric channel at all, so it yields none and simply doesn't appear.
+    ///
+    /// The channel tracks carry the *original* keys' timing (see
+    /// [`Keyframe::shaped`]), so sampling one is sampling the real animation —
+    /// the drawn curve can't drift from what plays back.
+    pub(crate) fn channels(&self) -> Vec<Channel> {
+        match self {
+            PropRef::Vec2(v) => vec![
+                Channel::from(v.keys(), "X", CH_X, |p: &Vec2| p.x),
+                Channel::from(v.keys(), "Y", CH_Y, |p: &Vec2| p.y),
+            ],
+            PropRef::Num(v) => vec![Channel::from(v.keys(), "", CH_X, |n: &f64| *n)],
+            PropRef::Color(v) => vec![
+                Channel::from(v.keys(), "R", CH_R, |c: &MColor| c.r),
+                Channel::from(v.keys(), "G", CH_G, |c: &MColor| c.g),
+                Channel::from(v.keys(), "B", CH_B, |c: &MColor| c.b),
+            ],
+            PropRef::Str(_) => Vec::new(),
+        }
+    }
     /// Copy the keys at `idxs` onto the clipboard, tagged with their type.
     pub(crate) fn keys_at(&self, idxs: &[usize]) -> ClipTrack {
         match self {
@@ -929,6 +1101,56 @@ impl PropRefMut<'_> {
     }
     pub(crate) fn set_segment_handles(&mut self, index: usize, out: Handle, next_in: Handle) {
         on_prop_mut!(self, v => v.set_segment_handles(index, out, next_in))
+    }
+    /// Write one numeric channel of keyframe `index`, leaving the others (and
+    /// the key's timing) alone — the inverse of [`PropRef::channels`], and what
+    /// dragging a key up or down in the curve editor produces.
+    ///
+    /// Channel indices match `channels()` order. A channel that doesn't exist
+    /// on this property is ignored rather than clamped to a neighbour: a stale
+    /// index should do nothing, not silently edit the wrong axis.
+    pub(crate) fn set_channel_value(&mut self, index: usize, channel: usize, value: f64) {
+        match self {
+            PropRefMut::Vec2(v) => {
+                let Some(k) = v.keys().get(index) else { return };
+                let mut p = k.value;
+                match channel {
+                    0 => p.x = value,
+                    1 => p.y = value,
+                    _ => return,
+                }
+                v.set_key_value(index, p);
+            }
+            PropRefMut::Num(v) => {
+                if channel == 0 {
+                    v.set_key_value(index, value);
+                }
+            }
+            PropRefMut::Color(v) => {
+                let Some(k) = v.keys().get(index) else { return };
+                let mut c = k.value;
+                // Colour channels stay in [0,1]: the curve editor's vertical
+                // axis is unbounded, but a colour outside the unit range is not
+                // a colour, and clamping here beats every renderer guessing.
+                let value = value.clamp(0.0, 1.0);
+                match channel {
+                    0 => c.r = value,
+                    1 => c.g = value,
+                    2 => c.b = value,
+                    _ => return,
+                }
+                v.set_key_value(index, c);
+            }
+            // Text has no numeric channel to plot, so nothing can address one.
+            PropRefMut::Str(_) => {}
+        }
+    }
+
+    pub(crate) fn set_segment_interp(&mut self, index: usize, interp: Interp) {
+        on_prop_mut!(self, v => v.set_segment_interp(index, interp))
+    }
+    pub(crate) fn set_key_broken(&mut self, index: usize, broken: bool) {
+        on_prop_mut!(self, v => v.set_key_broken(index, broken))
     }
     /// Paste a clipboard track, but only onto a property of the same type — a
     /// `Vec2` clip must never land on a scalar. Mismatches can't happen through

@@ -1018,6 +1018,13 @@ pub struct Project {
     /// written before the node graph existed still loads.
     #[serde(default)]
     pub graph: crate::graph::NodeGraph,
+    /// Timing curves saved by hand, on top of [`crate::value::EasePreset::BUILT_IN`].
+    /// Project-level because an ease is a house style: the bounce you tuned for
+    /// one layer is the one every other layer in the piece should use, and it
+    /// has to travel with the `.pbc` for that to hold. `#[serde(default)]` so a
+    /// file written before the library existed still loads.
+    #[serde(default)]
+    pub eases: Vec<crate::value::EasePreset>,
     /// Drivers as they were stored **before they became nodes**: a list beside
     /// the graph rather than `out` nodes in it.
     ///
@@ -1044,6 +1051,7 @@ impl Project {
             root,
             modules: Default::default(),
             graph: crate::graph::NodeGraph::new(),
+            eases: Vec::new(),
             legacy_bindings: Vec::new(),
             legacy_shape_bindings: Vec::new(),
         }
@@ -1344,5 +1352,23 @@ mod knob_tests {
         ]));
         let p = ParamValue::Num(track);
         assert!(p.as_const().is_none());
+    }
+
+    #[test]
+    fn ease_library_round_trips_and_defaults_empty_on_an_old_file() {
+        let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        project.eases.push(crate::value::EasePreset::new(
+            "House Bounce",
+            crate::value::Handle::new(0.68, -0.2),
+            crate::value::Handle::new(0.32, 1.2),
+        ));
+        let json = serde_json::to_string(&project).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.eases, project.eases, "saved curves must survive a save/open");
+
+        // A `.pbc` written before the library existed has no key at all.
+        let stripped = json.replace("\"eases\"", "\"eases_was_here\"");
+        let old: Project = serde_json::from_str(&stripped).unwrap();
+        assert!(old.eases.is_empty(), "a pre-library file loads with no presets");
     }
 }

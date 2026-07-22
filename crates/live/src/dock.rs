@@ -24,7 +24,11 @@ pub(crate) enum Editor {
     Layers,
     Properties,
     Transport,
-    Dopesheet,
+    /// The keyframe editor: the dopesheet and the curve editor, which are two
+    /// views of one thing and so share one panel (see [`crate::TimelineMode`]).
+    /// `alias` so a layout saved when this was `Dopesheet` still loads.
+    #[serde(alias = "Dopesheet")]
+    Timeline,
     /// The composition node-graph editor: a Blender-style canvas of typed nodes
     /// wired output→input, drawn from the `NodeRegistry`. It runs its own scroll
     /// area and isn't in the default layout — summon it with the area-header
@@ -41,7 +45,7 @@ pub(crate) enum Editor {
 /// they can't be swapped away, split, or closed, which is exactly what keeps
 /// the canvas invariants intact while the content panels rearrange around them.
 pub(crate) const SWAPPABLE: [Editor; 4] =
-    [Editor::Layers, Editor::Properties, Editor::Dopesheet, Editor::NodeGraph];
+    [Editor::Layers, Editor::Properties, Editor::Timeline, Editor::NodeGraph];
 
 impl Editor {
     /// Human name shown in the area-header picker.
@@ -52,7 +56,7 @@ impl Editor {
             Editor::Layers => "Layers",
             Editor::Properties => "Properties",
             Editor::Transport => "Transport",
-            Editor::Dopesheet => "Dopesheet",
+            Editor::Timeline => "Timeline",
             Editor::NodeGraph => "Nodes",
         }
     }
@@ -71,7 +75,7 @@ impl Editor {
     /// the vello target; **Comp** and **Transport** are single fixed-height
     /// bars in non-resizable panels, so they have nothing to overflow.
     pub(crate) fn scroll_wrapped(self) -> bool {
-        matches!(self, Editor::Layers | Editor::Properties | Editor::Dopesheet)
+        matches!(self, Editor::Layers | Editor::Properties | Editor::Timeline)
     }
 }
 
@@ -174,7 +178,7 @@ impl Dock {
                         Bottom,
                         DOPESHEET_H,
                         true,
-                        Editor::Dopesheet,
+                        Editor::Timeline,
                         Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
                     ),
                 ),
@@ -201,7 +205,7 @@ impl Dock {
                     Bottom,
                     320.0,
                     true,
-                    Editor::Dopesheet,
+                    Editor::Timeline,
                     Dock::split(
                         Left,
                         TREE_W,

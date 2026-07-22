@@ -22,7 +22,7 @@ use motion_core::{
     demo::demo_document, evaluate_comp, node::ParamValue, Grid, Guide, GuideAxis, Guides, Onion, ViewAids,
     eval::RenderItem as MRenderItem, node::CompId, node::ModuleId, node::Module as MModule, Color as MColor,
     Comp, Document, EvalCtx, Expr, Project as MProject,
-    ExprValue, Handle, Keyframe, Node as MNode, NodeId, PropPath,
+    mirror_handle, EasePreset, ExprValue, Handle, Interp, Keyframe, Track, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
     MathOp, Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
     compile_modules, lower_geometry, lower_output, Binding, Edge, Endpoint, GraphCtx, GraphNode, GraphNodeId, NodeCategory,
@@ -44,6 +44,7 @@ use winit::window::{Window, WindowId};
 // below) so no module needs its own import bookkeeping.
 mod aids;
 mod app;
+mod curves;
 mod dock;
 mod gizmo;
 mod icon;
@@ -53,6 +54,7 @@ mod nodegraph;
 mod onion;
 mod props;
 mod scene;
+mod strips;
 mod theme;
 mod timeline;
 #[cfg(test)]
@@ -60,6 +62,7 @@ mod tests;
 
 use aids::*;
 use app::*;
+use curves::*;
 use dock::*;
 use gizmo::*;
 use layers::*;
@@ -68,6 +71,7 @@ use nodegraph::*;
 use onion::*;
 use props::*;
 use scene::*;
+use strips::*;
 use timeline::*;
 
 fn main() {
