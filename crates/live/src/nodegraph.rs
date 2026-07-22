@@ -115,10 +115,13 @@ const FIELD_H: f32 = 16.0;
 const HEADER_H: f32 = 24.0;
 const ROW_H: f32 = 20.0;
 const BODY_PAD: f32 = 8.0;
+/// A line of in-node config (a combo, a drag row, a note) below the socket rows.
+const CFG_LINE: f32 = 22.0;
+/// The gap between the last socket row and the first config line.
+const CFG_TOP_GAP: f32 = 6.0;
 const DOT_R: f32 = 5.0;
 /// How close the pointer must land to a socket to hit it on drop.
 const DOT_HIT: f32 = 9.0;
-const MARGIN: f32 = 16.0;
 
 /// One deferred node-graph edit. At most one per frame, like `GraphOp` and the
 /// dock's `DockCmd`, so `App` mutates the model after the UI pass.
@@ -127,6 +130,10 @@ pub(crate) enum NgOp {
     Add { kind: String, pos: Vec2 },
     /// Move a node to a new position (a drag delta already applied).
     Move { id: GraphNodeId, pos: Vec2 },
+    /// Shift several nodes by one delta — a group drag of the marquee selection.
+    /// One op, so moving a whole selection still fits the one-edit-per-frame
+    /// contract every other structural edit follows.
+    MoveBy { ids: Vec<GraphNodeId>, delta: Vec2 },
     /// Remove a node and its wires.
     Remove { id: GraphNodeId },
     /// Wire an output to an input. Validated by the model against the registry,
@@ -277,9 +284,37 @@ fn category_tint(c: NodeCategory) -> egui::Color32 {
 /// A node's box height for a descriptor: the header plus a row per socket on the
 /// taller side. An unknown-kind node (missing descriptor) still gets one row so
 /// its kind string is readable.
-fn node_height(desc: Option<&NodeDescriptor>) -> f32 {
+fn node_height(node: &GraphNode, desc: Option<&NodeDescriptor>) -> f32 {
     let rows = desc.map_or(1, |d| d.inputs.len().max(d.outputs.len()).max(1));
-    HEADER_H + rows as f32 * ROW_H + BODY_PAD
+    HEADER_H + rows as f32 * ROW_H + config_height(node, desc) + BODY_PAD
+}
+
+/// An **upper bound** on the height a node's in-box config editors take, below
+/// its socket rows. Only a bound: the box is painted to the *measured* height of
+/// what the editors actually draw (see [`draw_node`]), so a generous estimate
+/// here just leaves the node's box a little roomier and never clips its config.
+fn config_height(node: &GraphNode, desc: Option<&NodeDescriptor>) -> f32 {
+    let lines = config_lines(node, desc);
+    if lines == 0 { 0.0 } else { CFG_TOP_GAP + lines as f32 * CFG_LINE }
+}
+
+/// Roughly how many config lines a node draws on its box — see [`config_height`].
+/// Padded for notes that may wrap in a node's narrow body; the exact box height
+/// is measured at draw time, so this only has to be a safe over-estimate.
+fn config_lines(node: &GraphNode, desc: Option<&NodeDescriptor>) -> usize {
+    let mut lines = match node.kind.as_str() {
+        "math" | "osc" => 2,
+        "ref" | "text" | "string" => 3,
+        "param" | "script" | "out" | "shapeOut" => 4,
+        // A `use` node's knobs are its module's — one override row each.
+        "use" => 2 + desc.map_or(0, |d| d.inputs.len()),
+        _ => 0,
+    };
+    // Any geometry-producing node carries a "Create layer" action line.
+    if desc.is_some_and(|d| d.outputs.iter().any(|s| s.ty == SocketType::Geometry)) {
+        lines += 1;
+    }
+    lines
 }
 
 /// The screen-space centre of input socket `i` (from the left edge) or output
@@ -315,8 +350,10 @@ pub(crate) enum NgScope {
     Module(ModuleId),
 }
 
-/// The panel. A scope bar, then (in project scope) modules and import, then a
-/// selected-node inspector, then the graph on a scrollable canvas.
+/// The panel. A scope bar, then (in module scope) the module header, then the
+/// graph on a pan/zoom canvas. There is no side inspector: every node carries
+/// its own properties — socket literals *and* non-socket config alike — on the
+/// box itself (see [`node_editors`]), so selecting a node is only a highlight.
 ///
 /// The drivers are **not** a section here any more: a driver is an `out` /
 /// `shapeOut` node on the canvas, added from the palette like anything else and
@@ -332,7 +369,7 @@ pub(crate) fn nodegraph_ui(
     modules: &[(ModuleId, String)],
     knobs: &[KnobInfo],
     module_output: Option<&Endpoint>,
-    script_preview: Option<&Result<String, String>>,
+    script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     status: Option<&str>,
     out: &mut NgEdits,
 ) {
@@ -342,6 +379,20 @@ pub(crate) fn nodegraph_ui(
         ui.heading("Nodes");
         ui.weak(format!("{} nodes", graph.nodes.len()));
         palette_menu(ui, graph, ctx.reg, out);
+        // Navigation: zoom the canvas in/out, or frame the whole graph. Drag the
+        // empty canvas with the middle mouse (or scroll) to pan; a left-drag
+        // there rubber-bands a selection.
+        ui.separator();
+        if icon::button(ui, icon::ZOOM_OUT, "Zoom out").clicked() {
+            zoom_scene(ui.ctx(), scope, 1.25);
+        }
+        if icon::button(ui, icon::ZOOM_IN, "Zoom in").clicked() {
+            zoom_scene(ui.ctx(), scope, 0.8);
+        }
+        if icon::button(ui, icon::ZOOM_FIT, "Frame all nodes").clicked() {
+            // A zero rect makes `Scene` re-fit to the graph's own bounds.
+            write_scene_rect(ui.ctx(), scope, egui::Rect::ZERO);
+        }
     });
     ui.separator();
     match scope {
@@ -363,14 +414,10 @@ pub(crate) fn nodegraph_ui(
         }
     }
     ui.separator();
-    inspector_ui(ui, graph, ctx, layers, modules, script_preview, out);
-    ui.separator();
     if graph.nodes.is_empty() {
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
     }
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        canvas(ui, graph, ctx, layers, out);
-    });
+    canvas(ui, graph, ctx, scope, layers, modules, script_preview, out);
 }
 
 /// Which graph node is selected for the inspector — ephemeral view state, so it
@@ -656,201 +703,171 @@ fn param_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: 
     }
 }
 
-/// The inspector for the selected node: drag editors for its `value` constant
-/// and any **unwired** numeric input, so a graph's literals are tunable without
-/// canvas widgets. A wired input has no field — its value comes down the wire.
-fn inspector_ui(
+/// A node's **non-socket properties**, drawn inside the node box (below its
+/// sockets) rather than in a side panel.
+///
+/// This is the other half of what makes a node self-contained. A socket value —
+/// a `value` node's number, an oscillator's `freq` — already rides on the socket
+/// row (see [`socket_field`]). Everything that *isn't* a socket rides here: a
+/// Math node's operator, an oscillator's waveform, a `ref`'s target, a `use`'s
+/// module, a sink's layer/property, a text node's typography. So a node carries
+/// its whole self on the canvas, and nothing is stranded in an inspector that
+/// described whichever node happened to be selected.
+///
+/// Every node draws its own editors every frame — the config is not gated on
+/// selection, exactly like the socket fields aren't. A pure layout pass records
+/// no edit, because each control writes `out` only on `.changed()`/`.clicked()`.
+#[allow(clippy::too_many_arguments)]
+fn node_editors(
     ui: &mut egui::Ui,
     graph: &NodeGraph,
-    ctx: &GraphCtx,
+    node: &GraphNode,
+    desc: &NodeDescriptor,
     layers: &[LayerInfo],
     modules: &[(ModuleId, String)],
-    script_preview: Option<&Result<String, String>>,
+    script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     out: &mut NgEdits,
 ) {
-    let sel = read_selection(ui.ctx());
-    let Some((node, desc)) = sel.and_then(|id| {
-        let n = graph.node(id)?;
-        Some((n, ctx.descriptor_for(n)?))
-    }) else {
-        ui.weak("Select a node (click its header) to edit its values.");
-        return;
-    };
-    ui.horizontal(|ui| {
-        ui.strong(node_title(node, Some(&desc), layers));
-        // A shape node can *become* a layer — the one action that makes
-        // something exist from the graph rather than binding to a layer the
-        // tree already had. It acts on the node you have selected, which is why
-        // it lives here rather than anywhere else.
-        if desc.outputs.iter().any(|s| s.ty == SocketType::Geometry)
-            && ui
-                .button(format!("{} Create layer", icon::ADD))
-                .on_hover_text(
-                    "Add a new layer to this composition whose shape is this node's geometry.",
+    // A geometry node can *become* a layer — the one action that makes something
+    // exist from the graph rather than binding to a layer the tree already had.
+    if desc.outputs.iter().any(|s| s.ty == SocketType::Geometry)
+        && ui
+            .button(format!("{} Create layer", icon::ADD))
+            .on_hover_text("Add a new layer to this composition whose shape is this node's geometry.")
+            .clicked()
+    {
+        out.create_layer = Some(Endpoint::new(node.id, "geometry"));
+    }
+
+    match node.kind.as_str() {
+        // The sinks: where the graph meets the scene. Like `ref`, they carry
+        // addressing rather than a socket value — the difference is direction.
+        "out" => out_editor(ui, graph, node, layers, out),
+        "shapeOut" => shape_out_editor(ui, graph, node, layers, out),
+        // A `ref` reads another layer's property; a `param` reads the driven
+        // layer's own knob. Both carry addressing rather than a socket value.
+        "ref" => ref_editor(ui, node, layers, out),
+        "param" => param_editor(ui, node, layers, out),
+        // A text node's typography: `family` names a system font (a lookup key,
+        // not a value) and align/wrap are shaping modes. Its `content` is a real
+        // `Text` input socket, so it draws on the socket row like any literal.
+        "text" => text_editor(ui, node, out),
+        "script" => {
+            let mut src = node.config.script.clone();
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut src)
+                        .hint_text("frame * 2.0")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .font(egui::TextStyle::Monospace),
                 )
-                .clicked()
-        {
-            out.create_layer = Some(Endpoint::new(node.id, "geometry"));
-        }
-    });
-    // The sinks: where the graph meets the scene. Like `ref`, they carry
-    // addressing rather than a socket value — the difference is only direction.
-    if node.kind == "out" {
-        out_editor(ui, graph, node, layers, out);
-        return;
-    }
-    if node.kind == "shapeOut" {
-        shape_out_editor(ui, graph, node, layers, out);
-        return;
-    }
-    // A `ref` reads another layer's property; a `param` reads the driven layer's
-    // own knob. Both carry addressing rather than a socket value.
-    if node.kind == "ref" {
-        ref_editor(ui, node, layers, out);
-        return;
-    }
-    if node.kind == "param" {
-        param_editor(ui, node, layers, out);
-        return;
-    }
-    if node.kind == "script" {
-        let mut src = node.config.script.clone();
-        if ui
-            .add(
-                egui::TextEdit::multiline(&mut src)
-                    .hint_text("frame * 2.0")
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(2)
-                    .font(egui::TextStyle::Monospace),
-            )
-            .on_hover_text(SCRIPT_HELP)
-            .changed()
-        {
-            out.op = Some(NgOp::SetScript { id: node.id, src });
-        }
-        // The live result: what this source evaluates to *right now*, at the
-        // playhead and in the context of a layer it drives. Writing Rhai
-        // without it is guesswork — a typo in a property name is otherwise
-        // invisible until the frame quietly comes out wrong.
-        match script_preview {
-            Some(Ok(v)) => {
-                ui.weak(format!("= {v}"));
+                .on_hover_text(SCRIPT_HELP)
+                .changed()
+            {
+                out.op = Some(NgOp::SetScript { id: node.id, src });
             }
-            Some(Err(e)) => {
-                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), e);
-            }
-            None => {
-                ui.weak("= (empty)");
-            }
-        }
-        return;
-    }
-    if node.kind == "use" {
-        if modules.is_empty() {
-            ui.weak("No modules yet — the palette's Module ▸ New module makes one.");
-            return;
-        }
-        let cur = node
-            .config
-            .module
-            .and_then(|m| modules.iter().find(|(id, _)| *id == m))
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| "(pick)".into());
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt(("use_mod", node.id.0)).selected_text(cur).show_ui(
-                ui,
-                |ui| {
-                    for (m, name) in modules {
-                        let picked = node.config.module == Some(*m);
-                        if ui.selectable_label(picked, name).clicked() && !picked {
-                            out.op = Some(NgOp::SetModule { id: node.id, module: Some(*m) });
-                        }
-                    }
-                },
-            );
-            // The way into module scope, on the node that names the module. The
-            // Modules list used to own this; a link is a better front door than
-            // a list, because a link is a thing you can see on the canvas.
-            if let Some(m) = node.config.module {
-                if icon::button(ui, icon::ENTER, "Open this module's body on the canvas").clicked() {
-                    out.scope = Some(NgScope::Module(m));
+            // The live result, at the playhead, in the context of a layer it
+            // drives — computed only for the selected node (the one the user is
+            // writing), so it shows under that node and no other.
+            match script_preview {
+                Some((id, Ok(v))) if *id == node.id => {
+                    ui.weak(format!("= {v}"));
                 }
+                Some((id, Err(e))) if *id == node.id => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), e);
+                }
+                _ => {}
             }
-        });
-        knob_rows(ui, graph, node, &desc, out);
-        return;
-    }
-    // A Math node's operator: which function it is, not a value it takes — and
-    // the one config that reshapes the node, since a unary op has no B.
-    if node.kind == "math" {
-        let cur = node.config.math_op;
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt(("math_op", node.id.0))
-                .width(120.0)
-                .selected_text(cur.label())
-                .show_ui(ui, |ui| {
-                    for op in MathOp::all() {
-                        if ui.selectable_label(op == cur, op.label()).clicked() && op != cur {
-                            out.op = Some(NgOp::SetMathOp { id: node.id, op });
-                        }
-                    }
-                });
-            if cur.arity() == 1 {
-                ui.weak("one operand");
-            }
-        });
-        return;
-    }
-    // An oscillator's waveform isn't a socket either — it picks *which*
-    // function the generator is, not a value fed into one. Falls through so the
-    // knob fields still show below it.
-    if node.kind == "osc" {
-        let cur = node.config.wave;
-        ui.horizontal(|ui| {
-            ui.label(icon::text(icon::WAVE));
-            egui::ComboBox::from_id_salt(("osc_wave", node.id.0))
-                .width(90.0)
-                .selected_text(cur.label())
-                .show_ui(ui, |ui| {
-                    for w in Waveform::ALL {
-                        if ui.selectable_label(w == cur, w.label()).clicked() && w != cur {
-                            out.op = Some(NgOp::SetWaveform { id: node.id, wave: w });
-                        }
-                    }
-                });
-        });
-    }
-    // A text node's *typography* isn't a socket: `family` names a system font
-    // (a lookup key, not a value) and align/wrap are enum-ish settings with
-    // nothing to wire. Its `content` is no longer here — that became a real
-    // `Text` input socket, so it draws through the ordinary unwired-literal
-    // loop below and can be driven by a wire instead. Falls through afterwards
-    // so the socket fields still show.
-    if node.kind == "text" {
-        text_editor(ui, node, out);
-    }
-    // A `string` node's constant gets a **roomier** editor here as well as its
-    // inline one: the node's field is one line, and a caption with an embedded
-    // newline would be invisible in it. The same value either way — this is a
-    // second view, not a second place it lives.
-    if node.kind == "string" {
-        let mut cur = match node.value("value") {
-            Some(ExprValue::Str(t)) => t,
-            _ => String::new(),
-        };
-        if ui
-            .add(egui::TextEdit::multiline(&mut cur).hint_text("text").desired_rows(2))
-            .changed()
-        {
-            out.op = Some(set_value(node.id, "value", ExprValue::Str(cur)));
         }
-        return;
-    }
-    // Everything above is config that *isn't* a socket. A node made purely of
-    // sockets — a constant, an operator, a shape — has nothing left to show
-    // here, and saying so beats an empty panel that looks like it failed.
-    if node.kind != "osc" && node.kind != "text" {
-        ui.weak("Every value on this node is edited on the node itself.");
+        "use" => {
+            if modules.is_empty() {
+                ui.weak("No modules yet — Add ▸ Module ▸ New module makes one.");
+                return;
+            }
+            let cur = node
+                .config
+                .module
+                .and_then(|m| modules.iter().find(|(id, _)| *id == m))
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| "(pick)".into());
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt(("use_mod", node.id.0)).selected_text(cur).show_ui(
+                    ui,
+                    |ui| {
+                        for (m, name) in modules {
+                            let picked = node.config.module == Some(*m);
+                            if ui.selectable_label(picked, name).clicked() && !picked {
+                                out.op = Some(NgOp::SetModule { id: node.id, module: Some(*m) });
+                            }
+                        }
+                    },
+                );
+                // The way into module scope, on the node that names the module.
+                if let Some(m) = node.config.module {
+                    if icon::button(ui, icon::ENTER, "Open this module's body on the canvas")
+                        .clicked()
+                    {
+                        out.scope = Some(NgScope::Module(m));
+                    }
+                }
+            });
+            knob_rows(ui, graph, node, desc, out);
+        }
+        // A Math node's operator: which function it is, not a value it takes —
+        // and the one config that reshapes the node, since a unary op has no B.
+        "math" => {
+            let cur = node.config.math_op;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt(("math_op", node.id.0))
+                    .width(120.0)
+                    .selected_text(cur.label())
+                    .show_ui(ui, |ui| {
+                        for op in MathOp::all() {
+                            if ui.selectable_label(op == cur, op.label()).clicked() && op != cur {
+                                out.op = Some(NgOp::SetMathOp { id: node.id, op });
+                            }
+                        }
+                    });
+                if cur.arity() == 1 {
+                    ui.weak("one operand");
+                }
+            });
+        }
+        // An oscillator's waveform picks *which* function the generator is, not a
+        // value fed into one, so there's nothing for a wire to carry.
+        "osc" => {
+            let cur = node.config.wave;
+            ui.horizontal(|ui| {
+                ui.label(icon::text(icon::WAVE));
+                egui::ComboBox::from_id_salt(("osc_wave", node.id.0))
+                    .width(90.0)
+                    .selected_text(cur.label())
+                    .show_ui(ui, |ui| {
+                        for w in Waveform::ALL {
+                            if ui.selectable_label(w == cur, w.label()).clicked() && w != cur {
+                                out.op = Some(NgOp::SetWaveform { id: node.id, wave: w });
+                            }
+                        }
+                    });
+            });
+        }
+        // A `string` node's constant gets a **roomier** multiline here as well as
+        // its one-line socket field: a caption with an embedded newline would be
+        // invisible in the socket row. The same value either way.
+        "string" => {
+            let mut cur = match node.value("value") {
+                Some(ExprValue::Str(t)) => t,
+                _ => String::new(),
+            };
+            if ui
+                .add(egui::TextEdit::multiline(&mut cur).hint_text("text").desired_rows(2))
+                .changed()
+            {
+                out.op = Some(set_value(node.id, "value", ExprValue::Str(cur)));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1042,61 +1059,264 @@ fn palette_menu(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &
     });
 }
 
-/// Lay the graph out and interact with it. Node positions come from the model
-/// (they're saved), so a drag emits a `Move` op and — for the frame in hand —
-/// the delta is applied locally so the box tracks the pointer without a lag.
+// ── Canvas navigation: pan, zoom, and multi-selection view state. ────────────
+//
+// The graph rides inside an [`egui::containers::Scene`] — egui's pan/zoom
+// container. It draws its contents in a transformed layer, so the node boxes and
+// the real egui widgets on them (a `value`'s field, a combo) pan and scale as
+// one, with pointer input mapped back for interaction. `Scene` owns a
+// `scene_rect` — the slice of graph space the view shows — which we persist in
+// egui memory, keyed by scope so the project graph and a module's body keep
+// independent views.
+
+/// The memory id holding a scope's `scene_rect` — the view rectangle `Scene`
+/// pans and zooms. Per scope, so entering a module doesn't inherit the project
+/// graph's framing.
+fn scene_rect_id(scope: NgScope) -> egui::Id {
+    match scope {
+        NgScope::Project => egui::Id::new("ng_scene_rect_project"),
+        NgScope::Module(m) => egui::Id::new(("ng_scene_rect_mod", m.0)),
+    }
+}
+
+fn read_scene_rect(ctx: &egui::Context, scope: NgScope) -> egui::Rect {
+    ctx.data(|d| d.get_temp(scene_rect_id(scope))).unwrap_or(egui::Rect::ZERO)
+}
+
+fn write_scene_rect(ctx: &egui::Context, scope: NgScope, rect: egui::Rect) {
+    ctx.data_mut(|d| d.insert_temp(scene_rect_id(scope), rect));
+}
+
+/// Scale the view about its centre — the toolbar's zoom buttons. `factor < 1`
+/// shrinks the shown rectangle (zoom **in**); `> 1` grows it (zoom **out**). A
+/// zero rect is the uninitialised state `Scene` re-fits from, so it's left be.
+fn zoom_scene(ctx: &egui::Context, scope: NgScope, factor: f32) {
+    let r = read_scene_rect(ctx, scope);
+    if r.size() == egui::Vec2::ZERO {
+        return;
+    }
+    write_scene_rect(ctx, scope, egui::Rect::from_center_size(r.center(), r.size() * factor));
+}
+
+/// The marquee/multi-selection set — every node the box-select or a click chose.
+/// Drives the highlight and group drag. Kept beside the single primary selection
+/// ([`read_selection`]), which the script preview and other one-node paths read.
+fn read_selset(ctx: &egui::Context) -> std::collections::HashSet<GraphNodeId> {
+    ctx.data(|d| d.get_temp(egui::Id::new("ng_selset"))).unwrap_or_default()
+}
+
+fn write_selset(ctx: &egui::Context, sel: std::collections::HashSet<GraphNodeId>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ng_selset"), sel));
+}
+
+/// Every node whose box intersects `sel` (graph coordinates) — what a marquee
+/// drag selects. A free function so the geometry is unit-testable without a
+/// window.
+pub(crate) fn nodes_in_rect(graph: &NodeGraph, ctx: &GraphCtx, sel: egui::Rect) -> Vec<GraphNodeId> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            let h = node_height(n, ctx.descriptor_for(n).as_deref());
+            let r = egui::Rect::from_min_size(
+                egui::pos2(n.pos.x as f32, n.pos.y as f32),
+                egui::vec2(NODE_W, h),
+            );
+            sel.intersects(r)
+        })
+        .map(|n| n.id)
+        .collect()
+}
+
+/// The pan/zoom host. Wraps [`draw_graph`] in a [`Scene`], then resolves a
+/// marquee drag against the background the scene reports.
+///
+/// [`Scene`]: egui::containers::Scene
+#[allow(clippy::too_many_arguments)]
 fn canvas(
     ui: &mut egui::Ui,
     graph: &NodeGraph,
     ctx: &GraphCtx,
+    scope: NgScope,
     layers: &[LayerInfo],
+    modules: &[(ModuleId, String)],
+    script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     out: &mut NgEdits,
 ) {
-    // Content extent covers every node so the scroll area can reach them.
-    let mut extent = egui::vec2(NODE_W, ROW_H);
-    for n in &graph.nodes {
-        let h = node_height(ctx.descriptor_for(n).as_deref());
-        extent.x = extent.x.max(n.pos.x as f32 + NODE_W);
-        extent.y = extent.y.max(n.pos.y as f32 + h);
-    }
-    let (area, _) =
-        ui.allocate_exact_size(extent + egui::vec2(MARGIN, MARGIN), egui::Sense::hover());
-    let origin = area.min;
-    let selected = read_selection(ui.ctx());
+    let mut scene_rect = read_scene_rect(ui.ctx(), scope);
+    let mut selset = read_selset(ui.ctx());
 
-    // Pending wire (an in-flight connection drag): ephemeral view state, so it
-    // lives in egui memory keyed to this panel, not in the model.
-    let pending_id = ui.id().with("ng_pending");
+    // Middle-drag (and scroll) pans; pinch / ctrl-scroll zooms. Left-drag is left
+    // free — a node header claims it to move, and the empty background reports it
+    // for the marquee below.
+    let scene = egui::containers::Scene::new()
+        .zoom_range(egui::Rangef::new(0.2, 2.0))
+        // Room for a large graph; the boxes are placed by explicit rects, so this
+        // only bounds the inner ui's nominal size, not where nodes may sit.
+        .max_inner_size(egui::Vec2::splat(100_000.0))
+        .drag_pan_buttons(egui::containers::DragPanButtons::MIDDLE);
+
+    let response = scene.show(ui, &mut scene_rect, |ui| {
+        draw_graph(ui, graph, ctx, layers, modules, script_preview, &mut selset, out)
+    });
+    let scene_layer = response.inner;
+
+    marquee(ui, &response.response, scene_layer, graph, ctx, &mut selset);
+
+    write_selset(ui.ctx(), selset);
+    write_scene_rect(ui.ctx(), scope, scene_rect);
+}
+
+/// Resolve a **marquee**: a left-drag that began on the empty canvas (a node
+/// header claims its own press, so the scene background only ever reports the
+/// empty-space drags). Draws the rubber band and, on release, selects every node
+/// it covers. A plain click on the background clears the selection.
+///
+/// `pan` is the scene's background response; its layer carries the view
+/// transform, so we map the global pointer into graph space with it rather than
+/// trusting a single coordinate space.
+fn marquee(
+    ui: &mut egui::Ui,
+    pan: &egui::Response,
+    scene_layer: egui::LayerId,
+    graph: &NodeGraph,
+    ctx: &GraphCtx,
+    selset: &mut std::collections::HashSet<GraphNodeId>,
+) {
+    let to_global =
+        ui.ctx().layer_transform_to_global(scene_layer).unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let from_global = to_global.inverse();
+    let ptr_scene = ui.input(|i| i.pointer.interact_pos()).map(|p| from_global.mul_pos(p));
+    let shift = ui.input(|i| i.modifiers.shift);
+
+    let mid = egui::Id::new("ng_marquee");
+    let mut anchor: Option<egui::Pos2> = ui.data(|d| d.get_temp(mid)).flatten();
+
+    // A background click (not on any node) drops the selection.
+    if pan.clicked() && !shift {
+        selset.clear();
+        write_selection(ui.ctx(), None);
+    }
+    if pan.drag_started_by(egui::PointerButton::Primary) {
+        anchor = ptr_scene;
+    }
+    if pan.dragged_by(egui::PointerButton::Primary) {
+        if let (Some(a), Some(c)) = (anchor, ptr_scene) {
+            // Painted in graph space *inside* the scene layer so it pans/zooms
+            // with the nodes; mapped to global for the parent-layer painter.
+            let r = egui::Rect::from_two_pos(to_global.mul_pos(a), to_global.mul_pos(c));
+            ui.painter().rect(
+                r,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(90, 140, 220, 40),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(130, 175, 240)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    if pan.drag_stopped_by(egui::PointerButton::Primary) {
+        if let (Some(a), Some(c)) = (anchor.take(), ptr_scene) {
+            let sel = egui::Rect::from_two_pos(a, c);
+            if !shift {
+                selset.clear();
+            }
+            for id in nodes_in_rect(graph, ctx, sel) {
+                selset.insert(id);
+            }
+            // Primary selection follows the box — the first node in it, so the
+            // script preview and other one-node reads still have a target.
+            write_selection(ui.ctx(), selset.iter().next().copied());
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(mid, anchor));
+}
+
+/// Lay the graph out and interact with it, in **graph coordinates** (the `Scene`
+/// layer maps them to the screen). Node positions come from the model (they're
+/// saved), so a drag emits a `Move` — or a `MoveBy` for a whole selection — and,
+/// for the frame in hand, the delta is applied locally so the box tracks the
+/// pointer without a lag. Returns the layer it drew into, so the caller can map
+/// the pointer for the marquee.
+#[allow(clippy::too_many_arguments)]
+fn draw_graph(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    ctx: &GraphCtx,
+    layers: &[LayerInfo],
+    modules: &[(ModuleId, String)],
+    script_preview: Option<&(GraphNodeId, Result<String, String>)>,
+    selset: &mut std::collections::HashSet<GraphNodeId>,
+    out: &mut NgEdits,
+) -> egui::LayerId {
+    // Graph space is the model's own space now — no screen origin to add, since
+    // the scene layer's transform places and scales everything.
+    let origin = egui::Pos2::ZERO;
+
+    // Pending wire (an in-flight connection drag): ephemeral view state in egui
+    // memory. The pointer arrives in global space, so map it into graph space
+    // with this layer's transform for every hit test.
+    let layer = ui.layer_id();
+    let from_global = ui.ctx().layer_transform_from_global(layer);
+    let map_ptr = |p: egui::Pos2| from_global.map_or(p, |t| t.mul_pos(p));
+    let pending_id = egui::Id::new("ng_pending");
     let mut pending: Option<Endpoint> = ui.data(|d| d.get_temp(pending_id)).flatten();
 
     // Pass 1 — body drags, so every node's live top-left is known before we draw
     // sockets or wires off it. `live_pos` is this frame's position (model + any
-    // drag delta); a drag also emits the `Move` that persists it.
+    // drag delta); a drag also emits the `Move`/`MoveBy` that persists it.
     let mut live_pos: std::collections::HashMap<GraphNodeId, egui::Pos2> =
         std::collections::HashMap::new();
+    // A group drag shifts the whole selection by one delta, applied after the
+    // loop so nodes processed later still move this frame.
+    let mut group_delta: Option<egui::Vec2> = None;
     for n in &graph.nodes {
         let base = origin + egui::vec2(n.pos.x as f32, n.pos.y as f32);
-        let h = node_height(ctx.descriptor_for(n).as_deref());
+        let h = node_height(n, ctx.descriptor_for(n).as_deref());
         let rect = egui::Rect::from_min_size(base, egui::vec2(NODE_W, h));
         // The header bar is the drag handle (like Blender); sockets sit below it
         // and take pointer priority in their own spots.
         let header = egui::Rect::from_min_size(rect.min, egui::vec2(NODE_W, HEADER_H));
         let resp =
             ui.interact(header, ui.id().with(("ng_drag", n.id.0)), egui::Sense::click_and_drag());
-        // A click (no drag) selects the node for the inspector.
+        // A click (no drag) selects just this node.
         if resp.clicked() {
+            selset.clear();
+            selset.insert(n.id);
             write_selection(ui.ctx(), Some(n.id));
         }
         let mut pos = base;
-        if resp.dragged() {
-            pos += resp.drag_delta();
-            let model = pos - origin.to_vec2();
-            out.op = Some(NgOp::Move { id: n.id, pos: Vec2::new(model.x as f64, model.y as f64) });
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            let delta = resp.drag_delta();
+            if selset.contains(&n.id) && selset.len() > 1 {
+                // Dragging one of many selected moves them all, as one op.
+                group_delta = Some(delta);
+                out.op = Some(NgOp::MoveBy {
+                    ids: selset.iter().copied().collect(),
+                    delta: Vec2::new(delta.x as f64, delta.y as f64),
+                });
+            } else {
+                // Dragging a lone (or unselected) node selects and moves it.
+                if !selset.contains(&n.id) {
+                    selset.clear();
+                    selset.insert(n.id);
+                    write_selection(ui.ctx(), Some(n.id));
+                }
+                pos += delta;
+                out.op =
+                    Some(NgOp::Move { id: n.id, pos: Vec2::new(pos.x as f64, pos.y as f64) });
+            }
         }
         live_pos.insert(n.id, pos);
     }
+    if let Some(delta) = group_delta {
+        for id in selset.iter() {
+            if let Some(p) = live_pos.get_mut(id) {
+                *p += delta;
+            }
+        }
+    }
 
-    // Socket screen positions, from the live top-lefts.
+    // Socket positions, from the live top-lefts (graph space).
     let mut out_pos: std::collections::HashMap<Endpoint, egui::Pos2> =
         std::collections::HashMap::new();
     let mut in_pos: std::collections::HashMap<Endpoint, egui::Pos2> =
@@ -1131,13 +1351,16 @@ fn canvas(
     for n in &graph.nodes {
         let top = live_pos[&n.id];
         let desc = ctx.descriptor_for(n);
-        let h = node_height(desc.as_deref());
+        let h = node_height(n, desc.as_deref());
         let rect = egui::Rect::from_min_size(top, egui::vec2(NODE_W, h));
-        let is_sel = selected == Some(n.id);
+        let is_sel = selset.contains(&n.id);
         draw_node(
-            ui, &painter, n, desc.as_deref(), rect, is_sel, graph, layers, out, &mut pending,
-            &in_pos, &out_pos,
+            ui, &painter, n, desc.as_deref(), rect, is_sel, graph, layers, modules,
+            script_preview, out, &mut pending, &in_pos, &out_pos,
         );
+        // The boxes are painted, not allocated, so tell the ui they're there —
+        // otherwise `Scene`'s "frame all" and its initial fit see an empty graph.
+        ui.expand_to_include_rect(rect);
     }
 
     // A pending wire follows the pointer until it's dropped.
@@ -1145,7 +1368,7 @@ fn canvas(
         if let (Some(&from), Some(ptr)) =
             (out_pos.get(src), ui.input(|i| i.pointer.interact_pos()))
         {
-            wire(&painter, from, ptr, egui::Color32::from_gray(200));
+            wire(&painter, from, map_ptr(ptr), egui::Color32::from_gray(200));
         }
     }
 
@@ -1156,10 +1379,8 @@ fn canvas(
     let released = ui.input(|i| i.pointer.any_released());
     if released {
         if let Some(src) = pending.take() {
-            if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()) {
-                if let Some((ep, _)) =
-                    in_pos.iter().find(|(_, &p)| p.distance(ptr) <= DOT_HIT)
-                {
+            if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()).map(map_ptr) {
+                if let Some((ep, _)) = in_pos.iter().find(|(_, &p)| p.distance(ptr) <= DOT_HIT) {
                     out.op = Some(NgOp::Connect { from: src, to: ep.clone() });
                 }
             }
@@ -1167,6 +1388,7 @@ fn canvas(
     }
 
     ui.data_mut(|d| d.insert_temp(pending_id, pending));
+    layer
 }
 
 /// Draw one node box and interact with its header button and sockets.
@@ -1180,14 +1402,20 @@ fn draw_node(
     selected: bool,
     graph: &NodeGraph,
     layers: &[LayerInfo],
+    modules: &[(ModuleId, String)],
+    script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     out: &mut NgEdits,
     pending: &mut Option<Endpoint>,
     in_pos: &std::collections::HashMap<Endpoint, egui::Pos2>,
     out_pos: &std::collections::HashMap<Endpoint, egui::Pos2>,
 ) {
     let rounding = 6.0;
-    // Body.
-    painter.rect_filled(rect, rounding, ui.visuals().extreme_bg_color);
+    let bg = ui.visuals().extreme_bg_color;
+    // The body fill and the border are painted **last**, once the in-node config
+    // below has reported how tall the node really is — so the box grows to fit a
+    // node's properties. Their draw order is reserved here (fill behind the
+    // header, border in front of it) and filled in at the end via `paint_box`.
+    let body_idx = painter.add(egui::Shape::Noop);
     // Header band, tinted by category (or red for an unknown kind).
     let header = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), HEADER_H));
     let tint = desc.map_or(egui::Color32::from_rgb(120, 52, 52), |d| category_tint(d.category));
@@ -1198,12 +1426,22 @@ fn draw_node(
         0.0,
         tint,
     );
-    let border = if selected {
+    let border_stroke = if selected {
         egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 160, 60))
     } else {
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
-    painter.rect_stroke(rect, rounding, border, egui::StrokeKind::Inside);
+    let border_idx = painter.add(egui::Shape::Noop);
+    // Fill the reserved fill/border shapes for a box `r` tall — the whole node
+    // rectangle, once its real height is known. Borrows only `Copy` state and
+    // the shared painter, so it coexists with the config `Ui` below.
+    let paint_box = |r: egui::Rect| {
+        painter.set(body_idx, egui::Shape::rect_filled(r, rounding, bg));
+        painter.set(
+            border_idx,
+            egui::Shape::rect_stroke(r, rounding, border_stroke, egui::StrokeKind::Inside),
+        );
+    };
 
     // Title, and a delete button at the header's right.
     let title = node_title(node, desc, layers);
@@ -1234,7 +1472,11 @@ fn draw_node(
         out.op = Some(NgOp::Remove { id: node.id });
     }
 
-    let Some(desc) = desc else { return };
+    // An unknown-kind node has no sockets or config, so its box is just `rect`.
+    let Some(desc) = desc else {
+        paint_box(rect);
+        return;
+    };
 
     // Input sockets: dot, label, and — where the row has a literal — the field
     // that edits it, right there on the node. Secondary-click on the dot
@@ -1294,6 +1536,33 @@ fn draw_node(
             *pending = Some(ep);
         }
     }
+
+    // The node's non-socket properties, drawn on the box below its sockets. The
+    // box is then painted to fit whatever they measured to, so a `ref`'s combos
+    // or a script's editor are never clipped.
+    let rows = desc.inputs.len().max(desc.outputs.len()).max(1);
+    let sockets_bottom = rect.top() + HEADER_H + rows as f32 * ROW_H;
+    let mut content_bottom = sockets_bottom;
+    if config_lines(node, Some(desc)) > 0 {
+        let cfg_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + BODY_PAD, sockets_bottom + CFG_TOP_GAP),
+            egui::pos2(rect.right() - BODY_PAD, sockets_bottom + CFG_TOP_GAP + 600.0),
+        );
+        let builder = egui::UiBuilder::new()
+            .max_rect(cfg_rect)
+            .id_salt(("ng_cfg", node.id.0))
+            .layout(egui::Layout::top_down(egui::Align::Min));
+        let used = ui.scope_builder(builder, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            node_editors(ui, graph, node, desc, layers, modules, script_preview, out);
+            ui.min_rect()
+        });
+        content_bottom = used.inner.bottom();
+    }
+    paint_box(egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), content_bottom + BODY_PAD),
+    ));
 }
 
 /// The slot an inline field occupies in a socket row: the gap between the
@@ -1555,7 +1824,7 @@ fn ref_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: &m
 /// anyone can type.
 pub(crate) fn const_socket(kind: &str) -> Option<&'static str> {
     match kind {
-        "value" | "string" => Some("value"),
+        "value" | "string" | "vec2" => Some("value"),
         _ => None,
     }
 }

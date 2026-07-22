@@ -3325,6 +3325,36 @@ fn the_panel_lays_out_every_node_kind_without_an_id_clash() {
     assert!(edits.op.is_none(), "a pure layout pass must not record an edit");
 }
 
+/// A marquee selects exactly the nodes whose boxes the drag rectangle touches,
+/// in graph coordinates — the geometry the box-select is built on, checked
+/// without a window.
+#[test]
+fn a_marquee_selects_the_nodes_its_box_covers() {
+    use crate::nodegraph::nodes_in_rect;
+    let reg = NodeRegistry::with_builtins();
+    let ctx = GraphCtx::bare(&reg);
+    let mut g = NodeGraph::new();
+    // Three nodes spread down the canvas; boxes are 208 wide from their pos.
+    let a = g.add_node("value", Vec2::new(0.0, 0.0));
+    let b = g.add_node("value", Vec2::new(0.0, 200.0));
+    let _c = g.add_node("value", Vec2::new(600.0, 0.0)); // off to the right
+
+    // A box over the two left-column nodes takes both and leaves the far one.
+    let sel = egui::Rect::from_min_max(egui::pos2(-20.0, -20.0), egui::pos2(220.0, 260.0));
+    let mut hit = nodes_in_rect(&g, &ctx, sel);
+    hit.sort();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(hit, want);
+
+    // A box that merely grazes a node's edge still counts it (intersection, not
+    // containment) — and one over empty canvas selects nothing.
+    let graze = egui::Rect::from_min_max(egui::pos2(-50.0, -50.0), egui::pos2(1.0, 1.0));
+    assert_eq!(nodes_in_rect(&g, &ctx, graze), vec![a]);
+    let empty = egui::Rect::from_min_max(egui::pos2(300.0, 300.0), egui::pos2(400.0, 400.0));
+    assert!(nodes_in_rect(&g, &ctx, empty).is_empty());
+}
+
 
 // --- Curve editor ------------------------------------------------------
 
