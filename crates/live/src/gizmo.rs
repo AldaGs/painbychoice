@@ -167,13 +167,19 @@ pub(crate) struct GizmoTarget {
     pub(crate) scale: (f64, f64),
     /// Needed to *recover* `parent`, and now to drag the anchor itself.
     pub(crate) anchor: Vec2,
-    /// The comp's eye point and distance, when it has a camera.
+    /// The composition's camera as the *viewer* sees it — eye, distance and
+    /// orbit — or `None` in a flat comp.
     ///
-    /// **This is what gates the depth handles.** Without a camera there is no
+    /// **This gates the depth handles.** Without a camera there is no
     /// projection, so depth has no direction on screen and a Z arrow would be a
-    /// control you could drag with nothing happening. The gizmo therefore shows
-    /// exactly the axes the composition can actually express.
-    pub(crate) view: Option<(Point, f64)>,
+    /// control you could drag with nothing happening. The gizmo shows exactly
+    /// the axes the composition can actually express.
+    ///
+    /// It is the *same* projector the frame was drawn through, orbit included.
+    /// Anything less and the handles would describe a view nobody is looking
+    /// at — which is precisely the class of bug that made the rings collapse
+    /// into one circle.
+    pub(crate) view: Option<motion_core::Projector>,
 }
 
 impl GizmoTarget {
@@ -181,7 +187,7 @@ impl GizmoTarget {
         node: u64,
         parent_xf: motion_core::mat4::Xf,
         info: &NodeInfo,
-        view: Option<(Point, f64)>,
+        view: Option<motion_core::Projector>,
     ) -> Self {
         let pos = Vec2::new(info.pos.0, info.pos.1);
         let anchor = Vec2::new(info.anchor.0, info.anchor.1);
@@ -248,9 +254,9 @@ impl GizmoTarget {
         // negative z — and runs through `at_zero`. Without one the projection
         // is orthographic and the ray is simply the depth axis.
         let (origin, dir) = match self.view {
-            Some((eye, dist)) => (
-                MVec3::new(eye.x, eye.y, -dist),
-                MVec3::new(at_zero.x - eye.x, at_zero.y - eye.y, dist),
+            Some(v) => (
+                MVec3::new(v.eye.x, v.eye.y, -v.distance),
+                MVec3::new(at_zero.x - v.eye.x, at_zero.y - v.eye.y, v.distance),
             ),
             None => (
                 MVec3::new(at_zero.x, at_zero.y, 0.0),
@@ -258,7 +264,11 @@ impl GizmoTarget {
             ),
         };
 
-        let m = self.parent_xf.to_mat4();
+        // The ray lives in *viewed* composition space, so the chain to undo is
+        // the whole forward one: the parent, then the orbit. Inverting their
+        // product does both at once and cannot get the order wrong.
+        let m = self.view.map(|v| v.view()).unwrap_or(motion_core::Mat4::IDENTITY)
+            * self.parent_xf.to_mat4();
         let Some(inv) = m.inverse_affine() else {
             // A collapsed scale somewhere above has no inverse. Holding the
             // grab still beats writing a NaN position into the document.
@@ -283,15 +293,15 @@ impl GizmoTarget {
         let p_parent = MVec3::new(self.pos.x + d.x, self.pos.y + d.y, self.pos_z + d.z);
         let p_comp = self.parent_xf.to_mat4().transform_point(p_parent);
         let comp = match self.view {
-            Some((eye, dist)) => {
-                let s = dist / (dist + p_comp.z);
+            Some(v) => {
+                // The orbit first — it is a change of viewpoint and belongs
+                // ahead of the divide — then the perspective itself.
+                let q = v.view().transform_point(p_comp);
+                let s = v.distance / (v.distance + q.z);
                 if !s.is_finite() || s.abs() < 1e-9 {
-                    Point::new(p_comp.x, p_comp.y)
+                    Point::new(q.x, q.y)
                 } else {
-                    Point::new(
-                        eye.x + (p_comp.x - eye.x) * s,
-                        eye.y + (p_comp.y - eye.y) * s,
-                    )
+                    Point::new(v.eye.x + (q.x - v.eye.x) * s, v.eye.y + (q.y - v.eye.y) * s)
                 }
             }
             None => Point::new(p_comp.x, p_comp.y),
@@ -355,7 +365,14 @@ struct Layout {
     dir: [egui::Vec2; 3],
     /// Each rotation ring's screen basis, in **gimbal** order — see
     /// [`gimbal_frame`].
-    ring: [(egui::Vec2, egui::Vec2); 3],
+    ///
+    /// `None` where the ring is genuinely edge-on: its plane contains the
+    /// viewing direction, so it projects to a *line*, not an ellipse. Such a
+    /// ring is neither drawn nor grabbable, because the alternative — falling
+    /// back to a circle in the screen plane — draws three identical circles
+    /// stacked on one another and invites you to drag a rotation that is not
+    /// the one you think. Orbit the view and it opens up.
+    ring: [Option<(egui::Vec2, egui::Vec2)>; 3],
     /// Whether the depth handles are live: a camera exists and the layer is not
     /// sitting on the optical axis, where receding moves it nowhere and a drag
     /// would have no gearing to invert.
@@ -375,13 +392,17 @@ impl Layout {
         }
     }
     /// A point on the ring that turns about `axis`, at parameter `t` radians.
-    fn ring_point(&self, axis: GizmoAxis, t: f32) -> egui::Pos2 {
-        let (u, v) = self.ring[axis as usize];
-        self.origin + u * (RING_R * t.cos()) + v * (RING_R * t.sin())
+    fn ring_point(&self, axis: GizmoAxis, t: f32) -> Option<egui::Pos2> {
+        let (u, v) = self.ring[axis as usize]?;
+        Some(self.origin + u * (RING_R * t.cos()) + v * (RING_R * t.sin()))
     }
     /// The screen basis a drag measures its ring angle in.
     fn screen(&self, now: egui::Pos2) -> ScreenDrag {
         ScreenDrag { now, axis: self.axis, ring: self.ring }
+    }
+    /// Whether this ring can be seen, and so grabbed, from here.
+    fn ring_visible(&self, axis: GizmoAxis) -> bool {
+        self.ring[axis as usize].is_some()
     }
     fn corner(&self) -> egui::Pos2 {
         self.origin + self.dir[0] * CORNER_AT + self.dir[1] * CORNER_AT
@@ -426,14 +447,17 @@ fn layout(t: &GizmoTarget, fit: Affine, ppp: f64) -> Layout {
     // not in the layer's final orientation — so the Z ring stays put while the
     // inner two follow what the outer ones have already done, and the rings
     // fold together exactly when the Euler angles stop being independent.
-    let mut ring = [(egui::Vec2::X, egui::Vec2::Y); 3];
+    let mut ring = [None; 3];
     for a in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
         let frame = gimbal_frame(a, t.rot_deg, t.rot_xy);
         let (u, v) = a.ring_basis();
         let du = step(axis_column(&frame, u));
         let dv = step(axis_column(&frame, v));
+        // Both spanning directions must read on screen. If either does not, the
+        // ring is edge-on and there is no ellipse to draw — say so with `None`
+        // rather than inventing one.
         if du.length() > 1e-4 && dv.length() > 1e-4 {
-            ring[a as usize] = (du.normalized(), dv.normalized());
+            ring[a as usize] = Some((du.normalized(), dv.normalized()));
         }
     }
 
@@ -487,7 +511,7 @@ fn hit(l: &Layout, p: egui::Pos2) -> Option<GizmoHandle> {
     // Rings last, and Z first among them: it is the one a 2D layer has, so a
     // click where the rings cross keeps meaning what it always did.
     for &axis in [GizmoAxis::Z, GizmoAxis::X, GizmoAxis::Y].iter() {
-        if axis != GizmoAxis::Z && !l.spatial {
+        if !l.ring_visible(axis) {
             continue;
         }
         if ring_distance(l, axis, p) <= RING_GRAB {
@@ -504,11 +528,14 @@ fn hit(l: &Layout, p: egui::Pos2) -> Option<GizmoHandle> {
 /// a few dozen distances and stays correct for every degenerate case a closed
 /// form would have to special-case.
 fn ring_distance(l: &Layout, axis: GizmoAxis, p: egui::Pos2) -> f32 {
+    let Some(mut prev) = l.ring_point(axis, 0.0) else {
+        // Edge-on: not on screen, so not grabbable.
+        return f32::MAX;
+    };
     let mut best = f32::MAX;
-    let mut prev = l.ring_point(axis, 0.0);
     for i in 1..=RING_SAMPLES {
         let t = i as f32 / RING_SAMPLES as f32 * std::f32::consts::TAU;
-        let next = l.ring_point(axis, t);
+        let Some(next) = l.ring_point(axis, t) else { return f32::MAX };
         best = best.min(dist_to_segment(p, prev, next));
         prev = next;
     }
@@ -534,10 +561,13 @@ fn paint(painter: &egui::Painter, l: &Layout, hot: Option<GizmoHandle>) {
     for &axis in l.axes() {
         let base = if axis == GizmoAxis::Z { RING_COL } else { axis.colour() };
         let c = col(GizmoHandle::RotateAxis(axis), base);
-        let pts: Vec<egui::Pos2> = (0..=RING_SAMPLES)
+        let pts: Option<Vec<egui::Pos2>> = (0..=RING_SAMPLES)
             .map(|i| l.ring_point(axis, i as f32 / RING_SAMPLES as f32 * std::f32::consts::TAU))
             .collect();
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, c)));
+        // An edge-on ring simply is not there to draw.
+        if let Some(pts) = pts {
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, c)));
+        }
     }
 
     // The depth arrow, toward the vanishing point. Drawn before the in-plane
@@ -639,8 +669,9 @@ pub(crate) struct ScreenDrag {
     /// Screen travel per unit of movement along each of the layer's own axes.
     /// Direction and gearing together — the length is what a drag divides by.
     pub(crate) axis: [egui::Vec2; 3],
-    /// Each rotation ring's screen basis, in gimbal order.
-    pub(crate) ring: [(egui::Vec2, egui::Vec2); 3],
+    /// Each rotation ring's screen basis, in gimbal order. `None` where the
+    /// ring is edge-on and no angle about it can be read.
+    pub(crate) ring: [Option<(egui::Vec2, egui::Vec2)>; 3],
 }
 
 impl ScreenDrag {
@@ -651,7 +682,7 @@ impl ScreenDrag {
         Self {
             now: egui::Pos2::ZERO,
             axis: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::ZERO],
-            ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
+            ring: [Some((egui::Vec2::X, egui::Vec2::Y)); 3],
         }
     }
 
@@ -659,7 +690,7 @@ impl ScreenDrag {
     /// own basis. `None` where the ring has collapsed to a line on screen and an
     /// angle around it would mean nothing — the gimbal seen edge-on.
     fn ring_angle(&self, axis: GizmoAxis, origin: egui::Pos2, p: egui::Pos2) -> Option<f64> {
-        let (du, dv) = self.ring[axis as usize];
+        let (du, dv) = self.ring[axis as usize]?;
         let w = p - origin;
         let (a, b) = (w.dot(du) as f64, w.dot(dv) as f64);
         (a.hypot(b) > 1e-4).then(|| b.atan2(a))

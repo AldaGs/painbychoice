@@ -15,6 +15,9 @@ pub(crate) struct CanvasEdits {
     /// Step the current zoom by this factor, about the canvas centre (the
     /// − / + buttons).
     pub zoom_by: Option<f64>,
+    /// Return the viewer to straight on — back to the view that actually
+    /// renders.
+    pub reset_orbit: bool,
 }
 
 /// The fixed zoom stops offered in the toolbar menu, as percentages.
@@ -35,6 +38,7 @@ pub(crate) fn canvas_toolbar(
     bar: egui::Rect,
     zoom_pct: i32,
     is_fit: bool,
+    orbit: (f64, f64),
     aids: &ViewAids,
     out: &mut CanvasEdits,
     aid_out: &mut AidEdits,
@@ -64,6 +68,25 @@ pub(crate) fn canvas_toolbar(
                     });
                 if ui.small_button("+").on_hover_text("Zoom in").clicked() {
                     out.zoom_by = Some(1.25);
+                }
+
+                // The viewpoint badge. It appears **only** when the canvas is
+                // showing something other than the rendered frame, because that
+                // is the one state a user can otherwise mistake for the real
+                // thing — Blender's "User Perspective", After Effects' Custom
+                // View. Straight on, it costs no space at all.
+                if orbit != (0.0, 0.0) {
+                    ui.separator();
+                    if ui
+                        .button(format!("◳ {:.0}° {:.0}°", orbit.0, orbit.1))
+                        .on_hover_text(
+                            "Viewing from an orbited angle — this is not the rendered \
+                             frame. Click to return to the camera's view.",
+                        )
+                        .clicked()
+                    {
+                        out.reset_orbit = true;
+                    }
                 }
                 ui.separator();
                 // Alignment aids. `selectable_label` rather than plain buttons
@@ -451,12 +474,42 @@ pub(crate) const MAX_SCALE: f64 = 64.0;
 pub(crate) struct CanvasNav {
     pub zoom: Option<f64>,
     pub pan: (f64, f64),
+    /// Where the **viewer** is standing, in degrees: yaw about the composition's
+    /// vertical axis, pitch about its horizontal one. `(0, 0)` is straight on.
+    ///
+    /// View state, never saved: this is where you are looking from, not
+    /// something about the document. A render always evaluates straight on, so
+    /// orbiting can never change what ships.
+    ///
+    /// It exists because a straight-down view physically cannot show rotation
+    /// about X or Y — those rings lie in planes containing the depth axis, so
+    /// looking along that axis puts them exactly edge-on. Tilting the viewer is
+    /// the only honest way to open them.
+    pub orbit: (f64, f64),
 }
 
 impl Default for CanvasNav {
     fn default() -> Self {
-        Self { zoom: None, pan: (0.0, 0.0) }
+        Self { zoom: None, pan: (0.0, 0.0), orbit: (0.0, 0.0) }
     }
+}
+
+impl CanvasNav {
+    /// Pitch is clamped just short of a pole. At exactly 90 degrees the
+    /// composition is edge-on — a line — and yaw stops meaning anything, which
+    /// is the flat-spin every orbit control has to refuse.
+    pub const MAX_PITCH: f64 = 89.0;
+
+    /// The orbit as a matrix, for [`motion_core::evaluate_comp_orbited`].
+    ///
+    /// Yaw first, then pitch, so dragging sideways always spins about the
+    /// composition's own vertical rather than about a tilted one — the reading
+    /// that stays predictable after you have already pitched.
+    pub fn orbit_matrix(&self) -> motion_core::Mat4 {
+        motion_core::Mat4::rotate_x(self.orbit.1.to_radians())
+            * motion_core::Mat4::rotate_y(self.orbit.0.to_radians())
+    }
+
 }
 
 /// The rectangle "Fit" actually fits into: the canvas rect pulled in by
@@ -503,6 +556,9 @@ pub(crate) fn nav_zoom_about(
     cursor_px: (f64, f64),
     scale: f64,
     ppp: f64,
+    // Carried through untouched: where you stand is independent of how close
+    // you are standing, so zooming must not straighten the view out.
+    orbit: (f64, f64),
 ) -> CanvasNav {
     let scale = scale.clamp(MIN_SCALE, MAX_SCALE);
     // Translation the transform must have for comp_pt to land on cursor_px.
@@ -515,7 +571,7 @@ pub(crate) fn nav_zoom_about(
         dx - (cx - doc.width * scale * 0.5),
         dy - (cy - doc.height * scale * 0.5),
     );
-    CanvasNav { zoom: Some(scale / ppp), pan }
+    CanvasNav { zoom: Some(scale / ppp), pan, orbit }
 }
 
 /// Map a document blend mode onto peniko's.

@@ -1167,7 +1167,7 @@ fn canvas_zoom_keeps_the_point_under_the_cursor() {
             let scale = canvas_scale(&doc, area, nav, ppp);
             let pt = canvas_transform(&doc, area, nav, ppp).inverse()
                 * Point::new(cursor.0, cursor.1);
-            nav = nav_zoom_about(&doc, area, pt, cursor, scale * factor, ppp);
+            nav = nav_zoom_about(&doc, area, pt, cursor, scale * factor, ppp, (0.0, 0.0));
             // The same comp point must map back to the cursor after the zoom.
             let landed = canvas_transform(&doc, area, nav, ppp) * pt;
             assert!(
@@ -1401,7 +1401,7 @@ fn basis_at(rot: f64, now: (f64, f64)) -> ScreenDrag {
             egui::vec2(-r.sin() as f32, r.cos() as f32),
             egui::Vec2::ZERO,
         ],
-        ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
+        ring: [Some((egui::Vec2::X, egui::Vec2::Y)); 3],
     }
 }
 
@@ -4670,7 +4670,7 @@ fn spatial_basis(now: egui::Pos2, z_px: f32) -> ScreenDrag {
     ScreenDrag {
         now,
         axis: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::X * z_px],
-        ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
+        ring: [Some((egui::Vec2::X, egui::Vec2::Y)); 3],
     }
 }
 
@@ -4678,7 +4678,7 @@ fn spatial_basis(now: egui::Pos2, z_px: f32) -> ScreenDrag {
 /// one to the other is unambiguous.
 fn ring_basis(now: egui::Pos2) -> ScreenDrag {
     let mut b = spatial_basis(now, 4.0);
-    b.ring[GizmoAxis::X as usize] = (egui::Vec2::X, egui::vec2(0.0, -1.0));
+    b.ring[GizmoAxis::X as usize] = Some((egui::Vec2::X, egui::vec2(0.0, -1.0)));
     b
 }
 
@@ -4771,7 +4771,7 @@ fn an_axis_arrow_follows_the_layers_own_orientation() {
     let basis = ScreenDrag {
         now: egui::pos2(30.0, 0.0),
         axis: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::X],
-        ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
+        ring: [Some((egui::Vec2::X, egui::Vec2::Y)); 3],
     };
     let r = resolve_drag(&d, Point::ZERO, basis);
     assert!(r.pos.x.abs() < 1e-9, "local X no longer points along parent x: {:?}", r.pos);
@@ -4844,7 +4844,11 @@ fn spatial_target(rot_xy: (f64, f64)) -> GizmoTarget {
         rot_xy,
         scale: (1.0, 1.0),
         anchor: Vec2::ZERO,
-        view: Some((Point::new(960.0, 540.0), 1200.0)),
+        view: Some(motion_core::Projector {
+            eye: Point::new(960.0, 540.0),
+            distance: 1200.0,
+            orbit: motion_core::Mat4::IDENTITY,
+        }),
     }
 }
 
@@ -4907,5 +4911,117 @@ fn tipping_the_layer_moves_its_arrows() {
     assert!(
         (a - b).length() > 0.05,
         "the Y arrow should swing when the layer tips about X: {a:?} vs {b:?}"
+    );
+}
+
+/// A layer sitting exactly on the optical axis — the configuration in which the
+/// rings collapsed — with the viewer standing wherever `orbit` says.
+fn on_axis_target(orbit: motion_core::Mat4) -> GizmoTarget {
+    GizmoTarget {
+        node: 1,
+        parent_xf: motion_core::Xf::Flat(Affine::IDENTITY),
+        parent: Affine::IDENTITY,
+        pos: Vec2::new(960.0, 540.0),
+        pos_z: 0.0,
+        rot_deg: 0.0,
+        rot_xy: (0.0, 0.0),
+        scale: (1.0, 1.0),
+        anchor: Vec2::ZERO,
+        view: Some(motion_core::Projector {
+            eye: Point::new(960.0, 540.0),
+            distance: 4405.0,
+            orbit,
+        }),
+    }
+}
+
+/// How far the layer's depth axis travels on screen per unit — zero means depth
+/// has no direction at all from here, which is what makes the X and Y rotation
+/// rings degenerate.
+fn depth_step(t: &GizmoTarget) -> f32 {
+    let fit = Affine::scale(0.55);
+    let o = t.to_screen3(fit, 1.0, motion_core::Vec3::ZERO);
+    (t.to_screen3(fit, 1.0, motion_core::Vec3::new(0.0, 0.0, 1.0)) - o).length()
+}
+
+/// **The reason the orbit exists.** Looking straight down the depth axis, a
+/// layer on the optical axis has no depth direction on screen whatsoever: the X
+/// and Y rotation rings lie in planes containing that axis, so they are exactly
+/// edge-on and no honest drawing can make them circles.
+#[test]
+fn looking_straight_down_the_axis_flattens_the_depth_direction() {
+    let t = on_axis_target(motion_core::Mat4::IDENTITY);
+    assert!(
+        depth_step(&t) < 1e-5,
+        "straight on, depth should go nowhere: {}",
+        depth_step(&t)
+    );
+}
+
+/// Orbiting the viewer opens it up — the same layer, seen from somewhere else,
+/// now has a real depth direction, so the rings become ellipses you can grab.
+#[test]
+fn orbiting_gives_the_depth_axis_a_direction() {
+    let t = on_axis_target(motion_core::Mat4::rotate_x(0.6));
+    assert!(
+        depth_step(&t) > 0.05,
+        "orbited, depth must read on screen: {}",
+        depth_step(&t)
+    );
+}
+
+/// The orbit is part of the chain in *both* directions, so screen and parent
+/// space still round-trip exactly while the view is turned. Miss it in the
+/// inverse and every drag would be correct only while looking straight on.
+#[test]
+fn the_round_trip_survives_an_orbited_view() {
+    let t = on_axis_target(
+        motion_core::Mat4::rotate_x(0.5) * motion_core::Mat4::rotate_y(-0.35),
+    );
+    let fit = Affine::scale(0.55) * Affine::translate((9.0, -4.0));
+    for probe in [Point::new(960.0, 540.0), Point::new(1200.0, 400.0)] {
+        let d = motion_core::Vec3::new(probe.x - t.pos.x, probe.y - t.pos.y, 0.0);
+        let back = t.unproject(fit, 1.0, t.to_screen3(fit, 1.0, d));
+        assert!(
+            (back.x - probe.x).abs() < 1e-3 && (back.y - probe.y).abs() < 1e-3,
+            "{probe:?} came back as {back:?}"
+        );
+    }
+}
+
+/// The orbit is the *editor's* viewpoint, never the document's. A render must be
+/// unaffected by where someone happened to be looking from, which is why it is a
+/// separate evaluate entry point rather than a field on the project.
+#[test]
+fn orbiting_never_changes_what_renders() {
+    use motion_core::{evaluate_comp, evaluate_comp_orbited, Value};
+    let mut comp = motion_core::node::Comp::new(
+        400.0,
+        400.0,
+        MNode::group(0, "root").with_child(MNode::shape(
+            1,
+            "box",
+            MShape::Rect {
+                size: Value::constant(Vec2::new(50.0, 50.0)),
+                radius: Value::constant(0.0),
+            },
+        )),
+    );
+    comp.camera = Some(motion_core::Camera { distance: Value::constant(1000.0) });
+    let project = motion_core::node::Project::single(comp);
+    let id = project.root;
+
+    let straight = evaluate_comp(&project, id, 0.0);
+    let orbited = evaluate_comp_orbited(&project, id, 0.0, motion_core::Mat4::rotate_x(0.7));
+    let plain = evaluate_comp_orbited(&project, id, 0.0, motion_core::Mat4::IDENTITY);
+
+    assert_eq!(
+        straight.items[0].transform, plain.items[0].transform,
+        "an identity orbit is the straight-on render"
+    );
+    assert_ne!(
+        straight.items[0].path.elements().len(),
+        orbited.items[0].path.elements().len(),
+        "an orbited view is a different picture — but only in the preview"
     );
 }

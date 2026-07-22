@@ -30,7 +30,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::expr::EvalCtx;
-use crate::mat4::Xf;
+use crate::mat4::{Mat4, Xf};
+use crate::vec3::Vec3;
 use crate::value::Value;
 
 /// A composition's camera. Present means the comp projects; absent means it is
@@ -66,14 +67,29 @@ impl Camera {
     /// walk carries down the tree must be a plain `Copy` value it can apply
     /// thousands of times without touching the evaluator again.
     pub fn resolve(&self, ctx: &mut EvalCtx, width: f64, height: f64) -> Projector {
+        self.resolve_orbited(ctx, width, height, Mat4::IDENTITY)
+    }
+
+    /// Resolve with the editor standing somewhere other than straight on. Only
+    /// the live preview passes anything but the identity here — see
+    /// [`Projector::orbit`].
+    pub fn resolve_orbited(
+        &self,
+        ctx: &mut EvalCtx,
+        width: f64,
+        height: f64,
+        orbit: Mat4,
+    ) -> Projector {
         Projector {
             eye: kurbo::Point::new(width / 2.0, height / 2.0),
             distance: self.distance.resolve(ctx),
+            orbit,
         }
     }
 }
 
-/// A camera resolved at one frame: where the eye is, and how far back.
+/// A camera resolved at one frame: where the eye is, how far back, and which
+/// way the *viewer* is standing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Projector {
     /// The optical axis' landing point in composition space — the comp centre.
@@ -81,16 +97,51 @@ pub struct Projector {
     /// toward as it recedes.
     pub eye: kurbo::Point,
     pub distance: f64,
+    /// **The viewport orbit** — a rotation of the whole composition about the
+    /// eye, applied before the perspective divide.
+    ///
+    /// This is not part of the composition. It is where the *editor* is
+    /// standing, the same split Blender draws between its viewport camera and
+    /// its render camera: a render always uses [`Mat4::IDENTITY`] here, so what
+    /// ships is unaffected by where you happened to be looking from.
+    ///
+    /// It exists because a straight-down view cannot show rotation about X or
+    /// Y at all. Those rings live in planes containing the depth axis, so
+    /// looking along that axis puts them exactly edge-on — they are lines, and
+    /// no gizmo drawing can honestly make them otherwise. Tilting the viewer is
+    /// the only thing that opens them up.
+    ///
+    /// Note that orbiting makes every layer non-screen-parallel, so the whole
+    /// scene takes the foreshortening path. That is correct rather than
+    /// unfortunate: tipped away from the viewer is exactly what those layers
+    /// now are. At identity it costs nothing.
+    pub orbit: Mat4,
 }
 
 impl Projector {
+    /// Composition space → viewed composition space: the orbit, taken about the
+    /// eye rather than about the origin, so tilting the view pivots around what
+    /// you are looking at instead of swinging the frame away.
+    ///
+    /// Composed *into* the chain ahead of the perspective divide, which is what
+    /// makes the orbit a genuine change of viewpoint rather than a second,
+    /// competing projection. At identity it is a no-op and every layer keeps
+    /// the flat fast path.
+    pub fn view(&self) -> Mat4 {
+        if self.orbit == Mat4::IDENTITY {
+            return Mat4::IDENTITY;
+        }
+        let e = Vec3::new(self.eye.x, self.eye.y, 0.0);
+        Mat4::translate(e) * self.orbit * Mat4::translate(-e)
+    }
+
     /// The layer-local → screen projective map for a world matrix.
     ///
     /// This is the exact projection, unlike [`Self::project`], which collapses
     /// a layer to a single depth. Used for the layers that need foreshortening;
     /// [`Homography::is_affine`] says when it would have made no difference.
     pub fn homography(&self, m: &crate::mat4::Mat4) -> crate::warp::Homography {
-        crate::warp::homography_for(m, self.eye, self.distance)
+        crate::warp::homography_for(&(self.view() * *m), self.eye, self.distance)
     }
 
     /// A layer at this depth is at or behind the eye. Nothing in front of the
@@ -111,11 +162,12 @@ impl Projector {
     /// this tier is responsible for.
     pub fn project(&self, xf: Xf) -> Option<Xf> {
         // A flat transform cannot carry depth by construction, so it projects
-        // to itself. Checked first so a 2D layer in a 3D comp costs nothing.
-        if let Xf::Flat(a) = xf {
+        // to itself — but only while the viewer is standing straight on. Orbit
+        // and even a flat layer has been tipped away from them.
+        if let (Xf::Flat(a), true) = (xf, self.orbit == Mat4::IDENTITY) {
             return Some(Xf::Flat(a));
         }
-        let m = xf.to_mat4();
+        let m = self.view() * xf.to_mat4();
         // The translation column: where this layer's origin landed in comp
         // space, depth included.
         let depth = m.0[14];
@@ -151,11 +203,13 @@ const EPSILON: f64 = 1e-6;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mat4::Mat4;
-    use crate::vec3::Vec3;
 
     fn cam() -> Projector {
-        Projector { eye: kurbo::Point::new(960.0, 540.0), distance: 1000.0 }
+        Projector {
+            eye: kurbo::Point::new(960.0, 540.0),
+            distance: 1000.0,
+            orbit: Mat4::IDENTITY,
+        }
     }
     const EYE: kurbo::Point = kurbo::Point::new(960.0, 540.0);
 
@@ -210,5 +264,41 @@ mod tests {
         assert!(c.project(at).is_none(), "exactly at the eye");
         let behind = Xf::Spatial(Mat4::translate(Vec3::new(0.0, 0.0, -1500.0)));
         assert!(c.project(behind).is_none(), "behind the eye");
+    }
+
+    /// The orbit is a change of *viewpoint*, so at identity it must cost
+    /// nothing and change nothing — a render is exactly what it always was.
+    #[test]
+    fn an_identity_orbit_is_a_no_op() {
+        let c = cam();
+        assert_eq!(c.view(), Mat4::IDENTITY);
+        let a = kurbo::Affine::translate((40.0, 15.0));
+        assert!(c.project(Xf::Flat(a)).unwrap().is_flat(), "still on the fast path");
+    }
+
+    /// Orbiting tips everything away from the viewer, so a layer that was
+    /// screen-parallel no longer is. That is the whole point — it is what opens
+    /// the X and Y rotation rings from edge-on lines into ellipses — but it does
+    /// mean the flat fast path is given up while the view is turned.
+    #[test]
+    fn orbiting_tips_even_a_flat_layer() {
+        let mut c = cam();
+        c.orbit = Mat4::rotate_x(0.5);
+        let a = kurbo::Affine::translate((40.0, 15.0));
+        assert!(!c.project(Xf::Flat(a)).unwrap().is_flat());
+    }
+
+    /// The orbit pivots about the eye, not the origin: what you are looking at
+    /// stays put while the world turns around it.
+    #[test]
+    fn the_orbit_pivots_about_the_eye() {
+        let mut c = cam();
+        c.orbit = Mat4::rotate_y(0.4);
+        let at_eye = Mat4::translate(Vec3::new(EYE.x, EYE.y, 0.0));
+        let viewed = c.view().transform_point(Vec3::new(EYE.x, EYE.y, 0.0));
+        assert!((viewed.x - EYE.x).abs() < 1e-9, "the eye point held still: {viewed:?}");
+        assert!((viewed.y - EYE.y).abs() < 1e-9);
+        assert!((viewed.z).abs() < 1e-9);
+        let _ = at_eye;
     }
 }

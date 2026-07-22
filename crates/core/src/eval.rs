@@ -200,7 +200,17 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     // and warnings sink. Expression warnings gathered during the walk are folded
     // into the scene's provenance-tagged list afterward.
     let mut ctx = EvalCtx::new(doc, frame);
-    walk(&doc.root, Xf::IDENTITY, 1.0, None, &mut ctx, None, &mut Vec::new(), &mut scene);
+    walk(
+        &doc.root,
+        Xf::IDENTITY,
+        1.0,
+        None,
+        crate::mat4::Mat4::IDENTITY,
+        &mut ctx,
+        None,
+        &mut Vec::new(),
+        &mut scene,
+    );
     scene.warnings.append(&mut ctx.take_warnings());
     scene
 }
@@ -212,8 +222,27 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
 /// precomp reach its own nodes, not the parent's. Cross-comp references are
 /// deliberately out of scope for v1.
 pub fn evaluate_comp(project: &Project, comp: CompId, frame: f64) -> Scene {
+    evaluate_comp_orbited(project, comp, frame, crate::mat4::Mat4::IDENTITY)
+}
+
+/// Evaluate a composition as seen from an orbited viewpoint.
+///
+/// `orbit` rotates the whole composition about its camera's eye before the
+/// perspective divide — where the *editor* is standing, not part of the
+/// document. **A render always uses the identity**, which is why this is a
+/// separate entry point rather than a field on the project: what ships cannot
+/// depend on where someone happened to be looking from.
+///
+/// Without a camera there is nothing to orbit around and this is ignored: an
+/// orthographic comp has no viewpoint to move.
+pub fn evaluate_comp_orbited(
+    project: &Project,
+    comp: CompId,
+    frame: f64,
+    orbit: crate::mat4::Mat4,
+) -> Scene {
     let mut scene = Scene::default();
-    eval_comp(project, comp, frame, Xf::IDENTITY, 1.0, None, &mut Vec::new(), &mut scene);
+    eval_comp(project, comp, frame, Xf::IDENTITY, 1.0, None, &mut Vec::new(), &mut scene, orbit);
     scene
 }
 
@@ -233,6 +262,7 @@ fn eval_comp(
     view: Option<Projector>,
     stack: &mut Vec<CompId>,
     scene: &mut Scene,
+    orbit: crate::mat4::Mat4,
 ) {
     let Some(comp) = project.comp(id) else {
         // A dangling instance: the comp was deleted but a layer still points at
@@ -252,11 +282,11 @@ fn eval_comp(
     // in, so a flat precomp dropped into a 3D comp still recedes with it rather
     // than punching a stubbornly orthographic hole in the scene.
     let view = match &comp.camera {
-        Some(cam) => Some(cam.resolve(&mut ctx, comp.width, comp.height)),
+        Some(cam) => Some(cam.resolve_orbited(&mut ctx, comp.width, comp.height, orbit)),
         None => view,
     };
     stack.push(id);
-    walk(&comp.root, xf, opacity, view, &mut ctx, Some(project), stack, scene);
+    walk(&comp.root, xf, opacity, view, orbit, &mut ctx, Some(project), stack, scene);
     stack.pop();
     scene.warnings.append(&mut ctx.take_warnings());
 }
@@ -284,6 +314,10 @@ fn walk(
     parent_xf: Xf,
     parent_opacity: f64,
     view: Option<Projector>,
+    // Carried only to hand on to a nested comp that has a camera of its own —
+    // the editor's viewpoint is one viewpoint for the whole tree, not one per
+    // composition.
+    orbit: crate::mat4::Mat4,
     ctx: &mut EvalCtx,
     project: Option<&Project>,
     stack: &mut Vec<CompId>,
@@ -458,7 +492,7 @@ fn walk(
             // is also where nested timing becomes properly relative — a comp
             // boundary is what stage 1 left open.
             Some(project) if !stack.contains(&id) => {
-                eval_comp(project, id, ctx.frame, xf, opacity, view, stack, scene);
+                eval_comp(project, id, ctx.frame, xf, opacity, view, stack, scene, orbit);
             }
             // Comp-level cycle guard, mirroring the expression one: a comp that
             // contains itself warns and stops rather than recursing forever.
@@ -536,7 +570,7 @@ fn walk(
         // parent's fade has to reach it the ordinary way. Taking the isolated
         // content's 1.0 here would make children of a faded layer draw at full
         // strength.
-        let child_bounds = walk(child, xf, full, view, ctx, project, stack, scene);
+        let child_bounds = walk(child, xf, full, view, orbit, ctx, project, stack, scene);
 
         // A track matte: this layer takes its coverage from the one above it,
         // which is the next sibling in document order. Handled here rather than
@@ -544,7 +578,7 @@ fn walk(
         // both layers — a layer has no idea what sits above it.
         let matted = child.matte.zip(node.children.get(i + 1)).and_then(|(mode, above)| {
             let matte_start = scene.items.len();
-            walk(above, xf, full, view, ctx, project, stack, scene);
+            walk(above, xf, full, view, orbit, ctx, project, stack, scene);
             let end = scene.items.len();
             // Nothing to take a shape from, or nothing to cut: leave both
             // layers drawing normally rather than emitting a group that would

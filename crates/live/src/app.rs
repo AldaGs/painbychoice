@@ -104,6 +104,10 @@ pub(crate) struct App {
     /// A middle-button pan in progress: `(cursor at press, nav.pan at press)`,
     /// both in physical pixels. Pan tracks the cursor 1:1, so no scale is kept.
     pub(crate) pan_drag: Option<((f64, f64), (f64, f64))>,
+    /// An orbit drag in flight: where the cursor went down, and the orbit it
+    /// started from. Snapshotted like every other drag in this crate so the
+    /// angles come from one delta rather than accumulating per frame.
+    pub(crate) orbit_drag: Option<((f64, f64), (f64, f64))>,
     /// Next unused node id, for shapes created in-app.
     pub(crate) next_id: u64,
     /// AE's work area: a comp-level *preview* range that bounds the playback
@@ -800,6 +804,7 @@ impl App {
             canvas_rect: None,
             nav: CanvasNav::default(),
             pan_drag: None,
+            orbit_drag: None,
             next_id,
             work_area: None,
             dope_label_w: 80.0,
@@ -1528,6 +1533,17 @@ impl ApplicationHandler for App {
                         start_pan.1 + (position.y - start_cursor.1),
                     );
                 }
+                // An orbit drag turns the viewer. A quarter turn per ORBIT_SPAN
+                // pixels: fast enough to get behind something in one gesture,
+                // slow enough to hold a small angle steady.
+                if let Some((start_cursor, start_orbit)) = self.orbit_drag {
+                    const ORBIT_SPAN: f64 = 3.0;
+                    let pitch = start_orbit.1 + (position.y - start_cursor.1) / ORBIT_SPAN;
+                    self.nav.orbit = (
+                        start_orbit.0 + (position.x - start_cursor.0) / ORBIT_SPAN,
+                        pitch.clamp(-CanvasNav::MAX_PITCH, CanvasNav::MAX_PITCH),
+                    );
+                }
                 // Repaint so egui's hover/consumed state stays current even
                 // while paused — otherwise the next click is judged against a
                 // stale frame and canvas picking fires over the UI.
@@ -1557,17 +1573,27 @@ impl ApplicationHandler for App {
                 if button == winit::event::MouseButton::Middle =>
             {
                 match state {
+                    // Alt turns the middle drag into an orbit. Alt rather than a
+                    // button of its own because a three-button mouse has no
+                    // fourth, and rather than plain middle-drag because pan is
+                    // the gesture a 2D composition needs far more often.
+                    ElementState::Pressed if !over_ui && self.egui_ctx.input(|i| i.modifiers.alt) => {
+                        self.orbit_drag = Some((self.cursor, self.nav.orbit));
+                    }
                     ElementState::Pressed if !over_ui => {
                         if self.nav.zoom.is_none() {
                             if let Some(canvas) = self.canvas_rect {
                                 let ppp = window.scale_factor();
                                 let scale = canvas_scale(self.doc(), canvas, self.nav, ppp);
-                                self.nav = CanvasNav { zoom: Some(scale / ppp), pan: (0.0, 0.0) };
+                                self.nav = CanvasNav { zoom: Some(scale / ppp), pan: (0.0, 0.0), ..self.nav };
                             }
                         }
                         self.pan_drag = Some((self.cursor, self.nav.pan));
                     }
-                    ElementState::Released => self.pan_drag = None,
+                    ElementState::Released => {
+                        self.pan_drag = None;
+                        self.orbit_drag = None;
+                    }
                     _ => {}
                 }
                 window.request_redraw();
@@ -1590,7 +1616,7 @@ impl ApplicationHandler for App {
                             * Point::new(self.cursor.0, self.cursor.1);
                         let new_scale = scale * 1.25_f64.powf(steps);
                         self.nav =
-                            nav_zoom_about(self.doc(), canvas, comp_pt, self.cursor, new_scale, ppp);
+                            nav_zoom_about(self.doc(), canvas, comp_pt, self.cursor, new_scale, ppp, self.nav.orbit);
                         window.request_redraw();
                     }
                 }
@@ -2467,7 +2493,12 @@ impl App {
         // While a font is hovered in the picker, this frame is drawn from a
         // preview copy instead of the real project (see `preview_project`).
         let previewing = self.preview_project();
-        let scene = evaluate_comp(previewing.as_ref().unwrap_or(&self.project), self.current, t);
+        let scene = evaluate_comp_orbited(
+            previewing.as_ref().unwrap_or(&self.project),
+            self.current,
+            t,
+            self.nav.orbit_matrix(),
+        );
         // Warnings are re-derived every frame, so print only when the set
         // actually changes — a broken script would otherwise spam stderr at the
         // refresh rate. The current set is kept for the comp bar's indicator.
@@ -2606,10 +2637,7 @@ impl App {
         let gizmo_view = self.doc().camera.as_ref().map(|c| {
             let comp = self.doc().clone();
             let mut ctx = EvalCtx::new(&comp, frame as f64);
-            (
-                kurbo::Point::new(comp.width / 2.0, comp.height / 2.0),
-                c.distance.resolve(&mut ctx),
-            )
+            c.resolve_orbited(&mut ctx, comp.width, comp.height, self.nav.orbit_matrix())
         });
         let gizmo_target = match (self.selected, &sel_info) {
             (Some(id), Some(info)) => scene
@@ -2746,6 +2774,7 @@ impl App {
         // rect (one frame stale, like the fit), which is plenty for a label.
         let zoom_pct = (canvas_scale(self.doc(), canvas, self.nav, ppp) / ppp * 100.0).round() as i32;
         let is_fit = self.nav.zoom.is_none();
+        let nav_orbit = self.nav.orbit;
         let mut canvas_edits = CanvasEdits::default();
         // The selected script node's live result, computed against the document
         // *before* the UI pass (the panel can't borrow `App`), the same way the
@@ -2945,6 +2974,7 @@ impl App {
                             bar,
                             zoom_pct,
                             is_fit,
+                            nav_orbit,
                             &aids,
                             &mut canvas_edits,
                             &mut aid_edits,
@@ -3122,10 +3152,16 @@ impl App {
         // Preview zoom toolbar: a menu pick sets the mode outright; the − / +
         // buttons step the live scale about the canvas centre (which turns Fit
         // into an explicit zoom, since a fixed step needs a fixed anchor).
+        if canvas_edits.reset_orbit {
+            self.nav.orbit = (0.0, 0.0);
+            window.request_redraw();
+        }
         if let Some(mode) = canvas_edits.set_zoom {
             self.nav = match mode {
-                None => CanvasNav::default(),
-                Some(z) => CanvasNav { zoom: Some(z), pan: (0.0, 0.0) },
+                // "Fit" reframes; it does not decide where you are standing, so
+                // the orbit rides through it.
+                None => CanvasNav { orbit: self.nav.orbit, ..CanvasNav::default() },
+                Some(z) => CanvasNav { zoom: Some(z), pan: (0.0, 0.0), ..self.nav },
             };
             window.request_redraw();
         }
@@ -3134,7 +3170,7 @@ impl App {
             let center = ((canvas.x0 + canvas.x1) * 0.5, (canvas.y0 + canvas.y1) * 0.5);
             let comp_pt = canvas_transform(self.doc(), canvas, self.nav, ppp).inverse()
                 * Point::new(center.0, center.1);
-            self.nav = nav_zoom_about(self.doc(), canvas, comp_pt, center, scale * factor, ppp);
+            self.nav = nav_zoom_about(self.doc(), canvas, comp_pt, center, scale * factor, ppp, self.nav.orbit);
             window.request_redraw();
         }
 
@@ -3450,7 +3486,12 @@ impl App {
             // and a font being hovered must survive an unrelated change.
             let previewing = self.preview_project();
             let scene =
-                evaluate_comp(previewing.as_ref().unwrap_or(&self.project), self.current, t);
+                evaluate_comp_orbited(
+                    previewing.as_ref().unwrap_or(&self.project),
+                    self.current,
+                    t,
+                    self.nav.orbit_matrix(),
+                );
             let bg = self.doc().bg;
             let pp = self.doc().passepartout;
         self.vscene =
