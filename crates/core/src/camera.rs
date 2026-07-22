@@ -38,14 +38,49 @@ use crate::value::Value;
 /// flat, and the engine behaves exactly as it did before depth existed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Camera {
-    /// How far in front of the `z = 0` plane the eye sits, in composition
-    /// pixels. Animatable, so a dolly is a keyframed value like anything else.
+    /// Where the eye sits, as an **object in the composition** — not a lone
+    /// setting.
     ///
-    /// Larger is flatter: at 100000 the projection is very nearly orthographic,
-    /// and depth reads only as a faint size change. The default is sized to the
-    /// comp so a layer pushed a few hundred pixels back reads as *moved*, not as
-    /// slightly resized.
-    pub distance: Value<f64>,
+    /// `x`/`y` offset the viewpoint from the comp centre, so panning the camera
+    /// slides the vanishing point and pulls parallax between depths. `z` is the
+    /// dolly: it is *signed depth*, negative in front of the `z = 0` plane, and
+    /// `-z` is the eye-to-plane distance the perspective divides by. Pushing the
+    /// camera toward the plane (z → 0) strengthens perspective; pulling it far
+    /// back flattens toward orthographic.
+    ///
+    /// Every channel is animatable, so a dolly or a truck is a keyframed value
+    /// like any other. The default sits the eye on the axis, `default_distance`
+    /// in front, which reproduces the fixed camera this replaced.
+    #[serde(default = "default_camera_position")]
+    pub position: Value<Vec3>,
+    /// The camera's orientation, euler degrees, default looking straight down
+    /// `+Z` at the composition. Rotating it pivots the whole scene about the
+    /// eye — the same operation the viewport orbit performs, but **part of the
+    /// document**: this one renders.
+    #[serde(default = "zero_rotation")]
+    pub rotation: Value<Vec3>,
+    /// A pre-object camera stored only a scalar `distance`. It cannot
+    /// deserialize into `position` (a number is not a vector), so it lands here
+    /// and [`Camera::migrate_frames`] folds it into `position.z` as `-distance`.
+    /// Never written back out.
+    #[serde(default, rename = "distance", skip_serializing)]
+    legacy_distance: Option<Value<f64>>,
+}
+
+/// The eye offset a camera falls back to when its `position` is missing — only
+/// reachable through a malformed file, since new cameras always write one and a
+/// legacy camera's `distance` overwrites the `z` here. The `x`/`y` are the
+/// meaningful part (centred); `z` is a placeholder the fold replaces.
+fn default_camera_position() -> Value<Vec3> {
+    Value::constant(Vec3::new(0.0, 0.0, -FALLBACK_DISTANCE))
+}
+
+/// Only used to seed [`default_camera_position`]; a real camera's depth comes
+/// from [`Camera::default_distance`], which is sized to the comp.
+const FALLBACK_DISTANCE: f64 = 2000.0;
+
+fn zero_rotation() -> Value<Vec3> {
+    Value::constant(Vec3::ZERO)
 }
 
 impl Camera {
@@ -57,7 +92,40 @@ impl Camera {
     }
 
     pub fn new(width: f64, height: f64) -> Self {
-        Self { distance: Value::constant(Self::default_distance(width, height)) }
+        Self {
+            position: Value::constant(Vec3::new(0.0, 0.0, -Self::default_distance(width, height))),
+            rotation: Value::constant(Vec3::ZERO),
+            legacy_distance: None,
+        }
+    }
+
+    /// Fold a pre-object scalar `distance` into the position, and migrate every
+    /// camera track onto the frame grid. Mirrors [`crate::node::Transform`]'s
+    /// own migration: the old value *was* the eye-to-plane distance, so the
+    /// eye's depth is its negation, and a camera upgraded this way projects
+    /// identically.
+    /// A camera on the axis at a given eye-to-plane distance, looking straight
+    /// on — the whole camera reduced to the one number it used to be. For tests
+    /// and for the comp bar's "add camera", where only the framing is chosen.
+    pub fn from_distance(distance: f64) -> Self {
+        Self {
+            position: Value::constant(Vec3::new(0.0, 0.0, -distance)),
+            rotation: Value::constant(Vec3::ZERO),
+            legacy_distance: None,
+        }
+    }
+
+    pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        if let Some(distance) = self.legacy_distance.take() {
+            self.position = deepen_distance(distance);
+        }
+        self.position.migrate_frames(fps);
+        self.rotation.migrate_frames(fps);
+    }
+
+    pub(crate) fn retime(&mut self, ratio: f64) {
+        self.position.retime(ratio);
+        self.rotation.retime(ratio);
     }
 
     /// Resolve to the frame's actual projection.
@@ -80,11 +148,30 @@ impl Camera {
         height: f64,
         orbit: Mat4,
     ) -> Projector {
+        let pos = self.position.resolve(ctx);
+        let rot = self.rotation.resolve(ctx);
+        // The camera's own rotation pivots the world about the eye — the very
+        // thing the editor orbit does, so it composes as one more orbit. The
+        // editor's is applied *outside* the camera's: you orbit around the shot
+        // the camera has already framed, not around a fixed axis.
+        let cam = Mat4::rotate_z(rot.z.to_radians())
+            * Mat4::rotate_y(rot.y.to_radians())
+            * Mat4::rotate_x(rot.x.to_radians());
         Projector {
-            eye: kurbo::Point::new(width / 2.0, height / 2.0),
-            distance: self.distance.resolve(ctx),
-            orbit,
+            eye: kurbo::Point::new(width / 2.0 + pos.x, height / 2.0 + pos.y),
+            // `-z`, guarded: the eye is in front of the plane (negative z), so a
+            // positive distance is its negation. At or behind the plane the
+            // divide is meaningless; a hair of distance keeps a frame drawing
+            // rather than filling with NaNs while you drag the camera through.
+            distance: (-pos.z).max(1e-3),
+            orbit: orbit * cam,
         }
+    }
+
+    /// The eye-to-plane distance at this frame — what the comp bar edits as
+    /// "eye", derived from the object's depth so the two can never disagree.
+    pub fn eye_distance(&self, ctx: &mut EvalCtx) -> f64 {
+        -self.position.resolve(ctx).z
     }
 }
 
@@ -196,6 +283,23 @@ impl Projector {
     }
 }
 
+/// Widen a legacy scalar `distance` into a full eye position: centred in x/y,
+/// with the depth as `-distance`. Keyframe timing is preserved, so an animated
+/// dolly upgrades into an animated depth channel unchanged.
+fn deepen_distance(distance: Value<f64>) -> Value<Vec3> {
+    match distance {
+        Value::Const(d) => Value::Const(Vec3::new(0.0, 0.0, -d)),
+        Value::Keyframed(track) => {
+            Value::Keyframed(track.map_value(|d| Vec3::new(0.0, 0.0, -d)))
+        }
+        Value::Expr(e) => Value::Expr(crate::expr::Expr::Vec3 {
+            x: Box::new(crate::expr::Expr::num(0.0)),
+            y: Box::new(crate::expr::Expr::num(0.0)),
+            z: Box::new(crate::expr::Expr::un(crate::expr::UnOp::Neg, e)),
+        }),
+    }
+}
+
 /// Depths closer to the eye than this are treated as *at* it. Guards the divide
 /// without pretending a layer 0.0001px in front of the lens is meaningful.
 const EPSILON: f64 = 1e-6;
@@ -300,5 +404,77 @@ mod tests {
         assert!((viewed.y - EYE.y).abs() < 1e-9);
         assert!((viewed.z).abs() < 1e-9);
         let _ = at_eye;
+    }
+
+    /// The whole object generalisation must not disturb the fixed camera it
+    /// replaced: on the axis, looking straight on, the projection is identical.
+    #[test]
+    fn a_default_camera_matches_the_old_fixed_one() {
+        let cam = Camera::from_distance(1000.0);
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let p = cam.resolve(&mut ctx, 1920.0, 1080.0);
+        assert_eq!(p.eye, kurbo::Point::new(960.0, 540.0));
+        assert_eq!(p.distance, 1000.0);
+        assert_eq!(p.orbit, Mat4::IDENTITY);
+    }
+
+    /// A pre-object `.pbc` stored only `distance`. It must load as a camera
+    /// sitting that far in front on the axis — the eye's depth is the distance
+    /// negated — with its dolly preserved.
+    #[test]
+    fn a_legacy_distance_only_camera_loads_as_an_object() {
+        let mut cam: Camera = serde_json::from_str(r#"{"distance": {"Const": 800.0}}"#).unwrap();
+        cam.migrate_frames(60.0);
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let pos = cam.position.resolve(&mut ctx);
+        assert_eq!(pos, Vec3::new(0.0, 0.0, -800.0), "depth is -distance, centred");
+        assert_eq!(cam.eye_distance(&mut ctx), 800.0);
+    }
+
+    /// Moving the camera in x/y slides the eye, so the vanishing point moves and
+    /// depths pull apart — parallax, the reason a camera is an object.
+    #[test]
+    fn panning_the_camera_moves_the_eye() {
+        let cam = Camera {
+            position: Value::constant(Vec3::new(120.0, -40.0, -1000.0)),
+            rotation: Value::constant(Vec3::ZERO),
+            legacy_distance: None,
+        };
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let p = cam.resolve(&mut ctx, 1920.0, 1080.0);
+        assert_eq!(p.eye, kurbo::Point::new(960.0 + 120.0, 540.0 - 40.0));
+    }
+
+    /// Dollying the camera toward the plane shortens the eye-to-plane distance,
+    /// strengthening perspective; pulling back lengthens it.
+    #[test]
+    fn dollying_the_camera_changes_the_distance() {
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let near = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -300.0)), rotation: Value::constant(Vec3::ZERO), legacy_distance: None };
+        let far = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -3000.0)), rotation: Value::constant(Vec3::ZERO), legacy_distance: None };
+        assert!(near.resolve(&mut ctx, 100.0, 100.0).distance < far.resolve(&mut ctx, 100.0, 100.0).distance);
+    }
+
+    /// A camera crossing the plane cannot divide by zero: the distance is
+    /// clamped so a drag through it holds rather than filling the frame with
+    /// NaNs.
+    #[test]
+    fn a_camera_on_the_plane_does_not_divide_by_zero() {
+        let cam = Camera { position: Value::constant(Vec3::ZERO), rotation: Value::constant(Vec3::ZERO), legacy_distance: None };
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        assert!(cam.resolve(&mut ctx, 100.0, 100.0).distance > 0.0);
+    }
+
+    /// The camera's own rotation renders, unlike the editor orbit: it is baked
+    /// into the projector's orbit, so a straight-on evaluate already sees it.
+    #[test]
+    fn camera_rotation_is_part_of_the_projection() {
+        let cam = Camera {
+            position: Value::constant(Vec3::new(0.0, 0.0, -1000.0)),
+            rotation: Value::constant(Vec3::new(0.0, 30.0, 0.0)),
+            legacy_distance: None,
+        };
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        assert_ne!(cam.resolve(&mut ctx, 100.0, 100.0).orbit, Mat4::IDENTITY);
     }
 }

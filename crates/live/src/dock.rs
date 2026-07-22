@@ -554,11 +554,17 @@ pub(crate) struct CompEdits {
     pub(crate) passepartout: Option<f64>,
     /// A new motion-path half-window, in frames.
     pub(crate) motion_path_range: Option<i64>,
-    /// The comp's camera, changed. `Some(None)` removes it (back to a flat
-    /// comp); `Some(Some(d))` adds one or dollies the existing one to `d`.
-    /// The double option is the point: "no change" and "no camera" are
-    /// different answers and collapsing them would make the toggle one-way.
-    pub(crate) camera: Option<Option<f64>>,
+    /// Add the camera (`Some(true)`) or remove it (`Some(false)`). Distinct
+    /// from the transform edits below so "add a camera" and "move the camera"
+    /// stay separate answers — you cannot move one that does not exist.
+    pub(crate) camera_toggle: Option<bool>,
+    /// Per-axis edits to the camera's position, `[x, y, z]`. `z` is the dolly.
+    pub(crate) camera_pos: [Option<f64>; 3],
+    /// Per-axis edits to the camera's rotation, in degrees.
+    pub(crate) camera_rot: [Option<f64>; 3],
+    /// Return the camera to its default framing — the "return its position"
+    /// half of treating it as an object you can move and put back.
+    pub(crate) camera_reset: bool,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -589,6 +595,15 @@ pub(crate) struct LayoutEdits {
 /// menu (switch preset / save current). These drive the canvas fit, the
 /// playback clock, the frame step, and the timeline mapping — so editing them
 /// here reshapes the whole comp. Reports edits into `out` / `layout`.
+/// The camera as the comp bar shows it: position and rotation, each an `(x, y,
+/// z)` triple resolved at the current frame. Just the numbers to display — the
+/// bar reports edits back through [`CompEdits`], it does not hold the camera.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CameraBar {
+    pub(crate) pos: (f64, f64, f64),
+    pub(crate) rot: (f64, f64, f64),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn comp_ui(
     ui: &mut egui::Ui,
@@ -599,7 +614,8 @@ pub(crate) fn comp_ui(
     bg: MColor,
     passepartout: f64,
     motion_path_range: i64,
-    camera: Option<f64>,
+    // The open comp's camera at the current frame, or `None` when flat.
+    camera: Option<CameraBar>,
     out: &mut CompEdits,
     presets: &[String],
     name_buf: &mut String,
@@ -725,28 +741,59 @@ pub(crate) fn comp_ui(
             .on_hover_text("Give this comp a camera, so layer Z reads as depth")
             .changed()
         {
-            // A new camera is sized to the comp here, where the comp's own
-            // dimensions are already in hand — no sentinel value has to travel
-            // to the caller meaning "you pick".
-            out.camera =
-                Some(on.then(|| motion_core::Camera::default_distance(width, height)));
+            out.camera_toggle = Some(on);
         }
-        if let Some(d) = camera {
-            let mut d = d;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut d)
-                        .speed(10.0)
-                        .range(1.0..=1_000_000.0)
-                        .prefix("eye "),
-                )
-                .on_hover_text(
-                    "Distance from the eye to the z=0 plane, in comp pixels.                      Larger is flatter.",
-                )
-                .changed()
-            {
-                out.camera = Some(Some(d));
-            }
+        // The camera is an object — position and rotation — so it gets an
+        // object's editor rather than a lone field, behind a popup so the bar
+        // stays a bar. The label doubles as a readout: the dolly is the number
+        // you reach for most, so it rides on the button.
+        if let Some(CameraBar { pos, rot }) = camera {
+            ui.menu_button(format!("Camera  eye {:.0}", -pos.2), |ui| {
+                ui.set_min_width(180.0);
+                ui.strong("Camera");
+                ui.label("Position");
+                ui.horizontal(|ui| {
+                    let mut v = pos;
+                    if ui.add(egui::DragValue::new(&mut v.0).speed(1.0).prefix("x ")).changed() {
+                        out.camera_pos[0] = Some(v.0);
+                    }
+                    if ui.add(egui::DragValue::new(&mut v.1).speed(1.0).prefix("y ")).changed() {
+                        out.camera_pos[1] = Some(v.1);
+                    }
+                });
+                // Depth on its own row, negated into the eye distance every
+                // other reading uses — a positive "eye" is friendlier than a
+                // negative z, and the two can never disagree because one is the
+                // negation of the other.
+                let mut eye = -pos.2;
+                if ui
+                    .add(egui::DragValue::new(&mut eye).speed(10.0).range(1.0..=1_000_000.0).prefix("eye "))
+                    .on_hover_text("Distance from the eye to the z=0 plane. Larger is flatter.")
+                    .changed()
+                {
+                    out.camera_pos[2] = Some(-eye);
+                }
+
+                ui.label("Rotation");
+                ui.horizontal(|ui| {
+                    let mut r = rot;
+                    if ui.add(egui::DragValue::new(&mut r.0).speed(0.5).prefix("x ").suffix("°")).changed() {
+                        out.camera_rot[0] = Some(r.0);
+                    }
+                    if ui.add(egui::DragValue::new(&mut r.1).speed(0.5).prefix("y ").suffix("°")).changed() {
+                        out.camera_rot[1] = Some(r.1);
+                    }
+                    if ui.add(egui::DragValue::new(&mut r.2).speed(0.5).prefix("z ").suffix("°")).changed() {
+                        out.camera_rot[2] = Some(r.2);
+                    }
+                });
+
+                ui.separator();
+                if ui.button("Reset to default").clicked() {
+                    out.camera_reset = true;
+                    ui.close();
+                }
+            });
         }
 
         // Passepartout: how hard the preview dims outside the frame. Shown as a

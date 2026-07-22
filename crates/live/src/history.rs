@@ -125,7 +125,11 @@ pub(crate) fn edit_label(
     if comp.width.is_some() || comp.height.is_some() || comp.duration.is_some() {
         return "Composition settings";
     }
-    if comp.camera.is_some() {
+    if comp.camera_toggle.is_some()
+        || comp.camera_reset
+        || comp.camera_pos.iter().any(|e| e.is_some())
+        || comp.camera_rot.iter().any(|e| e.is_some())
+    {
         return "Camera";
     }
     if comp.rename.is_some() {

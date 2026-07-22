@@ -2710,12 +2710,15 @@ impl App {
         let comp_bg = self.doc().bg;
         let comp_pp = self.doc().passepartout;
         let comp_path_range = self.doc().motion_path_range;
-        // The camera's *resolved* distance at this frame — the bar edits the
-        // number you can see, so a keyframed dolly reads back as it plays.
+        // The camera's *resolved* transform at this frame — the popup edits the
+        // numbers you can see, so a keyframed dolly or truck reads back as it
+        // plays.
         let comp_camera = self.doc().camera.as_ref().map(|c| {
             let comp = self.doc().clone();
             let mut ctx = EvalCtx::new(&comp, frame as f64);
-            c.distance.resolve(&mut ctx)
+            let p = c.position.resolve(&mut ctx);
+            let r = c.rotation.resolve(&mut ctx);
+            CameraBar { pos: (p.x, p.y, p.z), rot: (r.x, r.y, r.z) }
         });
         let timebase = self.doc().timebase();
         let view = self.view;
@@ -3358,9 +3361,47 @@ impl App {
             self.doc_mut().motion_path_range = r.clamp(0, MAX_RANGE);
             dirty = true;
         }
-        if let Some(cam) = comp.camera {
-            self.doc_mut().camera =
-                cam.map(|d| motion_core::Camera { distance: Value::constant(d) });
+        if let Some(add) = comp.camera_toggle {
+            let (w, h) = (self.doc().width, self.doc().height);
+            self.doc_mut().camera = add.then(|| motion_core::Camera::new(w, h));
+            dirty = true;
+        }
+        if comp.camera_reset {
+            let (w, h) = (self.doc().width, self.doc().height);
+            self.doc_mut().camera = Some(motion_core::Camera::new(w, h));
+            dirty = true;
+        }
+        // Per-axis camera edits. Each nudges one component of the position or
+        // rotation, reading the other two off the current frame so an untouched
+        // axis holds — and `set_at` writes a constant or a keyframe depending on
+        // what the channel already is, so a still camera stays still and an
+        // animated one keys.
+        if comp.camera_pos.iter().any(|e| e.is_some())
+            || comp.camera_rot.iter().any(|e| e.is_some())
+        {
+            let f = frame as f64;
+            let doc = self.doc().clone();
+            if let Some(cam) = self.doc_mut().camera.as_mut() {
+                let mut ctx = EvalCtx::new(&doc, f);
+                if comp.camera_pos.iter().any(|e| e.is_some()) {
+                    let cur = cam.position.resolve(&mut ctx);
+                    let v = motion_core::Vec3::new(
+                        comp.camera_pos[0].unwrap_or(cur.x),
+                        comp.camera_pos[1].unwrap_or(cur.y),
+                        comp.camera_pos[2].unwrap_or(cur.z),
+                    );
+                    cam.position.set_at(f as i64, v);
+                }
+                if comp.camera_rot.iter().any(|e| e.is_some()) {
+                    let cur = cam.rotation.resolve(&mut ctx);
+                    let v = motion_core::Vec3::new(
+                        comp.camera_rot[0].unwrap_or(cur.x),
+                        comp.camera_rot[1].unwrap_or(cur.y),
+                        comp.camera_rot[2].unwrap_or(cur.z),
+                    );
+                    cam.rotation.set_at(f as i64, v);
+                }
+            }
             dirty = true;
         }
         if let Some(delta) = dope.move_by {

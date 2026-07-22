@@ -2286,7 +2286,7 @@ mod tests {
                 ..Transform::default()
             })),
         );
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(1000.0));
         let p = Project::single(comp);
 
         let scene = evaluate_project(&p, 0.0);
@@ -2312,7 +2312,7 @@ mod tests {
             })
             .with_child(child);
         let mut comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(parent));
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(1000.0));
         let p = Project::single(comp);
 
         let scene = evaluate_project(&p, 0.0);
@@ -2334,7 +2334,7 @@ mod tests {
                 ..Transform::default()
             })),
         );
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(1000.0));
         let p = Project::single(comp);
 
         assert!(evaluate_project(&p, 0.0).items.is_empty(), "nothing drawn from behind the lens");
@@ -2360,7 +2360,7 @@ mod tests {
             ..Transform::default()
         });
         let mut comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(card));
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(400.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(400.0));
 
         let scene = evaluate_project(&Project::single(comp), 0.0);
         assert_eq!(scene.items.len(), 1);
@@ -2429,7 +2429,7 @@ mod tests {
             200.0,
             Node::group(0, "root").with_child(at(1, 0.0)).with_child(at(2, 500.0)),
         );
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(1000.0));
         let scene = evaluate_project(&Project::single(comp), 0.0);
         let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
         assert_eq!(ids, vec![2, 1], "the far layer goes down first");
@@ -2448,7 +2448,7 @@ mod tests {
                 .with_child(dot(2))
                 .with_child(dot(3)),
         );
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(1000.0));
         let scene = evaluate_project(&Project::single(comp), 0.0);
         let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
         assert_eq!(ids, vec![1, 2, 3], "a camera alone must not restack a flat comp");
@@ -2496,7 +2496,7 @@ mod tests {
             200.0,
             Node::group(0, "root").with_child(matted).with_child(at(2, 0.0)).with_child(at(3, 900.0)),
         );
-        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        comp.camera = Some(crate::camera::Camera::from_distance(1000.0));
         let scene = evaluate_project(&Project::single(comp), 0.0);
         let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
         assert_eq!(ids, vec![3, 1, 2], "the pair stayed adjacent and in order");

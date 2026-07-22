@@ -5007,7 +5007,7 @@ fn orbiting_never_changes_what_renders() {
             },
         )),
     );
-    comp.camera = Some(motion_core::Camera { distance: Value::constant(1000.0) });
+    comp.camera = Some(motion_core::Camera::from_distance(1000.0));
     let project = motion_core::node::Project::single(comp);
     let id = project.root;
 

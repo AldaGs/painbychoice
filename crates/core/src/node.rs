@@ -1130,6 +1130,9 @@ impl Comp {
     pub fn migrate(&mut self) {
         let fps = self.timebase().fps();
         self.root.migrate_frames(fps);
+        if let Some(camera) = &mut self.camera {
+            camera.migrate_frames(fps);
+        }
     }
 
     /// Change the comp's frame rate, keeping every animated thing at the same
@@ -1152,6 +1155,12 @@ impl Comp {
             return false;
         }
         self.root.retime(new / old);
+        // The camera's dolly and orientation are keyframed on the same grid, so
+        // they re-time with everything else — miss it and an animated camera
+        // drifts out of sync with the scene it is shooting.
+        if let Some(camera) = &mut self.camera {
+            camera.retime(new / old);
+        }
         true
     }
 
