@@ -255,7 +255,8 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
     // to reach `prop_of_mut`.
     let ctx = GraphCtx::new(reg, &project.modules);
     let compiled: Vec<(NodeId, PropKind, Expr)> = project
-        .bindings
+        .graph
+        .bindings()
         .iter()
         .map(|b| {
             let expr = lower_output(&project.graph, &ctx, &b.output);
@@ -263,7 +264,8 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
         })
         .collect();
     let shapes: Vec<(NodeId, MShape)> = project
-        .shape_bindings
+        .graph
+        .shape_bindings()
         .iter()
         .filter_map(|b| Some((b.target, lower_geometry(&project.graph, &ctx, &b.output)?)))
         .collect();
@@ -284,6 +286,82 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
             }
         }
     }
+}
+
+/// Freeze every property and shape a graph edit just **unbound**.
+///
+/// Drivers are derived from the graph (`NodeGraph::bindings`), so a binding can
+/// end half a dozen ways: delete the `out` node, pull its wire, retarget it,
+/// delete the node feeding it. Rather than teach each op about baking, the
+/// caller snapshots the drivers before its edit and hands them here after; every
+/// driver that no longer exists has its target baked to a constant at `frame`.
+///
+/// That is the courtesy the old driver list's Remove button did, now covering
+/// the routes that button never had. Without it, unbinding would strand the
+/// property on the expression it was last given — still animating, with nothing
+/// on the canvas to explain why.
+///
+/// **Retargeting isn't unbinding.** If some *other* driver still writes the same
+/// property of the same layer, baking would fight it: the bake would freeze the
+/// value and the recompile that follows would immediately overwrite it. Those
+/// are skipped and left to the recompile.
+///
+/// A free function, like [`compile_drivers`], so this — the one piece of the
+/// change that silently rewrites the document — is testable without a window.
+pub(crate) fn bake_unbound(
+    project: &mut MProject,
+    comp: CompId,
+    frame: i64,
+    before: &[Binding],
+    before_shapes: &[ShapeBinding],
+) -> bool {
+    let after = project.graph.bindings();
+    let after_shapes = project.graph.shape_bindings();
+    // Resolve against a snapshot so the read context can't alias the node being
+    // mutated — the same guard `bake_binding` and `GraphOp::Bake` use.
+    let Some(snapshot) = project.comp(comp).cloned() else { return false };
+    let mut ctx = EvalCtx::new(&snapshot, frame as f64);
+    let Some(open) = project.comps.get_mut(&comp) else { return false };
+    let mut baked = false;
+    for b in before {
+        if after.contains(b) || after.iter().any(|a| a.target == b.target && a.prop == b.prop) {
+            continue;
+        }
+        if let Some(node) = open.root.find_mut(b.target) {
+            if let Some(mut p) = prop_of_mut(node, PropKind::from_path(b.prop)) {
+                p.bake_to_const(&mut ctx);
+                baked = true;
+            }
+        }
+    }
+    for b in before_shapes {
+        if after_shapes.contains(b) || after_shapes.iter().any(|a| a.target == b.target) {
+            continue;
+        }
+        // A graph-authored shape keeps its *kind* and freezes its params, so the
+        // layer looks identical and is hand-editable again rather than stranded
+        // on expressions no node feeds.
+        if let Some(node) = open.root.find_mut(b.target) {
+            match node.shape.as_mut() {
+                Some(MShape::Rect { size, radius }) => {
+                    size.bake_to_const(&mut ctx);
+                    radius.bake_to_const(&mut ctx);
+                    baked = true;
+                }
+                Some(MShape::Ellipse { size }) => {
+                    size.bake_to_const(&mut ctx);
+                    baked = true;
+                }
+                Some(MShape::Text { size, .. }) => {
+                    size.bake_to_const(&mut ctx);
+                    baked = true;
+                }
+                // A `Path` has no `Value` params, and a group has no shape.
+                Some(MShape::Path(_)) | None => {}
+            }
+        }
+    }
+    baked
 }
 
 /// The look a freshly created layer gets, decided by `App` (it owns the id
@@ -326,12 +404,13 @@ pub(crate) fn create_layer_from_geometry(
     let node = MNode::shape(seed.id, format!("{name} {}", seed.id), shape)
         .with_fill(seed.fill)
         .with_transform(seed.transform);
-    project.shape_bindings.push(ShapeBinding { output, target: NodeId(seed.id) });
+    project.graph.bind_geometry(output, NodeId(seed.id));
     Some(node)
 }
 
-/// Raise `target`'s shape onto the canvas and bind it back. `Err` carries the
-/// message for the Nodes panel's status line.
+/// Raise the shape of whatever `sink` targets onto the canvas and wire it into
+/// that sink — the geometry half of the **fold**, run from the node that already
+/// names the layer. `Err` carries the message for the Nodes panel's status line.
 ///
 /// Refuses rather than converting a keyframed param: binding makes every param
 /// an expression, so a track would simply be replaced. A refusal leaves the
@@ -340,20 +419,93 @@ pub(crate) fn import_shape(
     project: &mut MProject,
     reg: &NodeRegistry,
     comp: CompId,
-    target: NodeId,
+    sink: GraphNodeId,
 ) -> Result<(), String> {
+    let target = project
+        .graph
+        .node(sink)
+        .and_then(|n| n.config.out_shape)
+        .ok_or_else(|| "point this node at a layer first.".to_string())?;
     let shape = project
         .comp(comp)
         .and_then(|c| c.root.find(target))
         .and_then(|n| n.shape.clone())
         .ok_or_else(|| "that layer has no shape (a group has none).".to_string())?;
-    // Placed clear of the usual spawn corner, like `import_property`.
-    let at = Vec2::new(360.0, 40.0);
+    let at = raise_spot(&project.graph, sink);
     let ctx = GraphCtx::new(reg, &project.modules);
     let output = motion_core::raise_geometry(&mut project.graph, &ctx, &shape, at)
         .map_err(|e| e.to_string())?;
-    project.shape_bindings.push(ShapeBinding { output, target });
-    Ok(())
+    wire_into_sink(&mut project.graph, reg, output, sink, "geometry")
+}
+
+/// Raise the expression of whatever `sink` targets onto the canvas and wire it
+/// into that sink — the **property-graph fold**, run from the node that already
+/// names the layer and the property.
+///
+/// The recipe you built in the old per-property editor becomes editable here and
+/// goes on driving the same property, because the node it lands in was already
+/// bound to it. `Err` carries the message for the Nodes panel's status line: a
+/// property that isn't expression-driven has nothing to raise, and saying so is
+/// better than a button that does nothing (promote it first — the old panel's
+/// `= fx`).
+pub(crate) fn import_property(
+    project: &mut MProject,
+    reg: &NodeRegistry,
+    comp: CompId,
+    sink: GraphNodeId,
+) -> Result<(), String> {
+    let (target, prop) = project
+        .graph
+        .node(sink)
+        .and_then(|n| n.config.out_target)
+        .ok_or_else(|| "point this node at a property first.".to_string())?;
+    let expr = project
+        .comp(comp)
+        .and_then(|c| c.root.find(target))
+        .and_then(|n| prop_of(n, PropKind::from_path(prop)).and_then(|p| p.expr().cloned()))
+        .ok_or_else(|| {
+            format!(
+                "{} isn't expression-driven — promote it first (= fx).",
+                prop_path_label(prop)
+            )
+        })?;
+    // Raise (mutates the graph) reading the registry — disjoint fields, so both
+    // borrows coexist.
+    let at = raise_spot(&project.graph, sink);
+    let ctx = GraphCtx::new(reg, &project.modules);
+    let output = motion_core::raise(&mut project.graph, &ctx, &expr, at);
+    wire_into_sink(&mut project.graph, reg, output, sink, "value")
+}
+
+/// Where a raised recipe lands: left of the sink it feeds, so the wire it
+/// arrives with reads left-to-right like every other. The mirror of
+/// `NodeGraph::bind_output`'s placement, which puts a sink right of its source.
+fn raise_spot(graph: &NodeGraph, sink: GraphNodeId) -> Vec2 {
+    graph.node(sink).map_or(Vec2::new(40.0, 40.0), |n| n.pos - Vec2::new(260.0, 0.0))
+}
+
+/// Wire a freshly raised output into the sink that asked for it.
+///
+/// Goes through `connect` rather than pushing the edge, because unlike a
+/// programmatic bind this *can* legitimately mismatch: a property whose
+/// expression resolves to a different kind than the socket the sink now carries
+/// (retargeted since, or an expression that was always the wrong shape). Better
+/// to leave the raised nodes on the canvas unwired and say so than to record a
+/// wire the descriptor says can't exist.
+fn wire_into_sink(
+    graph: &mut NodeGraph,
+    reg: &NodeRegistry,
+    output: Endpoint,
+    sink: GraphNodeId,
+    socket: &str,
+) -> Result<(), String> {
+    // `bare`: a raised recipe's root is never a `use` node, and a sink's own
+    // sockets are typed by its target property, not by any module.
+    let ctx = GraphCtx::bare(reg);
+    graph
+        .connect(&ctx, output, Endpoint::new(sink, socket))
+        .map(|_| ())
+        .map_err(|_| "the raised recipe doesn't fit this property's type.".to_string())
 }
 
 /// The graph the Nodes panel is editing, by scope — the project's own, or one
@@ -457,6 +609,23 @@ impl App {
     /// the other post-pass appliers, so the panel stays a pure snapshot→intent
     /// function. A connection is validated against the registry inside
     /// [`NodeGraph::connect`]; a rejected drop simply doesn't wire.
+    /// Apply one node-graph edit, then **bake whatever it unbound** — see
+    /// [`bake_unbound`] for why that has to happen at all.
+    pub(crate) fn apply_ng_op_at(&mut self, op: NgOp, frame: i64) {
+        // Only the project graph produces drivers; a module body has none, so a
+        // module-scope edit skips the diff entirely.
+        if !matches!(self.ng_scope, NgScope::Project) {
+            self.apply_ng_op(op);
+            return;
+        }
+        let before = self.project.graph.bindings();
+        let before_shapes = self.project.graph.shape_bindings();
+        self.apply_ng_op(op);
+        if bake_unbound(&mut self.project, self.current, frame, &before, &before_shapes) {
+            self.doc_rev += 1;
+        }
+    }
+
     pub(crate) fn apply_ng_op(&mut self, op: NgOp) {
         // Any successful edit retires the last refusal: it was about the graph
         // as it stood, and the graph just moved.
@@ -527,123 +696,50 @@ impl App {
                     n.values.remove(&socket);
                 }
             }
-        }
-    }
-
-    /// Apply one driver-list edit. `Remove` **bakes** the property to a constant
-    /// at its current value first, so dropping a driver leaves the layer where it
-    /// was and hands it back to hand-editing rather than stranding it on a stale
-    /// expression.
-    pub(crate) fn apply_binding_op(&mut self, op: BindingOp, frame: i64) {
-        let bindings = &mut self.project.bindings;
-        match op {
-            BindingOp::Add { output, target, prop } => {
-                bindings.push(Binding { output, target, prop });
-            }
-            BindingOp::SetOutput { index, output } => {
-                if let Some(b) = bindings.get_mut(index) {
-                    b.output = output;
+            NgOp::SetOutTarget { id, target } => {
+                let Some(n) = graph.node_mut(id) else { return };
+                let before = n.config.out_target.map(|(_, p)| p);
+                n.config.out_target = target;
+                // The socket is typed by the property, so a change of *kind*
+                // invalidates whatever was wired in. Drop that wire here rather
+                // than leave an edge the descriptor now says can't exist —
+                // `validate` would flag it and lowering would read the wrong
+                // type. Same-kind changes (Rotation → Opacity) keep the wire.
+                let after = target.map(|(_, p)| p);
+                let kind_of = |p: Option<PropPath>| p.map(|p| p.socket_type());
+                if kind_of(before) != kind_of(after) {
+                    graph.disconnect_input(&Endpoint::new(id, "value"));
                 }
             }
-            BindingOp::SetTarget { index, target } => {
-                if let Some(b) = bindings.get_mut(index) {
-                    b.target = target;
+            NgOp::SetMathOp { id, op } => {
+                let Some(n) = graph.node_mut(id) else { return };
+                n.config.math_op = op;
+                // A unary operator has no `b` socket, so a wire into it would
+                // outlive the thing it plugs into — `validate` would flag it and
+                // lowering would never read it. Dropped here rather than left to
+                // rot, the same way retargeting an `out` node drops a wire whose
+                // type no longer fits.
+                if op.arity() == 1 {
+                    graph.disconnect_input(&Endpoint::new(id, "b"));
                 }
             }
-            BindingOp::SetProp { index, prop } => {
-                if let Some(b) = bindings.get_mut(index) {
-                    b.prop = prop;
-                }
-            }
-            BindingOp::Remove { index } => {
-                if index < bindings.len() {
-                    let b = bindings.remove(index);
-                    self.bake_binding(&b, frame);
-                }
-            }
-        }
-    }
-
-    /// Apply one **geometry**-driver edit. Same shape as `apply_binding_op`,
-    /// including the bake on removal: the layer keeps the shape the graph built,
-    /// but its params freeze to constants at `frame`, so it's hand-editable
-    /// again instead of stranded on expressions no node feeds any more.
-    pub(crate) fn apply_shape_binding_op(&mut self, op: ShapeBindingOp, frame: i64) {
-        match op {
-            ShapeBindingOp::Add { output, target } => {
-                self.project.shape_bindings.push(ShapeBinding { output, target });
-            }
-            ShapeBindingOp::SetOutput { index, output } => {
-                if let Some(b) = self.project.shape_bindings.get_mut(index) {
-                    b.output = output;
-                }
-            }
-            ShapeBindingOp::SetTarget { index, target } => {
-                if let Some(b) = self.project.shape_bindings.get_mut(index) {
-                    b.target = target;
-                }
-            }
-            ShapeBindingOp::Remove { index } => {
-                if index < self.project.shape_bindings.len() {
-                    let b = self.project.shape_bindings.remove(index);
-                    self.bake_shape_binding(&b, frame);
+            NgOp::SetOutShape { id, target } => {
+                if let Some(n) = graph.node_mut(id) {
+                    n.config.out_shape = target;
                 }
             }
         }
     }
 
-    /// Freeze a graph-authored shape's params to constants at `frame` — what a
-    /// geometry driver's removal leaves behind. Resolves against a clone so the
-    /// read context can't alias the node being mutated (the same guard
-    /// `bake_binding` uses).
-    fn bake_shape_binding(&mut self, b: &ShapeBinding, frame: i64) {
-        let snapshot = self.doc().clone();
-        let mut ctx = EvalCtx::new(&snapshot, frame as f64);
-        let id = self.current;
-        if let Some(comp) = self.project.comp_mut(id) {
-            if let Some(node) = comp.root.find_mut(b.target) {
-                match node.shape.as_mut() {
-                    Some(MShape::Rect { size, radius }) => {
-                        size.bake_to_const(&mut ctx);
-                        radius.bake_to_const(&mut ctx);
-                    }
-                    Some(MShape::Ellipse { size }) => size.bake_to_const(&mut ctx),
-                    Some(MShape::Text { size, .. }) => size.bake_to_const(&mut ctx),
-                    // A `Path` has no `Value` params, and a group has no shape.
-                    Some(MShape::Path(_)) | None => {}
-                }
+    /// Run [`import_property`] and report the outcome on the status line.
+    pub(crate) fn import_property(&mut self, sink: GraphNodeId) {
+        match import_property(&mut self.project, &self.node_registry, self.current, sink) {
+            Ok(()) => {
+                self.ng_status = None;
+                self.recompile_graph();
             }
+            Err(msg) => self.ng_status = Some(msg),
         }
-        self.doc_rev += 1;
-    }
-
-    /// Raise a scene property's expression onto the node canvas and bind it back
-    /// — the **property-graph fold**. Reads the property's current `Expr`, raises
-    /// it into the project graph as nodes, and adds a driver from the raised
-    /// output to the same property, so the recipe is now edited on the canvas and
-    /// still drives the layer. A no-op if the property isn't expression-driven —
-    /// promote it first (the old panel's `= fx`).
-    pub(crate) fn import_property(&mut self, target: NodeId, prop: PropPath) {
-        let kind = PropKind::from_path(prop);
-        let expr = self
-            .project
-            .comp(self.current)
-            .and_then(|c| c.root.find(target))
-            .and_then(|n| prop_of(n, kind).and_then(|p| p.expr().cloned()));
-        let Some(expr) = expr else {
-            self.ng_status = Some(format!(
-                "{} isn't expression-driven — promote it first (= fx).",
-                prop_path_label(prop)
-            ));
-            return;
-        };
-        // Raise (mutates the graph) using the registry — disjoint fields, so both
-        // borrows coexist. Place the root clear of the usual spawn corner.
-        let at = kurbo::Vec2::new(360.0, 40.0);
-        let ctx = GraphCtx::new(&self.node_registry, &self.project.modules);
-        let output = motion_core::raise(&mut self.project.graph, &ctx, &expr, at);
-        self.project.bindings.push(Binding { output, target, prop });
-        self.recompile_graph();
     }
 
     /// Recompile every driver: lower its graph output to an `Expr` and set the
@@ -673,6 +769,16 @@ impl App {
                 let module = self
                     .project
                     .add_module(MModule::new(format!("Module {n}"), Expr::Lit(ExprValue::Num(0.0))));
+                // Link it from the project graph straight away. A module with no
+                // `use` node anywhere is unreachable from the canvas now that the
+                // Modules list is gone — you'd have to add a `use` node and
+                // remember the module existed. Creating the link with the module
+                // means the way back is always visible where you left it.
+                let pos = Vec2::new(40.0, 40.0 + 28.0 * (self.project.graph.nodes.len() % 6) as f64);
+                let link = self.project.graph.add_node("use", pos);
+                if let Some(node) = self.project.graph.node_mut(link) {
+                    node.config.module = Some(module);
+                }
                 self.open_module(module);
             }
             NgModuleOp::Rename { module, name } => {
@@ -817,13 +923,15 @@ impl App {
             }
         }
         self.project
-            .bindings
+            .graph
+            .bindings()
             .iter()
             .find(|b| seen.contains(&b.output.node))
             .map(|b| b.target)
             .or_else(|| {
                 self.project
-                    .shape_bindings
+                    .graph
+                    .shape_bindings()
                     .iter()
                     .find(|b| seen.contains(&b.output.node))
                     .map(|b| b.target)
@@ -847,23 +955,6 @@ impl App {
         let Some(m) = self.project.modules.get_mut(&module) else { return };
         let output = motion_core::raise(&mut m.graph, &ctx, &body, kurbo::Vec2::new(40.0, 40.0));
         m.output = Some(output);
-    }
-
-    /// Freeze a driven property to a constant at `frame` — what a driver's
-    /// removal leaves behind. Resolves against a clone so the read context can't
-    /// alias the node being mutated (same guard as `GraphOp::Bake`).
-    fn bake_binding(&mut self, b: &Binding, frame: i64) {
-        let snapshot = self.doc().clone();
-        let mut ctx = EvalCtx::new(&snapshot, frame as f64);
-        let id = self.current;
-        if let Some(comp) = self.project.comp_mut(id) {
-            if let Some(node) = comp.root.find_mut(b.target) {
-                if let Some(mut p) = prop_of_mut(node, PropKind::from_path(b.prop)) {
-                    p.bake_to_const(&mut ctx);
-                }
-            }
-        }
-        self.doc_rev += 1;
     }
 
     /// Apply one frame's worth of alignment-aid intent to the open comp.
@@ -1674,8 +1765,8 @@ impl App {
     /// Refuses rather than converting when a param is keyframed: binding makes
     /// every param an expression, so a track would be replaced. See
     /// [`motion_core::RaiseShapeError`].
-    pub(crate) fn import_shape(&mut self, target: NodeId) {
-        match import_shape(&mut self.project, &self.node_registry, self.current, target) {
+    pub(crate) fn import_shape(&mut self, sink: GraphNodeId) {
+        match import_shape(&mut self.project, &self.node_registry, self.current, sink) {
             Ok(()) => {
                 self.ng_status = None;
                 self.recompile_graph();
@@ -1836,7 +1927,9 @@ impl App {
         // already carries the lowered expressions (recompile ran before save), so
         // this is belt-and-braces — it keeps a hand-edited graph and its
         // properties consistent rather than trusting the file to be in sync.
-        if !(self.project.bindings.is_empty() && self.project.shape_bindings.is_empty()) {
+        if !(self.project.graph.bindings().is_empty()
+            && self.project.graph.shape_bindings().is_empty())
+        {
             self.recompile_graph();
         }
         self.seek_frame(0);
@@ -2148,8 +2241,6 @@ impl App {
             }
             v
         };
-        let ng_bindings = self.project.bindings.clone();
-        let ng_shape_bindings = self.project.shape_bindings.clone();
         // Modules for a `use` node's picker: id + display name.
         let ng_modules: Vec<(ModuleId, String)> =
             self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
@@ -2221,8 +2312,6 @@ impl App {
                         ng_scope,
                         &ng_layers,
                         &ng_modules,
-                        &ng_bindings,
-                        &ng_shape_bindings,
                         &ng_knobs,
                         ng_module_output.as_ref(),
                         ng_script_preview.as_ref(),
@@ -2342,19 +2431,12 @@ impl App {
                     | NgOp::SetModule { .. }
                     | NgOp::SetText { .. }
                     | NgOp::SetWaveform { .. }
+                    | NgOp::SetMathOp { .. }
                     | NgOp::ClearValue { .. }
+                    | NgOp::SetOutTarget { .. }
+                    | NgOp::SetOutShape { .. }
             );
-            self.apply_ng_op(op);
-            window.request_redraw();
-        }
-        if let Some(bop) = ng_edits.binding.take() {
-            self.apply_binding_op(bop, frame);
-            ng_changed = true;
-            window.request_redraw();
-        }
-        if let Some(sop) = ng_edits.shape_binding.take() {
-            self.apply_shape_binding_op(sop, frame);
-            ng_changed = true;
+            self.apply_ng_op_at(op, frame);
             window.request_redraw();
         }
         // Module ops and scope changes: both recompile on their own (a module
@@ -2375,21 +2457,23 @@ impl App {
             }
             window.request_redraw();
         }
-        if ng_changed && !(self.project.bindings.is_empty() && self.project.shape_bindings.is_empty())
+        if ng_changed
+            && !(self.project.graph.bindings().is_empty()
+                && self.project.graph.shape_bindings().is_empty())
         {
             self.recompile_graph();
             window.request_redraw();
         }
         // Import raises + binds + recompiles on its own, so it's handled apart
         // from the `ng_changed` recompile above.
-        if let Some((target, prop)) = ng_edits.import.take() {
-            self.import_property(target, prop);
+        if let Some(sink) = ng_edits.import.take() {
+            self.import_property(sink);
             window.request_redraw();
         }
         // The geometry fold, both directions. Like `import`, each raises/binds
         // and recompiles itself, so neither rides the `ng_changed` path above.
-        if let Some(target) = ng_edits.import_shape.take() {
-            self.import_shape(target);
+        if let Some(sink) = ng_edits.import_shape.take() {
+            self.import_shape(sink);
             window.request_redraw();
         }
         if let Some(output) = ng_edits.create_layer.take() {
@@ -2579,6 +2663,14 @@ impl App {
         // A click commits the font, so it joins the recents.
         if let Some(family) = edits.text_family.as_ref() {
             remember_font(&mut self.recent_fonts, family);
+        }
+        // The properties panel's knob edits go through the Nodes panel's own
+        // applier — same op, same path. Done *before* `apply_edits`, which takes
+        // a long `&mut` borrow of the selected node that this couldn't share.
+        // It recompiles on its own (a module's knob changes its `use` sockets),
+        // so it needn't join the `dirty` bookkeeping below.
+        if let Some(kop) = edits.knob.take() {
+            self.apply_ng_knob_op(kop);
         }
         let mut dirty = self.apply_edits(frame, &edits);
         // Applied here rather than with the other comp settings above so it can

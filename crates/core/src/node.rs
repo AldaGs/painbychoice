@@ -1018,15 +1018,20 @@ pub struct Project {
     /// written before the node graph existed still loads.
     #[serde(default)]
     pub graph: crate::graph::NodeGraph,
-    /// Drivers: each binds a `graph` output to a scene layer's property.
-    #[serde(default)]
-    pub bindings: Vec<crate::graph::Binding>,
-    /// Geometry drivers: each binds a `graph` geometry output to a scene
-    /// layer's *shape*. Separate from `bindings` because a shape isn't a
-    /// `Value` and so has no `PropPath` to name (see
-    /// [`crate::graph::ShapeBinding`]).
-    #[serde(default)]
-    pub shape_bindings: Vec<crate::graph::ShapeBinding>,
+    /// Drivers as they were stored **before they became nodes**: a list beside
+    /// the graph rather than `out` nodes in it.
+    ///
+    /// Load-only, and private. [`Project::migrate`] drains both of these into
+    /// the graph as sink nodes, and [`crate::graph::NodeGraph::bindings`]
+    /// derives the drivers from there on. They stay here purely so a `.pbc`
+    /// written before the change still opens with its drivers intact — dropping
+    /// the fields would make serde skip the keys silently, which is data loss
+    /// wearing a compatible face. `skip_serializing` means nothing writes them
+    /// back, so a file round-trips into the new shape once and stays there.
+    #[serde(default, rename = "bindings", skip_serializing)]
+    legacy_bindings: Vec<crate::graph::Binding>,
+    #[serde(default, rename = "shape_bindings", skip_serializing)]
+    legacy_shape_bindings: Vec<crate::graph::ShapeBinding>,
 }
 
 impl Project {
@@ -1039,8 +1044,8 @@ impl Project {
             root,
             modules: Default::default(),
             graph: crate::graph::NodeGraph::new(),
-            bindings: Vec::new(),
-            shape_bindings: Vec::new(),
+            legacy_bindings: Vec::new(),
+            legacy_shape_bindings: Vec::new(),
         }
     }
 
@@ -1079,11 +1084,28 @@ impl Project {
         id
     }
 
-    /// Bring every comp up to the current format — see [`Comp::migrate`]. Must
+    /// Bring every comp up to the current format — see [`Comp::migrate`] — and
+    /// convert any pre-node drivers into the sink nodes that replaced them. Must
     /// be called after *every* load.
+    ///
+    /// The conversion is one-way and idempotent: draining the legacy lists into
+    /// the graph leaves them empty, and nothing ever writes them again. A driver
+    /// whose output no longer exists still becomes an `out` node — it lands at
+    /// the origin with a dangling wire, which `validate` reports and the canvas
+    /// shows, rather than vanishing without a word.
     pub fn migrate(&mut self) {
         for comp in self.comps.values_mut() {
             comp.migrate();
+        }
+        self.graph.migrate_kinds();
+        for m in self.modules.values_mut() {
+            m.graph.migrate_kinds();
+        }
+        for b in std::mem::take(&mut self.legacy_bindings) {
+            self.graph.bind_output(b.output, b.target, b.prop);
+        }
+        for b in std::mem::take(&mut self.legacy_shape_bindings) {
+            self.graph.bind_geometry(b.output, b.target);
         }
     }
 }

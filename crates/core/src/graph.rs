@@ -20,7 +20,7 @@ use std::collections::{HashSet, VecDeque};
 use kurbo::Vec2;
 use serde::{Deserialize, Serialize};
 
-use crate::expr::{PropPath, Waveform};
+use crate::expr::{BinOp, MathOp, PropPath, UnOp, Waveform};
 use crate::node::{ModuleId, NodeId};
 use crate::registry::{NodeDescriptor, NodeRegistry};
 use crate::socket::Socket;
@@ -79,19 +79,61 @@ impl<'a> GraphCtx<'a> {
     /// [`crate::lower`].
     pub fn descriptor_for(&self, node: &GraphNode) -> Option<Cow<'a, NodeDescriptor>> {
         let desc = self.reg.get(&node.kind)?;
-        if node.kind != "use" {
-            return Some(Cow::Borrowed(desc));
+        match node.kind.as_str() {
+            "use" => {
+                // An unlinked `use`, or one whose module was deleted, keeps the
+                // bare descriptor: no knobs to offer. It lowers to neutral anyway.
+                let Some(def) = node.config.module.and_then(|m| self.modules.get(&m)) else {
+                    return Some(Cow::Borrowed(desc));
+                };
+                let mut specialized = desc.clone();
+                for p in &def.params {
+                    specialized
+                        .inputs
+                        .push(Socket::new(&p.name, &p.name, param_socket_type(&p.value)));
+                }
+                Some(Cow::Owned(specialized))
+            }
+            // A Math node's arity and resting operands follow its operator: a
+            // unary op has no second operand to show, and Multiply's identity
+            // is 1 where Add's is 0. Both come from the op, so picking one from
+            // the node's own list reshapes it.
+            "math" => {
+                let mut specialized = desc.clone();
+                match node.config.math_op {
+                    MathOp::Bin(op) => {
+                        let (a, b) = op.seed_operands();
+                        if let Some(s) = specialized.inputs.get_mut(0) {
+                            s.default = Some(crate::expr::ExprValue::Num(a));
+                        }
+                        if let Some(s) = specialized.inputs.get_mut(1) {
+                            s.default = Some(crate::expr::ExprValue::Num(b));
+                        }
+                    }
+                    // Unary: the `b` socket doesn't exist. Dropping it rather
+                    // than hiding it is what makes a wire into it impossible
+                    // instead of merely invisible.
+                    MathOp::Un(_) => specialized.inputs.truncate(1),
+                }
+                Some(Cow::Owned(specialized))
+            }
+            // An `out` node's input is the *property* it drives, so its type
+            // follows the target rather than the kind. An untargeted one keeps
+            // the bare `Number` socket — it drives nothing until it's pointed
+            // somewhere, and a typeless socket would accept a wire it might
+            // later have to drop.
+            "out" => {
+                let Some((_, prop)) = node.config.out_target else {
+                    return Some(Cow::Borrowed(desc));
+                };
+                let mut specialized = desc.clone();
+                if let Some(s) = specialized.inputs.first_mut() {
+                    s.ty = prop.socket_type();
+                }
+                Some(Cow::Owned(specialized))
+            }
+            _ => Some(Cow::Borrowed(desc)),
         }
-        // An unlinked `use`, or one whose module was deleted, keeps the bare
-        // descriptor: no knobs to offer. It lowers to neutral anyway.
-        let Some(def) = node.config.module.and_then(|m| self.modules.get(&m)) else {
-            return Some(Cow::Borrowed(desc));
-        };
-        let mut specialized = desc.clone();
-        for p in &def.params {
-            specialized.inputs.push(Socket::new(&p.name, &p.name, param_socket_type(&p.value)));
-        }
-        Some(Cow::Owned(specialized))
     }
 }
 
@@ -185,6 +227,24 @@ pub struct NodeConfig {
     /// [`ExprValue`]: crate::expr::ExprValue
     #[serde(default)]
     pub text: TextConfig,
+    /// An `out` node's target: which scene layer's which property this driver
+    /// feeds. `None` until picked — an untargeted sink is inert, so a node
+    /// dropped on the canvas doesn't seize a property before you've said which.
+    ///
+    /// This field plus the wire into the node's `value` socket *are* the driver
+    /// (see [`NodeGraph::bindings`]); there is no separate list.
+    #[serde(default)]
+    pub out_target: Option<(NodeId, PropPath)>,
+    /// A `shapeOut` node's target layer. Names no property, for the same reason
+    /// [`ShapeBinding`] doesn't: the shape *is* what's bound.
+    #[serde(default)]
+    pub out_shape: Option<NodeId>,
+    /// A `math` node's operator. Not a socket: it selects *which* function the
+    /// node is, not a value fed into one — the same reason an `osc`'s waveform
+    /// is config. Defaults to Add, so a node placed before this field existed
+    /// reads back as the `add` it used to be.
+    #[serde(default)]
+    pub math_op: MathOp,
 }
 
 /// The plain-data half of a `text` node — everything
@@ -405,6 +465,15 @@ impl NodeGraph {
         self.edges.len() != before
     }
 
+    /// Drop whatever feeds `input`, returning whether anything did. The
+    /// endpoint-addressed form of [`Self::disconnect`], for when the caller
+    /// knows the socket but not the wire — retyping an `out` node's socket, say.
+    pub fn disconnect_input(&mut self, input: &Endpoint) -> bool {
+        let before = self.edges.len();
+        self.edges.retain(|e| &e.to != input);
+        self.edges.len() != before
+    }
+
     /// The edge feeding `input`, if any — an input has at most one.
     pub fn incoming(&self, input: &Endpoint) -> Option<&Edge> {
         self.edges.iter().find(|e| &e.to == input)
@@ -413,6 +482,98 @@ impl NodeGraph {
     /// Every wire leaving `node`'s outputs.
     pub fn edges_from(&self, node: GraphNodeId) -> impl Iterator<Item = &Edge> {
         self.edges.iter().filter(move |e| e.from.node == node)
+    }
+
+    /// The **drivers this graph declares**: one per `out` node that both names a
+    /// target and has something wired into it.
+    ///
+    /// Derived, never stored. A driver is a fact *about* the graph — an `out`
+    /// node's config plus the wire feeding it — so reading it back out is the
+    /// only way it can't drift from what the canvas shows. The old parallel
+    /// `Project::bindings` list could disagree with the graph (a wire deleted
+    /// under a binding, a binding pointing at a node that's gone); this can't
+    /// represent that state at all.
+    ///
+    /// An `out` node that's untargeted, or unwired, contributes nothing rather
+    /// than a half-driver: both are the resting state of a node you just placed.
+    pub fn bindings(&self) -> Vec<Binding> {
+        self.nodes
+            .iter()
+            .filter(|n| n.kind == "out")
+            .filter_map(|n| {
+                let (target, prop) = n.config.out_target?;
+                let edge = self.incoming(&Endpoint::new(n.id, "value"))?;
+                Some(Binding { output: edge.from.clone(), target, prop })
+            })
+            .collect()
+    }
+
+    /// The **geometry drivers** this graph declares — [`Self::bindings`] for
+    /// `shapeOut` nodes, on the same derive-don't-store terms.
+    pub fn shape_bindings(&self) -> Vec<ShapeBinding> {
+        self.nodes
+            .iter()
+            .filter(|n| n.kind == "shapeOut")
+            .filter_map(|n| {
+                let target = n.config.out_shape?;
+                let edge = self.incoming(&Endpoint::new(n.id, "geometry"))?;
+                Some(ShapeBinding { output: edge.from.clone(), target })
+            })
+            .collect()
+    }
+
+    /// Place an `out` node driving `target`'s `prop` from `output`, and wire it
+    /// — how anything that binds programmatically (the fold's import, a load-time
+    /// migration) says "make this a driver".
+    ///
+    /// The wire is pushed directly rather than through [`Self::connect`]: the
+    /// node is brand new, so neither the one-wire-per-input rule nor the cycle
+    /// rule can be at stake, and a sink has no outputs to close a loop with.
+    /// Types line up by construction — the socket is retyped from `prop` — and a
+    /// caller passing a mismatched output would rather see it drive nothing than
+    /// have the binding silently dropped on the floor.
+    pub fn bind_output(&mut self, output: Endpoint, target: NodeId, prop: PropPath) -> GraphNodeId {
+        let id = self.add_node("out", self.sink_pos(&output));
+        self.node_mut(id).expect("just added").config.out_target = Some((target, prop));
+        self.edges.push(Edge { from: output, to: Endpoint::new(id, "value") });
+        id
+    }
+
+    /// [`Self::bind_output`] for geometry: a `shapeOut` node driving `target`'s
+    /// shape.
+    pub fn bind_geometry(&mut self, output: Endpoint, target: NodeId) -> GraphNodeId {
+        let id = self.add_node("shapeOut", self.sink_pos(&output));
+        self.node_mut(id).expect("just added").config.out_shape = Some(target);
+        self.edges.push(Edge { from: output, to: Endpoint::new(id, "geometry") });
+        id
+    }
+
+    /// Rewrite the node kinds that were **folded into another kind**, so a graph
+    /// authored before the fold still evaluates.
+    ///
+    /// Only `add`/`mul`/`neg` → `math` so far. Cheap enough to be worth doing
+    /// even though nothing shipped with those kinds: they're plain strings, an
+    /// unrecognised one merely draws red and lowers to nothing, and a graph
+    /// silently going inert is a bad way to find that out.
+    pub fn migrate_kinds(&mut self) {
+        for n in &mut self.nodes {
+            let op = match n.kind.as_str() {
+                "add" => MathOp::Bin(BinOp::Add),
+                "mul" => MathOp::Bin(BinOp::Mul),
+                "neg" => MathOp::Un(UnOp::Neg),
+                _ => continue,
+            };
+            n.kind = "math".to_string();
+            n.config.math_op = op;
+        }
+    }
+
+    /// Where a sink node lands: just right of the node it reads, so the wire it
+    /// arrives with is short and reads left-to-right like every other. Falls back
+    /// to the origin when the source is missing, which only a caller binding a
+    /// dangling endpoint can produce.
+    fn sink_pos(&self, output: &Endpoint) -> Vec2 {
+        self.node(output.node).map_or(Vec2::ZERO, |n| n.pos + Vec2::new(220.0, 0.0))
     }
 
     /// Resolve the socket type of an output endpoint, erroring the way `connect`
@@ -529,7 +690,7 @@ mod tests {
         let mut g = NodeGraph::new();
         // rect.size (Vector output) → add.a (Number input) is a type mismatch.
         let rect = g.add_node("rect", Vec2::ZERO);
-        let add = g.add_node("add", Vec2::new(200.0, 0.0));
+        let add = g.add_node("math", Vec2::new(200.0, 0.0));
         let err = g
             .connect(ctx, Endpoint::new(rect, "size"), Endpoint::new(add, "a"))
             .unwrap_err();
@@ -550,7 +711,7 @@ mod tests {
         let mut g = NodeGraph::new();
         let v1 = g.add_node("value", Vec2::ZERO);
         let v2 = g.add_node("value", Vec2::new(0.0, 60.0));
-        let add = g.add_node("add", Vec2::new(200.0, 0.0));
+        let add = g.add_node("math", Vec2::new(200.0, 0.0));
         g.connect(ctx, Endpoint::new(v1, "value"), Endpoint::new(add, "a")).unwrap();
         g.connect(ctx, Endpoint::new(v2, "value"), Endpoint::new(add, "a")).unwrap();
         assert_eq!(g.edges.len(), 1, "the second wire replaces the first");
@@ -562,8 +723,10 @@ mod tests {
         let reg = reg();
         let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
-        let a = g.add_node("neg", Vec2::ZERO);
-        let b = g.add_node("neg", Vec2::new(200.0, 0.0));
+        let a = g.add_node("math", Vec2::ZERO);
+        g.node_mut(a).unwrap().config.math_op = MathOp::Un(UnOp::Neg);
+        let b = g.add_node("math", Vec2::new(200.0, 0.0));
+        g.node_mut(b).unwrap().config.math_op = MathOp::Un(UnOp::Neg);
         // a.result → b.a, then b.result → a.a would loop.
         g.connect(ctx, Endpoint::new(a, "result"), Endpoint::new(b, "a")).unwrap();
         let err = g
@@ -580,7 +743,7 @@ mod tests {
         let reg = reg();
         let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
-        let add = g.add_node("add", Vec2::ZERO);
+        let add = g.add_node("math", Vec2::ZERO);
         // `add` has no output called "nope".
         let bad_socket = g.connect(ctx, Endpoint::new(add, "nope"), Endpoint::new(add, "a"));
         assert!(matches!(bad_socket, Err(ConnectError::NoSuchSocket(_))));
@@ -596,7 +759,7 @@ mod tests {
         let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let v = g.add_node("value", Vec2::ZERO);
-        let add = g.add_node("add", Vec2::new(200.0, 0.0));
+        let add = g.add_node("math", Vec2::new(200.0, 0.0));
         g.connect(ctx, Endpoint::new(v, "value"), Endpoint::new(add, "a")).unwrap();
         assert!(g.remove_node(v));
         assert!(g.edges.is_empty(), "the incident wire went with the node");
@@ -604,6 +767,66 @@ mod tests {
         // silently reattach.
         let w = g.add_node("value", Vec2::ZERO);
         assert_ne!(w, v);
+    }
+
+    /// A Math node **reshapes itself** from its operator: a unary op has no `B`
+    /// socket at all, and each op rests at its own identity. Dropping the socket
+    /// rather than hiding it is what makes a wire into it impossible instead of
+    /// merely invisible.
+    #[test]
+    fn a_math_nodes_shape_follows_its_operator() {
+        use crate::expr::ExprValue;
+        let reg = NodeRegistry::with_builtins();
+        let ctx = GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let m = g.add_node("math", Vec2::ZERO);
+
+        let shape = |g: &NodeGraph| {
+            let d = ctx.descriptor_for(g.node(m).unwrap()).unwrap().into_owned();
+            let defaults: Vec<_> = d.inputs.iter().map(|s| s.default.clone()).collect();
+            (d.inputs.len(), defaults)
+        };
+        // Add, the default: two operands resting at its identity, 0.
+        assert_eq!(shape(&g), (2, vec![Some(ExprValue::Num(0.0)); 2]));
+
+        // Multiply: still two, but resting at 1 — an unwired operand must pass
+        // its input through, not annihilate it.
+        g.node_mut(m).unwrap().config.math_op = MathOp::Bin(BinOp::Mul);
+        assert_eq!(shape(&g), (2, vec![Some(ExprValue::Num(1.0)); 2]));
+
+        // Square Root: one operand. The `b` socket is gone, so a wire to it is
+        // refused by the same rule that refuses any socket that doesn't exist.
+        g.node_mut(m).unwrap().config.math_op = MathOp::Un(UnOp::Sqrt);
+        assert_eq!(shape(&g).0, 1);
+        let v = g.add_node("value", Vec2::new(-200.0, 0.0));
+        assert!(matches!(
+            g.connect(&ctx, Endpoint::new(v, "value"), Endpoint::new(m, "b")),
+            Err(ConnectError::NoSuchSocket(_)),
+        ));
+    }
+
+    /// A graph authored when Add and Multiply were their own kinds still
+    /// evaluates: the kinds fold into `math` with the matching operator, rather
+    /// than going unrecognised and silently lowering to nothing.
+    #[test]
+    fn the_retired_operator_kinds_fold_into_the_math_node() {
+        use crate::node::{Comp, Node, Project};
+        let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        let add = project.graph.add_node("add", Vec2::ZERO);
+        let mul = project.graph.add_node("mul", Vec2::new(0.0, 100.0));
+        let neg = project.graph.add_node("neg", Vec2::new(0.0, 200.0));
+
+        project.migrate();
+
+        let op = |id| project.graph.node(id).unwrap().config.math_op;
+        let kind = |id| project.graph.node(id).unwrap().kind.clone();
+        assert_eq!((kind(add), op(add)), ("math".to_string(), MathOp::Bin(BinOp::Add)));
+        assert_eq!((kind(mul), op(mul)), ("math".to_string(), MathOp::Bin(BinOp::Mul)));
+        assert_eq!((kind(neg), op(neg)), ("math".to_string(), MathOp::Un(UnOp::Neg)));
+        // And they're real Math nodes now — the registry knows the kind, so they
+        // draw and lower like any other.
+        let reg = NodeRegistry::with_builtins();
+        assert!(GraphCtx::bare(&reg).descriptor_for(project.graph.node(mul).unwrap()).is_some());
     }
 
     /// The graph and its drivers are document data: a project must carry them
@@ -616,11 +839,7 @@ mod tests {
 
         let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
         let osc = project.graph.add_node("osc", Vec2::new(20.0, 20.0));
-        project.bindings.push(Binding {
-            output: Endpoint::new(osc, "value"),
-            target: NodeId(0),
-            prop: PropPath::Rotation,
-        });
+        project.graph.bind_output(Endpoint::new(osc, "value"), NodeId(0), PropPath::Rotation);
         // A geometry driver, a text node's typography config, and a string
         // socket literal ride along too — all three are document data, so all
         // three must survive the trip.
@@ -628,26 +847,138 @@ mod tests {
         let tn = project.graph.node_mut(text).unwrap();
         tn.config.text.family = "Georgia".into();
         tn.set_value("content", crate::expr::ExprValue::Str("hello".into()));
-        project
-            .shape_bindings
-            .push(ShapeBinding { output: Endpoint::new(text, "geometry"), target: NodeId(0) });
+        project.graph.bind_geometry(Endpoint::new(text, "geometry"), NodeId(0));
 
         let json = serde_json::to_string(&project).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(back.graph, project.graph);
-        assert_eq!(back.bindings, project.bindings);
-        assert_eq!(back.shape_bindings, project.shape_bindings);
+        // The drivers rode in the graph, so they come back derived from it.
+        assert_eq!(back.graph.bindings(), project.graph.bindings());
+        assert_eq!(back.graph.shape_bindings(), project.graph.shape_bindings());
 
-        // A legacy project JSON with none of the fields loads with empty
-        // defaults — including one written before geometry drivers existed.
+        // A legacy project JSON with no graph at all loads with empty defaults.
         let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let obj = legacy.as_object_mut().unwrap();
-        obj.remove("graph");
-        obj.remove("bindings");
-        obj.remove("shape_bindings");
+        legacy.as_object_mut().unwrap().remove("graph");
         let old: Project = serde_json::from_value(legacy).unwrap();
-        assert!(old.graph.nodes.is_empty() && old.bindings.is_empty());
-        assert!(old.shape_bindings.is_empty());
+        assert!(old.graph.nodes.is_empty() && old.graph.bindings().is_empty());
+        assert!(old.graph.shape_bindings().is_empty());
+    }
+
+    /// A `.pbc` written **before drivers were nodes** carried them in two lists
+    /// beside the graph. Loading one must turn each into the sink node that
+    /// replaced it — otherwise every driver in every existing project silently
+    /// stops driving, since nothing reads those lists any more.
+    #[test]
+    fn a_pre_node_projects_driver_lists_migrate_into_sink_nodes() {
+        use crate::expr::PropPath;
+        use crate::node::{Comp, Node, NodeId, Project};
+
+        let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        let osc = project.graph.add_node("osc", Vec2::new(20.0, 20.0));
+        let rect = project.graph.add_node("rect", Vec2::new(20.0, 120.0));
+        // Hand-build the old on-disk shape: a graph with no sinks, plus the two
+        // lists. The fields are private now, so JSON is the only way to say it —
+        // which is the point, since JSON is the only place it still exists.
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.insert(
+            "bindings".into(),
+            serde_json::json!([{
+                "output": { "node": osc, "socket": "value" },
+                "target": NodeId(0),
+                "prop": PropPath::Rotation,
+            }]),
+        );
+        obj.insert(
+            "shape_bindings".into(),
+            serde_json::json!([{
+                "output": { "node": rect, "socket": "geometry" },
+                "target": NodeId(0),
+            }]),
+        );
+
+        let mut loaded: Project = serde_json::from_value(json).unwrap();
+        // Before migration the lists are still lists, so the graph shows nothing.
+        assert!(loaded.graph.bindings().is_empty(), "a sink can't exist before migration");
+        loaded.migrate();
+
+        assert_eq!(
+            loaded.graph.bindings(),
+            [Binding {
+                output: Endpoint::new(osc, "value"),
+                target: NodeId(0),
+                prop: PropPath::Rotation,
+            }],
+        );
+        assert_eq!(
+            loaded.graph.shape_bindings(),
+            [ShapeBinding { output: Endpoint::new(rect, "geometry"), target: NodeId(0) }],
+        );
+        // And they're real, visible, editable nodes — not a hidden list.
+        assert_eq!(loaded.graph.nodes.iter().filter(|n| n.kind == "out").count(), 1);
+        assert_eq!(loaded.graph.nodes.iter().filter(|n| n.kind == "shapeOut").count(), 1);
+
+        // Saving now writes the nodes and *not* the legacy keys, so the file
+        // converts once and a second migrate has nothing left to do.
+        let round = serde_json::to_string(&loaded).unwrap();
+        assert!(!round.contains("\"bindings\""), "the legacy lists must not be written back");
+        let mut again: Project = serde_json::from_str(&round).unwrap();
+        again.migrate();
+        assert_eq!(again.graph.nodes.len(), loaded.graph.nodes.len());
+    }
+
+    /// An `out` node's input socket is typed by the property it targets, so the
+    /// canvas can refuse a wire that would drive a colour from a number.
+    #[test]
+    fn an_out_nodes_socket_follows_its_target_property() {
+        use crate::expr::PropPath;
+        use crate::node::NodeId;
+
+        let reg = reg();
+        let ctx = GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let out = g.add_node("out", Vec2::ZERO);
+        // Untargeted: the bare descriptor's resting Number socket.
+        assert_eq!(ctx.descriptor_for(g.node(out).unwrap()).unwrap().inputs[0].ty, SocketType::Number);
+
+        g.node_mut(out).unwrap().config.out_target = Some((NodeId(0), PropPath::Fill));
+        assert_eq!(ctx.descriptor_for(g.node(out).unwrap()).unwrap().inputs[0].ty, SocketType::Color);
+
+        // …and the type rule then applies to it like any other socket.
+        let osc = g.add_node("osc", Vec2::new(0.0, 60.0));
+        assert!(matches!(
+            g.connect(&ctx, Endpoint::new(osc, "value"), Endpoint::new(out, "value")),
+            Err(ConnectError::TypeMismatch { .. }),
+        ));
+    }
+
+    /// A driver exists only where an `out` node has *both* a target and a wire.
+    /// Deriving rather than storing is what makes that true — there is no state
+    /// in which the list says one thing and the canvas shows another.
+    #[test]
+    fn a_driver_needs_both_a_target_and_a_wire() {
+        use crate::expr::PropPath;
+        use crate::node::NodeId;
+
+        let reg = reg();
+        let ctx = GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let osc = g.add_node("osc", Vec2::ZERO);
+        let out = g.add_node("out", Vec2::new(220.0, 0.0));
+
+        // Wired but untargeted.
+        g.connect(&ctx, Endpoint::new(osc, "value"), Endpoint::new(out, "value")).unwrap();
+        assert!(g.bindings().is_empty());
+
+        // Targeted and wired.
+        g.node_mut(out).unwrap().config.out_target = Some((NodeId(7), PropPath::Rotation));
+        assert_eq!(g.bindings().len(), 1);
+
+        // Pulling the wire retires the driver — no stale row left behind.
+        let edge = g.incoming(&Endpoint::new(out, "value")).unwrap().clone();
+        g.disconnect(&edge);
+        assert!(g.bindings().is_empty());
     }
 
     #[test]
@@ -657,7 +988,7 @@ mod tests {
         let mut g = NodeGraph::new();
         g.add_node("acme.missing", Vec2::ZERO); // plugin not loaded
         let good = g.add_node("value", Vec2::new(0.0, 60.0));
-        let add = g.add_node("add", Vec2::new(200.0, 0.0));
+        let add = g.add_node("math", Vec2::new(200.0, 0.0));
         g.connect(ctx, Endpoint::new(good, "value"), Endpoint::new(add, "a")).unwrap();
 
         let problems = g.validate(ctx);

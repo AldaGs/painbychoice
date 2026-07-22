@@ -24,7 +24,8 @@ pub mod value;
 
 pub use eval::{evaluate, evaluate_comp, evaluate_project, RenderItem, Scene};
 pub use expr::{
-    eval_script, eval_script_ctx, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
+    eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
+    MathOp, UnOp,
     PropPath, ToExpr, Waveform,
 };
 pub use node::{

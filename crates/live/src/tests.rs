@@ -4,6 +4,7 @@
 //! Moved verbatim out of `main.rs` when it was split by concern.
 
 use crate::*;
+use motion_core::{BinOp, UnOp};
 
 fn test_axis(view: TimelineView) -> Axis {
     // 8px pad each side → a 400px usable span.
@@ -2542,9 +2543,7 @@ fn a_geometry_driver_authors_a_layers_shape() {
         .graph
         .connect(&GraphCtx::bare(&reg), Endpoint::new(ramp, "value"), Endpoint::new(rect, "radius"))
         .unwrap();
-    project
-        .shape_bindings
-        .push(ShapeBinding { output: Endpoint::new(rect, "geometry"), target });
+    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), target);
 
     compile_drivers(&mut project, &reg, comp);
 
@@ -2577,14 +2576,8 @@ fn a_property_driver_overrides_one_param_of_a_graph_authored_shape() {
     let rect = project.graph.add_node("rect", Vec2::new(0.0, 0.0));
     let v = project.graph.add_node("value", Vec2::new(-200.0, 0.0));
     project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Vec2(Vec2::new(50.0, 50.0)));
-    project
-        .shape_bindings
-        .push(ShapeBinding { output: Endpoint::new(rect, "geometry"), target });
-    project.bindings.push(Binding {
-        output: Endpoint::new(v, "value"),
-        target,
-        prop: PropPath::ShapeSize,
-    });
+    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), target);
+    project.graph.bind_output(Endpoint::new(v, "value"), target, PropPath::ShapeSize);
 
     compile_drivers(&mut project, &reg, comp);
 
@@ -2604,10 +2597,8 @@ fn a_stale_geometry_driver_leaves_the_shape_untouched() {
     // Give the layer a hand-made ellipse first.
     project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().shape =
         Some(MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
-    let add = project.graph.add_node("add", Vec2::new(0.0, 0.0));
-    project
-        .shape_bindings
-        .push(ShapeBinding { output: Endpoint::new(add, "geometry"), target });
+    let add = project.graph.add_node("math", Vec2::new(0.0, 0.0));
+    project.graph.bind_geometry(Endpoint::new(add, "geometry"), target);
 
     compile_drivers(&mut project, &reg, comp);
 
@@ -2624,10 +2615,7 @@ fn a_stale_geometry_driver_leaves_the_shape_untouched() {
 #[test]
 fn opening_a_module_seeds_its_canvas_from_its_body() {
     let reg = NodeRegistry::with_builtins();
-    let body = Expr::Mul(
-        Box::new(Expr::Time(motion_core::expr::TimeSource::T01)),
-        Box::new(Expr::Lit(ExprValue::Num(90.0))),
-    );
+    let body = Expr::bin(BinOp::Mul,Expr::Time(motion_core::expr::TimeSource::T01),Expr::Lit(ExprValue::Num(90.0)));
     let mut modules = std::collections::BTreeMap::new();
     modules.insert(ModuleId(1), MModule::new("spin", body.clone()));
 
@@ -2699,11 +2687,7 @@ fn one_param_recipe_drives_two_layers_at_their_own_knob_values() {
     let p = project.graph.add_node("param", Vec2::ZERO);
     project.graph.node_mut(p).unwrap().config.param = "gain".into();
     for target in [NodeId(1), NodeId(2)] {
-        project.bindings.push(Binding {
-            output: Endpoint::new(p, "value"),
-            target,
-            prop: PropPath::Rotation,
-        });
+        project.graph.bind_output(Endpoint::new(p, "value"), target, PropPath::Rotation);
     }
     compile_drivers(&mut project, &reg, comp_id);
 
@@ -2732,11 +2716,7 @@ fn removing_a_knob_a_param_still_reads_falls_back_instead_of_failing() {
 
     let p = project.graph.add_node("param", Vec2::ZERO);
     project.graph.node_mut(p).unwrap().config.param = "gain".into();
-    project.bindings.push(Binding {
-        output: Endpoint::new(p, "value"),
-        target: NodeId(1),
-        prop: PropPath::Rotation,
-    });
+    project.graph.bind_output(Endpoint::new(p, "value"), NodeId(1), PropPath::Rotation);
     compile_drivers(&mut project, &reg, comp_id);
 
     let scene = evaluate_comp(&project, comp_id, 0.0);
@@ -2779,11 +2759,7 @@ fn linked_module_project() -> (MProject, NodeRegistry, ModuleId, GraphNodeId) {
 
     let u = project.graph.add_node("use", Vec2::ZERO);
     project.graph.node_mut(u).unwrap().config.module = Some(id);
-    project.bindings.push(Binding {
-        output: Endpoint::new(u, "value"),
-        target: NodeId(1),
-        prop: PropPath::Rotation,
-    });
+    project.graph.bind_output(Endpoint::new(u, "value"), NodeId(1), PropPath::Rotation);
     let comp_id = project.root;
     compile_drivers(&mut project, &reg, comp_id);
     (project, reg, id, u)
@@ -2825,11 +2801,7 @@ fn editing_a_module_body_drives_every_link() {
     project.comp_mut(project.root).unwrap().root.children.push(MNode::group(2, "b"));
     let u2 = project.graph.add_node("use", Vec2::new(0.0, 200.0));
     project.graph.node_mut(u2).unwrap().config.module = Some(id);
-    project.bindings.push(Binding {
-        output: Endpoint::new(u2, "value"),
-        target: NodeId(2),
-        prop: PropPath::Rotation,
-    });
+    project.graph.bind_output(Endpoint::new(u2, "value"), NodeId(2), PropPath::Rotation);
     let comp_id = project.root;
     compile_drivers(&mut project, &reg, comp_id);
 
@@ -2839,7 +2811,8 @@ fn editing_a_module_body_drives_every_link() {
         let p = m.output.clone().unwrap().node;
         let ten = m.graph.add_node("value", Vec2::new(0.0, 60.0));
         m.graph.node_mut(ten).unwrap().set_value("value", ExprValue::Num(10.0));
-        let mul = m.graph.add_node("mul", Vec2::new(200.0, 0.0));
+        let mul = m.graph.add_node("math", Vec2::new(200.0, 0.0));
+        m.graph.node_mut(mul).unwrap().config.math_op = MathOp::Bin(BinOp::Mul);
         let ctx = &GraphCtx::bare(&reg);
         m.graph.connect(ctx, Endpoint::new(p, "value"), Endpoint::new(mul, "a")).unwrap();
         m.graph.connect(ctx, Endpoint::new(ten, "value"), Endpoint::new(mul, "b")).unwrap();
@@ -2915,8 +2888,8 @@ fn a_geometry_node_can_create_the_layer_it_drives() {
     let Some(MShape::Rect { radius, .. }) = &node.shape else { panic!("{:?}", node.shape) };
     assert_eq!(radius.resolve(&mut EvalCtx::at(0.0)), 7.0);
     // Exactly one binding, pointing at the new layer.
-    assert_eq!(project.shape_bindings.len(), 1);
-    assert_eq!(project.shape_bindings[0].target, NodeId(42));
+    assert_eq!(project.graph.shape_bindings().len(), 1);
+    assert_eq!(project.graph.shape_bindings()[0].target, NodeId(42));
     // The free fn builds the layer but doesn't parent it — that's the caller's
     // job, so the tree is untouched here.
     assert_eq!(project.comp(comp).unwrap().root.children.len(), before);
@@ -2933,12 +2906,22 @@ fn a_value_output_cannot_create_a_layer() {
         LayerSeed { id: 9, transform: Transform::default(), fill: MColor::rgb(0.0, 0.0, 0.0) };
     assert!(create_layer_from_geometry(&mut project, &reg, Endpoint::new(v, "value"), seed)
         .is_none());
-    assert!(project.shape_bindings.is_empty(), "a refused create left a binding behind");
+    assert!(project.graph.shape_bindings().is_empty(), "a refused create left a binding behind");
 }
 
 /// The other direction: a shape made with the toolbar comes *onto* the canvas
 /// as nodes and keeps driving its layer, so you can carry on editing it there
 /// instead of rebuilding it by hand.
+///
+/// Import runs **from a sink node** now: the node already names the layer, so
+/// the fold's two directions meet on one object instead of a separate section
+/// with its own duplicate layer picker.
+fn shape_sink_for(project: &mut MProject, target: NodeId) -> GraphNodeId {
+    let sink = project.graph.add_node("shapeOut", Vec2::new(360.0, 40.0));
+    project.graph.node_mut(sink).unwrap().config.out_shape = Some(target);
+    sink
+}
+
 #[test]
 fn a_hand_made_shape_imports_onto_the_canvas_and_still_drives_its_layer() {
     let (mut project, comp, target) = shape_driver_project();
@@ -2950,10 +2933,12 @@ fn a_hand_made_shape_imports_onto_the_canvas_and_still_drives_its_layer() {
             radius: Value::constant(5.0),
         });
 
-    import_shape(&mut project, &reg, comp, target).expect("a const rect should import");
+    let sink = shape_sink_for(&mut project, target);
+    import_shape(&mut project, &reg, comp, sink).expect("a const rect should import");
 
-    assert_eq!(project.graph.nodes.len(), 1, "one rect node came across");
-    assert_eq!(project.shape_bindings.len(), 1);
+    // The sink was already there; import raised the rect and wired it in.
+    assert_eq!(project.graph.nodes.len(), 2, "the rect node joined the sink");
+    assert_eq!(project.graph.shape_bindings().len(), 1);
     // Recompiling reproduces the shape it was raised from — the round trip is
     // lossless, which is what makes importing safe to do to a live layer.
     compile_drivers(&mut project, &reg, comp);
@@ -2982,13 +2967,15 @@ fn importing_a_keyframed_shape_changes_nothing() {
             ])),
         });
 
-    let err = import_shape(&mut project, &reg, comp, target).unwrap_err();
+    let sink = shape_sink_for(&mut project, target);
+    let err = import_shape(&mut project, &reg, comp, sink).unwrap_err();
     assert!(err.contains("Radius"), "the message must name the param: {err}");
     assert!(err.contains("Bake"), "and say what to do about it: {err}");
 
-    // Nothing moved: no nodes, no binding, and the track is still a track.
-    assert!(project.graph.nodes.is_empty(), "a refused import left nodes behind");
-    assert!(project.shape_bindings.is_empty(), "a refused import left a binding behind");
+    // Nothing moved: nothing raised, nothing wired, and the track is still a
+    // track. The empty sink the user placed is of course still theirs.
+    assert_eq!(project.graph.nodes.len(), 1, "a refused import raised nodes anyway");
+    assert!(project.graph.shape_bindings().is_empty(), "a refused import left a binding behind");
     let node = project.comp(comp).unwrap().root.find(target).unwrap();
     let Some(MShape::Rect { radius, .. }) = &node.shape else { panic!("{:?}", node.shape) };
     assert!(radius.is_animated(), "the keyframe track survived the refusal");
@@ -3000,7 +2987,340 @@ fn importing_a_keyframed_shape_changes_nothing() {
 fn importing_a_group_reports_that_it_has_no_shape() {
     let (mut project, comp, target) = shape_driver_project();
     let reg = NodeRegistry::with_builtins();
-    let err = import_shape(&mut project, &reg, comp, target).unwrap_err();
+    let sink = shape_sink_for(&mut project, target);
+    let err = import_shape(&mut project, &reg, comp, sink).unwrap_err();
     assert!(err.contains("no shape"), "{err}");
-    assert!(project.graph.nodes.is_empty());
+    assert_eq!(project.graph.nodes.len(), 1, "nothing was raised");
+}
+
+/// Import refuses politely when the sink names no layer yet — the button is
+/// only offered on a targeted sink, so this is the guard, not the path.
+#[test]
+fn importing_into_an_untargeted_sink_says_so() {
+    let (mut project, comp, _) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let sink = project.graph.add_node("shapeOut", Vec2::ZERO);
+    let err = import_shape(&mut project, &reg, comp, sink).unwrap_err();
+    assert!(err.contains("point this node at a layer"), "{err}");
+}
+
+// ── Drivers as nodes: unbinding, and what it leaves behind. ─────────────────
+
+/// A project with one layer, one `osc`, and an `out` node driving the layer's
+/// rotation — the value half of the fold, built the way the canvas builds it.
+fn out_node_project() -> (MProject, CompId, NodeRegistry, GraphNodeId) {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let osc = project.graph.add_node("osc", Vec2::ZERO);
+    // A flat, non-zero oscillator: amp 0 with an offset, so the driven value is
+    // the same at every frame and a bake can be checked without picking one.
+    project.graph.node_mut(osc).unwrap().set_value("amp", ExprValue::Num(0.0));
+    project.graph.node_mut(osc).unwrap().set_value("offset", ExprValue::Num(30.0));
+    let sink = project.graph.bind_output(Endpoint::new(osc, "value"), target, PropPath::Rotation);
+    compile_drivers(&mut project, &reg, comp);
+    (project, comp, reg, sink)
+}
+
+/// The headline: an `out` node **is** the driver. Wiring one drives the
+/// property, with no list anywhere saying so.
+#[test]
+fn an_out_node_drives_the_property_it_targets() {
+    let (project, comp, ..) = out_node_project();
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    assert!(rot.is_expr(), "the sink node drove it");
+    assert!((placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6);
+}
+
+/// Deleting the sink node unbinds the property — and **bakes** it, so the layer
+/// stays where it was instead of being stranded on an expression no node feeds.
+/// This is the route the old Drivers list's "×" was the only way to take.
+#[test]
+fn deleting_a_sink_node_bakes_the_property_it_was_driving() {
+    let (mut project, comp, reg, sink) = out_node_project();
+    let before = project.graph.bindings();
+    let before_shapes = project.graph.shape_bindings();
+
+    project.graph.remove_node(sink);
+    assert!(project.graph.bindings().is_empty(), "the driver went with the node");
+    assert!(bake_unbound(&mut project, comp, 0, &before, &before_shapes));
+
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    assert!(!rot.is_expr(), "the property is a hand-editable constant again");
+    // Frozen at what the graph was giving it, not reset to zero.
+    assert!(
+        (placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6,
+        "the layer stayed where the driver had put it",
+    );
+    // And a recompile can't resurrect it — there is no driver left to run.
+    compile_drivers(&mut project, &reg, comp);
+    assert!(!project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg.is_expr());
+}
+
+/// Pulling the *wire* out of a sink unbinds just as deleting the node does —
+/// the derived-driver design is what makes the two routes identical rather than
+/// two code paths that have to agree.
+#[test]
+fn pulling_a_sinks_wire_unbinds_and_bakes_it_too() {
+    let (mut project, comp, _reg, sink) = out_node_project();
+    let before = project.graph.bindings();
+
+    project.graph.disconnect_input(&Endpoint::new(sink, "value"));
+    assert!(project.graph.bindings().is_empty());
+    assert!(bake_unbound(&mut project, comp, 0, &before, &[]));
+
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    assert!(!rot.is_expr());
+    assert!((placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6);
+}
+
+/// Retargeting a sink to a *different* property bakes the one it left, so the
+/// abandoned property doesn't keep animating from a driver that no longer
+/// points at it.
+#[test]
+fn retargeting_a_sink_bakes_the_property_it_left() {
+    let (mut project, comp, reg, sink) = out_node_project();
+    let before = project.graph.bindings();
+
+    project.graph.node_mut(sink).unwrap().config.out_target =
+        Some((NodeId(1), PropPath::Opacity));
+    assert!(bake_unbound(&mut project, comp, 0, &before, &[]));
+    compile_drivers(&mut project, &reg, comp);
+
+    let layer = project.comp(comp).unwrap().root.find(NodeId(1)).unwrap();
+    assert!(!layer.transform.rotation_deg.is_expr(), "the abandoned property was frozen");
+    assert!(layer.transform.opacity.is_expr(), "and the new one picked the driver up");
+    assert!((placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6);
+}
+
+/// A sink still driving a property must **not** be baked when some *other*
+/// driver on it goes away — the bake would freeze a value the very next
+/// recompile overwrites, and one edit would look like it did nothing.
+#[test]
+fn a_property_another_driver_still_writes_is_left_alone() {
+    let (mut project, comp, reg, _sink) = out_node_project();
+    // A second sink on the same property, from a second source.
+    let v = project.graph.add_node("value", Vec2::new(0.0, 200.0));
+    project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Num(5.0));
+    let second = project.graph.bind_output(Endpoint::new(v, "value"), NodeId(1), PropPath::Rotation);
+    let before = project.graph.bindings();
+    assert_eq!(before.len(), 2);
+
+    project.graph.remove_node(second);
+    assert!(!bake_unbound(&mut project, comp, 0, &before, &[]), "nothing to bake");
+    compile_drivers(&mut project, &reg, comp);
+
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    assert!(rot.is_expr(), "the surviving driver still owns the property");
+}
+
+/// A sink with a target but nothing wired in, or a wire but no target, is
+/// **inert** — the resting state of a node you just dropped on the canvas. It
+/// must not seize the property it names.
+#[test]
+fn a_half_configured_sink_drives_nothing() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let sink = project.graph.add_node("out", Vec2::ZERO);
+    project.graph.node_mut(sink).unwrap().config.out_target = Some((target, PropPath::Rotation));
+
+    compile_drivers(&mut project, &reg, comp);
+    let rot = &project.comp(comp).unwrap().root.find(target).unwrap().transform.rotation_deg;
+    assert!(!rot.is_expr(), "a targeted but unwired sink drives nothing");
+}
+
+/// The value half of the fold, run from a sink: a property already carrying an
+/// expression is raised onto the canvas and wired into the node that was
+/// already bound to it, so the recipe keeps driving the same property and is
+/// now editable as nodes.
+#[test]
+fn a_property_expression_imports_into_the_sink_that_drives_it() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    // A hand-written expression on the layer's rotation: 2 + 3.
+    project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().transform.rotation_deg =
+        Value::expr(Expr::bin(BinOp::Add,Expr::Lit(ExprValue::Num(2.0)),Expr::Lit(ExprValue::Num(3.0))));
+    let sink = project.graph.add_node("out", Vec2::new(360.0, 40.0));
+    project.graph.node_mut(sink).unwrap().config.out_target = Some((target, PropPath::Rotation));
+    assert!(project.graph.bindings().is_empty(), "an unwired sink drives nothing yet");
+
+    import_property(&mut project, &reg, comp, sink).expect("a const expression should import");
+
+    // Raised as nodes *and* wired in, so the sink is now a live driver.
+    assert!(project.graph.nodes.len() > 1, "the expression came across as nodes");
+    assert_eq!(project.graph.bindings().len(), 1, "and the sink picked it up");
+    compile_drivers(&mut project, &reg, comp);
+    assert!(
+        (placed_angle_deg(&evaluate_comp(&project, comp, 0.0), target) - 5.0).abs() < 1e-9,
+        "the round trip preserved the expression's value",
+    );
+}
+
+/// A property with no expression has nothing to raise. Reported rather than
+/// silently doing nothing — a button that appears to work and doesn't is worse
+/// than one that explains itself.
+#[test]
+fn importing_a_property_with_no_expression_says_so() {
+    let (mut project, comp, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    let sink = project.graph.add_node("out", Vec2::ZERO);
+    project.graph.node_mut(sink).unwrap().config.out_target = Some((target, PropPath::Rotation));
+
+    let err = import_property(&mut project, &reg, comp, sink).unwrap_err();
+    assert!(err.contains("isn't expression-driven"), "{err}");
+    assert!(err.contains("Rotation"), "the message names the property: {err}");
+    assert_eq!(project.graph.nodes.len(), 1, "nothing was raised");
+}
+
+/// A layer's knobs are reported by the **properties** panel now, since they're
+/// that layer's own data. The Nodes panel's `param` picker still reads them, so
+/// one source feeds both — this pins that the properties snapshot carries them.
+#[test]
+fn the_properties_panel_reports_the_selected_layers_knobs() {
+    let (mut project, comp, target) = shape_driver_project();
+    project
+        .comp_mut(comp)
+        .unwrap()
+        .root
+        .find_mut(target)
+        .unwrap()
+        .set_param("gain", ParamKind::Num.seed());
+
+    let doc = project.comp(comp).unwrap();
+    let info = crate::props::NodeInfo::resolve(doc.root.find(target).unwrap(), doc, 0.0);
+    assert_eq!(info.knobs.len(), 1);
+    assert_eq!(info.knobs[0].name, "gain");
+    assert_eq!(info.knobs[0].kind, "number");
+}
+
+// ── Node-borne values: the literals a node carries on its own box. ──────────
+
+/// Which rows get an inline field is decided **structurally** — is there a
+/// literal there? — not by a list of node kinds. These four cases are the whole
+/// rule, and three of them are consequences rather than special cases.
+#[test]
+fn a_row_has_an_inline_field_exactly_when_it_has_a_literal() {
+    use crate::nodegraph::row_literal;
+    let reg = NodeRegistry::with_builtins();
+    let ctx = GraphCtx::bare(&reg);
+    let mut g = NodeGraph::new();
+    let osc = g.add_node("osc", Vec2::ZERO);
+    let rect = g.add_node("rect", Vec2::new(0.0, 200.0));
+    let d = |g: &NodeGraph, id| ctx.descriptor_for(g.node(id).unwrap()).unwrap().into_owned();
+
+    // 1. An unwired input with a descriptor default: its default, editable.
+    let desc = d(&g, osc);
+    let freq = desc.find_input("freq").unwrap();
+    assert_eq!(row_literal(&g, g.node(osc).unwrap(), freq, true), Some(ExprValue::Num(0.1)));
+
+    // 2. A stored override wins over the default.
+    g.node_mut(osc).unwrap().set_value("freq", ExprValue::Num(2.0));
+    assert_eq!(row_literal(&g, g.node(osc).unwrap(), freq, true), Some(ExprValue::Num(2.0)));
+
+    // 3. Wired: no field. The wire is the value, and a field beside it would
+    //    show a number nothing reads.
+    let v = g.add_node("value", Vec2::new(-200.0, 0.0));
+    g.connect(&ctx, Endpoint::new(v, "value"), Endpoint::new(osc, "freq")).unwrap();
+    assert_eq!(row_literal(&g, g.node(osc).unwrap(), freq, true), None);
+
+    // 4. A geometry output has no literal — nor does any ordinary output.
+    let rdesc = d(&g, rect);
+    let geo = rdesc.find_output("geometry").unwrap();
+    assert_eq!(row_literal(&g, g.node(rect).unwrap(), geo, false), None);
+    let size_echo = rdesc.find_output("size").unwrap();
+    assert_eq!(row_literal(&g, g.node(rect).unwrap(), size_echo, false), None);
+}
+
+/// A constant node's value sits on an **output** socket, because that's the only
+/// socket it has — so it's the one output that does get a field.
+#[test]
+fn a_constant_nodes_value_is_editable_on_its_output_row() {
+    use crate::nodegraph::{const_socket, row_literal};
+    let reg = NodeRegistry::with_builtins();
+    let ctx = GraphCtx::bare(&reg);
+    let mut g = NodeGraph::new();
+
+    for (kind, neutral) in
+        [("value", ExprValue::Num(0.0)), ("string", ExprValue::Str(String::new()))]
+    {
+        let id = g.add_node(kind, Vec2::ZERO);
+        let desc = ctx.descriptor_for(g.node(id).unwrap()).unwrap().into_owned();
+        let s = desc.find_output("value").unwrap();
+        // Unset: a neutral of the socket's *own* kind, so a string node offers a
+        // text field rather than a number one.
+        assert_eq!(row_literal(&g, g.node(id).unwrap(), s, false), Some(neutral), "{kind}");
+    }
+    // And the other leaves are not constants: what they produce is a read, not
+    // a literal anyone can type.
+    for kind in ["ref", "param", "script", "localTime", "t01"] {
+        assert_eq!(const_socket(kind), None, "{kind} is not a constant node");
+    }
+}
+
+/// A `use` node's override socket has neither a default nor (until overridden)
+/// a stored value, so it shows **no** inline field. That matters: unset there
+/// means *inherit the module's default*, and a field seeded to zero would state
+/// the opposite. Its explicit inherit/override toggle stays in the inspector.
+#[test]
+fn a_modules_override_socket_shows_no_inline_field_while_inheriting() {
+    use crate::nodegraph::row_literal;
+    let reg = NodeRegistry::with_builtins();
+    let mut modules = std::collections::BTreeMap::new();
+    let mut m = MModule::new("m", Expr::Lit(ExprValue::Num(3.0)));
+    m.set_param("gain", ParamKind::Num.seed());
+    modules.insert(ModuleId(1), m);
+    let ctx = GraphCtx::new(&reg, &modules);
+
+    let mut g = NodeGraph::new();
+    let u = g.add_node("use", Vec2::ZERO);
+    g.node_mut(u).unwrap().config.module = Some(ModuleId(1));
+    let desc = ctx.descriptor_for(g.node(u).unwrap()).unwrap().into_owned();
+    let knob = desc.find_input("gain").expect("the module's knob became a socket");
+
+    assert_eq!(row_literal(&g, g.node(u).unwrap(), knob, true), None, "inheriting shows no field");
+
+    // Once actually overridden there *is* a literal, so the field appears.
+    g.node_mut(u).unwrap().set_value("gain", ExprValue::Num(9.0));
+    assert_eq!(row_literal(&g, g.node(u).unwrap(), knob, true), Some(ExprValue::Num(9.0)));
+}
+
+/// The panel renders headlessly without panicking or clashing widget ids — the
+/// canvas now puts real egui widgets on every node, and a duplicated id salt
+/// across sockets would only show up when something is actually laid out.
+#[test]
+fn the_panel_lays_out_every_node_kind_without_an_id_clash() {
+    let reg = NodeRegistry::with_builtins();
+    let ctx = GraphCtx::bare(&reg);
+    let mut graph = NodeGraph::new();
+    // One of everything, so every row shape (scalar, vector, colour, text,
+    // geometry, sink, constant) is laid out at least once.
+    for (i, desc) in reg.iter().enumerate() {
+        graph.add_node(&desc.id, Vec2::new(0.0, i as f64 * 120.0));
+    }
+    let layers = vec![crate::nodegraph::LayerInfo {
+        id: 1,
+        name: "Star".into(),
+        knobs: vec![],
+    }];
+
+    let egui_ctx = egui::Context::default();
+    // The panel draws icon glyphs, so the icon family has to be bound here the
+    // same way the real app binds it at startup.
+    crate::icon::install(&egui_ctx);
+    let mut edits = crate::nodegraph::NgEdits::default();
+    let _ = egui_ctx.run_ui(egui::RawInput::default(), |ui| {
+        crate::nodegraph::nodegraph_ui(
+            ui,
+            &graph,
+            &ctx,
+            NgScope::Project,
+            &layers,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &mut edits,
+        );
+    });
+    assert!(edits.op.is_none(), "a pure layout pass must not record an edit");
 }

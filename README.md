@@ -2005,6 +2005,143 @@ geometry (`layout_expr`, `box_height`) were genuinely dead, but the ones coverin
 *semantics* that merely moved (module rename/delete, body edits reaching every
 link, overrides surviving a re-point) are re-pinned against the node path that
 owns them now.
+
+**Drivers are nodes now, and derived rather than stored.** The panel had grown
+list sections above the canvas — Drivers and Geometry — whose rows were combo
+boxes binding an output to a layer's property. That made *the one edit that gives
+a graph any effect* the one edit you couldn't make on the canvas, and it kept two
+representations of a single fact: `Project::bindings` beside the graph could
+disagree with it (a wire deleted under a binding, a binding naming a node that's
+gone). Both sections are gone. Two **sink** descriptors replace them —
+`out` (Property Out) and `shapeOut` (Shape Out), the only built-ins with no
+outputs, because a driver *ends* the dataflow — added from the palette like any
+node and targeted in the inspector like any node. `out`'s input socket is
+**typed by the property it targets** (`PropPath::socket_type` +
+`GraphCtx::descriptor_for`, the same per-placed-node specialization a `use`
+node's knobs already used), so the canvas refuses a number wire into a fill at
+authoring time; changing the target across a kind boundary drops the wire that no
+longer fits. A sink's header reads what it drives (`Rotation → Star`), which is
+the point of it being a node at all: the binding is legible without selecting
+anything. `NodeGraph::bindings()` / `shape_bindings()` derive the drivers from
+the `out` nodes' config plus the wires feeding them, so the disagreeing-state
+simply can't be represented; `Project`'s two `Vec`s are now private, load-only,
+and drained into sink nodes by `Project::migrate` (dropping the fields outright
+would make serde skip the keys silently — data loss wearing a compatible face).
+Unbinding got *harder* and better for it: a driver can now end half a dozen ways
+(delete the sink, pull its wire, retarget it, delete its source), so rather than
+teach each op about baking, `bake_unbound(project, comp, frame, before, before_shapes)`
+diffs the drivers either side of an edit and freezes every target that lost one —
+skipping any property another driver still writes, since baking there would
+freeze a value the next recompile immediately overwrites. Free-standing, like
+`compile_drivers`, because it is the one piece of this that silently rewrites the
+document.
+
+**The panel's last three lists went the same way.** With the drivers on the
+canvas, what remained above it — Modules, Import, Layer knobs — were the sections
+that made the Nodes panel a panel *with* a graph in it rather than a graph.
+Each had a different right answer:
+  - **Import** is an action, not a list, and it always named a layer and a
+    property that a sink node already names. It moved onto the sinks: an `out`
+    node that's targeted but unwired offers "Import its expression", a `shapeOut`
+    offers "Import its shape". One object now means "this graph and that property
+    are the same thing", in both directions, and the duplicate layer/property
+    combos are gone. `import_property` joined `import_shape` as a free function
+    taking the sink, so both are testable without a window and both report a
+    refusal the same way.
+  - **Modules** was a list whose two jobs were *create* and *navigate*. Creating
+    moved to the palette (`Module ▸ New module…`) — the one entry that isn't a
+    registered kind, because it makes a document object as well as a node — and
+    it now places a `use` node linked to the new module, so a module is never
+    unreachable from the canvas. Navigating moved onto the `use` node: the link
+    is a better front door than a list, because a link is a thing you can see.
+  - **Layer knobs** was the odd one out: a layer's knobs are *that layer's own
+    data*, and editing them through a panel-wide "pick a layer" combo meant
+    choosing the selection twice. They moved to the **properties panel**, where
+    the rest of a layer's data lives. `knobs_ui` now takes the op channel rather
+    than the whole `NgEdits`, so the module-scope editor and the properties-panel
+    editor are the same widget writing the same owner-agnostic `NgKnobOp` through
+    the same applier — one knob concept, one code path, two callers.
+
+In project scope the panel is now a header, a status line, the selected node's
+inspector, and the canvas. Nothing is bound, made, imported, or exposed anywhere
+but on a node.
+
+**And the values moved onto the nodes.** A node's own numbers were still being
+edited in a "Values —" block above the canvas that described whichever node
+happened to be selected — so a `value` node showed a bare box with its number
+somewhere else, and reading a graph meant clicking each node in turn. Every
+socket literal now draws its editor **in its own row on the box** (`socket_field`,
+a scoped `Ui` over the row so a vector's two drags and a colour button fit the
+same slot), which is what makes a node self-contained. Which rows get a field is
+**structural** — `row_literal` asks whether there is a literal there, not what
+kind the node is — and three behaviours fall out of that rather than being
+special-cased: a wired input has no field (the wire is the value), a `use` node's
+override socket has none while inheriting (unset means *inherit*, and a field
+seeded to zero would state the opposite), and geometry/layer/matte sockets have
+none because they have no `ExprValue` at all. The one thing that *is* per-kind is
+`const_socket`: which nodes keep their constant on an output socket, since that's
+their only socket — one function, so the canvas and the inspector can't disagree.
+`NODE_W` grew to 208 to hold a label column plus a field.
+
+The inspector kept exactly what isn't a socket — a `ref`'s target, a `param`'s
+name, a script's source, a `use`'s module, an `osc`'s waveform, a text node's
+typography, a sink's property, Create-layer and Import — which is a far clearer
+remit than "some of the values", and it now says so when a node has nothing left
+for it. `string` is the one deliberate exception: its inline field is one line
+and its inspector one is multi-line, because a caption with an embedded newline
+would otherwise be invisible. Same value, two views.
+
+The panel had no tests at all before this (it's UI, and the repo's rule is that
+document work is a free function). It has some now, because this change put real
+widgets on the canvas: the four `row_literal` rules are pinned directly, and a
+headless `Context::run_ui` lays out one node of every registered kind, which is
+the only way an id clash or a font that isn't bound shows up before runtime.
+
+**Then the node roster, in four passes. Pass 1: one Math node, and an IR that can
+carry it.** `add`, `mul` and `neg` were three kinds, and every operator worth
+having next — subtract, divide, power, min, sqrt, trig — would have been another,
+each with its own palette entry and its own lowering arm, all differing only in
+which `f64 → f64 → f64` they apply. They are now one **`math`** node whose
+operator is config, like an oscillator's waveform.
+
+That merge is safe in a way a `value`/`string` merge would not be, and the
+distinction is worth keeping straight: the rule those two obey is that a node
+must not change its **output type** under you, because the output type is what
+colours a wire. Every Math mode is Number → Number. What *does* change is the
+**arity** — `Sqrt` takes one operand — and `GraphCtx::descriptor_for` drops the
+`b` socket for a unary op, the same per-placed-node specialization that grows a
+`use` node's knobs and types an `out` node's input. Dropping the socket rather
+than hiding it is what makes a wire into it impossible instead of merely
+invisible; `App` pulls any existing wire when the op goes unary, as it does when
+a retargeted sink's type stops fitting.
+
+The IR grew to match, and shrank in the process: `Expr::Add`/`Mul`/`Neg` became
+`Expr::Bin { op: BinOp, .. }` and `Expr::Un { op: UnOp, .. }`. Nine binary and
+seven unary operators now cost *one* arm each in `arity`/`child`/`Display`/eval
+instead of sixteen. `ExprValue::zip`/`map` already broadcast component-wise, so
+every operator works on vectors and colours for free — `position / 2` means what
+it looks like. Two deliberate calls: **trig is in degrees**, because every angle
+a user touches in this app is (`rotation_deg`, the properties panel, the gizmo)
+and a graph needing `× 57.2958` to aim one layer at another would be telling on
+itself; and **no operator may produce a NaN or an infinity** — divide by zero,
+modulo by zero, a fractional power of a negative, the root of a negative all
+resolve to 0, because a NaN reaching a transform blanks the layer with no clue
+why, which is the least debuggable failure this engine has. String concatenation
+stayed pinned to `Add` alone: subtracting from text has no meaning worth
+guessing, and inventing one would make the IR's strictness a lie.
+
+`Project::migrate` folds the retired kinds (`add`/`mul`/`neg` → `math` + op). Not
+strictly needed — no `.pbc` in existence carried them, the same population of
+zero that retired `Editor::Graph`'s shim — but a node kind is a plain string, an
+unrecognised one just draws red and lowers to nothing, and a graph going silently
+inert is a bad way to discover that.
+
+Passes 2–4, not yet built: **Vector** (`Separate XY` / `Combine XY`, needing the
+IR's second addition — component read and construct); **Remap** (Map Range,
+Clamp, Mix — pure *macro* nodes lowering to composed `Bin` trees, no IR change,
+which is the EBN split holding: a node that looks like an operator needn't be an
+arm of the IR); and **everything onto the node** (variable node height, per-kind
+config drawn on the box, the inspector retired for good).
 (4) The compositor stage — the real gate for effects/mattes/masks.
 (5) Effect nodes + their properties-panel show, then plugins registering
 descriptors like built-ins. Steps 1–3 need no new engine; step 4 is the large

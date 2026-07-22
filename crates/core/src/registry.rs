@@ -294,17 +294,26 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .output("geometry", "Geometry", Geometry)
             .output("content", "Content", Text)
             .output("size", "Font Size", Number),
-        // ── Math: an input (or two) and a result. ────────────────────────────
-        NodeDescriptor::new("add", Cat::Math, "Add")
+        // ── Math: **one** node for every operator. ───────────────────────────
+        //
+        // Add and Multiply were separate kinds, and every operator we wanted
+        // next (subtract, divide, power, min, sqrt, trig) would have been
+        // another. They differ only in which `f64 → f64 → f64` they apply, so
+        // as separate kinds the palette would grow a wall of near-identical
+        // entries and every one would need its own lowering arm. Which operator
+        // it runs is *config*, like an oscillator's waveform.
+        //
+        // Safe in a way a `value`/`string` merge would not be: every mode is
+        // Number → Number, so the output type — the thing that colours a wire —
+        // never changes under you. What *does* change is the arity, and
+        // `GraphCtx::descriptor_for` drops the `b` socket for a unary op, the
+        // same per-placed-node specialization a `use` node's knobs use.
+        //
+        // The defaults here are Add's identity; `descriptor_for` re-seeds them
+        // from the chosen operator, so an unwired Multiply rests at 1, not 0.
+        NodeDescriptor::new("math", Cat::Math, "Math")
             .input_def("a", "A", Number, num(0.0))
             .input_def("b", "B", Number, num(0.0))
-            .output("result", "Result", Number),
-        NodeDescriptor::new("mul", Cat::Math, "Multiply")
-            .input_def("a", "A", Number, num(1.0))
-            .input_def("b", "B", Number, num(1.0))
-            .output("result", "Result", Number),
-        NodeDescriptor::new("neg", Cat::Math, "Negate")
-            .input_def("a", "A", Number, num(0.0))
             .output("result", "Result", Number),
         // ── Inputs: leaves that read a value in. ─────────────────────────────
         NodeDescriptor::new("value", Cat::Input, "Value").output("value", "Value", Number),
@@ -345,6 +354,24 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .output("value", "Value", Number),
         // ── Module reuse. ────────────────────────────────────────────────────
         NodeDescriptor::new("use", Cat::Module, "Module").output("value", "Value", Number),
+        // ── Sinks: where the graph meets the scene. ──────────────────────────
+        //
+        // These are the only nodes with no outputs, and that is the point: a
+        // driver *ends* the dataflow. Binding a graph output to a layer used to
+        // be a row in a side list, which made the one edit that gives a graph
+        // any effect the one edit you couldn't make on the canvas. As nodes,
+        // binding is the same gesture as every other wire.
+        //
+        // `out`'s input is typed `Number` here only as its unconfigured resting
+        // shape — once it targets a property, `GraphCtx::descriptor_for`
+        // retypes the socket from that property (see `PropPath::socket_type`),
+        // so the canvas refuses a colour wire into a rotation.
+        //
+        // No `input_def` on either: an unwired sink drives nothing, and a
+        // resting literal would mean "silently pin this property to zero".
+        NodeDescriptor::new("out", Cat::Layer, "Property Out").input("value", "Value", Number),
+        NodeDescriptor::new("shapeOut", Cat::Layer, "Shape Out")
+            .input("geometry", "Geometry", Geometry),
     ]
 }
 
@@ -357,7 +384,7 @@ mod tests {
         let reg = NodeRegistry::with_builtins();
         assert_eq!(reg.len(), builtin_descriptors().len());
         // A representative id from each buildable-now category resolves.
-        for id in ["rect", "add", "value", "osc", "use"] {
+        for id in ["rect", "math", "value", "osc", "use"] {
             assert!(reg.contains(id), "{id} should be a built-in");
         }
     }
@@ -408,7 +435,7 @@ mod tests {
     fn by_category_filters_and_keeps_order() {
         let reg = NodeRegistry::with_builtins();
         let math: Vec<_> = reg.by_category(NodeCategory::Math).map(|d| d.id.as_str()).collect();
-        assert_eq!(math, ["add", "mul", "neg"]);
+        assert_eq!(math, ["math"], "every operator is one node now");
     }
 
     /// Every built-in must be in a category the palette can evaluate today —

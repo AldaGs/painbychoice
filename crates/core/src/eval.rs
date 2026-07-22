@@ -280,6 +280,7 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::BinOp;
     use crate::node::{Node, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
@@ -1069,10 +1070,7 @@ mod tests {
         let m = project.add_module(
             Module::new(
                 "two-knobs",
-                Expr::Mul(
-                    Box::new(Expr::Param { node: None, name: "level".into() }),
-                    Box::new(Expr::Param { node: None, name: "scale".into() }),
-                ),
+                Expr::bin(BinOp::Mul,Expr::Param { node: None, name: "level".into() },Expr::Param { node: None, name: "scale".into() }),
             )
             .with_param("level", ParamValue::Num(Value::constant(0.5)))
             .with_param("scale", ParamValue::Num(Value::constant(1.0))),

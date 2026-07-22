@@ -24,7 +24,7 @@ use motion_core::{
     Comp, Document, EvalCtx, Expr, Project as MProject,
     ExprValue, Handle, Keyframe, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
-    Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
+    MathOp, Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
     compile_modules, lower_geometry, lower_output, Binding, Edge, Endpoint, GraphCtx, GraphNode, GraphNodeId, NodeCategory,
     NodeDescriptor, NodeGraph, NodeRegistry, ShapeBinding, SocketType, TextConfig,
 };

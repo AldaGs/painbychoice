@@ -57,6 +57,16 @@ pub(crate) struct NodeInfo {
     pub(crate) stroke_width_anim: bool,
     /// Text-layer fields, `Some` only for a `Shape::Text`.
     pub(crate) text: Option<TextInfo>,
+    /// The **knobs** this layer exposes — named values a `param` node in the
+    /// graph reads (`param("gain")` resolves against whichever layer the driver
+    /// points at).
+    ///
+    /// They live here, not in the Nodes panel, because they are this layer's own
+    /// data: one layer's knobs are as much a property of it as its opacity, and
+    /// editing them from a panel-wide "pick a layer" combo meant choosing the
+    /// selection twice. What makes a knob *useful* is still the graph — but so
+    /// is what makes `position` useful, and that has always lived here.
+    pub(crate) knobs: Vec<KnobInfo>,
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -245,6 +255,7 @@ impl NodeInfo {
                 }),
                 _ => None,
             },
+            knobs: node.params.iter().map(crate::nodegraph::knob_info).collect(),
         }
     }
 }
@@ -287,6 +298,11 @@ pub(crate) struct PropEdits {
     // `PropKind` rather than one bool per property, so adding an animatable
     // property doesn't grow this struct.
     pub(crate) key: KeySelectionKinds,
+    /// A knob added, removed, or re-valued this frame. Reuses the Nodes panel's
+    /// owner-agnostic op verbatim — a knob is the same thing whichever panel you
+    /// reach it from, so it gets one op and one apply path, not two that have to
+    /// agree.
+    pub(crate) knob: Option<NgKnobOp>,
 }
 
 /// The set of properties whose stopwatch was clicked this frame.
@@ -719,6 +735,15 @@ pub(crate) fn properties_ui(
         });
         ease_editor(ui, e, ease_out);
     }
+
+    // The layer's exposed **knobs**, last: they're the seam to the graph rather
+    // than something the layer draws with, so they sit below the properties that
+    // do. The widget is the Nodes panel's own `knobs_ui` — the module-scope knob
+    // editor and this are the same editor, because a knob is the same thing at
+    // both scopes.
+    ui.separator();
+    crate::nodegraph::knobs_ui(ui, ParamOwner::Node(NodeId(n.id)), &n.knobs, &mut edits.knob);
+    ui.weak("A `param(\"name\")` node in the graph reads these, on whichever layer it drives.");
 }
 
 /// Which animated property a dopesheet row refers to. Lets the UI report a

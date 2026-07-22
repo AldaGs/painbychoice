@@ -17,7 +17,7 @@
 
 use kurbo::Vec2;
 
-use crate::expr::{Expr, ExprValue, Generator, TimeSource};
+use crate::expr::{Expr, ExprValue, Generator, MathOp, TimeSource};
 use crate::graph::{Endpoint, GraphCtx, NodeGraph};
 use crate::node::Shape;
 use crate::value::Value;
@@ -85,14 +85,10 @@ fn raise_rec(
             let (id, y) = leaf(graph, kind);
             (Endpoint::new(id, socket), y)
         }
-        Expr::Add(a, b) => op2(graph, ctx, "add", a, b, x, cursor_y),
-        Expr::Mul(a, b) => op2(graph, ctx, "mul", a, b, x, cursor_y),
-        Expr::Neg(a) => {
-            let (ea, cy) = raise_rec(graph, ctx, a, x - COL, cursor_y);
-            let id = graph.add_node("neg", Vec2::new(x, cy));
-            let _ = graph.connect(ctx, ea, Endpoint::new(id, "a"));
-            (Endpoint::new(id, "result"), cy)
+        Expr::Bin { op, a, b } => {
+            raise_math(graph, ctx, MathOp::Bin(*op), a, Some(b), x, cursor_y)
         }
+        Expr::Un { op, a } => raise_math(graph, ctx, MathOp::Un(*op), a, None, x, cursor_y),
         Expr::Gen(g) => raise_generator(graph, ctx, g, x, cursor_y),
         Expr::Script(src) => {
             let (id, y) = leaf(graph, "script");
@@ -125,21 +121,38 @@ fn raise_rec(
 
 /// Raise a two-operand operator (`add`/`mul`): raise both children, place the
 /// operator centred on them, wire them into `a`/`b`.
-fn op2(
+/// Raise an operator — one `math` node, its operands raised into its inputs.
+///
+/// `b` is `None` for a unary operator, and that is the whole difference: the
+/// node kind, the socket names and the wiring are identical, because the graph
+/// has one Math node the way the IR has one `Bin`/`Un` pair.
+///
+/// The op is set **before** the wires go in, for the same reason a `use` node's
+/// module is: a unary node has no `b` socket until it knows it's unary, and
+/// `connect` validates against the descriptor the config produces.
+fn raise_math(
     graph: &mut NodeGraph,
     ctx: &GraphCtx,
-    kind: &str,
+    op: MathOp,
     a: &Expr,
-    b: &Expr,
+    b: Option<&Expr>,
     x: f64,
     cursor_y: &mut f64,
 ) -> (Endpoint, f64) {
     let (ea, ya) = raise_rec(graph, ctx, a, x - COL, cursor_y);
-    let (eb, yb) = raise_rec(graph, ctx, b, x - COL, cursor_y);
-    let center = (ya + yb) / 2.0;
-    let id = graph.add_node(kind, Vec2::new(x, center));
+    let (eb, center) = match b {
+        Some(b) => {
+            let (eb, yb) = raise_rec(graph, ctx, b, x - COL, cursor_y);
+            (Some(eb), (ya + yb) / 2.0)
+        }
+        None => (None, ya),
+    };
+    let id = graph.add_node("math", Vec2::new(x, center));
+    graph.node_mut(id).expect("just added").config.math_op = op;
     let _ = graph.connect(ctx, ea, Endpoint::new(id, "a"));
-    let _ = graph.connect(ctx, eb, Endpoint::new(id, "b"));
+    if let Some(eb) = eb {
+        let _ = graph.connect(ctx, eb, Endpoint::new(id, "b"));
+    }
     (Endpoint::new(id, "result"), center)
 }
 
@@ -351,6 +364,7 @@ impl ShapeParam<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::{BinOp, UnOp};
     use crate::expr::{ExprValue, PropPath, Waveform};
     use crate::lower::lower_output;
     use crate::registry::NodeRegistry;
@@ -377,12 +391,14 @@ mod tests {
     #[test]
     fn math_round_trips() {
         // ((3 * frameRef) + -(2)) — a nested tree of operators and leaves.
-        let expr = Expr::Add(
-            Box::new(Expr::Mul(
-                Box::new(Expr::Lit(ExprValue::Num(3.0))),
-                Box::new(Expr::Ref { node: NodeId(2), prop: PropPath::Rotation, time_offset: 0.0 }),
-            )),
-            Box::new(Expr::Neg(Box::new(Expr::Lit(ExprValue::Num(2.0))))),
+        let expr = Expr::bin(
+            BinOp::Add,
+            Expr::bin(
+                BinOp::Mul,
+                Expr::Lit(ExprValue::Num(3.0)),
+                Expr::Ref { node: NodeId(2), prop: PropPath::Rotation, time_offset: 0.0 },
+            ),
+            Expr::un(UnOp::Neg, Expr::Lit(ExprValue::Num(2.0))),
         );
         round_trips(expr);
     }
@@ -409,10 +425,7 @@ mod tests {
     /// canvas out of parts that already exist.
     #[test]
     fn a_concatenation_round_trips() {
-        round_trips(Expr::Add(
-            Box::new(Expr::Lit(ExprValue::Str("take ".into()))),
-            Box::new(Expr::Lit(ExprValue::Num(3.0))),
-        ));
+        round_trips(Expr::bin(BinOp::Add,Expr::Lit(ExprValue::Str("take ".into())),Expr::Lit(ExprValue::Num(3.0))));
     }
 
     #[test]
@@ -420,10 +433,7 @@ mod tests {
         // osc whose amp is itself an expression, not just a literal.
         let expr = Expr::Gen(Generator::Oscillator {
             freq: Box::new(Expr::Lit(ExprValue::Num(0.2))),
-            amp: Box::new(Expr::Mul(
-                Box::new(Expr::Lit(ExprValue::Num(10.0))),
-                Box::new(Expr::Param { node: None, name: "gain".into() }),
-            )),
+            amp: Box::new(Expr::bin(BinOp::Mul,Expr::Lit(ExprValue::Num(10.0)),Expr::Param { node: None, name: "gain".into() })),
             phase: Box::new(Expr::Lit(ExprValue::Num(0.0))),
             offset: Box::new(Expr::Lit(ExprValue::Num(0.0))),
             wave: Waveform::Sine,
@@ -464,20 +474,14 @@ mod tests {
     #[test]
     fn a_time_source_feeding_math_round_trips() {
         // localTime into a mul — proves a Time output wires into a Number input.
-        let expr = Expr::Mul(
-            Box::new(Expr::Time(TimeSource::Local)),
-            Box::new(Expr::Lit(ExprValue::Num(4.0))),
-        );
+        let expr = Expr::bin(BinOp::Mul,Expr::Time(TimeSource::Local),Expr::Lit(ExprValue::Num(4.0)));
         round_trips(expr);
     }
 
     /// A script leaf, wired into math, round-trips its source intact.
     #[test]
     fn a_script_round_trips() {
-        let expr = Expr::Add(
-            Box::new(Expr::Script("frame * 2.0".into())),
-            Box::new(Expr::Lit(ExprValue::Num(1.0))),
-        );
+        let expr = Expr::bin(BinOp::Add,Expr::Script("frame * 2.0".into()),Expr::Lit(ExprValue::Num(1.0)));
         round_trips(expr);
     }
 
@@ -507,10 +511,7 @@ mod tests {
             module: ModuleId(3),
             overrides: vec![(
                 "amp".into(),
-                Expr::Mul(
-                    Box::new(Expr::Lit(ExprValue::Num(4.0))),
-                    Box::new(Expr::Time(TimeSource::T01)),
-                ),
+                Expr::bin(BinOp::Mul,Expr::Lit(ExprValue::Num(4.0)),Expr::Time(TimeSource::T01)),
             )],
         };
         let mut g = NodeGraph::new();
@@ -595,10 +596,7 @@ mod tests {
         let mut g = NodeGraph::new();
         let shape = Shape::Rect {
             size: Value::constant(Vec2::new(10.0, 10.0)),
-            radius: Value::expr(Expr::Mul(
-                Box::new(Expr::Lit(ExprValue::Num(2.0))),
-                Box::new(Expr::Time(TimeSource::T01)),
-            )),
+            radius: Value::expr(Expr::bin(BinOp::Mul,Expr::Lit(ExprValue::Num(2.0)),Expr::Time(TimeSource::T01))),
         };
         let ep = raise_geometry(&mut g, ctx, &shape, Vec2::ZERO).unwrap();
         // The rect, plus the mul and its two leaves.

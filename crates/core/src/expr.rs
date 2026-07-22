@@ -271,12 +271,257 @@ impl PropPath {
             PropPath::TextContent => ExprValue::Str(String::new()),
         }
     }
+
+    /// The socket type a wire must carry to drive this property — the same kind
+    /// split [`Self::zero`] makes, said in the graph's vocabulary.
+    ///
+    /// This is what lets an `out` node be typed by the property it targets: pick
+    /// Fill and its input socket turns colour, so the canvas refuses a number
+    /// wire at authoring time rather than resolving it to a fallback at render
+    /// time.
+    pub fn socket_type(self) -> crate::socket::SocketType {
+        use crate::socket::SocketType as S;
+        match self.zero() {
+            ExprValue::Num(_) => S::Number,
+            ExprValue::Vec2(_) => S::Vector,
+            ExprValue::Color(_) => S::Color,
+            ExprValue::Str(_) => S::Text,
+        }
+    }
 }
 
-/// The dataflow IR. Deliberately tiny for now: a literal, a reference to another
+/// A two-operand arithmetic operator.
+///
+/// Deliberately a *parameter* of one [`Expr::Bin`] arm rather than an arm each.
+/// Every one of these is the same shape — resolve both sides, combine them
+/// component-wise — so as separate arms they would be nine copies of one
+/// tree-walk, and `arity`/`child`/`Display` would each grow a nine-way match.
+/// The graph's Math node is the mirror image: one node, one mode picker.
+///
+/// **Nothing here can fail a frame.** Division by zero, a fractional power of a
+/// negative, a modulo by zero: each is a non-finite result, and `apply` returns
+/// zero rather than letting a NaN travel into a transform where it would blank
+/// the layer with no clue why. Same warn-don't-fail contract a dangling
+/// reference follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BinOp {
+    #[default]
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Min,
+    Max,
+    /// Remainder. The wrap-around workhorse — `frame % 24` is a loop.
+    Mod,
+    /// The angle to a point, **in degrees**, so it can drive `rotation` without
+    /// a conversion node in between. See [`UnOp::Sin`] on why degrees.
+    Atan2,
+}
+
+/// A one-operand operator. See [`BinOp`] for why these are a parameter rather
+/// than an arm each, and for the never-produce-a-NaN rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UnOp {
+    #[default]
+    Neg,
+    Abs,
+    Sqrt,
+    Floor,
+    Round,
+    /// Trig works in **degrees**, not radians.
+    ///
+    /// A deliberate break with `f64`'s own convention: every angle a user
+    /// touches in this app is degrees (`Transform::rotation_deg`, the
+    /// properties panel, the gizmo), and a graph that needed `× 57.2958` to
+    /// point one layer at another would be quietly telling on itself. The
+    /// conversion lives here, once, instead of in every graph.
+    Sin,
+    Cos,
+}
+
+impl BinOp {
+    pub const ALL: [BinOp; 9] = [
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::Div,
+        BinOp::Pow,
+        BinOp::Min,
+        BinOp::Max,
+        BinOp::Mod,
+        BinOp::Atan2,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BinOp::Add => "Add",
+            BinOp::Sub => "Subtract",
+            BinOp::Mul => "Multiply",
+            BinOp::Div => "Divide",
+            BinOp::Pow => "Power",
+            BinOp::Min => "Minimum",
+            BinOp::Max => "Maximum",
+            BinOp::Mod => "Modulo",
+            BinOp::Atan2 => "Arctan2",
+        }
+    }
+
+    /// Apply to one component pair. Guarded: see the type's docs.
+    pub fn apply(self, x: f64, y: f64) -> f64 {
+        let v = match self {
+            BinOp::Add => x + y,
+            BinOp::Sub => x - y,
+            BinOp::Mul => x * y,
+            BinOp::Div => x / y,
+            BinOp::Pow => x.powf(y),
+            BinOp::Min => x.min(y),
+            BinOp::Max => x.max(y),
+            BinOp::Mod => x % y,
+            BinOp::Atan2 => x.atan2(y).to_degrees(),
+        };
+        finite_or_zero(v)
+    }
+
+    /// What a freshly placed operator rests at, so an unwired node is harmless:
+    /// the operator's **identity** where it has one (0 for add, 1 for multiply
+    /// and divide), and a value that doesn't blow up where it doesn't.
+    pub fn seed_operands(self) -> (f64, f64) {
+        match self {
+            BinOp::Add | BinOp::Sub | BinOp::Min | BinOp::Max | BinOp::Atan2 => (0.0, 0.0),
+            BinOp::Mul | BinOp::Div | BinOp::Pow | BinOp::Mod => (1.0, 1.0),
+        }
+    }
+
+    /// The infix symbol, for the printed tree. `None` for the ones that read
+    /// better as a call — `min(a, b)` rather than an invented sign.
+    fn symbol(self) -> Option<&'static str> {
+        match self {
+            BinOp::Add => Some("+"),
+            BinOp::Sub => Some("-"),
+            BinOp::Mul => Some("*"),
+            BinOp::Div => Some("/"),
+            BinOp::Pow => Some("^"),
+            BinOp::Min | BinOp::Max | BinOp::Mod | BinOp::Atan2 => None,
+        }
+    }
+
+    /// The name a printed call uses, and what a script would spell.
+    fn call_name(self) -> &'static str {
+        match self {
+            BinOp::Add => "add",
+            BinOp::Sub => "sub",
+            BinOp::Mul => "mul",
+            BinOp::Div => "div",
+            BinOp::Pow => "pow",
+            BinOp::Min => "min",
+            BinOp::Max => "max",
+            BinOp::Mod => "mod",
+            BinOp::Atan2 => "atan2",
+        }
+    }
+}
+
+impl UnOp {
+    pub const ALL: [UnOp; 7] =
+        [UnOp::Neg, UnOp::Abs, UnOp::Sqrt, UnOp::Floor, UnOp::Round, UnOp::Sin, UnOp::Cos];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UnOp::Neg => "Negate",
+            UnOp::Abs => "Absolute",
+            UnOp::Sqrt => "Square Root",
+            UnOp::Floor => "Floor",
+            UnOp::Round => "Round",
+            UnOp::Sin => "Sine",
+            UnOp::Cos => "Cosine",
+        }
+    }
+
+    /// Apply to one component. Guarded: see [`BinOp`]'s docs.
+    pub fn apply(self, x: f64) -> f64 {
+        let v = match self {
+            UnOp::Neg => -x,
+            UnOp::Abs => x.abs(),
+            UnOp::Sqrt => x.sqrt(),
+            UnOp::Floor => x.floor(),
+            UnOp::Round => x.round(),
+            UnOp::Sin => x.to_radians().sin(),
+            UnOp::Cos => x.to_radians().cos(),
+        };
+        finite_or_zero(v)
+    }
+
+    fn call_name(self) -> &'static str {
+        match self {
+            UnOp::Neg => "neg",
+            UnOp::Abs => "abs",
+            UnOp::Sqrt => "sqrt",
+            UnOp::Floor => "floor",
+            UnOp::Round => "round",
+            UnOp::Sin => "sin",
+            UnOp::Cos => "cos",
+        }
+    }
+}
+
+/// Which operator a Math node is running — either arity, in one value, because
+/// the node picks from one list and stores one thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MathOp {
+    Bin(BinOp),
+    Un(UnOp),
+}
+
+impl Default for MathOp {
+    fn default() -> Self {
+        MathOp::Bin(BinOp::Add)
+    }
+}
+
+impl MathOp {
+    /// Every operator, in picker order: the binaries first (the common ones
+    /// lead), then the unaries.
+    pub fn all() -> Vec<MathOp> {
+        BinOp::ALL.into_iter().map(MathOp::Bin).chain(UnOp::ALL.into_iter().map(MathOp::Un)).collect()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MathOp::Bin(o) => o.label(),
+            MathOp::Un(o) => o.label(),
+        }
+    }
+
+    /// How many operands this operator takes — 2 or 1. The Math node's socket
+    /// count follows it, which is why picking `Square Root` drops the B input.
+    pub fn arity(self) -> usize {
+        match self {
+            MathOp::Bin(_) => 2,
+            MathOp::Un(_) => 1,
+        }
+    }
+}
+
+/// Replace a non-finite result with zero — the guard that keeps arithmetic from
+/// ending a frame. A NaN in a transform silently blanks the layer, which is the
+/// least debuggable failure this engine can produce; a zero is wrong in an
+/// obvious place instead.
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
+/// The dataflow IR. Deliberately tiny: a literal, a reference to another
 /// property (optionally at a shifted time — the `valueAtTime(t')` case), and
-/// arithmetic. `Add`/`Mul`/`Neg` are enough to express the rest (`a - b` is
-/// `Add(a, Neg(b))`); front-ends lower richer syntax down to this.
+/// arithmetic. Richer front-end syntax lowers down to this, and a node that
+/// looks like an operator needn't *be* one — `mix(a, b, t)` is
+/// `a + (b - a) * t` in this IR, not an arm of it. Keeping that line is what
+/// stops the graph becoming a second evaluator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Expr {
     Lit(ExprValue),
@@ -288,9 +533,14 @@ pub enum Expr {
         #[serde(default)]
         time_offset: f64,
     },
-    Add(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
-    Neg(Box<Expr>),
+    /// A two-operand arithmetic operator. One arm for every binary op rather
+    /// than one arm each: they differ only in the `f64 → f64 → f64` they apply,
+    /// and `ExprValue::zip` already broadcasts that across numbers, vectors and
+    /// colours, so a new operator is a new [`BinOp`] and nothing else.
+    Bin { op: BinOp, a: Box<Expr>, b: Box<Expr> },
+    /// A one-operand operator — the [`Expr::Bin`] story with `map` in place of
+    /// `zip`.
+    Un { op: UnOp, a: Box<Expr> },
     /// A user-defined parameter, by name. `node: None` means "this node's" —
     /// the common case, and what keeps a parameterised node self-contained
     /// (copy the node and its expressions still point at its own knobs).
@@ -612,6 +862,14 @@ impl Expr {
     pub fn num(n: f64) -> Expr {
         Expr::Lit(ExprValue::Num(n))
     }
+    /// A binary operator over two sub-expressions.
+    pub fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {
+        Expr::Bin { op, a: Box::new(a), b: Box::new(b) }
+    }
+    /// A unary operator over one sub-expression.
+    pub fn un(op: UnOp, a: Expr) -> Expr {
+        Expr::Un { op, a: Box::new(a) }
+    }
     /// A reference to `prop` on `node`, at the current frame.
     pub fn reference(node: NodeId, prop: PropPath) -> Expr {
         Expr::Ref { node, prop, time_offset: 0.0 }
@@ -627,9 +885,8 @@ impl Expr {
         match self {
             Expr::Lit(_) => ExprKind::Lit,
             Expr::Ref { .. } => ExprKind::Ref,
-            Expr::Add(..) => ExprKind::Add,
-            Expr::Mul(..) => ExprKind::Mul,
-            Expr::Neg(..) => ExprKind::Neg,
+            Expr::Bin { .. } => ExprKind::Bin,
+            Expr::Un { .. } => ExprKind::Un,
             Expr::Param { .. } => ExprKind::Param,
             Expr::Script(_) => ExprKind::Script,
             Expr::Use { .. } => ExprKind::Use,
@@ -640,8 +897,9 @@ impl Expr {
 
     /// A fresh node of `kind`, with children seeded to neutral literals so an
     /// editor can grow a tree by changing one node's kind at a time (a `Lit`
-    /// becomes an `Add` of two zeros you then edit or change further). `Add`
-    /// seeds 0+0, `Mul` 1×1 — the identities, so a half-built node is harmless.
+    /// becomes a `Bin` of two zeros you then edit or change further). The
+    /// operands come from [`BinOp::seed_operands`] — the operator's identity
+    /// where it has one — so a half-built node is harmless.
     pub fn seed(kind: ExprKind) -> Expr {
         match kind {
             ExprKind::Lit => Expr::num(0.0),
@@ -650,9 +908,8 @@ impl Expr {
                 prop: PropPath::Position,
                 time_offset: 0.0,
             },
-            ExprKind::Add => Expr::Add(Box::new(Expr::num(0.0)), Box::new(Expr::num(0.0))),
-            ExprKind::Mul => Expr::Mul(Box::new(Expr::num(1.0)), Box::new(Expr::num(1.0))),
-            ExprKind::Neg => Expr::Neg(Box::new(Expr::num(0.0))),
+            ExprKind::Bin => Expr::bin(BinOp::default(), Expr::num(0.0), Expr::num(0.0)),
+            ExprKind::Un => Expr::un(UnOp::default(), Expr::num(0.0)),
             ExprKind::Param => Expr::Param { node: None, name: String::new() },
             ExprKind::Use => Expr::Use { module: ModuleId(0), overrides: Vec::new() },
             ExprKind::Script => Expr::Script(String::new()),
@@ -666,12 +923,13 @@ impl Expr {
         }
     }
 
-    /// How many child slots this node has: `Add`/`Mul` two, `Neg` one, others
-    /// none. Lets an editor iterate a node's inputs without matching the kind.
+    /// How many child slots this node has: a binary operator two, a unary one,
+    /// others none. Lets an editor iterate a node's inputs without matching the
+    /// kind.
     pub fn arity(&self) -> usize {
         match self {
-            Expr::Add(..) | Expr::Mul(..) => 2,
-            Expr::Neg(..) => 1,
+            Expr::Bin { .. } => 2,
+            Expr::Un { .. } => 1,
             Expr::Gen(g) => g.arity(),
             // A link's children are its overrides, in order — so the canvas
             // lays each override out as a wired box and edits it like any other
@@ -690,8 +948,8 @@ impl Expr {
     /// editor walk inputs without matching on the variant.
     pub fn child(&self, slot: usize) -> Option<&Expr> {
         match (self, slot) {
-            (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => Some(a),
-            (Expr::Add(_, b) | Expr::Mul(_, b), 1) => Some(b),
+            (Expr::Bin { a, .. } | Expr::Un { a, .. }, 0) => Some(a),
+            (Expr::Bin { b, .. }, 1) => Some(b),
             (Expr::Gen(g), _) => g.knob(slot),
             (Expr::Use { overrides, .. }, _) => overrides.get(slot).map(|(_, e)| e),
             _ => None,
@@ -714,8 +972,8 @@ impl Expr {
             return Some(self);
         };
         let child = match (self, slot) {
-            (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_ref(),
-            (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_ref(),
+            (Expr::Bin { a, .. } | Expr::Un { a, .. }, 0) => a.as_ref(),
+            (Expr::Bin { b, .. }, 1) => b.as_ref(),
             (Expr::Gen(g), _) => g.knob(slot)?,
             (Expr::Use { overrides, .. }, _) => &overrides.get(slot)?.1,
             _ => return None,
@@ -730,8 +988,8 @@ impl Expr {
             return Some(self);
         };
         let child = match (self, slot) {
-            (Expr::Add(a, _) | Expr::Mul(a, _) | Expr::Neg(a), 0) => a.as_mut(),
-            (Expr::Add(_, b) | Expr::Mul(_, b), 1) => b.as_mut(),
+            (Expr::Bin { a, .. } | Expr::Un { a, .. }, 0) => a.as_mut(),
+            (Expr::Bin { b, .. }, 1) => b.as_mut(),
             (Expr::Gen(g), _) => g.knob_mut(slot)?,
             (Expr::Use { overrides, .. }, _) => &mut overrides.get_mut(slot)?.1,
             _ => return None,
@@ -745,9 +1003,10 @@ impl Expr {
 pub enum ExprKind {
     Lit,
     Ref,
-    Add,
-    Mul,
-    Neg,
+    /// Any two-operand operator; which one is the [`BinOp`] it carries.
+    Bin,
+    /// Any one-operand operator; which one is the [`UnOp`] it carries.
+    Un,
     Param,
     Script,
     /// A link to a shared module. Deliberately **not** in [`ExprKind::ALL`]:
@@ -769,12 +1028,11 @@ pub enum ExprKind {
 
 impl ExprKind {
     /// Every kind, in picker order — the generators grouped after the primitives.
-    pub const ALL: [ExprKind; 15] = [
+    pub const ALL: [ExprKind; 14] = [
         ExprKind::Lit,
         ExprKind::Ref,
-        ExprKind::Add,
-        ExprKind::Mul,
-        ExprKind::Neg,
+        ExprKind::Bin,
+        ExprKind::Un,
         ExprKind::Param,
         ExprKind::Script,
         ExprKind::LocalTime,
@@ -791,9 +1049,8 @@ impl ExprKind {
         match self {
             ExprKind::Lit => "value",
             ExprKind::Ref => "ref",
-            ExprKind::Add => "add",
-            ExprKind::Mul => "mul",
-            ExprKind::Neg => "neg",
+            ExprKind::Bin => "math",
+            ExprKind::Un => "math",
             ExprKind::Param => "param",
             ExprKind::Script => "script",
             ExprKind::Use => "use",
@@ -840,9 +1097,13 @@ impl fmt::Display for Expr {
                     write!(f, "@{}.{prop:?}[{time_offset:+}]", node.0)
                 }
             }
-            Expr::Add(a, b) => write!(f, "({a} + {b})"),
-            Expr::Mul(a, b) => write!(f, "({a} * {b})"),
-            Expr::Neg(a) => write!(f, "-{a}"),
+
+            Expr::Bin { op, a, b } => match op.symbol() {
+                Some(sym) => write!(f, "({a} {sym} {b})"),
+                None => write!(f, "{}({a}, {b})", op.call_name()),
+            },
+            Expr::Un { op: UnOp::Neg, a } => write!(f, "-{a}"),
+            Expr::Un { op, a } => write!(f, "{}({a})", op.call_name()),
             Expr::Param { node: None, name } => write!(f, "param({name})"),
             Expr::Param { node: Some(n), name } => write!(f, "param(#{}, {name})", n.0),
             Expr::Script(src) => write!(f, "{{ {src} }}"),
@@ -1483,24 +1744,29 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
             let frame = ctx.frame + time_offset;
             ctx.resolve_prop(*node, *prop, frame)
         }
-        Expr::Add(a, b) => {
+        Expr::Bin { op, a, b } => {
+            let op = *op;
             let (a, b) = (eval_expr(a, ctx), eval_expr(b, ctx));
             // `+` on text is concatenation, and it's contagious: if *either*
             // side is a string the whole sum is one, so `"take " + n` reads the
             // way it does in every scripting language. `zip` can't express this
             // — it only knows how to combine two numbers component-wise.
-            match (&a, &b) {
-                (ExprValue::Str(_), _) | (_, ExprValue::Str(_)) => {
+            //
+            // **Add only.** Every other operator on a string falls through to
+            // `zip`, which leaves the left side untouched — subtracting from
+            // text has no meaning to guess at, and inventing one would make the
+            // strictness the rest of the IR promises a lie.
+            match (op, &a, &b) {
+                (BinOp::Add, ExprValue::Str(_), _) | (BinOp::Add, _, ExprValue::Str(_)) => {
                     ExprValue::Str(format!("{}{}", a.to_str(), b.to_str()))
                 }
-                _ => a.zip(b, |x, y| x + y),
+                _ => a.zip(b, move |x, y| op.apply(x, y)),
             }
         }
-        Expr::Mul(a, b) => {
-            let (a, b) = (eval_expr(a, ctx), eval_expr(b, ctx));
-            a.zip(b, |x, y| x * y)
+        Expr::Un { op, a } => {
+            let op = *op;
+            eval_expr(a, ctx).map(move |x| op.apply(x))
         }
-        Expr::Neg(a) => eval_expr(a, ctx).map(|x| -x),
         // A parameter reads off its owning node — `None` meaning "the node
         // being resolved", which `walk` and `resolve_target` keep current.
         Expr::Param { node, name } => {
@@ -1637,13 +1903,98 @@ mod tests {
         assert!((opacity_of(&doc2, 2, 5.0) - 0.5).abs() < 1e-9);
     }
 
+    /// Every operator, at one worked value each — the table that says what this
+    /// node actually computes, in one place.
+    #[test]
+    fn every_operator_computes_what_it_says() {
+        let at = |e: Expr| {
+            let v: Value<f64> = Value::expr(e);
+            v.resolve(&mut EvalCtx::at(0.0))
+        };
+        let bin = |op, x: f64, y: f64| at(Expr::bin(op, Expr::num(x), Expr::num(y)));
+        assert_eq!(bin(BinOp::Add, 2.0, 3.0), 5.0);
+        assert_eq!(bin(BinOp::Sub, 2.0, 3.0), -1.0);
+        assert_eq!(bin(BinOp::Mul, 2.0, 3.0), 6.0);
+        assert_eq!(bin(BinOp::Div, 6.0, 3.0), 2.0);
+        assert_eq!(bin(BinOp::Pow, 2.0, 3.0), 8.0);
+        assert_eq!(bin(BinOp::Min, 2.0, 3.0), 2.0);
+        assert_eq!(bin(BinOp::Max, 2.0, 3.0), 3.0);
+        assert_eq!(bin(BinOp::Mod, 7.0, 4.0), 3.0);
+        // Degrees, not radians — straight up is 90, ready to drive `rotation`.
+        assert_eq!(bin(BinOp::Atan2, 1.0, 0.0), 90.0);
+
+        let un = |op, x: f64| at(Expr::un(op, Expr::num(x)));
+        assert_eq!(un(UnOp::Neg, 3.0), -3.0);
+        assert_eq!(un(UnOp::Abs, -3.0), 3.0);
+        assert_eq!(un(UnOp::Sqrt, 9.0), 3.0);
+        assert_eq!(un(UnOp::Floor, 2.7), 2.0);
+        assert_eq!(un(UnOp::Round, 2.7), 3.0);
+        // Degrees here too, for the same reason.
+        assert_eq!(un(UnOp::Sin, 90.0), 1.0);
+        assert_eq!(un(UnOp::Cos, 0.0), 1.0);
+    }
+
+    /// **No operator may produce a NaN or an infinity.** A NaN reaching a
+    /// transform blanks the layer with no clue why — the least debuggable
+    /// failure this engine has — so every ill-defined case resolves to zero
+    /// instead, the same warn-don't-fail contract a dangling reference follows.
+    #[test]
+    fn arithmetic_never_produces_a_nan_or_an_infinity() {
+        let at = |e: Expr| {
+            let v: Value<f64> = Value::expr(e);
+            v.resolve(&mut EvalCtx::at(0.0))
+        };
+        let bin = |op, x: f64, y: f64| at(Expr::bin(op, Expr::num(x), Expr::num(y)));
+        assert_eq!(bin(BinOp::Div, 1.0, 0.0), 0.0, "divide by zero");
+        assert_eq!(bin(BinOp::Div, 0.0, 0.0), 0.0, "zero over zero");
+        assert_eq!(bin(BinOp::Mod, 1.0, 0.0), 0.0, "modulo by zero");
+        assert_eq!(bin(BinOp::Pow, -8.0, 0.5), 0.0, "fractional power of a negative");
+        assert_eq!(at(Expr::un(UnOp::Sqrt, Expr::num(-9.0))), 0.0, "root of a negative");
+    }
+
+    /// The operand a fresh operator rests at is its **identity** where it has
+    /// one, so an unwired node passes its input through rather than annihilating
+    /// it. A Multiply seeded at 0 would silently zero whatever you wired in.
+    #[test]
+    fn an_operator_rests_at_its_identity() {
+        assert_eq!(BinOp::Add.seed_operands(), (0.0, 0.0));
+        assert_eq!(BinOp::Sub.seed_operands(), (0.0, 0.0));
+        assert_eq!(BinOp::Mul.seed_operands(), (1.0, 1.0));
+        assert_eq!(BinOp::Div.seed_operands(), (1.0, 1.0));
+    }
+
+    /// Operators broadcast a scalar across a vector or a colour, because
+    /// `ExprValue::zip` already did — so every new operator gained that for
+    /// free, and `position / 2` means what it looks like.
+    #[test]
+    fn an_operator_broadcasts_a_scalar_over_a_vector() {
+        let e = Expr::bin(
+            BinOp::Div,
+            Expr::Lit(ExprValue::Vec2(Vec2::new(10.0, 20.0))),
+            Expr::num(2.0),
+        );
+        let v: Value<Vec2> = Value::expr(e);
+        assert_eq!(v.resolve(&mut EvalCtx::at(0.0)), Vec2::new(5.0, 10.0));
+    }
+
+    /// `+` concatenates when either side is text — but **only** `+`. Subtracting
+    /// from a string has no meaning worth guessing at, and inventing one would
+    /// make the strictness the rest of the IR promises a lie.
+    #[test]
+    fn only_add_concatenates_text() {
+        let cat = |op| {
+            let e = Expr::bin(op, Expr::Lit(ExprValue::Str("take ".into())), Expr::num(3.0));
+            let v: Value<String> = Value::expr(e);
+            v.resolve(&mut EvalCtx::at(0.0))
+        };
+        assert_eq!(cat(BinOp::Add), "take 3");
+        assert_eq!(cat(BinOp::Mul), "take ", "a non-Add op leaves the text alone");
+    }
+
     #[test]
     fn arithmetic_composes() {
         // 2 + 3 * 4 = 14.
-        let e = Expr::Add(
-            Box::new(Expr::num(2.0)),
-            Box::new(Expr::Mul(Box::new(Expr::num(3.0)), Box::new(Expr::num(4.0)))),
-        );
+        let e = Expr::bin(BinOp::Add,Expr::num(2.0),Expr::bin(BinOp::Mul, Expr::num(3.0), Expr::num(4.0)));
         let v: Value<f64> = Value::expr(e);
         let mut ctx = EvalCtx::at(0.0);
         assert_eq!(v.resolve(&mut ctx), 14.0);
@@ -1695,8 +2046,8 @@ mod tests {
             let e = Expr::seed(k);
             assert_eq!(e.kind(), k);
             let expected = match k {
-                ExprKind::Add | ExprKind::Mul => 2,
-                ExprKind::Neg => 1,
+                ExprKind::Bin => 2,
+                ExprKind::Un => 1,
                 // Leaves: a literal, a lookup, a module link, or a reading of
                 // the layer clock.
                 ExprKind::Use
@@ -1721,14 +2072,11 @@ mod tests {
     #[test]
     fn at_mut_addresses_a_subtree_by_slot_path() {
         // (2 + (3 * 4)) — edit the 4 (path [1, 1]) into a 9.
-        let mut e = Expr::Add(
-            Box::new(Expr::num(2.0)),
-            Box::new(Expr::Mul(Box::new(Expr::num(3.0)), Box::new(Expr::num(4.0)))),
-        );
+        let mut e = Expr::bin(BinOp::Add,Expr::num(2.0),Expr::bin(BinOp::Mul, Expr::num(3.0), Expr::num(4.0)));
         *e.at_mut(&[1, 1]).unwrap() = Expr::num(9.0);
         assert_eq!(e.to_string(), "(2 + (3 * 9))");
         // A slot past the node's arity is None (Neg has only slot 0).
-        assert!(Expr::seed(ExprKind::Neg).at_mut(&[1]).is_none());
+        assert!(Expr::seed(ExprKind::Un).at_mut(&[1]).is_none());
     }
 
     #[test]
@@ -1766,10 +2114,7 @@ mod tests {
 
     #[test]
     fn display_prints_the_tree_readably() {
-        let e = Expr::Add(
-            Box::new(Expr::num(2.0)),
-            Box::new(Expr::Mul(Box::new(Expr::num(3.0)), Box::new(Expr::num(4.0)))),
-        );
+        let e = Expr::bin(BinOp::Add,Expr::num(2.0),Expr::bin(BinOp::Mul, Expr::num(3.0), Expr::num(4.0)));
         assert_eq!(e.to_string(), "(2 + (3 * 4))");
         assert_eq!(Expr::reference(NodeId(1), PropPath::Position).to_string(), "@1.Position");
         assert_eq!(
@@ -2018,10 +2363,7 @@ mod tests {
         )
         .with_transform(T {
             opacity: Value::expr(Expr::Param { node: None, name: "size".into() }),
-            scale: Value::expr(Expr::Mul(
-                Box::new(Expr::Lit(ExprValue::Vec2(Vec2::new(1.0, 1.0)))),
-                Box::new(Expr::Param { node: None, name: "size".into() }),
-            )),
+            scale: Value::expr(Expr::bin(BinOp::Mul,Expr::Lit(ExprValue::Vec2(Vec2::new(1.0, 1.0))),Expr::Param { node: None, name: "size".into() })),
             ..T::default()
         });
         n.set_param("size", ParamValue::Num(Value::constant(0.4)));

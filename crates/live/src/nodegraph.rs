@@ -100,7 +100,16 @@ Nodes are named, not id'd; a vec/colour comes back as an array.";
 
 
 // ── Canvas geometry (logical points). ────────────────────────────────────────
-const NODE_W: f32 = 156.0;
+// Wide enough for a label column *and* a field beside it: a node carries its
+// own values now, so the box has to hold them. A vector row is the binding
+// constraint — two drag fields sharing what's left after the label.
+const NODE_W: f32 = 208.0;
+/// The label column every socket row's text gets, before its field starts.
+const LABEL_W: f32 = 52.0;
+/// How far a field stays clear of the node's edge.
+const FIELD_PAD: f32 = 6.0;
+/// A field's height inside its `ROW_H` row — a little air top and bottom.
+const FIELD_H: f32 = 16.0;
 const HEADER_H: f32 = 24.0;
 const ROW_H: f32 = 20.0;
 const BODY_PAD: f32 = 8.0;
@@ -139,30 +148,20 @@ pub(crate) enum NgOp {
     SetText { id: GraphNodeId, text: TextConfig },
     /// Set an `osc` node's waveform — which function it is, not a value it takes.
     SetWaveform { id: GraphNodeId, wave: Waveform },
+    /// Set a `math` node's operator. Like a waveform, it picks which function
+    /// the node *is* — and here it also decides how many operands it takes, so
+    /// `App` drops a wire into `b` when the new op is unary.
+    SetMathOp { id: GraphNodeId, op: MathOp },
     /// Drop a socket's stored literal. On a `use` node's knob that is how an
     /// override goes back to *inheriting* the module's default — an absent
     /// entry and a zero mean different things there.
     ClearValue { id: GraphNodeId, socket: String },
-}
-
-/// One deferred edit to the driver list ([`motion_core::Binding`]). Separate
-/// from [`NgOp`] because it touches the project's drivers, not the graph model.
-pub(crate) enum BindingOp {
-    Add { output: Endpoint, target: NodeId, prop: PropPath },
-    SetOutput { index: usize, output: Endpoint },
-    SetTarget { index: usize, target: NodeId },
-    SetProp { index: usize, prop: PropPath },
-    Remove { index: usize },
-}
-
-/// One deferred edit to the **geometry**-driver list
-/// ([`motion_core::ShapeBinding`]). A geometry driver names no property — the
-/// shape *is* what's bound — so it has no `SetProp`.
-pub(crate) enum ShapeBindingOp {
-    Add { output: Endpoint, target: NodeId },
-    SetOutput { index: usize, output: Endpoint },
-    SetTarget { index: usize, target: NodeId },
-    Remove { index: usize },
+    /// Point an `out` node at a layer's property — half of what makes it a
+    /// driver (the wire into it is the other half).
+    SetOutTarget { id: GraphNodeId, target: Option<(NodeId, PropPath)> },
+    /// Point a `shapeOut` node at a layer. Names no property: the shape *is*
+    /// what's bound.
+    SetOutShape { id: GraphNodeId, target: Option<NodeId> },
 }
 
 /// One deferred edit to the project's **modules** — the document scope's own
@@ -231,21 +230,19 @@ pub(crate) fn collect_layer_info(node: &MNode, out: &mut Vec<LayerInfo>) {
 #[derive(Default)]
 pub(crate) struct NgEdits {
     pub(crate) op: Option<NgOp>,
-    pub(crate) binding: Option<BindingOp>,
-    pub(crate) shape_binding: Option<ShapeBindingOp>,
     pub(crate) module_op: Option<NgModuleOp>,
     pub(crate) knob: Option<NgKnobOp>,
     /// Switch which graph the canvas edits (project ↔ a module's body). View
     /// state, so it rides beside the document ops rather than in one.
     pub(crate) scope: Option<NgScope>,
-    /// Raise a scene layer's property expression onto the canvas (the fold): the
-    /// panel names `(layer, property)`, `App` reads its `Expr`, raises it, and
-    /// binds the result back so editing the nodes drives the property.
-    pub(crate) import: Option<(NodeId, PropPath)>,
-    /// Raise a scene layer's *shape* onto the canvas and bind it back — the
-    /// geometry half of the same fold. Names only the layer; the property combo
-    /// beside it is irrelevant to a shape.
-    pub(crate) import_shape: Option<NodeId>,
+    /// Fill a sink node by **import**: raise the expression its target property
+    /// already has onto the canvas and wire it into this node. Names the sink,
+    /// not the property — the node is where the layer and property are named, so
+    /// the fold's two directions meet on one object.
+    pub(crate) import: Option<GraphNodeId>,
+    /// The geometry half of the same fold: raise the target layer's *shape* into
+    /// this `shapeOut` node.
+    pub(crate) import_shape: Option<GraphNodeId>,
     /// Create a **new layer** whose shape is this geometry output. The one
     /// action that makes something exist from the graph rather than binding to
     /// a layer the tree already had.
@@ -316,8 +313,13 @@ pub(crate) enum NgScope {
     Module(ModuleId),
 }
 
-/// The panel. A scope bar, then (in project scope) drivers and import, then a
+/// The panel. A scope bar, then (in project scope) modules and import, then a
 /// selected-node inspector, then the graph on a scrollable canvas.
+///
+/// The drivers are **not** a section here any more: a driver is an `out` /
+/// `shapeOut` node on the canvas, added from the palette like anything else and
+/// configured in the inspector like anything else. What used to be two lists of
+/// combo-box rows sitting above the graph is now the graph.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn nodegraph_ui(
     ui: &mut egui::Ui,
@@ -326,8 +328,6 @@ pub(crate) fn nodegraph_ui(
     scope: NgScope,
     layers: &[LayerInfo],
     modules: &[(ModuleId, String)],
-    bindings: &[Binding],
-    shape_bindings: &[ShapeBinding],
     knobs: &[KnobInfo],
     module_output: Option<&Endpoint>,
     script_preview: Option<&Result<String, String>>,
@@ -344,21 +344,12 @@ pub(crate) fn nodegraph_ui(
     ui.separator();
     match scope {
         NgScope::Project => {
-            modules_ui(ui, modules, out);
-            ui.separator();
-            drivers_ui(ui, graph, ctx, layers, bindings, out);
-            ui.separator();
-            shape_drivers_ui(ui, graph, ctx, layers, shape_bindings, out);
-            ui.separator();
-            import_ui(ui, layers, out);
-            // Right under Import, because that's where a refusal most often
-            // comes from. Amber, not red: the action didn't happen, but nothing
-            // is broken — the same hue the comp bar's warning count uses.
+            // Amber, not red: the action didn't happen, but nothing is broken —
+            // the same hue the comp bar's warning count uses. Most refusals come
+            // from a sink's Import, which is in the inspector below.
             if let Some(msg) = status {
                 ui.colored_label(crate::props::WARN_COLOR, format!("{} {msg}", icon::WARNING));
             }
-            ui.separator();
-            layer_knobs_ui(ui, layers, out);
         }
         NgScope::Module(id) => {
             let name = modules
@@ -376,7 +367,7 @@ pub(crate) fn nodegraph_ui(
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
     }
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        canvas(ui, graph, ctx, out);
+        canvas(ui, graph, ctx, layers, out);
     });
 }
 
@@ -418,199 +409,6 @@ fn graph_outputs(
 /// to a neutral zero.
 fn is_value_type(ty: SocketType) -> bool {
     matches!(ty, SocketType::Number | SocketType::Vector | SocketType::Color | SocketType::Time)
-}
-
-/// The **Drivers**: each row binds one graph output to one layer's property.
-/// This is what makes the graph *do* something — `App` lowers each binding to an
-/// `Expr` and hands it to the property.
-fn drivers_ui(
-    ui: &mut egui::Ui,
-    graph: &NodeGraph,
-    ctx: &GraphCtx,
-    layers: &[LayerInfo],
-    bindings: &[Binding],
-    out: &mut NgEdits,
-) {
-    let outputs = graph_outputs(graph, ctx, is_value_type);
-    ui.horizontal(|ui| {
-        ui.label(icon::text(icon::LINK));
-        ui.strong("Drivers");
-        ui.weak(format!("{}", bindings.len()));
-        let can_add = !outputs.is_empty() && !layers.is_empty();
-        if ui
-            .add_enabled(can_add, egui::Button::new(format!("{} Add", icon::ADD)).small())
-            .on_disabled_hover_text("Add a node and a layer first")
-            .clicked()
-        {
-            out.binding = Some(BindingOp::Add {
-                output: outputs[0].0.clone(),
-                target: NodeId(layers[0].id),
-                prop: PropPath::Rotation,
-            });
-        }
-    });
-    if bindings.is_empty() {
-        ui.weak("None. Bind a graph output to a layer's property to drive it.");
-    }
-    for (i, b) in bindings.iter().enumerate() {
-        ui.horizontal(|ui| {
-            if icon::button(ui, icon::CLOSE, "Remove (freezes the property)").clicked() {
-                out.binding = Some(BindingOp::Remove { index: i });
-            }
-            let cur_out = outputs
-                .iter()
-                .find(|(e, _)| e == &b.output)
-                .map(|(_, l)| l.clone())
-                .unwrap_or_else(|| "<gone>".into());
-            egui::ComboBox::from_id_salt(("drv_out", i)).width(110.0).selected_text(cur_out).show_ui(
-                ui,
-                |ui| {
-                    for (e, l) in &outputs {
-                        if ui.selectable_label(e == &b.output, l).clicked() && e != &b.output {
-                            out.binding =
-                                Some(BindingOp::SetOutput { index: i, output: e.clone() });
-                        }
-                    }
-                },
-            );
-            ui.label("→");
-            let cur_layer = layers
-                .iter()
-                .find(|l| l.id == b.target.0)
-                .map(|l| l.name.clone())
-                .unwrap_or_else(|| format!("#{}", b.target.0));
-            egui::ComboBox::from_id_salt(("drv_tgt", i)).width(90.0).selected_text(cur_layer).show_ui(
-                ui,
-                |ui| {
-                    for l in layers {
-                        if ui.selectable_label(l.id == b.target.0, &l.name).clicked()
-                            && l.id != b.target.0
-                        {
-                            out.binding =
-                                Some(BindingOp::SetTarget { index: i, target: NodeId(l.id) });
-                        }
-                    }
-                },
-            );
-            egui::ComboBox::from_id_salt(("drv_prop", i))
-                .width(80.0)
-                .selected_text(prop_path_label(b.prop))
-                .show_ui(ui, |ui| {
-                    for k in PROP_PATHS {
-                        if ui.selectable_label(k == b.prop, prop_path_label(k)).clicked()
-                            && k != b.prop
-                        {
-                            out.binding = Some(BindingOp::SetProp { index: i, prop: k });
-                        }
-                    }
-                });
-        });
-    }
-}
-
-/// The **Geometry** drivers: each row binds one shape node's `geometry` output
-/// to a layer's *shape*. This is the half of the graph that authors geometry
-/// rather than driving numbers — the bound layer's shape is rebuilt from the
-/// graph on every recompile, so its kind and every param come from the nodes.
-fn shape_drivers_ui(
-    ui: &mut egui::Ui,
-    graph: &NodeGraph,
-    ctx: &GraphCtx,
-    layers: &[LayerInfo],
-    bindings: &[ShapeBinding],
-    out: &mut NgEdits,
-) {
-    let outputs = graph_outputs(graph, ctx, |t| t == SocketType::Geometry);
-    ui.horizontal(|ui| {
-        ui.label(icon::text(icon::SHAPE));
-        ui.strong("Geometry");
-        ui.weak(format!("{}", bindings.len()));
-        let can_add = !outputs.is_empty() && !layers.is_empty();
-        if ui
-            .add_enabled(can_add, egui::Button::new(format!("{} Add", icon::ADD)).small())
-            .on_disabled_hover_text("Add a shape node (Geometry ▸ Rectangle) and a layer first")
-            .clicked()
-        {
-            out.shape_binding = Some(ShapeBindingOp::Add {
-                output: outputs[0].0.clone(),
-                target: NodeId(layers[0].id),
-            });
-        }
-    });
-    if bindings.is_empty() {
-        ui.weak("None. Bind a shape node's geometry to a layer to author its shape here.");
-    }
-    for (i, b) in bindings.iter().enumerate() {
-        ui.horizontal(|ui| {
-            if icon::button(ui, icon::CLOSE, "Remove (freezes the shape)").clicked() {
-                out.shape_binding = Some(ShapeBindingOp::Remove { index: i });
-            }
-            let cur_out = outputs
-                .iter()
-                .find(|(e, _)| e == &b.output)
-                .map(|(_, l)| l.clone())
-                .unwrap_or_else(|| "<gone>".into());
-            egui::ComboBox::from_id_salt(("geo_out", i)).width(110.0).selected_text(cur_out).show_ui(
-                ui,
-                |ui| {
-                    for (e, l) in &outputs {
-                        if ui.selectable_label(e == &b.output, l).clicked() && e != &b.output {
-                            out.shape_binding =
-                                Some(ShapeBindingOp::SetOutput { index: i, output: e.clone() });
-                        }
-                    }
-                },
-            );
-            ui.label("→");
-            let cur_layer = layers
-                .iter()
-                .find(|l| l.id == b.target.0)
-                .map(|l| l.name.clone())
-                .unwrap_or_else(|| format!("#{}", b.target.0));
-            egui::ComboBox::from_id_salt(("geo_tgt", i)).width(90.0).selected_text(cur_layer).show_ui(
-                ui,
-                |ui| {
-                    for l in layers {
-                        if ui.selectable_label(l.id == b.target.0, &l.name).clicked()
-                            && l.id != b.target.0
-                        {
-                            out.shape_binding =
-                                Some(ShapeBindingOp::SetTarget { index: i, target: NodeId(l.id) });
-                        }
-                    }
-                },
-            );
-        });
-    }
-}
-
-/// The **Modules** section, shown in project scope: every shared module, with a
-/// way to open one's body on this canvas and a way to make a new one. This is
-/// the document scope's front door.
-fn modules_ui(ui: &mut egui::Ui, modules: &[(ModuleId, String)], out: &mut NgEdits) {
-    ui.horizontal(|ui| {
-        ui.label(icon::text(icon::MODULE));
-        ui.strong("Modules");
-        ui.weak(format!("{}", modules.len()));
-        if ui
-            .add(egui::Button::new(format!("{} New", icon::ADD)).small())
-            .on_hover_text("Create an empty shared module and open its body")
-            .clicked()
-        {
-            out.module_op = Some(NgModuleOp::New);
-        }
-    });
-    if modules.is_empty() {
-        ui.weak("None. A module is a driver stored once and linked from many places.");
-    }
-    for (id, name) in modules {
-        ui.horizontal(|ui| {
-            if icon::button(ui, icon::ENTER, "Open this module's body").clicked() {
-                out.scope = Some(NgScope::Module(*id));
-            }
-            ui.label(name);
-        });
-    }
 }
 
 /// The header of **module scope**: which module is open, how to leave, its name,
@@ -677,7 +475,7 @@ fn module_scope_ui(
     // Knobs: what a link may override. A module with no knobs is a fixed
     // recipe; each one added here becomes an input socket on every `use` node
     // linking this module (see `GraphCtx::descriptor_for`).
-    knobs_ui(ui, ParamOwner::Module(id), knobs, out);
+    knobs_ui(ui, ParamOwner::Module(id), knobs, &mut out.knob);
 }
 
 /// The **knob editor**, for either owner: what knobs exist, plus add (in each
@@ -688,11 +486,17 @@ fn module_scope_ui(
 /// the expression. What differs is only what the knob is *for*: a module's
 /// knobs become override sockets on every link to it, a layer's are read by a
 /// `param` node in whatever drives that layer.
-fn knobs_ui(
+///
+/// Takes the op channel directly rather than the whole [`NgEdits`], because the
+/// two owners are now edited from **two panels**: a module's knobs here (they're
+/// its signature, and the canvas is where you see it), a layer's in the
+/// properties panel (they're that layer's own data, like every other row there).
+/// One widget, one op, one apply path — only the caller differs.
+pub(crate) fn knobs_ui(
     ui: &mut egui::Ui,
     owner: ParamOwner,
     knobs: &[KnobInfo],
-    out: &mut NgEdits,
+    out: &mut Option<NgKnobOp>,
 ) {
     ui.horizontal_wrapped(|ui| {
         ui.label(icon::text(icon::KNOB));
@@ -722,7 +526,7 @@ fn knobs_ui(
                 })
                 .clicked()
             {
-                out.knob = Some(NgKnobOp::Add {
+                *out = Some(NgKnobOp::Add {
                     owner,
                     name: pending.trim().to_string(),
                     kind,
@@ -738,14 +542,13 @@ fn knobs_ui(
     for k in knobs {
         ui.horizontal(|ui| {
             if icon::button(ui, icon::CLOSE, "Remove this knob").clicked() {
-                out.knob = Some(NgKnobOp::Remove { owner, name: k.name.clone() });
+                *out = Some(NgKnobOp::Remove { owner, name: k.name.clone() });
             }
             ui.label(&k.name);
             match k.value.clone() {
                 Some(v) => {
                     if let Some(v) = literal_field(ui, ("knobv", owner, &k.name), v) {
-                        out.knob =
-                            Some(NgKnobOp::SetValue { owner, name: k.name.clone(), value: v });
+                        *out = Some(NgKnobOp::SetValue { owner, name: k.name.clone(), value: v });
                     }
                 }
                 // Keyframed or expression-driven: no field, since one number
@@ -851,109 +654,6 @@ fn param_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: 
     }
 }
 
-/// The **Layer knobs** section, shown in project scope: pick a layer, edit the
-/// knobs it exposes.
-///
-/// A layer's knobs are the thing that makes one graph output fit many layers: a
-/// `param` node lowers to `Expr::Param { node: None, .. }`, which reads the
-/// knob of whichever layer the *driver* points at. So one `osc × param("gain")`
-/// recipe drives five layers at five different gains, without five graphs.
-fn layer_knobs_ui(ui: &mut egui::Ui, layers: &[LayerInfo], out: &mut NgEdits) {
-    if layers.is_empty() {
-        return;
-    }
-    let mem = egui::Id::new("ng_knob_layer");
-    let mut sel: u64 = ui.ctx().data(|d| d.get_temp(mem)).unwrap_or(layers[0].id);
-    if !layers.iter().any(|l| l.id == sel) {
-        sel = layers[0].id;
-    }
-    ui.horizontal(|ui| {
-        ui.label(icon::text(icon::KNOB));
-        ui.strong("Layer knobs");
-        let cur = layers
-            .iter()
-            .find(|l| l.id == sel)
-            .map(|l| l.name.clone())
-            .unwrap_or_else(|| format!("#{sel}"));
-        egui::ComboBox::from_id_salt("knob_layer").width(90.0).selected_text(cur).show_ui(
-            ui,
-            |ui| {
-                for l in layers {
-                    if ui.selectable_label(l.id == sel, &l.name).clicked() {
-                        sel = l.id;
-                    }
-                }
-            },
-        );
-    });
-    ui.ctx().data_mut(|d| d.insert_temp(mem, sel));
-    let knobs: &[KnobInfo] =
-        layers.iter().find(|l| l.id == sel).map(|l| l.knobs.as_slice()).unwrap_or(&[]);
-    knobs_ui(ui, ParamOwner::Node(NodeId(sel)), knobs, out);
-}
-
-/// The **Import** row — the fold's front door: pull an expression-driven
-/// property onto the canvas as nodes. Picks a layer + property; `App` raises that
-/// property's `Expr` into the graph and binds it back, so the recipe you built in
-/// the old per-property editor becomes editable here. The pending pick lives in
-/// egui memory (view state), like the driver combos.
-fn import_ui(ui: &mut egui::Ui, layers: &[LayerInfo], out: &mut NgEdits) {
-    if layers.is_empty() {
-        return;
-    }
-    let mem = egui::Id::new("ng_import_sel");
-    let mut sel: (u64, PropPath) =
-        ui.ctx().data(|d| d.get_temp(mem)).unwrap_or((layers[0].id, PropPath::Rotation));
-    ui.horizontal(|ui| {
-        ui.label(icon::text(icon::IMPORT));
-        ui.strong("Import");
-        let cur_layer = layers
-            .iter()
-            .find(|l| l.id == sel.0)
-            .map(|l| l.name.clone())
-            .unwrap_or_else(|| format!("#{}", sel.0));
-        egui::ComboBox::from_id_salt("imp_layer").width(90.0).selected_text(cur_layer).show_ui(
-            ui,
-            |ui| {
-                for l in layers {
-                    if ui.selectable_label(l.id == sel.0, &l.name).clicked() {
-                        sel.0 = l.id;
-                    }
-                }
-            },
-        );
-        egui::ComboBox::from_id_salt("imp_prop").width(80.0).selected_text(prop_path_label(sel.1)).show_ui(
-            ui,
-            |ui| {
-                for p in PROP_PATHS {
-                    if ui.selectable_label(p == sel.1, prop_path_label(p)).clicked() {
-                        sel.1 = p;
-                    }
-                }
-            },
-        );
-        if icon::button(ui, icon::IMPORT, "Raise this property's expression onto the canvas")
-            .clicked()
-        {
-            out.import = Some((NodeId(sel.0), sel.1));
-        }
-        // The geometry half. Acts on the layer alone — a shape isn't one of the
-        // properties in the combo beside it.
-        if ui
-            .button(format!("{} Shape", icon::SHAPE))
-            .on_hover_text(
-                "Raise this layer's shape onto the canvas as nodes, and bind it back.
-                 Refused if a shape param is keyframed — bake it first.",
-            )
-            .clicked()
-        {
-            out.import_shape = Some(NodeId(sel.0));
-        }
-    });
-    ui.weak("Pulls an expression-driven property, or a whole shape, onto the graph as nodes.");
-    ui.ctx().data_mut(|d| d.insert_temp(mem, sel));
-}
-
 /// The inspector for the selected node: drag editors for its `value` constant
 /// and any **unwired** numeric input, so a graph's literals are tunable without
 /// canvas widgets. A wired input has no field — its value comes down the wire.
@@ -975,14 +675,11 @@ fn inspector_ui(
         return;
     };
     ui.horizontal(|ui| {
-        ui.strong(format!(
-            "Values — {}",
-            node.title.clone().unwrap_or_else(|| desc.label.clone())
-        ));
-        // A shape node can *become* a layer. Offered here rather than in the
-        // Geometry section because it acts on the node you have selected, and
-        // because that section's Add button means the other thing: bind to a
-        // layer that already exists.
+        ui.strong(node_title(node, Some(&desc), layers));
+        // A shape node can *become* a layer — the one action that makes
+        // something exist from the graph rather than binding to a layer the
+        // tree already had. It acts on the node you have selected, which is why
+        // it lives here rather than anywhere else.
         if desc.outputs.iter().any(|s| s.ty == SocketType::Geometry)
             && ui
                 .button(format!("{} Create layer", icon::ADD))
@@ -994,6 +691,16 @@ fn inspector_ui(
             out.create_layer = Some(Endpoint::new(node.id, "geometry"));
         }
     });
+    // The sinks: where the graph meets the scene. Like `ref`, they carry
+    // addressing rather than a socket value — the difference is only direction.
+    if node.kind == "out" {
+        out_editor(ui, graph, node, layers, out);
+        return;
+    }
+    if node.kind == "shapeOut" {
+        shape_out_editor(ui, graph, node, layers, out);
+        return;
+    }
     // A `ref` reads another layer's property; a `param` reads the driven layer's
     // own knob. Both carry addressing rather than a socket value.
     if node.kind == "ref" {
@@ -1038,7 +745,7 @@ fn inspector_ui(
     }
     if node.kind == "use" {
         if modules.is_empty() {
-            ui.weak("No modules yet. Make one in the Graph panel (→ module).");
+            ui.weak("No modules yet — the palette's Module ▸ New module makes one.");
             return;
         }
         let cur = node
@@ -1047,15 +754,49 @@ fn inspector_ui(
             .and_then(|m| modules.iter().find(|(id, _)| *id == m))
             .map(|(_, n)| n.clone())
             .unwrap_or_else(|| "(pick)".into());
-        egui::ComboBox::from_id_salt(("use_mod", node.id.0)).selected_text(cur).show_ui(ui, |ui| {
-            for (m, name) in modules {
-                let picked = node.config.module == Some(*m);
-                if ui.selectable_label(picked, name).clicked() && !picked {
-                    out.op = Some(NgOp::SetModule { id: node.id, module: Some(*m) });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(("use_mod", node.id.0)).selected_text(cur).show_ui(
+                ui,
+                |ui| {
+                    for (m, name) in modules {
+                        let picked = node.config.module == Some(*m);
+                        if ui.selectable_label(picked, name).clicked() && !picked {
+                            out.op = Some(NgOp::SetModule { id: node.id, module: Some(*m) });
+                        }
+                    }
+                },
+            );
+            // The way into module scope, on the node that names the module. The
+            // Modules list used to own this; a link is a better front door than
+            // a list, because a link is a thing you can see on the canvas.
+            if let Some(m) = node.config.module {
+                if icon::button(ui, icon::ENTER, "Open this module's body on the canvas").clicked() {
+                    out.scope = Some(NgScope::Module(m));
                 }
             }
         });
         knob_rows(ui, graph, node, &desc, out);
+        return;
+    }
+    // A Math node's operator: which function it is, not a value it takes — and
+    // the one config that reshapes the node, since a unary op has no B.
+    if node.kind == "math" {
+        let cur = node.config.math_op;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(("math_op", node.id.0))
+                .width(120.0)
+                .selected_text(cur.label())
+                .show_ui(ui, |ui| {
+                    for op in MathOp::all() {
+                        if ui.selectable_label(op == cur, op.label()).clicked() && op != cur {
+                            out.op = Some(NgOp::SetMathOp { id: node.id, op });
+                        }
+                    }
+                });
+            if cur.arity() == 1 {
+                ui.weak("one operand");
+            }
+        });
         return;
     }
     // An oscillator's waveform isn't a socket either — it picks *which*
@@ -1086,9 +827,10 @@ fn inspector_ui(
     if node.kind == "text" {
         text_editor(ui, node, out);
     }
-    // A `string` node's constant, like `value`'s, lives under its output socket
-    // id. Multi-line: a caption is the common case and a one-line field makes
-    // an embedded newline invisible.
+    // A `string` node's constant gets a **roomier** editor here as well as its
+    // inline one: the node's field is one line, and a caption with an embedded
+    // newline would be invisible in it. The same value either way — this is a
+    // second view, not a second place it lives.
     if node.kind == "string" {
         let mut cur = match node.value("value") {
             Some(ExprValue::Str(t)) => t,
@@ -1100,52 +842,13 @@ fn inspector_ui(
         {
             out.op = Some(set_value(node.id, "value", ExprValue::Str(cur)));
         }
+        return;
     }
-    // A `value` node's constant lives under its output socket id.
-    if node.kind == "value" {
-        let cur = match node.value("value") {
-            Some(ExprValue::Num(n)) => n,
-            _ => 0.0,
-        };
-        if let Some(v) = num_field(ui, "value", cur) {
-            out.op = Some(set_value(node.id, "value", ExprValue::Num(v)));
-        }
-    }
-    for s in &desc.inputs {
-        if graph.incoming(&Endpoint::new(node.id, &s.id)).is_some() {
-            continue; // wired — no literal to edit
-        }
-        match (s.ty, node.value(&s.id).or_else(|| s.default.clone())) {
-            (SocketType::Number | SocketType::Time, cur) => {
-                let cur = match cur {
-                    Some(ExprValue::Num(n)) => n,
-                    _ => 0.0,
-                };
-                if let Some(v) = num_field(ui, &s.label, cur) {
-                    out.op = Some(set_value(node.id, &s.id, ExprValue::Num(v)));
-                }
-            }
-            // A vector input — a shape's size is the one that matters, and it's
-            // the reason this loop can't be numbers-only any more.
-            (SocketType::Vector, cur) => {
-                let mut v = match cur {
-                    Some(ExprValue::Vec2(v)) => v,
-                    _ => Vec2::ZERO,
-                };
-                let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label(&s.label);
-                    changed |= ui.add(egui::DragValue::new(&mut v.x).speed(0.5).prefix("x ")).changed();
-                    changed |= ui.add(egui::DragValue::new(&mut v.y).speed(0.5).prefix("y ")).changed();
-                });
-                if changed {
-                    out.op = Some(set_value(node.id, &s.id, ExprValue::Vec2(v)));
-                }
-            }
-            // Colour has no editor here yet; geometry/layer/matte have no
-            // literal at all — they're wired or nothing.
-            _ => {}
-        }
+    // Everything above is config that *isn't* a socket. A node made purely of
+    // sockets — a constant, an operator, a shape — has nothing left to show
+    // here, and saying so beats an empty panel that looks like it failed.
+    if node.kind != "osc" && node.kind != "text" {
+        ui.weak("Every value on this node is edited on the node itself.");
     }
 }
 
@@ -1216,6 +919,9 @@ fn neutral_literal(ty: SocketType) -> ExprValue {
     match ty {
         SocketType::Vector => ExprValue::Vec2(Vec2::ZERO),
         SocketType::Color => ExprValue::Color(MColor::rgba(0.0, 0.0, 0.0, 1.0)),
+        SocketType::Text => ExprValue::Str(String::new()),
+        // Number/Time, and the three that have no literal at all — a caller
+        // that asks about those has already decided a field belongs there.
         _ => ExprValue::Num(0.0),
     }
 }
@@ -1311,6 +1017,24 @@ fn palette_menu(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &
                         });
                     }
                 }
+                // Making a shared module is the one palette entry that isn't a
+                // registered kind: it creates a *document* object as well as a
+                // node. It belongs here anyway — what you get is a `use` node
+                // linked to a fresh module, which is a node like any other, and
+                // "New module" being a button in a list somewhere else was the
+                // last reason that list existed.
+                if cat == NodeCategory::Module {
+                    ui.separator();
+                    if ui
+                        .button(format!("{} New module…", icon::ADD))
+                        .on_hover_text(
+                            "Create an empty shared module, link a node to it, and open its body.",
+                        )
+                        .clicked()
+                    {
+                        out.module_op = Some(NgModuleOp::New);
+                    }
+                }
             });
         }
     });
@@ -1319,7 +1043,13 @@ fn palette_menu(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &
 /// Lay the graph out and interact with it. Node positions come from the model
 /// (they're saved), so a drag emits a `Move` op and — for the frame in hand —
 /// the delta is applied locally so the box tracks the pointer without a lag.
-fn canvas(ui: &mut egui::Ui, graph: &NodeGraph, ctx: &GraphCtx, out: &mut NgEdits) {
+fn canvas(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    ctx: &GraphCtx,
+    layers: &[LayerInfo],
+    out: &mut NgEdits,
+) {
     // Content extent covers every node so the scroll area can reach them.
     let mut extent = egui::vec2(NODE_W, ROW_H);
     for n in &graph.nodes {
@@ -1402,7 +1132,10 @@ fn canvas(ui: &mut egui::Ui, graph: &NodeGraph, ctx: &GraphCtx, out: &mut NgEdit
         let h = node_height(desc.as_deref());
         let rect = egui::Rect::from_min_size(top, egui::vec2(NODE_W, h));
         let is_sel = selected == Some(n.id);
-        draw_node(ui, &painter, n, desc.as_deref(), rect, is_sel, graph, out, &mut pending, &in_pos, &out_pos);
+        draw_node(
+            ui, &painter, n, desc.as_deref(), rect, is_sel, graph, layers, out, &mut pending,
+            &in_pos, &out_pos,
+        );
     }
 
     // A pending wire follows the pointer until it's dropped.
@@ -1444,6 +1177,7 @@ fn draw_node(
     rect: egui::Rect,
     selected: bool,
     graph: &NodeGraph,
+    layers: &[LayerInfo],
     out: &mut NgEdits,
     pending: &mut Option<Endpoint>,
     in_pos: &std::collections::HashMap<Endpoint, egui::Pos2>,
@@ -1470,9 +1204,7 @@ fn draw_node(
     painter.rect_stroke(rect, rounding, border, egui::StrokeKind::Inside);
 
     // Title, and a delete button at the header's right.
-    let title = node.title.clone().unwrap_or_else(|| {
-        desc.map(|d| d.label.clone()).unwrap_or_else(|| format!("? {}", node.kind))
-    });
+    let title = node_title(node, desc, layers);
     painter.text(
         egui::pos2(header.min.x + 8.0, header.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1502,8 +1234,10 @@ fn draw_node(
 
     let Some(desc) = desc else { return };
 
-    // Input sockets: dot + label on the left. Secondary-click disconnects the
-    // wire feeding it. It's also a drop target, resolved globally on release.
+    // Input sockets: dot, label, and — where the row has a literal — the field
+    // that edits it, right there on the node. Secondary-click on the dot
+    // disconnects the wire feeding it. It's also a drop target, resolved
+    // globally on release.
     for (i, s) in desc.inputs.iter().enumerate() {
         let ep = Endpoint::new(node.id, &s.id);
         let c = in_pos[&ep];
@@ -1516,6 +1250,14 @@ fn draw_node(
             egui::FontId::proportional(11.0),
             egui::Color32::from_gray(190),
         );
+        if let Some(cur) = row_literal(graph, node, s, true) {
+            let row = field_rect(rect, c, true);
+            if let Some(v) = socket_field(ui, row, (node.id.0, s.id.as_str()), cur) {
+                out.op = Some(NgOp::SetValue { id: node.id, socket: s.id.clone(), value: v });
+            }
+        }
+        // After the field, so the socket's own hit area wins where they touch:
+        // dropping a wire on a dot must not be swallowed by a drag field.
         let hit = egui::Rect::from_center_size(c, egui::vec2(DOT_HIT * 2.0, DOT_HIT * 2.0));
         let resp = ui.interact(hit, ui.id().with(("ng_in", node.id.0, i)), egui::Sense::click());
         if resp.secondary_clicked() {
@@ -1525,7 +1267,8 @@ fn draw_node(
         }
     }
 
-    // Output sockets: dot + label on the right. Dragging one starts a wire.
+    // Output sockets: dot + label on the right. Dragging one starts a wire. A
+    // constant node's value lives here too — it's the only socket it has.
     for (j, s) in desc.outputs.iter().enumerate() {
         let ep = Endpoint::new(node.id, &s.id);
         let c = out_pos[&ep];
@@ -1537,11 +1280,212 @@ fn draw_node(
             egui::FontId::proportional(11.0),
             egui::Color32::from_gray(190),
         );
+        if let Some(cur) = row_literal(graph, node, s, false) {
+            let row = field_rect(rect, c, false);
+            if let Some(v) = socket_field(ui, row, (node.id.0, s.id.as_str()), cur) {
+                out.op = Some(NgOp::SetValue { id: node.id, socket: s.id.clone(), value: v });
+            }
+        }
         let hit = egui::Rect::from_center_size(c, egui::vec2(DOT_HIT * 2.0, DOT_HIT * 2.0));
         let resp = ui.interact(hit, ui.id().with(("ng_out", node.id.0, j)), egui::Sense::drag());
         if resp.drag_started() {
             *pending = Some(ep);
         }
+    }
+}
+
+/// The slot an inline field occupies in a socket row: the gap between the
+/// label column and the node's far edge (mirrored for an output, whose label is
+/// right-aligned against its dot).
+///
+/// A fixed label column rather than a measured one, so every row's field starts
+/// at the same x and a node reads as a column of values rather than a ragged
+/// edge. A label longer than the column is clipped by the painter, which is the
+/// same thing that happened before there were fields.
+fn field_rect(node: egui::Rect, socket: egui::Pos2, is_input: bool) -> egui::Rect {
+    let (x0, x1) = if is_input {
+        (socket.x + DOT_R + 5.0 + LABEL_W, node.right() - FIELD_PAD)
+    } else {
+        (node.left() + FIELD_PAD, socket.x - DOT_R - 5.0 - LABEL_W)
+    };
+    egui::Rect::from_min_max(
+        egui::pos2(x0, socket.y - FIELD_H / 2.0),
+        egui::pos2(x1.max(x0), socket.y + FIELD_H / 2.0),
+    )
+}
+
+/// The layer picker both sinks need: which layer this driver writes to.
+/// Returns the pick when it changes.
+fn layer_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    cur: Option<NodeId>,
+    layers: &[LayerInfo],
+) -> Option<NodeId> {
+    let label = cur
+        .and_then(|t| layers.iter().find(|l| l.id == t.0))
+        .map(|l| l.name.clone())
+        .or_else(|| cur.map(|t| format!("#{}", t.0)))
+        .unwrap_or_else(|| "(pick a layer)".into());
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(salt).width(110.0).selected_text(label).show_ui(ui, |ui| {
+        for l in layers {
+            if ui.selectable_label(cur == Some(NodeId(l.id)), &l.name).clicked() {
+                picked = Some(NodeId(l.id));
+            }
+        }
+    });
+    picked.filter(|p| Some(*p) != cur)
+}
+
+/// The editor for an `out` node: which layer's which property it drives.
+///
+/// The two combos are what the Drivers list's rows used to be — moved onto the
+/// node they configure, so the binding and the thing bound are one object. What
+/// the row *couldn't* show is here too: whether anything is actually wired in,
+/// since a driver with a target and no wire drives nothing.
+///
+/// Changing the property retypes the input socket (see
+/// `GraphCtx::descriptor_for`), so a wire that no longer fits is dropped by
+/// `App` when it applies the op — said plainly here rather than discovered.
+fn out_editor(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    node: &GraphNode,
+    layers: &[LayerInfo],
+    out: &mut NgEdits,
+) {
+    if layers.is_empty() {
+        ui.weak("No layers to drive. Add one first.");
+        return;
+    }
+    let cur = node.config.out_target;
+    let (cur_layer, cur_prop) = (cur.map(|(l, _)| l), cur.map(|(_, p)| p));
+    ui.horizontal(|ui| {
+        ui.label(icon::text(icon::LINK)).on_hover_text("This node is a driver: it writes into the scene.");
+        if let Some(l) = layer_picker(ui, ("out_layer", node.id.0), cur_layer, layers) {
+            // Seeding Rotation on the first pick matches the driver list's old
+            // default: a scalar property, so the socket stays Number and any
+            // wire already dropped on it survives the targeting.
+            let prop = cur_prop.unwrap_or(PropPath::Rotation);
+            out.op = Some(NgOp::SetOutTarget { id: node.id, target: Some((l, prop)) });
+        }
+        egui::ComboBox::from_id_salt(("out_prop", node.id.0))
+            .width(90.0)
+            .selected_text(cur_prop.map_or("(property)", prop_path_label))
+            .show_ui(ui, |ui| {
+                for p in PROP_PATHS {
+                    if ui.selectable_label(cur_prop == Some(p), prop_path_label(p)).clicked()
+                        && cur_prop != Some(p)
+                    {
+                        // A property with no layer yet is legitimate — pick
+                        // either half first — so this seeds the layer the same
+                        // way the layer combo seeds the property.
+                        let layer = cur_layer.unwrap_or(NodeId(layers[0].id));
+                        out.op = Some(NgOp::SetOutTarget { id: node.id, target: Some((layer, p)) });
+                    }
+                }
+            });
+    });
+    match (cur, graph.incoming(&Endpoint::new(node.id, "value")).is_some()) {
+        (Some((_, p)), true) => {
+            ui.weak(format!("Driving it as {}.", p.socket_type().label()));
+        }
+        // Unwired and targeted is where **import** belongs — the fold's other
+        // direction, on the node that already names the property. If that
+        // property has an expression of its own, this pulls it onto the canvas
+        // as nodes and wires it in here, so the recipe becomes editable in the
+        // place that was about to drive it anyway.
+        (Some(_), false) => {
+            ui.weak("Nothing wired in — wire a value into this node to drive it.");
+            import_button(
+                ui,
+                "Import its expression",
+                "Raise this property's existing expression onto the canvas and wire it in.\n\
+                 Nothing to do unless the property is expression-driven (= fx).",
+                || out.import = Some(node.id),
+            );
+        }
+        (None, _) => {
+            ui.weak("Pick a layer and a property. Until then this node drives nothing.");
+        }
+    };
+}
+
+/// The **import** button both sinks carry: the fold's front door, on the node
+/// that names what it would pull in.
+///
+/// It used to be a section of its own with its own layer + property combos,
+/// duplicating the pickers a sink already has. Here the target is whatever the
+/// node targets, so there is one place a layer and a property are named and one
+/// object that means "this graph and that property are the same thing".
+fn import_button(ui: &mut egui::Ui, label: &str, hover: &str, mut on_click: impl FnMut()) {
+    if ui.button(format!("{} {label}", icon::IMPORT)).on_hover_text(hover).clicked() {
+        on_click();
+    }
+}
+
+/// The editor for a `shapeOut` node: which layer's *shape* it authors. One
+/// combo, because a shape names no property — the same asymmetry
+/// `ShapeBinding` has against `Binding`.
+fn shape_out_editor(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    node: &GraphNode,
+    layers: &[LayerInfo],
+    out: &mut NgEdits,
+) {
+    if layers.is_empty() {
+        ui.weak("No layers to drive. Add one first, or use a shape node's 'Create layer'.");
+        return;
+    }
+    let cur = node.config.out_shape;
+    ui.horizontal(|ui| {
+        ui.label(icon::text(icon::SHAPE))
+            .on_hover_text("This node is a geometry driver: it authors a layer's shape.");
+        if let Some(l) = layer_picker(ui, ("shapeout_layer", node.id.0), cur, layers) {
+            out.op = Some(NgOp::SetOutShape { id: node.id, target: Some(l) });
+        }
+    });
+    match (cur.is_some(), graph.incoming(&Endpoint::new(node.id, "geometry")).is_some()) {
+        (true, true) => {
+            ui.weak("This layer's shape is rebuilt from the graph on every edit.");
+        }
+        (true, false) => {
+            ui.weak("Nothing wired in — wire a shape node's geometry into this.");
+            import_button(
+                ui,
+                "Import its shape",
+                "Raise this layer's shape onto the canvas as nodes and wire it in.\n\
+                 Refused if a shape param is keyframed — bake it first.",
+                || out.import_shape = Some(node.id),
+            );
+        }
+        (false, _) => {
+            ui.weak("Pick a layer. Until then this node drives nothing.");
+        }
+    };
+}
+
+/// What a node's header reads. The descriptor's label, unless the user renamed
+/// it — except for a **sink**, which says what it drives instead of what it is.
+/// "Rotation → Star" on the canvas is the whole reason a driver is worth being a
+/// node: the binding is legible without selecting anything.
+fn node_title(node: &GraphNode, desc: Option<&NodeDescriptor>, layers: &[LayerInfo]) -> String {
+    if let Some(t) = &node.title {
+        return t.clone();
+    }
+    let layer_name = |t: NodeId| {
+        layers
+            .iter()
+            .find(|l| l.id == t.0)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| format!("#{}", t.0))
+    };
+    match (node.kind.as_str(), node.config.out_target, node.config.out_shape) {
+        ("out", Some((t, p)), _) => format!("{} → {}", prop_path_label(p), layer_name(t)),
+        ("shapeOut", _, Some(t)) => format!("Shape → {}", layer_name(t)),
+        _ => desc.map(|d| d.label.clone()).unwrap_or_else(|| format!("? {}", node.kind)),
     }
 }
 
@@ -1596,6 +1540,128 @@ fn ref_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: &m
     if changed {
         out.op = Some(NgOp::SetRef { id: node.id, target: Some((node_id, prop, off)) });
     }
+}
+
+/// The socket id whose literal is this node kind's **constant** — the value the
+/// node exists to hold, stored under an *output* socket because that's the only
+/// socket it has.
+///
+/// One function rather than a branch in each place that cares, so the canvas and
+/// the inspector can't disagree about which nodes are constants. `None` for every
+/// other kind, including the other leaves (`ref`, `param`, `script`, the time
+/// sources): they're leaves too, but what they produce is a read, not a literal
+/// anyone can type.
+pub(crate) fn const_socket(kind: &str) -> Option<&'static str> {
+    match kind {
+        "value" | "string" => Some("value"),
+        _ => None,
+    }
+}
+
+/// The literal a socket row **edits in place**, if it has one.
+///
+/// The rule is structural, not a list of kinds: a row is editable when there is
+/// a literal there to edit — a stored override, or the descriptor's resting
+/// default. Three things fall out of that without being special-cased:
+///
+/// - a **wired** input has no field, because the wire is the value;
+/// - a `use` node's **override** socket has neither a default nor (until you
+///   override it) a stored value, so it shows nothing — which is right, since
+///   unset there means *inherit the module's default*, and a field seeded to
+///   zero would state the opposite. Its explicit inherit/override toggle stays
+///   in the inspector;
+/// - a **geometry / layer / matte** socket has no default either, and no
+///   `ExprValue` to put in a field if it did.
+pub(crate) fn row_literal(
+    graph: &NodeGraph,
+    node: &GraphNode,
+    socket: &motion_core::Socket,
+    is_input: bool,
+) -> Option<ExprValue> {
+    if is_input {
+        if graph.incoming(&Endpoint::new(node.id, &socket.id)).is_some() {
+            return None; // wired — the wire is the value
+        }
+        node.value(&socket.id).or_else(|| socket.default.clone())
+    } else if const_socket(&node.kind) == Some(socket.id.as_str()) {
+        // The node's constant. Unset until first edited, so fall back to a
+        // neutral of the socket's own kind rather than showing nothing.
+        Some(node.value(&socket.id).unwrap_or_else(|| neutral_literal(socket.ty)))
+    } else {
+        None
+    }
+}
+
+/// Draw the editor for one socket literal **on the node**, in the gap its row
+/// leaves between the label and the far edge. Returns the new value when edited.
+///
+/// This is what makes a node self-contained: the number a `value` node holds, or
+/// an oscillator's freq, is on the box you are looking at rather than in a panel
+/// above it that describes whichever node happens to be selected. The inspector
+/// keeps only what *isn't* a socket — a `ref`'s target, a script's source, a
+/// sink's property — which is a much clearer remit than "some of the values".
+fn socket_field(
+    ui: &mut egui::Ui,
+    row: egui::Rect,
+    salt: (u64, &str),
+    cur: ExprValue,
+) -> Option<ExprValue> {
+    // A scoped `Ui` over the row, rather than `put` per widget: a vector needs
+    // two fields sharing the space, and a colour button isn't a `Widget`.
+    let builder = egui::UiBuilder::new()
+        .max_rect(row)
+        .id_salt(salt)
+        .layout(egui::Layout::left_to_right(egui::Align::Center));
+    ui.scope_builder(builder, |ui| {
+        // No spacing worth the name at this size, and no visible frame gap —
+        // the node body is the frame.
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.style_mut().spacing.interact_size.y = row.height();
+        match cur {
+            ExprValue::Num(n) => {
+                let mut v = n;
+                let w = ui.available_width();
+                ui.add_sized([w, row.height()], egui::DragValue::new(&mut v).speed(0.1))
+                    .changed()
+                    .then_some(ExprValue::Num(v))
+            }
+            ExprValue::Vec2(p) => {
+                let (mut x, mut y) = (p.x, p.y);
+                // Halved, less the one gap between them.
+                let w = (ui.available_width() - 2.0) / 2.0;
+                let mut changed = false;
+                changed |= ui
+                    .add_sized([w, row.height()], egui::DragValue::new(&mut x).speed(0.5))
+                    .changed();
+                changed |= ui
+                    .add_sized([w, row.height()], egui::DragValue::new(&mut y).speed(0.5))
+                    .changed();
+                changed.then(|| ExprValue::Vec2(Vec2::new(x, y)))
+            }
+            ExprValue::Color(c) => {
+                let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
+                egui::color_picker::color_edit_button_rgb(ui, &mut rgb).changed().then(|| {
+                    ExprValue::Color(MColor::rgba(
+                        rgb[0] as f64,
+                        rgb[1] as f64,
+                        rgb[2] as f64,
+                        c.a,
+                    ))
+                })
+            }
+            ExprValue::Str(t) => {
+                let mut v = t;
+                let w = ui.available_width();
+                ui.add_sized(
+                    [w, row.height()],
+                    egui::TextEdit::singleline(&mut v).clip_text(true),
+                )
+                .changed()
+                .then_some(ExprValue::Str(v))
+            }
+        }
+    })
+    .inner
 }
 
 /// A socket dot: a filled circle in the type's colour, ringed. A connected input

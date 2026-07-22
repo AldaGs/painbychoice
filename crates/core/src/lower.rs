@@ -24,7 +24,7 @@
 
 use std::collections::HashSet;
 
-use crate::expr::{Expr, ExprValue, Generator, TimeSource};
+use crate::expr::{Expr, ExprValue, Generator, MathOp, TimeSource};
 use crate::graph::{Endpoint, GraphCtx, GraphNodeId, NodeGraph};
 use crate::node::Shape;
 use crate::registry::NodeCategory;
@@ -64,15 +64,20 @@ fn lower_out(
         "string" => Expr::Lit(
             node.value(&output.socket).unwrap_or_else(|| ExprValue::Str(String::new())),
         ),
-        "add" => Expr::Add(
-            b(lower_in(graph, ctx, output.node, "a", visiting)),
-            b(lower_in(graph, ctx, output.node, "b", visiting)),
-        ),
-        "mul" => Expr::Mul(
-            b(lower_in(graph, ctx, output.node, "a", visiting)),
-            b(lower_in(graph, ctx, output.node, "b", visiting)),
-        ),
-        "neg" => Expr::Neg(b(lower_in(graph, ctx, output.node, "a", visiting))),
+        // One node for every operator, so this is one arm: which operator is
+        // config, and the arity follows it (see `GraphCtx::descriptor_for`), so
+        // a unary op simply has no `b` socket to lower.
+        "math" => match node.config.math_op {
+            MathOp::Bin(op) => Expr::Bin {
+                op,
+                a: b(lower_in(graph, ctx, output.node, "a", visiting)),
+                b: b(lower_in(graph, ctx, output.node, "b", visiting)),
+            },
+            MathOp::Un(op) => Expr::Un {
+                op,
+                a: b(lower_in(graph, ctx, output.node, "a", visiting)),
+            },
+        },
         "osc" => Expr::Gen(Generator::Oscillator {
             freq: b(lower_in(graph, ctx, output.node, "freq", visiting)),
             amp: b(lower_in(graph, ctx, output.node, "amp", visiting)),
@@ -310,6 +315,7 @@ fn b(e: Expr) -> Box<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::{BinOp, UnOp};
     use crate::expr::{eval_expr, EvalCtx};
     use crate::graph::Endpoint;
     use crate::registry::NodeRegistry;
@@ -341,7 +347,7 @@ mod tests {
         let mut g = NodeGraph::new();
         let a = g.add_node("value", Vec2::ZERO);
         let b_ = g.add_node("value", Vec2::new(0.0, 60.0));
-        let add = g.add_node("add", Vec2::new(200.0, 0.0));
+        let add = g.add_node("math", Vec2::new(200.0, 0.0));
         g.node_mut(a).unwrap().set_value("value", ExprValue::Num(3.0));
         g.node_mut(b_).unwrap().set_value("value", ExprValue::Num(4.0));
         g.connect(ctx, Endpoint::new(a, "value"), Endpoint::new(add, "a")).unwrap();
@@ -363,12 +369,13 @@ mod tests {
         let v = g.add_node("value", Vec2::ZERO);
         g.node_mut(v).unwrap().set_value("value", ExprValue::Num(5.0));
 
-        let add = g.add_node("add", Vec2::new(200.0, 0.0));
+        let add = g.add_node("math", Vec2::new(200.0, 0.0));
         g.connect(ctx, Endpoint::new(v, "value"), Endpoint::new(add, "a")).unwrap();
         // b is unwired → its default 0 → 5 + 0 = 5.
         assert_eq!(eval0(&lower_output(&g, ctx, &Endpoint::new(add, "result"))), 5.0);
 
-        let mul = g.add_node("mul", Vec2::new(200.0, 120.0));
+        let mul = g.add_node("math", Vec2::new(200.0, 120.0));
+        g.node_mut(mul).unwrap().config.math_op = MathOp::Bin(BinOp::Mul);
         g.connect(ctx, Endpoint::new(v, "value"), Endpoint::new(mul, "a")).unwrap();
         // b is unwired → mul's default 1 → 5 * 1 = 5 (not 0, which add would give).
         assert_eq!(eval0(&lower_output(&g, ctx, &Endpoint::new(mul, "result"))), 5.0);
@@ -380,7 +387,8 @@ mod tests {
         let reg = reg();
         let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
-        let neg = g.add_node("neg", Vec2::ZERO);
+        let neg = g.add_node("math", Vec2::ZERO);
+        g.node_mut(neg).unwrap().config.math_op = MathOp::Un(UnOp::Neg);
         g.node_mut(neg).unwrap().set_value("a", ExprValue::Num(2.0));
         // neg of a stored 2 → -2. Without the override, `a`'s default is 0 → 0,
         // so a non-zero result proves the stored value was read instead.
@@ -481,7 +489,8 @@ mod tests {
         let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let rect = g.add_node("rect", Vec2::ZERO);
-        let neg = g.add_node("neg", Vec2::new(200.0, 0.0));
+        let neg = g.add_node("math", Vec2::new(200.0, 0.0));
+        g.node_mut(neg).unwrap().config.math_op = MathOp::Un(UnOp::Neg);
         g.node_mut(rect).unwrap().set_value("radius", ExprValue::Num(12.0));
         g.connect(ctx, Endpoint::new(rect, "radius"), Endpoint::new(neg, "a")).unwrap();
         assert_eq!(eval0(&lower_output(&g, ctx, &Endpoint::new(neg, "result"))), -12.0);
@@ -557,10 +566,7 @@ mod tests {
     fn module_project() -> (NodeRegistry, std::collections::BTreeMap<ModuleId, crate::node::Module>)
     {
         use crate::node::{Module, ParamValue};
-        let body = Expr::Mul(
-            Box::new(Expr::Param { node: None, name: "amp".into() }),
-            Box::new(Expr::Lit(ExprValue::Num(2.0))),
-        );
+        let body = Expr::bin(BinOp::Mul,Expr::Param { node: None, name: "amp".into() },Expr::Lit(ExprValue::Num(2.0)));
         let m = Module::new("pulse", body)
             .with_param("amp", ParamValue::Num(crate::value::Value::constant(3.0)));
         (NodeRegistry::with_builtins(), [(ModuleId(1), m)].into_iter().collect())
@@ -646,7 +652,8 @@ mod tests {
         m.graph.node_mut(p).unwrap().config.param = "amp".into();
         let two = m.graph.add_node("value", Vec2::new(0.0, 60.0));
         m.graph.node_mut(two).unwrap().set_value("value", ExprValue::Num(2.0));
-        let mul = m.graph.add_node("mul", Vec2::new(200.0, 0.0));
+        let mul = m.graph.add_node("math", Vec2::new(200.0, 0.0));
+        m.graph.node_mut(mul).unwrap().config.math_op = MathOp::Bin(BinOp::Mul);
         {
             let ctx = &GraphCtx::bare(&reg);
             m.graph.connect(ctx, Endpoint::new(p, "value"), Endpoint::new(mul, "a")).unwrap();
@@ -696,7 +703,8 @@ mod tests {
         g.node_mut(u).unwrap().config.module = Some(ModuleId(1));
         let ctx = &GraphCtx::new(&reg, &modules);
         let doc = crate::node::Comp::new(64.0, 64.0, crate::node::Node::group(0, "root"));
-        let project = crate::node::Project { modules: modules.clone(), ..crate::node::Project::single(doc) };
+        let mut project = crate::node::Project::single(doc);
+        project.modules = modules.clone();
         let eval = |g: &NodeGraph| {
             let expr = lower_output(g, ctx, &Endpoint::new(u, "value"));
             let comp = project.comp(project.root).unwrap();
