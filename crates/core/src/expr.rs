@@ -516,6 +516,26 @@ impl MathOp {
     }
 }
 
+/// Which component of a 2-vector a [`Expr::Comp`] reads, and the axis a `split`
+/// node's two outputs name. Two axes because the values here are 2-vectors —
+/// position, scale, size, anchor — the dimensionality the whole app is built on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Axis {
+    X,
+    Y,
+}
+
+impl Axis {
+    /// The socket id a `split` node's output carries, and the suffix
+    /// [`fmt::Display`] prints (`v.x` / `v.y`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Axis::X => "x",
+            Axis::Y => "y",
+        }
+    }
+}
+
 /// Replace a non-finite result with zero — the guard that keeps arithmetic from
 /// ending a frame. A NaN in a transform silently blanks the layer, which is the
 /// least debuggable failure this engine can produce; a zero is wrong in an
@@ -591,6 +611,16 @@ pub enum Expr {
     /// after parameters. Always resolves to a `Num`; feed it through `Mul` to
     /// broadcast onto a vec/colour property.
     Gen(Generator),
+    /// Build a 2-vector from two scalar sub-expressions — what a `join` node
+    /// lowers to. Each child resolves to a number (a vec/colour coerces to a
+    /// component, a string to zero) and the pair becomes a `Vec2`. The one IR
+    /// node that *raises* dimensionality, so a graph can drive `position` or
+    /// `scale` from two independently-built scalars.
+    Vec2 { x: Box<Expr>, y: Box<Expr> },
+    /// One component of a vector-valued sub-expression — what a `split` node's
+    /// `x`/`y` outputs lower to. The inverse of [`Expr::Vec2`]: a `Vec2` yields
+    /// the named axis, a colour reads r/g, and a scalar passes through.
+    Comp { a: Box<Expr>, axis: Axis },
 }
 
 /// Which reading of the current layer's clock an [`Expr::Time`] takes.
@@ -858,15 +888,9 @@ impl Generator {
 /// or colour knob (say a `Param` of the wrong kind) coerces to its first
 /// component rather than erroring, so a generator always produces a value.
 fn eval_num(expr: &Expr, ctx: &mut EvalCtx) -> f64 {
-    match eval_expr(expr, ctx) {
-        ExprValue::Num(n) => n,
-        ExprValue::Vec2(v) => v.x,
-        ExprValue::Color(c) => c.r,
-        // Text has no scalar reading. Parsing it would be a hidden cast that
-        // silently turns a typo into a number, so a knob fed a string is 0 —
-        // the same neutral answer a kind mismatch gets everywhere else.
-        ExprValue::Str(_) => 0.0,
-    }
+    // Text has no scalar reading, so a knob fed a string is 0 — the same neutral
+    // answer a kind mismatch gets everywhere else. See [`as_scalar`].
+    as_scalar(eval_expr(expr, ctx))
 }
 
 impl Expr {
@@ -904,6 +928,8 @@ impl Expr {
             Expr::Use { .. } => ExprKind::Use,
             Expr::Time(t) => t.kind(),
             Expr::Gen(g) => g.kind(),
+            Expr::Vec2 { .. } => ExprKind::Vec2,
+            Expr::Comp { .. } => ExprKind::Comp,
         }
     }
 
@@ -932,6 +958,8 @@ impl Expr {
             ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {
                 Expr::Gen(Generator::seed(kind))
             }
+            ExprKind::Vec2 => Expr::Vec2 { x: Box::new(Expr::num(0.0)), y: Box::new(Expr::num(0.0)) },
+            ExprKind::Comp => Expr::Comp { a: Box::new(Expr::num(0.0)), axis: Axis::X },
         }
     }
 
@@ -940,8 +968,8 @@ impl Expr {
     /// kind.
     pub fn arity(&self) -> usize {
         match self {
-            Expr::Bin { .. } => 2,
-            Expr::Un { .. } => 1,
+            Expr::Bin { .. } | Expr::Vec2 { .. } => 2,
+            Expr::Un { .. } | Expr::Comp { .. } => 1,
             Expr::Gen(g) => g.arity(),
             // A link's children are its overrides, in order — so the canvas
             // lays each override out as a wired box and edits it like any other
@@ -960,8 +988,10 @@ impl Expr {
     /// editor walk inputs without matching on the variant.
     pub fn child(&self, slot: usize) -> Option<&Expr> {
         match (self, slot) {
-            (Expr::Bin { a, .. } | Expr::Un { a, .. }, 0) => Some(a),
+            (Expr::Bin { a, .. } | Expr::Un { a, .. } | Expr::Comp { a, .. }, 0) => Some(a),
             (Expr::Bin { b, .. }, 1) => Some(b),
+            (Expr::Vec2 { x, .. }, 0) => Some(x),
+            (Expr::Vec2 { y, .. }, 1) => Some(y),
             (Expr::Gen(g), _) => g.knob(slot),
             (Expr::Use { overrides, .. }, _) => overrides.get(slot).map(|(_, e)| e),
             _ => None,
@@ -973,6 +1003,7 @@ impl Expr {
     pub fn slot_label(&self, slot: usize) -> Option<&'static str> {
         match self {
             Expr::Gen(g) => g.knob_labels().get(slot).copied(),
+            Expr::Vec2 { .. } => ["x", "y"].get(slot).copied(),
             _ => None,
         }
     }
@@ -984,8 +1015,10 @@ impl Expr {
             return Some(self);
         };
         let child = match (self, slot) {
-            (Expr::Bin { a, .. } | Expr::Un { a, .. }, 0) => a.as_ref(),
+            (Expr::Bin { a, .. } | Expr::Un { a, .. } | Expr::Comp { a, .. }, 0) => a.as_ref(),
             (Expr::Bin { b, .. }, 1) => b.as_ref(),
+            (Expr::Vec2 { x, .. }, 0) => x.as_ref(),
+            (Expr::Vec2 { y, .. }, 1) => y.as_ref(),
             (Expr::Gen(g), _) => g.knob(slot)?,
             (Expr::Use { overrides, .. }, _) => &overrides.get(slot)?.1,
             _ => return None,
@@ -1000,8 +1033,10 @@ impl Expr {
             return Some(self);
         };
         let child = match (self, slot) {
-            (Expr::Bin { a, .. } | Expr::Un { a, .. }, 0) => a.as_mut(),
+            (Expr::Bin { a, .. } | Expr::Un { a, .. } | Expr::Comp { a, .. }, 0) => a.as_mut(),
             (Expr::Bin { b, .. }, 1) => b.as_mut(),
+            (Expr::Vec2 { x, .. }, 0) => x.as_mut(),
+            (Expr::Vec2 { y, .. }, 1) => y.as_mut(),
             (Expr::Gen(g), _) => g.knob_mut(slot)?,
             (Expr::Use { overrides, .. }, _) => &mut overrides.get_mut(slot)?.1,
             _ => return None,
@@ -1036,6 +1071,13 @@ pub enum ExprKind {
     Noise,
     Ramp,
     Bounce,
+    /// Build a vector from two scalars — the `join` node. Like [`ExprKind::Use`],
+    /// kept out of [`ExprKind::ALL`]: it's created by placing the graph node, not
+    /// by the generic kind picker.
+    Vec2,
+    /// Read one axis of a vector — the `split` node. Out of `ALL` for the same
+    /// reason as [`ExprKind::Vec2`].
+    Comp,
 }
 
 impl ExprKind {
@@ -1074,6 +1116,8 @@ impl ExprKind {
             ExprKind::Noise => "noise",
             ExprKind::Ramp => "ramp",
             ExprKind::Bounce => "bounce",
+            ExprKind::Vec2 => "join",
+            ExprKind::Comp => "split",
         }
     }
 
@@ -1128,6 +1172,8 @@ impl fmt::Display for Expr {
             }
             Expr::Time(t) => f.write_str(t.label()),
             Expr::Gen(g) => write!(f, "{g}"),
+            Expr::Vec2 { x, y } => write!(f, "vec2({x}, {y})"),
+            Expr::Comp { a, axis } => write!(f, "{a}.{}", axis.name()),
         }
     }
 }
@@ -1865,6 +1911,40 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
         // A generator always produces a scalar; a vec/colour property broadcasts
         // it through the same `Num` edge a literal number would.
         Expr::Gen(g) => ExprValue::Num(g.eval(ctx)),
+        // Two scalars up into a vector, or one axis down out of one — the join /
+        // split pair. Both coerce, so a mismatched wire lowers dimensionality
+        // gracefully rather than failing a frame.
+        Expr::Vec2 { x, y } => {
+            let (x, y) = (as_scalar(eval_expr(x, ctx)), as_scalar(eval_expr(y, ctx)));
+            ExprValue::Vec2(kurbo::Vec2::new(x, y))
+        }
+        Expr::Comp { a, axis } => ExprValue::Num(component(&eval_expr(a, ctx), *axis)),
+    }
+}
+
+/// Coerce an [`ExprValue`] to a scalar — the reading `Vec2`'s operands and the
+/// generator knobs share: a number is itself, a vec/colour gives its first
+/// component, a string has no number and gives zero.
+fn as_scalar(v: ExprValue) -> f64 {
+    match v {
+        ExprValue::Num(n) => n,
+        ExprValue::Vec2(p) => p.x,
+        ExprValue::Color(c) => c.r,
+        ExprValue::Str(_) => 0.0,
+    }
+}
+
+/// One axis of a value, for [`Expr::Comp`]. A vector gives x/y, a colour reads
+/// r/g, and a scalar has no axes so it passes through. Total and non-failing,
+/// like every other coercion here.
+fn component(v: &ExprValue, axis: Axis) -> f64 {
+    match (v, axis) {
+        (ExprValue::Vec2(p), Axis::X) => p.x,
+        (ExprValue::Vec2(p), Axis::Y) => p.y,
+        (ExprValue::Color(c), Axis::X) => c.r,
+        (ExprValue::Color(c), Axis::Y) => c.g,
+        (ExprValue::Num(n), _) => *n,
+        (ExprValue::Str(_), _) => 0.0,
     }
 }
 
@@ -2109,6 +2189,11 @@ mod tests {
                 ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {
                     e.arity()
                 }
+                // Not in `ALL` (created by placing the graph node), but the match
+                // must still cover them: a `join` takes two scalars, a `split` one
+                // vector.
+                ExprKind::Vec2 => 2,
+                ExprKind::Comp => 1,
             };
             assert_eq!(e.arity(), expected, "{k:?}");
         }

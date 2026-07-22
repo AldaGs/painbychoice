@@ -24,7 +24,7 @@
 
 use std::collections::HashSet;
 
-use crate::expr::{Expr, ExprValue, Generator, MathOp, TimeSource};
+use crate::expr::{Axis, Expr, ExprValue, Generator, MathOp, TimeSource};
 use crate::graph::{Endpoint, GraphCtx, GraphNodeId, NodeGraph};
 use crate::node::Shape;
 use crate::registry::NodeCategory;
@@ -64,6 +64,23 @@ fn lower_out(
         "string" => Expr::Lit(
             node.value(&output.socket).unwrap_or_else(|| ExprValue::Str(String::new())),
         ),
+        // A vector constant — `value`'s two-dimensional sibling. Its literal is
+        // stored under the output socket; an unset one rests at the zero vector,
+        // not the scalar 0 wearing a vector socket.
+        "vec2" => Expr::Lit(
+            node.value(&output.socket).unwrap_or(ExprValue::Vec2(kurbo::Vec2::ZERO)),
+        ),
+        // Build a vector from two scalars, and read one axis back out — the join /
+        // split pair. `join` combines its `x`/`y` inputs; `split` picks the axis
+        // its output socket names, off whatever feeds its `value` input.
+        "join" => Expr::Vec2 {
+            x: b(lower_in(graph, ctx, output.node, "x", visiting)),
+            y: b(lower_in(graph, ctx, output.node, "y", visiting)),
+        },
+        "split" => {
+            let axis = if output.socket == "y" { Axis::Y } else { Axis::X };
+            Expr::Comp { a: b(lower_in(graph, ctx, output.node, "value", visiting)), axis }
+        }
         // One node for every operator, so this is one arm: which operator is
         // config, and the arity follows it (see `GraphCtx::descriptor_for`), so
         // a unary op simply has no `b` socket to lower.
@@ -720,6 +737,49 @@ mod tests {
         // Override it with 7 → the link now runs the body against 7.
         g.node_mut(u).unwrap().set_value("amp", ExprValue::Num(7.0));
         assert_eq!(eval(&g), 7.0, "the override reaches the module's body");
+    }
+
+    /// `join` combines two scalars into a vector and `split` takes one back
+    /// apart — the pair that lets a graph reach inside `position`/`scale`. Built
+    /// as a graph, lowered, and evaluated: 3 and 4 become `[3, 4]`, and splitting
+    /// it yields 3 and 4 again.
+    #[test]
+    fn join_and_split_move_between_scalars_and_vectors() {
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let x = g.add_node("value", Vec2::ZERO);
+        let y = g.add_node("value", Vec2::new(0.0, 60.0));
+        g.node_mut(x).unwrap().set_value("value", ExprValue::Num(3.0));
+        g.node_mut(y).unwrap().set_value("value", ExprValue::Num(4.0));
+        let join = g.add_node("join", Vec2::new(200.0, 0.0));
+        g.connect(ctx, Endpoint::new(x, "value"), Endpoint::new(join, "x")).unwrap();
+        g.connect(ctx, Endpoint::new(y, "value"), Endpoint::new(join, "y")).unwrap();
+
+        let vexpr = lower_output(&g, ctx, &Endpoint::new(join, "value"));
+        assert_eq!(vexpr.to_string(), "vec2(3, 4)");
+        let mut c = EvalCtx::at(0.0);
+        assert_eq!(eval_expr(&vexpr, &mut c), ExprValue::Vec2(Vec2::new(3.0, 4.0)));
+
+        // Wire the vector into a `split` and read each axis back as a scalar.
+        let split = g.add_node("split", Vec2::new(400.0, 0.0));
+        g.connect(ctx, Endpoint::new(join, "value"), Endpoint::new(split, "value")).unwrap();
+        assert_eq!(eval0(&lower_output(&g, ctx, &Endpoint::new(split, "x"))), 3.0);
+        assert_eq!(eval0(&lower_output(&g, ctx, &Endpoint::new(split, "y"))), 4.0);
+    }
+
+    /// A `vec2` node is a vector constant — `value` at two dimensions — so a
+    /// position can be pinned without wiring two `join` inputs by hand.
+    #[test]
+    fn a_vec2_node_is_a_vector_constant() {
+        let reg = reg();
+        let ctx = &GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let v = g.add_node("vec2", Vec2::ZERO);
+        g.node_mut(v).unwrap().set_value("value", ExprValue::Vec2(Vec2::new(10.0, 20.0)));
+        let expr = lower_output(&g, ctx, &Endpoint::new(v, "value"));
+        let mut c = EvalCtx::at(0.0);
+        assert_eq!(eval_expr(&expr, &mut c), ExprValue::Vec2(Vec2::new(10.0, 20.0)));
     }
 
     /// The layer-clock leaves lower to their `Expr::Time` readings.

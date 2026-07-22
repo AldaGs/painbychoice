@@ -53,12 +53,14 @@ fn raise_rec(
 
     match expr {
         Expr::Lit(v) => {
-            // A text literal raises to the `string` node, not `value`: they
-            // lower identically but carry different socket types, and a text
-            // literal on a Number output would draw the wrong wire colour and
-            // refuse a legal connection.
+            // A literal raises to the node whose output socket carries its type:
+            // `string` for text, `vec2` for a vector, `value` for a number. They
+            // lower identically, but the socket type is what colours the wire and
+            // gates a connection — a vector literal on a Number output would draw
+            // the wrong colour and refuse a legal wire into a Vector input.
             let kind = match v {
                 ExprValue::Str(_) => "string",
+                ExprValue::Vec2(_) => "vec2",
                 _ => "value",
             };
             let (id, y) = leaf(graph, kind);
@@ -90,6 +92,23 @@ fn raise_rec(
         }
         Expr::Un { op, a } => raise_math(graph, ctx, MathOp::Un(*op), a, None, x, cursor_y),
         Expr::Gen(g) => raise_generator(graph, ctx, g, x, cursor_y),
+        // Build-a-vector: raise both scalars into a `join` centred on them.
+        Expr::Vec2 { x: xe, y: ye } => {
+            let (ex, yx) = raise_rec(graph, ctx, xe, x - COL, cursor_y);
+            let (ey, yy) = raise_rec(graph, ctx, ye, x - COL, cursor_y);
+            let center = (yx + yy) / 2.0;
+            let id = graph.add_node("join", Vec2::new(x, center));
+            let _ = graph.connect(ctx, ex, Endpoint::new(id, "x"));
+            let _ = graph.connect(ctx, ey, Endpoint::new(id, "y"));
+            (Endpoint::new(id, "value"), center)
+        }
+        // Read-an-axis: raise the source into a `split`, take the named output.
+        Expr::Comp { a, axis } => {
+            let (ea, y0) = raise_rec(graph, ctx, a, x - COL, cursor_y);
+            let id = graph.add_node("split", Vec2::new(x, y0));
+            let _ = graph.connect(ctx, ea, Endpoint::new(id, "value"));
+            (Endpoint::new(id, axis.name()), y0)
+        }
         Expr::Script(src) => {
             let (id, y) = leaf(graph, "script");
             graph.node_mut(id).unwrap().config.script = src.clone();
@@ -397,6 +416,22 @@ mod tests {
         let ep = raise(&mut g, ctx, &expr, Vec2::ZERO);
         let back = lower_output(&g, ctx, &ep);
         assert_eq!(back.to_string(), expr.to_string(), "round trip changed the expression");
+    }
+
+    /// The vector plumbing round-trips: a `join` built from two scalars, a `vec2`
+    /// literal, and a `split` reading an axis — `vec2(3, vec2(5, 6).y)`, one of
+    /// each node in one tree, raised to nodes and lowered back unchanged.
+    #[test]
+    fn the_vector_nodes_round_trip() {
+        use crate::expr::Axis;
+        let expr = Expr::Vec2 {
+            x: Box::new(Expr::Lit(ExprValue::Num(3.0))),
+            y: Box::new(Expr::Comp {
+                a: Box::new(Expr::Lit(ExprValue::Vec2(Vec2::new(5.0, 6.0)))),
+                axis: Axis::Y,
+            }),
+        };
+        round_trips(expr);
     }
 
     #[test]

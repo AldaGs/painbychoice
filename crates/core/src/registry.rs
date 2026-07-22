@@ -315,12 +315,30 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .input_def("a", "A", Number, num(0.0))
             .input_def("b", "B", Number, num(0.0))
             .output("result", "Result", Number),
+        // ── Vector plumbing: build a 2-vector from two scalars, and take it
+        //    apart again. These are what let a graph reach *inside* a
+        //    multidimensional property — drive `position.x` from one recipe and
+        //    `position.y` from another, or read a layer's scale apart to react to
+        //    just its width. `join` mirrors `math`'s two-in-one-out shape; `split`
+        //    is the only built-in with two value outputs, one per axis. ─────────
+        NodeDescriptor::new("join", Cat::Math, "Join Vector")
+            .input_def("x", "X", Number, num(0.0))
+            .input_def("y", "Y", Number, num(0.0))
+            .output("value", "Vector", Vector),
+        NodeDescriptor::new("split", Cat::Math, "Split Vector")
+            .input("value", "Vector", Vector)
+            .output("x", "X", Number)
+            .output("y", "Y", Number),
         // ── Inputs: leaves that read a value in. ─────────────────────────────
         NodeDescriptor::new("value", Cat::Input, "Value").output("value", "Value", Number),
         // A text literal. Separate from `value` rather than a mode of it: the
         // socket type is what the canvas colours a wire by, and one node that
         // changed its output type under you would make a graph unreadable.
         NodeDescriptor::new("string", Cat::Input, "String").output("value", "Value", Text),
+        // A vector constant — `value` at two dimensions. Its Vec2 rides on the
+        // output socket (edited inline as two drag fields), so a graph can pin a
+        // `position` or `scale` without wiring two `join` inputs by hand.
+        NodeDescriptor::new("vec2", Cat::Input, "Vector").output("value", "Value", Vector),
         NodeDescriptor::new("ref", Cat::Input, "Reference").output("value", "Value", Number),
         NodeDescriptor::new("param", Cat::Input, "Parameter").output("value", "Value", Number),
         // A leaf holding Rhai source — pulls from `frame`, not wired inputs.
@@ -435,7 +453,8 @@ mod tests {
     fn by_category_filters_and_keeps_order() {
         let reg = NodeRegistry::with_builtins();
         let math: Vec<_> = reg.by_category(NodeCategory::Math).map(|d| d.id.as_str()).collect();
-        assert_eq!(math, ["math"], "every operator is one node now");
+        // One operator node, plus the vector plumbing that also lives in Math.
+        assert_eq!(math, ["math", "join", "split"]);
     }
 
     /// Every built-in must be in a category the palette can evaluate today —

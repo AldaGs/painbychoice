@@ -1824,7 +1824,7 @@ fn ref_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: &m
 /// anyone can type.
 pub(crate) fn const_socket(kind: &str) -> Option<&'static str> {
     match kind {
-        "value" | "string" => Some("value"),
+        "value" | "string" | "vec2" => Some("value"),
         _ => None,
     }
 }
