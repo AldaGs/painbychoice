@@ -3791,8 +3791,25 @@ fn a_group_has_no_shape_to_split_and_says_so() {
 
 /// A decoder that invents frames, so the cache can be tested without files,
 /// ffmpeg, or a GPU — the same reason `core`'s tests never touch a disk.
+///
+/// It counts how often it is *started*, which is the number the whole
+/// streaming design exists to keep down: starting a decoder measured ~229ms
+/// against ~1.5ms to read the next frame from one already running.
 struct FakeDecoder {
     side: u32,
+    starts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeDecoder {
+    fn meta(&self) -> motion_core::AssetMeta {
+        motion_core::AssetMeta {
+            kind: motion_core::AssetKind::Video,
+            width: self.side as f64,
+            height: self.side as f64,
+            frames: 1000,
+            fps: 24.0,
+        }
+    }
 }
 
 impl motion_core::Decoder for FakeDecoder {
@@ -3802,21 +3819,57 @@ impl motion_core::Decoder for FakeDecoder {
     fn probe(&self, _path: &std::path::Path) -> bool {
         true
     }
-    fn open(&self, _path: &std::path::Path) -> Result<motion_core::AssetMeta, motion_core::DecodeError> {
-        Ok(motion_core::AssetMeta {
-            kind: motion_core::AssetKind::Video,
-            width: self.side as f64,
-            height: self.side as f64,
-            frames: 1000,
-            fps: 24.0,
-        })
+    fn open(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<motion_core::AssetMeta, motion_core::DecodeError> {
+        Ok(self.meta())
     }
     fn frame(
         &self,
         _path: &std::path::Path,
         _source_frame: i64,
+        _meta: &motion_core::AssetMeta,
     ) -> Result<motion_core::Frame, motion_core::DecodeError> {
-        motion_core::Frame::new(self.side, self.side, vec![0u8; (self.side * self.side * 4) as usize])
+        self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        motion_core::Frame::new(
+            self.side,
+            self.side,
+            vec![0u8; (self.side * self.side * 4) as usize],
+        )
+    }
+    fn stream(
+        &self,
+        _path: &std::path::Path,
+        from: i64,
+        meta: &motion_core::AssetMeta,
+    ) -> Option<Box<dyn motion_core::FrameStream>> {
+        self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(Box::new(FakeStream { side: self.side, next: from, last: meta.frames - 1 }))
+    }
+}
+
+struct FakeStream {
+    side: u32,
+    next: i64,
+    last: i64,
+}
+
+impl motion_core::FrameStream for FakeStream {
+    fn next_frame(&mut self) -> Result<Option<motion_core::Frame>, motion_core::DecodeError> {
+        if self.next > self.last {
+            return Ok(None);
+        }
+        self.next += 1;
+        motion_core::Frame::new(
+            self.side,
+            self.side,
+            vec![0u8; (self.side * self.side * 4) as usize],
+        )
+        .map(Some)
+    }
+    fn next_index(&self) -> i64 {
+        self.next
     }
 }
 
@@ -3831,10 +3884,17 @@ fn fake_file(name: &str) -> std::path::PathBuf {
     path
 }
 
-fn fake_cache(side: u32) -> FootageCache {
+/// A cache over the fake decoder, plus the counter of how often that decoder
+/// was started.
+fn fake_cache(side: u32) -> (FootageCache, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut reg = motion_core::DecoderRegistry::new();
-    reg.register(Box::new(FakeDecoder { side }));
-    FootageCache::new(reg)
+    reg.register(Box::new(FakeDecoder { side, starts: starts.clone() }));
+    (FootageCache::new(reg), starts)
+}
+
+fn started(starts: &std::sync::atomic::AtomicUsize) -> usize {
+    starts.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn seed() -> LayerSeed {
@@ -3918,20 +3978,98 @@ fn time_remap_is_a_property_only_once_it_is_enabled() {
     assert!(prop_of(&node, PropKind::ShapeSize).is_some());
 }
 
-/// The cache holds decoded frames and reports what it is holding, so the budget
-/// that keeps 4K footage from eating memory has something to measure.
+fn at(asset: &motion_core::Asset, frame: i64) -> motion_core::ImagePaint {
+    motion_core::ImagePaint { asset: asset.id, source_frame: frame }
+}
+
+/// Decoding is asynchronous, so the *first* ask for a frame never has it.
+/// Nothing in the editor may block waiting for it — that is the entire point of
+/// the worker.
+#[test]
+fn a_first_ask_does_not_block_and_the_frame_arrives_after() {
+    let (mut cache, _) = fake_cache(4);
+    let file = fake_file("pbc_async.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+
+    // Nothing decoded yet, and no frame of this footage to stand in either.
+    assert!(cache.image(&asset, at(&asset, 3)).is_none());
+    assert!(cache.is_busy(), "the decode was queued, not performed");
+
+    cache.wait_for(at(&asset, 3));
+    let (_, exact) = cache.image(&asset, at(&asset, 3)).expect("it arrived");
+    assert!(exact, "and it is the frame that was asked for");
+}
+
+/// **The regression test for the sluggish preview.** Playing footage asks for
+/// frames in order, and that must start the decoder *once* — not once per
+/// frame, which is what made the preview run at ~4fps.
+#[test]
+fn sequential_playback_starts_the_decoder_only_once() {
+    let (mut cache, starts) = fake_cache(4);
+    let file = fake_file("pbc_sequential.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+
+    for frame in 0..24 {
+        cache.image(&asset, at(&asset, frame));
+        cache.wait_for(at(&asset, frame));
+        let (_, exact) = cache.image(&asset, at(&asset, frame)).expect("decoded");
+        assert!(exact, "frame {frame} is the frame asked for");
+    }
+    assert_eq!(started(&starts), 1, "one stream served the whole run");
+}
+
+/// Jumping backwards can't be served by a forward-only stream, so it restarts
+/// the decoder — the expensive path, taken only when it must be.
+#[test]
+fn seeking_backwards_restarts_the_decoder() {
+    let (mut cache, starts) = fake_cache(4);
+    let file = fake_file("pbc_seek_back.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+
+    cache.image(&asset, at(&asset, 500));
+    cache.wait_for(at(&asset, 500));
+    assert_eq!(started(&starts), 1);
+
+    // Far enough back that no amount of walking forward reaches it, and well
+    // outside anything the prefetch promised.
+    cache.image(&asset, at(&asset, 10));
+    cache.wait_for(at(&asset, 10));
+    assert_eq!(started(&starts), 2, "a backwards jump needs a fresh stream");
+}
+
+/// While the wanted frame decodes, the nearest frame already decoded stands in.
+/// Blanking to the layer's fill instead would read as flickering every time the
+/// playhead moved somewhere new.
+#[test]
+fn a_pending_frame_shows_its_nearest_neighbour_meanwhile() {
+    let (mut cache, _) = fake_cache(4);
+    let file = fake_file("pbc_stale.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+
+    cache.image(&asset, at(&asset, 0));
+    cache.wait_for(at(&asset, 0));
+
+    // Ask for a frame far enough away that prefetch hasn't promised it.
+    let (_, exact) = cache.image(&asset, at(&asset, 900)).expect("something to draw");
+    assert!(!exact, "it is a stand-in, and says so");
+}
+
+/// The cache reports what it is holding, so the budget that keeps 4K footage
+/// from eating memory has something to measure.
 #[test]
 fn the_frame_cache_keeps_what_it_decodes() {
-    let mut cache = fake_cache(4);
+    let (mut cache, starts) = fake_cache(4);
     let file = fake_file("pbc_cache_keeps.bin");
     let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
-    let paint = motion_core::ImagePaint { asset: asset.id, source_frame: 3 };
 
-    assert!(cache.image(&asset, paint).is_some());
-    assert_eq!(cache.resident_bytes(), 4 * 4 * 4);
-    // A second ask for the same frame is served from the cache, not re-decoded.
-    assert!(cache.image(&asset, paint).is_some());
-    assert_eq!(cache.resident_bytes(), 4 * 4 * 4);
+    cache.image(&asset, at(&asset, 3));
+    cache.wait_for(at(&asset, 3));
+    assert!(cache.resident_bytes() >= 4 * 4 * 4);
+
+    // A second ask is served from the cache, without starting anything.
+    let before = started(&starts);
+    assert!(cache.image(&asset, at(&asset, 3)).is_some());
+    assert_eq!(started(&starts), before);
 }
 
 /// Asset ids are per-project, so opening another project must drop every
@@ -3939,12 +4077,14 @@ fn the_frame_cache_keeps_what_it_decodes() {
 /// this one's layers.
 #[test]
 fn loading_another_project_drops_the_cached_frames() {
-    let mut cache = fake_cache(4);
+    let (mut cache, _) = fake_cache(4);
     let file = fake_file("pbc_cache_clear.bin");
     let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
-    cache.image(&asset, motion_core::ImagePaint { asset: asset.id, source_frame: 0 });
+    cache.image(&asset, at(&asset, 0));
+    cache.wait_for(at(&asset, 0));
     assert!(cache.resident_bytes() > 0);
 
     cache.clear();
     assert_eq!(cache.resident_bytes(), 0);
+    assert!(cache.image(&asset, at(&asset, 0)).is_none(), "nothing survives the swap");
 }

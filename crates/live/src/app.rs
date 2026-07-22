@@ -1480,7 +1480,17 @@ impl ApplicationHandler for App {
                 self.render(&window);
                 // Keep animating while playing; when paused, egui still asks
                 // for repaints while the pointer interacts with the UI.
-                if self.playing || self.egui_ctx.has_requested_repaint() {
+                //
+                // The footage clause is what makes asynchronous decoding
+                // visible: a frame that arrives after this redraw has no event
+                // of its own to wake the loop, so it would sit in the cache
+                // unshown until the user happened to move the mouse. Polling
+                // only while the worker owes us something keeps a paused,
+                // fully-decoded editor at zero redraws.
+                if self.playing
+                    || self.egui_ctx.has_requested_repaint()
+                    || self.footage.is_busy()
+                {
                     window.request_redraw();
                 }
             }
@@ -2258,6 +2268,11 @@ impl App {
         let frame = self.current_frame();
         let t = frame as f64;
         let last_frame = self.doc().duration_frames().max(1);
+        // Take delivery of whatever the decode worker finished since the last
+        // redraw, before anything reads the cache. Frames it hands over include
+        // ones nobody asked for — that is the prefetch running ahead of the
+        // playhead, which is what makes footage play rather than crawl.
+        self.footage.collect();
         // While a font is hovered in the picker, this frame is drawn from a
         // preview copy instead of the real project (see `preview_project`).
         let previewing = self.preview_project();

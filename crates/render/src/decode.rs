@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 use motion_core::asset::{
-    AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame,
+    AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, FrameStream,
 };
 
 /// The decoders PBC ships with, in probe order.
@@ -60,7 +60,12 @@ impl Decoder for ImageDecoder {
         })
     }
 
-    fn frame(&self, path: &Path, _source_frame: i64) -> Result<Frame, DecodeError> {
+    fn frame(
+        &self,
+        path: &Path,
+        _source_frame: i64,
+        _meta: &AssetMeta,
+    ) -> Result<Frame, DecodeError> {
         // `source_frame` is ignored rather than checked: a still is one-frame
         // footage, and `Asset::source_frame` already clamps every request on it
         // to 0. An animated GIF is read as its first frame today.
@@ -157,15 +162,15 @@ impl Decoder for FfmpegDecoder {
         parse_probe(&String::from_utf8_lossy(&out.stdout))
     }
 
-    fn frame(&self, path: &Path, source_frame: i64) -> Result<Frame, DecodeError> {
-        let meta = self.open(path)?;
+    fn frame(
+        &self,
+        path: &Path,
+        source_frame: i64,
+        meta: &AssetMeta,
+    ) -> Result<Frame, DecodeError> {
         let (w, h) = (meta.width as u32, meta.height as u32);
-        // Seek by *time*, because that is the only handle ffmpeg's CLI offers,
-        // and land in the middle of the frame's own interval: asking for its
-        // exact start invites a rounding error to pick up the frame before it.
-        let t = if meta.fps > 0.0 { (source_frame as f64 + 0.5) / meta.fps } else { 0.0 };
         let out = Command::new(&self.ffmpeg)
-            .args(["-v", "error", "-ss", &format!("{t:.6}")])
+            .args(["-v", "error", "-ss", &format!("{:.6}", seek_seconds(source_frame, meta))])
             .arg("-i")
             .arg(path)
             .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
@@ -189,6 +194,95 @@ impl Decoder for FfmpegDecoder {
             )));
         }
         Frame::new(w, h, out.stdout)
+    }
+
+    fn stream(&self, path: &Path, from: i64, meta: &AssetMeta) -> Option<Box<dyn FrameStream>> {
+        // One process, left running, with frames read off its stdout as they
+        // come. Everything expensive about the sidecar — process creation,
+        // container parsing, decoder setup — is paid once here instead of once
+        // per frame.
+        let child = Command::new(&self.ffmpeg)
+            .args(["-v", "error", "-ss", &format!("{:.6}", seek_seconds(from, meta))])
+            .arg("-i")
+            .arg(path)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut child = child;
+        Some(Box::new(FfmpegStream {
+            stdout: std::io::BufReader::new(child.stdout.take()?),
+            child,
+            width: meta.width as u32,
+            height: meta.height as u32,
+            next: from,
+            last: meta.frames - 1,
+        }))
+    }
+}
+
+/// Where in the file frame `n` sits, in seconds.
+///
+/// Lands in the *middle* of the frame's own interval: asking for its exact
+/// start invites a rounding error to pick up the frame before it.
+fn seek_seconds(n: i64, meta: &AssetMeta) -> f64 {
+    if meta.fps > 0.0 {
+        (n as f64 + 0.5) / meta.fps
+    } else {
+        0.0
+    }
+}
+
+/// A running `ffmpeg` piping raw frames, read one at a time.
+struct FfmpegStream {
+    child: std::process::Child,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    width: u32,
+    height: u32,
+    next: i64,
+    /// Last valid source frame. The probed frame count can overstate a
+    /// variable-rate file, so the stream can also just end; both are handled.
+    last: i64,
+}
+
+impl FrameStream for FfmpegStream {
+    fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
+        use std::io::Read;
+        if self.next > self.last {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; self.width as usize * self.height as usize * 4];
+        // `read_exact` rather than `read`: a pipe hands over whatever happens to
+        // be buffered, so a single read routinely returns a partial frame.
+        // Treating that as a whole one would tear the picture.
+        match self.stdout.read_exact(&mut buf) {
+            Ok(()) => {
+                self.next += 1;
+                Frame::new(self.width, self.height, buf).map(Some)
+            }
+            // A clean EOF is the end of the footage, not a failure.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(DecodeError::Malformed(format!("reading frame {}: {e}", self.next))),
+        }
+    }
+
+    fn next_index(&self) -> i64 {
+        self.next
+    }
+}
+
+impl Drop for FfmpegStream {
+    /// Kill the process rather than waiting it out.
+    ///
+    /// A stream is dropped when the playhead jumps somewhere this one can't
+    /// reach, and the child is usually mid-decode with a full pipe. Left alone
+    /// it would sit blocked on a write nobody will ever read, so seeking around
+    /// a timeline would leak an ffmpeg per jump.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -272,6 +366,53 @@ mod tests {
     #[test]
     fn a_file_without_a_video_stream_is_refused() {
         assert!(matches!(parse_probe("duration=10.0\n"), Err(DecodeError::Malformed(_))));
+    }
+
+    /// The streaming path against **real ffmpeg**, because the fake decoder in
+    /// the editor's tests can't catch a mistake in how frames are framed on the
+    /// pipe — a wrong buffer size or a partial read would tear the picture, and
+    /// only the real thing shows that.
+    ///
+    /// Skips when ffmpeg isn't installed rather than failing: the tool is
+    /// optional, and stills work without it.
+    #[test]
+    fn a_real_ffmpeg_stream_yields_whole_frames_in_order() {
+        let d = FfmpegDecoder::new();
+        if !d.available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        // A tiny clip, generated by the tool under test so the fixture can't
+        // rot and nothing binary lives in the repo.
+        let path = std::env::temp_dir().join("pbc_stream_test.mp4");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=32x16:rate=10:duration=1")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("skipping: couldn't generate a fixture");
+            return;
+        }
+
+        let meta = d.open(&path).expect("probe the fixture");
+        assert_eq!((meta.width, meta.height), (32.0, 16.0));
+
+        let mut stream = d.stream(&path, 0, &meta).expect("video streams");
+        let mut count = 0;
+        while let Some(frame) = stream.next_frame().expect("a frame or the end") {
+            // The load-bearing assertion: a frame is *whole*. Reading whatever
+            // happened to be buffered on the pipe would pass a shorter buffer
+            // through and tear the image.
+            assert_eq!(frame.rgba.len(), 32 * 16 * 4, "frame {count} is a full frame");
+            assert_eq!((frame.width, frame.height), (32, 16));
+            count += 1;
+            assert_eq!(stream.next_index(), count, "the position advances by one");
+        }
+        assert!(count >= 9, "a one-second 10fps clip has ~10 frames, got {count}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Probing is by extension, and the two built-ins must not fight over a

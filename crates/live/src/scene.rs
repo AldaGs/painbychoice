@@ -482,7 +482,11 @@ fn draw_footage(
 ) -> bool {
     let Some(asset) = assets.get(&paint.asset) else { return false };
     let opacity = item.opacity.clamp(0.0, 1.0) as f32;
-    let Some(image) = footage.image(asset, paint) else { return false };
+    // The flag says whether this is the frame asked for or a neighbour standing
+    // in while the real one decodes. Drawn either way: holding the previous
+    // frame for a moment is how scrubbing stays continuous, where blanking to
+    // the fill colour would read as flickering.
+    let Some((image, _exact)) = footage.image(asset, paint) else { return false };
     // `draw_image` fills the source's own 0..w × 0..h rect, so the transform has
     // to carry the image onto the item's rectangle: scale native pixels to the
     // layer's size, then shift the centred rect's corner to the origin. Squeezed

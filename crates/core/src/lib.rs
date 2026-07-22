@@ -24,7 +24,8 @@ pub mod timebase;
 pub mod value;
 
 pub use asset::{
-    Asset, AssetId, AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, ImagePaint,
+    Asset, AssetId, AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, FrameStream,
+    ImagePaint,
 };
 pub use eval::{evaluate, evaluate_comp, evaluate_project, RenderItem, Scene};
 pub use expr::{

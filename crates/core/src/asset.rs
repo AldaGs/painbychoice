@@ -125,6 +125,22 @@ impl Asset {
         self.fps = fps;
     }
 
+    /// This asset's metadata, for handing to a decoder.
+    ///
+    /// The document caches these facts at import precisely so nothing has to
+    /// re-read the file to learn them. A decoder that probed for its own
+    /// metadata on every frame would make that cache pointless — and did, at
+    /// ~37ms per frame, before this existed.
+    pub fn meta(&self) -> AssetMeta {
+        AssetMeta {
+            kind: self.kind,
+            width: self.width,
+            height: self.height,
+            frames: self.frames,
+            fps: self.fps,
+        }
+    }
+
     /// How long this footage runs in a comp at `comp_fps`, in comp frames.
     ///
     /// A still has no duration of its own — it holds forever — so this is
@@ -260,9 +276,44 @@ pub trait Decoder: Send + Sync {
     /// import calls to build an [`Asset`].
     fn open(&self, path: &Path) -> Result<AssetMeta, DecodeError>;
 
-    /// Decode one frame. `source_frame` is always in range for the metadata
-    /// this decoder reported.
-    fn frame(&self, path: &Path, source_frame: i64) -> Result<Frame, DecodeError>;
+    /// Decode one frame, out of order. `source_frame` is always in range for
+    /// `meta`.
+    ///
+    /// `meta` is passed in rather than re-read because the caller already has
+    /// it — see [`Asset::meta`]. This is random access, so it is the
+    /// *expensive* path for anything that has to seek; prefer
+    /// [`Decoder::stream`] whenever frames are wanted in order.
+    fn frame(&self, path: &Path, source_frame: i64, meta: &AssetMeta)
+        -> Result<Frame, DecodeError>;
+
+    /// Open a sequential reader positioned at `from`.
+    ///
+    /// **This is the difference between a preview that plays and one that
+    /// doesn't.** Playback asks for frames in order, and a decoder re-opened
+    /// per frame pays its whole start-up cost every time: for the ffmpeg
+    /// sidecar that measured ~229ms/frame, against ~1.5ms/frame read from a
+    /// stream left open. Decoding was never the expensive part.
+    ///
+    /// `None` (the default) means "no sequential mode" and the caller falls
+    /// back to [`Decoder::frame`] — which is right for a still, where one
+    /// frame is already in order.
+    fn stream(&self, _path: &Path, _from: i64, _meta: &AssetMeta) -> Option<Box<dyn FrameStream>> {
+        None
+    }
+}
+
+/// A decoder positioned in a piece of footage, handing out frames in order.
+///
+/// Deliberately forward-only: that is the whole shape of the thing that makes
+/// it cheap. Offering a `seek` here would hide the fact that seeking means
+/// discarding the stream and opening another one, which is exactly the cost
+/// this trait exists to let callers avoid.
+pub trait FrameStream: Send {
+    /// The next frame. `Ok(None)` at the end of the footage.
+    fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError>;
+
+    /// Which source frame [`FrameStream::next_frame`] will return next.
+    fn next_index(&self) -> i64;
 }
 
 /// What [`Decoder::open`] reports: everything [`Asset`] caches, minus identity.
@@ -327,17 +378,35 @@ impl DecoderRegistry {
         }
     }
 
-    /// Decode one frame of `path`.
-    pub fn frame(&self, path: &Path, source_frame: i64) -> Result<Frame, DecodeError> {
+    /// Decode one frame of `path`, out of order.
+    pub fn frame(
+        &self,
+        path: &Path,
+        source_frame: i64,
+        meta: &AssetMeta,
+    ) -> Result<Frame, DecodeError> {
         if !path.exists() {
             return Err(DecodeError::Missing(path.to_path_buf()));
         }
         match self.decoder_for(path) {
-            Some(d) => d.frame(path, source_frame),
+            Some(d) => d.frame(path, source_frame, meta),
             None => Err(DecodeError::Unsupported(
                 path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default(),
             )),
         }
+    }
+
+    /// Open a sequential reader on `path` at `from`, if its decoder has one.
+    pub fn stream(
+        &self,
+        path: &Path,
+        from: i64,
+        meta: &AssetMeta,
+    ) -> Option<Box<dyn FrameStream>> {
+        if !path.exists() {
+            return None;
+        }
+        self.decoder_for(path)?.stream(path, from, meta)
     }
 
     pub fn is_empty(&self) -> bool {
