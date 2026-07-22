@@ -112,7 +112,9 @@ impl GizmoTarget {
             parent: world * local.inverse(),
             pos,
             rot_deg: info.rot,
-            scale: info.scale,
+            // The in-plane pair only: this gizmo drags handles in screen
+            // space, so depth scale is not something it can express or edit.
+            scale: (info.scale.0, info.scale.1),
             anchor,
         }
     }

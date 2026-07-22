@@ -1459,10 +1459,10 @@ fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
         &Comp::new(100.0, 100.0, MNode::group(0, "root")),
         0.0,
     );
-    info.pos = (25.0, -60.0);
+    info.pos = (25.0, -60.0, 0.0);
     info.rot = 33.0;
-    info.scale = (1.5, 0.5);
-    info.anchor = (12.0, 7.0);
+    info.scale = (1.5, 0.5, 1.0);
+    info.anchor = (12.0, 7.0, 0.0);
 
     let local = Affine::translate(Vec2::new(info.pos.0, info.pos.1))
         * Affine::rotate(info.rot.to_radians())

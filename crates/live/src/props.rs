@@ -32,7 +32,10 @@ pub(crate) struct NodeInfo {
     pub(crate) footage: Option<FootageInfo>,
     pub(crate) name: String,
     pub(crate) id: u64,
-    pub(crate) pos: (f64, f64),
+    /// x, y, z. The gizmo and every other screen-space reader take the first
+    /// two; depth is edited numerically until there is a camera to view it
+    /// through.
+    pub(crate) pos: (f64, f64, f64),
     /// The in-plane spin, in degrees — what the canvas gizmo's rotate handle
     /// drives and what a 2D layer has always had. Kept a scalar of its own
     /// (rather than folded into a triple) because it is the *screen* rotation:
@@ -42,11 +45,11 @@ pub(crate) struct NodeInfo {
     /// layer authored flat, and a layer with either non-zero is the one the
     /// renderer has to project rather than draw.
     pub(crate) rot_xy: (f64, f64),
-    pub(crate) scale: (f64, f64),
+    pub(crate) scale: (f64, f64, f64),
     /// The pivot the layer rotates and scales about. It sits inside the local
     /// matrix, so the gizmo needs it to reconstruct that matrix — and it is an
     /// animatable property in its own right, with a row and a stopwatch.
-    pub(crate) anchor: (f64, f64),
+    pub(crate) anchor: (f64, f64, f64),
     pub(crate) opacity: f64,
     /// How this layer combines with the backdrop. Anything but `Normal` makes
     /// it composite in isolation — see [`motion_core::BlendMode`].
@@ -281,11 +284,11 @@ impl NodeInfo {
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
-            pos: (pos.x, pos.y),
+            pos: (pos.x, pos.y, pos.z),
             rot: rot.z,
             rot_xy: (rot.x, rot.y),
-            scale: (scale.x, scale.y),
-            anchor: (anchor.x, anchor.y),
+            scale: (scale.x, scale.y, scale.z),
+            anchor: (anchor.x, anchor.y, anchor.z),
             opacity: tr.opacity.resolve(ctx),
             blend: node.blend,
             matte: node.matte,
@@ -404,14 +407,17 @@ fn footage_info(node: &motion_core::Node, ctx: &mut EvalCtx) -> Option<FootageIn
 pub(crate) struct PropEdits {
     pub(crate) anchor_x: Option<f64>,
     pub(crate) anchor_y: Option<f64>,
+    pub(crate) anchor_z: Option<f64>,
     pub(crate) pos_x: Option<f64>,
     pub(crate) pos_y: Option<f64>,
+    pub(crate) pos_z: Option<f64>,
     pub(crate) rot: Option<f64>,
     /// The out-of-plane rotations, edited independently of the in-plane spin.
     pub(crate) rot_x: Option<f64>,
     pub(crate) rot_y: Option<f64>,
     pub(crate) scale_x: Option<f64>,
     pub(crate) scale_y: Option<f64>,
+    pub(crate) scale_z: Option<f64>,
     pub(crate) opacity: Option<f64>,
     pub(crate) blend: Option<MBlendMode>,
     /// `Some(None)` removes the mask; `Some(Some(kind))` adds or replaces one.
@@ -723,13 +729,15 @@ pub(crate) fn properties_ui(
         // Both are wanted, and which you get is which one you reached for.
         ui.label("Anchor");
         ui.horizontal(|ui| {
-            let mut x = n.anchor.0;
-            let mut y = n.anchor.1;
-            if ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed() {
+            let (mut x, mut y, mut z) = n.anchor;
+            if ui.add(egui::DragValue::new(&mut x).speed(0.5).prefix("x ")).changed() {
                 edits.anchor_x = Some(x);
             }
-            if ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed() {
+            if ui.add(egui::DragValue::new(&mut y).speed(0.5).prefix("y ")).changed() {
                 edits.anchor_y = Some(y);
+            }
+            if ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ")).changed() {
+                edits.anchor_z = Some(z);
             }
         });
         if key_button(ui, n.anchor_anim) {
@@ -741,13 +749,15 @@ pub(crate) fn properties_ui(
         // nudge, or click to type a value and commit with Enter.
         ui.label("Position");
         ui.horizontal(|ui| {
-            let mut x = n.pos.0;
-            let mut y = n.pos.1;
-            if ui.add(egui::DragValue::new(&mut x).speed(0.5)).changed() {
+            let (mut x, mut y, mut z) = n.pos;
+            if ui.add(egui::DragValue::new(&mut x).speed(0.5).prefix("x ")).changed() {
                 edits.pos_x = Some(x);
             }
-            if ui.add(egui::DragValue::new(&mut y).speed(0.5)).changed() {
+            if ui.add(egui::DragValue::new(&mut y).speed(0.5).prefix("y ")).changed() {
                 edits.pos_y = Some(y);
+            }
+            if ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ")).changed() {
+                edits.pos_z = Some(z);
             }
         });
         if key_button(ui, n.pos_anim) {
@@ -779,13 +789,15 @@ pub(crate) fn properties_ui(
 
         ui.label("Scale");
         ui.horizontal(|ui| {
-            let mut sx = n.scale.0;
-            let mut sy = n.scale.1;
-            if ui.add(egui::DragValue::new(&mut sx).speed(0.01)).changed() {
+            let (mut sx, mut sy, mut sz) = n.scale;
+            if ui.add(egui::DragValue::new(&mut sx).speed(0.01).prefix("x ")).changed() {
                 edits.scale_x = Some(sx);
             }
-            if ui.add(egui::DragValue::new(&mut sy).speed(0.01)).changed() {
+            if ui.add(egui::DragValue::new(&mut sy).speed(0.01).prefix("y ")).changed() {
                 edits.scale_y = Some(sy);
+            }
+            if ui.add(egui::DragValue::new(&mut sz).speed(0.01).prefix("z ")).changed() {
+                edits.scale_z = Some(sz);
             }
         });
         if key_button(ui, n.scale_anim) {

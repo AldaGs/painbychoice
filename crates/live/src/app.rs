@@ -1586,15 +1586,23 @@ impl App {
         let tr = &mut node.transform;
         let mut changed = false;
 
-        if e.anchor_x.is_some() || e.anchor_y.is_some() {
+        if e.anchor_x.is_some() || e.anchor_y.is_some() || e.anchor_z.is_some() {
             let cur = tr.anchor.resolve(&mut ctx);
-            let v = motion_core::Vec3::new(e.anchor_x.unwrap_or(cur.x), e.anchor_y.unwrap_or(cur.y), cur.z);
+            let v = motion_core::Vec3::new(
+                e.anchor_x.unwrap_or(cur.x),
+                e.anchor_y.unwrap_or(cur.y),
+                e.anchor_z.unwrap_or(cur.z),
+            );
             tr.anchor.set_at(frame, v);
             changed = true;
         }
-        if e.pos_x.is_some() || e.pos_y.is_some() {
+        if e.pos_x.is_some() || e.pos_y.is_some() || e.pos_z.is_some() {
             let cur = tr.position.resolve(&mut ctx);
-            let v = motion_core::Vec3::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y), cur.z);
+            let v = motion_core::Vec3::new(
+                e.pos_x.unwrap_or(cur.x),
+                e.pos_y.unwrap_or(cur.y),
+                e.pos_z.unwrap_or(cur.z),
+            );
             tr.position.set_at(frame, v);
             changed = true;
         }
@@ -1611,9 +1619,13 @@ impl App {
             tr.rotation.set_at(frame, v);
             changed = true;
         }
-        if e.scale_x.is_some() || e.scale_y.is_some() {
+        if e.scale_x.is_some() || e.scale_y.is_some() || e.scale_z.is_some() {
             let cur = tr.scale.resolve(&mut ctx);
-            let v = motion_core::Vec3::new(e.scale_x.unwrap_or(cur.x), e.scale_y.unwrap_or(cur.y), cur.z);
+            let v = motion_core::Vec3::new(
+                e.scale_x.unwrap_or(cur.x),
+                e.scale_y.unwrap_or(cur.y),
+                e.scale_z.unwrap_or(cur.z),
+            );
             tr.scale.set_at(frame, v);
             changed = true;
         }
