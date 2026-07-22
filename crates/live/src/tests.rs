@@ -4134,13 +4134,11 @@ fn composite_events(scene: &MScene) -> Vec<String> {
     events
 }
 
-/// Nested blend modes open outermost-first and close innermost-first.
-///
-/// `walk` emits groups in post-order (a child's range is known first), which is
-/// the reverse of the order they must be opened in — so this pins the sort that
-/// undoes that. Getting it wrong would corrupt everything drawn afterwards.
+/// A blend mode is **not inherited**: a blended child opens its own layer
+/// beside its parent's rather than inside it, so each blends against whatever
+/// is beneath it.
 #[test]
-fn nested_isolated_layers_open_outermost_first_and_balance() {
+fn a_blended_child_opens_its_own_layer_beside_its_parents() {
     let mut outer = blended_box(1, 0.0, MBlendMode::Multiply);
     outer.children.push(blended_box(2, 10.0, MBlendMode::Screen));
     let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(outer));
@@ -4148,8 +4146,38 @@ fn nested_isolated_layers_open_outermost_first_and_balance() {
 
     assert_eq!(
         composite_events(&scene),
-        vec!["push1", "draw1", "push2", "draw2", "pop", "pop"],
-        "the outer layer wraps the inner one"
+        vec!["push1", "draw1", "pop", "push2", "draw2", "pop"],
+        "the parent's layer closes before the child's opens"
+    );
+}
+
+/// Layers still nest — through a **precomp**, whose contents are inside the
+/// instancing layer's range. This is the case the stack-based walk has to get
+/// right: opened outermost-first, closed innermost-first.
+///
+/// `walk` emits groups in post-order (an inner range is known first), which is
+/// the reverse of the order they must be opened in, so this pins the sort that
+/// undoes it. Getting it wrong would corrupt everything drawn afterwards.
+#[test]
+fn precomp_layers_nest_and_balance() {
+    let inner_comp = Comp::new(
+        100.0,
+        100.0,
+        MNode::group(10, "inner").with_child(blended_box(11, 0.0, MBlendMode::Screen)),
+    );
+    let mut project = MProject::single(inner_comp);
+    let inner_id = project.root;
+
+    let mut host = blended_box(1, 0.0, MBlendMode::Multiply);
+    host.precomp = Some(inner_id);
+    let outer_id =
+        project.insert(Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(host)));
+    let scene = evaluate_comp(&project, outer_id, 0.0);
+
+    assert_eq!(
+        composite_events(&scene),
+        vec!["push1", "draw1", "push11", "draw11", "pop", "pop"],
+        "the instancing layer wraps the nested comp's own blended layer"
     );
 }
 

@@ -484,10 +484,17 @@ pub struct Node {
     /// written before compositing existed loads as `Normal` and renders exactly
     /// as it did.
     ///
-    /// A blend mode applies to the layer **and its children**, because that is
-    /// what "isolated" means and what makes a group with a blend mode useful:
-    /// the group's contents resolve amongst themselves first, then the result
-    /// meets the backdrop once.
+    /// **A blend mode is not inherited.** It covers this layer's own content —
+    /// its artwork, and the composition it instances if it is a precomp — and
+    /// stops there. A child layer composites on its own terms, with its own
+    /// mode.
+    ///
+    /// The precomp half matters: a precomp layer's content genuinely *is* the
+    /// nested comp, so blending one blends everything inside it, which is what
+    /// putting a blend mode on a precomp is for. Its `children`, by contrast,
+    /// are separate layers that merely inherit its transform — so a group with
+    /// a blend mode and no artwork of its own does nothing, exactly as a null
+    /// does.
     #[serde(default)]
     pub blend: BlendMode,
     pub children: Vec<Node>,

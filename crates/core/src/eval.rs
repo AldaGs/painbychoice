@@ -256,7 +256,12 @@ fn walk(
     // isolated layer nested inside another can't double-count its ancestors.
     let isolated = node.blend.needs_isolation();
     let full = parent_opacity * local_opacity.clamp(0.0, 1.0);
-    let opacity = if isolated { 1.0 } else { full };
+    // Two opacities, because isolation covers the layer's *content* but not its
+    // children. Content draws at full strength and the group fades the
+    // composite; children are separate layers outside the group, so they take
+    // the accumulated fade per-item exactly as they always have.
+    let content_opacity = if isolated { 1.0 } else { full };
+    let opacity = content_opacity;
     let group_at = scene.items.len();
 
     // Recorded for every node, drawable or not — see `Scene::places`. `bounds`
@@ -334,32 +339,42 @@ fn walk(
         }
     }
 
+    // Everything emitted so far is this layer's own **content**: its artwork,
+    // plus the composition it instances (a precomp layer's content genuinely is
+    // the nested comp, which is why blending a precomp blends everything in
+    // it). Its `children` come next and are deliberately *outside* — see the
+    // group emitted below.
+    let content_end = scene.items.len();
+
     // Children are walked *inside* this node's mark only in the sense that each
     // re-marks itself; restore ours first so a sibling can't inherit it.
     ctx.exit_node(prev_node);
 
+    // A blended layer isolates its content, so that content is composited and
+    // blended before any child draws. Emitted here rather than after the
+    // children for exactly that reason.
+    if isolated && content_end > group_at {
+        scene.groups.push(LayerGroup {
+            source: node.id,
+            start: group_at,
+            end: content_end,
+            blend: node.blend,
+            alpha: full,
+        });
+    }
+
     for child in &node.children {
-        let child_bounds = walk(child, xf, opacity, ctx, project, stack, scene);
+        // `full`, not `opacity`: a child is outside its parent's group, so the
+        // parent's fade has to reach it the ordinary way. Taking the isolated
+        // content's 1.0 here would make children of a faded layer draw at full
+        // strength.
+        let child_bounds = walk(child, xf, full, ctx, project, stack, scene);
         bounds = match (bounds, child_bounds) {
             (Some(a), Some(b)) => Some(a.union(b)),
             (a, b) => a.or(b),
         };
     }
     scene.places[place_at].1.bounds = bounds;
-
-    // Emitted *after* the children, because only now is the subtree's extent in
-    // `items` known — which is exactly what makes the range representation
-    // work. Skipped when the subtree drew nothing: an isolated layer with no
-    // pixels would cost a backend an offscreen target to composite nothing.
-    if isolated && scene.items.len() > group_at {
-        scene.groups.push(LayerGroup {
-            source: node.id,
-            start: group_at,
-            end: scene.items.len(),
-            blend: node.blend,
-            alpha: full,
-        });
-    }
 
     ctx.frame = prev_frame;
     ctx.timing = prev_timing;
@@ -370,7 +385,7 @@ fn walk(
 mod tests {
     use super::*;
     use crate::expr::BinOp;
-    use crate::node::{Node, Shape, Transform};
+    use crate::node::{Comp, Node, Project, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
 
@@ -400,11 +415,11 @@ mod tests {
         assert!(scene.groups.is_empty(), "Normal costs nothing");
     }
 
-    /// A blended layer's group covers **its own item and its whole subtree** —
-    /// the property the range representation rests on, which holds because the
-    /// walk is depth-first and so a subtree is contiguous in `items`.
+    /// **A blend mode is not inherited.** It covers the layer's own artwork and
+    /// stops there; children are separate layers that composite on their own
+    /// terms, and merely inherit the transform.
     #[test]
-    fn a_blended_layers_group_spans_its_whole_subtree() {
+    fn a_blend_mode_covers_the_layers_own_artwork_not_its_children() {
         let mut parent = box_at(1, 0.0);
         parent.blend = BlendMode::Multiply;
         parent.children.push(box_at(2, 10.0));
@@ -420,12 +435,55 @@ mod tests {
         let g = scene.groups.first().expect("the blended layer is isolated");
         assert_eq!(g.source, NodeId(1));
         assert_eq!(g.blend, BlendMode::Multiply);
-        // The sibling drew first and is outside; the parent and both children
-        // are inside, contiguously.
-        assert_eq!((g.start, g.end), (1, 4));
-        for item in &scene.items[g.start..g.end] {
-            assert!(matches!(item.source, NodeId(1) | NodeId(2) | NodeId(3)));
-        }
+        // Exactly one item — the parent's own artwork. The children follow it
+        // in the draw list and are outside the range.
+        assert_eq!((g.start, g.end), (1, 2));
+        assert_eq!(scene.items[g.start].source, NodeId(1));
+    }
+
+    /// A group with a blend mode but no artwork of its own does nothing —
+    /// exactly as a null does. Its children are not its content.
+    #[test]
+    fn a_blend_mode_on_a_bare_group_does_nothing() {
+        let mut group = Node::group(1, "holder");
+        group.blend = BlendMode::Multiply;
+        group.children.push(box_at(2, 10.0));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(group));
+
+        let scene = evaluate(&doc, 0.0);
+        assert_eq!(scene.items.len(), 1, "the child still draws");
+        assert!(scene.groups.is_empty(), "but there is nothing of its own to blend");
+    }
+
+    /// A **precomp** layer's content genuinely is the nested comp, so blending
+    /// one blends everything inside it. That is what a blend mode on a precomp
+    /// is for, and it is why the group covers the precomp expansion even though
+    /// it stops before the layer's own children.
+    #[test]
+    fn blending_a_precomp_layer_covers_the_whole_nested_comp() {
+        let inner = Comp::new(
+            100.0,
+            100.0,
+            Node::group(10, "inner root").with_child(box_at(11, 0.0)).with_child(box_at(12, 10.0)),
+        );
+        let mut project = Project::single(inner);
+        let inner_id = project.root;
+
+        let mut host = box_at(1, 0.0);
+        host.blend = BlendMode::Screen;
+        host.precomp = Some(inner_id);
+        host.children.push(box_at(2, 50.0));
+        let outer = Comp::new(100.0, 100.0, Node::group(0, "root").with_child(host));
+        let outer_id = project.insert(outer);
+
+        let scene = evaluate_comp(&project, outer_id, 0.0);
+        let g = scene.groups.first().expect("the precomp layer is isolated");
+        // Its own artwork plus both layers of the nested comp — but not the
+        // child layer that follows.
+        assert_eq!(g.end - g.start, 3);
+        let sources: Vec<u64> = scene.items[g.start..g.end].iter().map(|i| i.source.0).collect();
+        assert_eq!(sources, vec![1, 11, 12]);
+        assert!(scene.items[g.end..].iter().any(|i| i.source == NodeId(2)));
     }
 
     /// An isolated layer's opacity moves to the group and off the items.
@@ -435,7 +493,7 @@ mod tests {
     /// wrong would double-apply the fade — once per item and again on the
     /// composite.
     #[test]
-    fn isolation_moves_opacity_from_the_items_to_the_group() {
+    fn isolation_moves_opacity_from_the_content_to_the_group() {
         let mut parent = box_at(1, 0.0);
         parent.blend = BlendMode::Screen;
         parent.transform.opacity = Value::constant(0.5);
@@ -445,9 +503,13 @@ mod tests {
         let scene = evaluate(&doc, 0.0);
         let g = scene.groups.first().expect("isolated");
         assert_eq!(g.alpha, 0.5, "the fade rides on the composite");
-        for item in &scene.items {
-            assert_eq!(item.opacity, 1.0, "and not on the items as well");
-        }
+        assert_eq!(scene.items[0].opacity, 1.0, "and not on the artwork as well");
+        // The child is *outside* the group, so nothing else applies the
+        // parent's fade to it — it has to arrive the ordinary way, per item.
+        // Missing this would make children of a faded layer draw at full
+        // strength.
+        assert_eq!(scene.items[1].source, NodeId(2));
+        assert_eq!(scene.items[1].opacity, 0.5, "a child still inherits the fade");
     }
 
     /// Ancestor opacity still reaches an isolated layer — it folds into the
@@ -466,11 +528,12 @@ mod tests {
         assert_eq!(scene.groups[0].alpha, 0.25, "0.5 above times 0.5 of its own");
     }
 
-    /// Nested isolated layers don't double-count: entering one resets the
-    /// running opacity, so the inner group's alpha is its own share only and
-    /// the outer group applies the rest to the finished image.
+    /// A blended child of a blended parent is a **sibling** in the draw list,
+    /// not a nested layer — each blends against whatever is beneath it. Its
+    /// alpha still accumulates the parent's fade, because it is outside the
+    /// parent's group and nothing else would apply it.
     #[test]
-    fn nested_isolated_layers_each_apply_their_own_share_once() {
+    fn a_blended_child_composites_beside_its_parent_not_inside_it() {
         let mut inner = box_at(2, 10.0);
         inner.blend = BlendMode::Screen;
         inner.transform.opacity = Value::constant(0.5);
@@ -483,11 +546,37 @@ mod tests {
         let scene = evaluate(&doc, 0.0);
         let inner_g = scene.groups.iter().find(|g| g.source == NodeId(2)).expect("inner");
         let outer_g = scene.groups.iter().find(|g| g.source == NodeId(1)).expect("outer");
-        assert_eq!(inner_g.alpha, 0.5, "its own share, not 0.25");
         assert_eq!(outer_g.alpha, 0.5);
-        // Ranges nest rather than partially overlap — what lets a backend walk
-        // them with a plain stack.
-        assert!(outer_g.start <= inner_g.start && inner_g.end <= outer_g.end);
+        assert_eq!(inner_g.alpha, 0.25, "its own 0.5, under its parent's 0.5");
+        // Disjoint, not nested: the parent's group closes before the child's
+        // opens.
+        assert!(outer_g.end <= inner_g.start);
+    }
+
+    /// Groups still nest — through a **precomp**, whose contents are inside the
+    /// instancing layer's range. This is the case a backend's stack-based walk
+    /// has to get right, and the reason `nesting_order` exists.
+    #[test]
+    fn groups_nest_through_a_precomp() {
+        let mut nested = box_at(11, 0.0);
+        nested.blend = BlendMode::Screen;
+        let inner = Comp::new(100.0, 100.0, Node::group(10, "inner root").with_child(nested));
+        let mut project = Project::single(inner);
+        let inner_id = project.root;
+
+        let mut host = box_at(1, 0.0);
+        host.blend = BlendMode::Multiply;
+        host.precomp = Some(inner_id);
+        let outer = Comp::new(100.0, 100.0, Node::group(0, "root").with_child(host));
+        let outer_id = project.insert(outer);
+
+        let scene = evaluate_comp(&project, outer_id, 0.0);
+        let host_g = scene.groups.iter().find(|g| g.source == NodeId(1)).expect("host");
+        let nested_g = scene.groups.iter().find(|g| g.source == NodeId(11)).expect("nested");
+        assert!(
+            host_g.start <= nested_g.start && nested_g.end <= host_g.end,
+            "the nested comp's layer sits inside the instancing layer's group"
+        );
     }
 
     /// A layer that draws nothing gets no group. An offscreen target to
