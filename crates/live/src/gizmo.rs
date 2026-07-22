@@ -27,8 +27,10 @@ pub(crate) enum GizmoHandle {
     Move,
     /// An arrow: translate along the layer's own X or Y.
     MoveAxis(GizmoAxis),
-    /// The ring: rotate about the anchor.
-    Rotate,
+    /// A ring: rotate about the anchor, around the named axis. Z is the
+    /// in-plane spin a 2D layer has always had; X and Y tip the layer out of
+    /// the plane and only appear in a comp with a camera.
+    RotateAxis(GizmoAxis),
     /// A box at the end of an axis: scale that axis about the anchor.
     ScaleAxis(GizmoAxis),
     /// The corner box: scale both axes together, preserving aspect.
@@ -42,6 +44,22 @@ pub(crate) enum GizmoHandle {
 pub(crate) enum GizmoAxis {
     X,
     Y,
+    /// Depth. Unlike X and Y it has no direction of its own on screen — it is
+    /// the axis you are looking *along* — so its handles are drawn toward the
+    /// vanishing point and only exist when a camera makes that point real.
+    Z,
+}
+
+impl GizmoAxis {
+    /// The two axes spanning the plane a rotation about this one turns in,
+    /// right-handed: rotating about X takes Y toward Z.
+    fn ring_basis(self) -> (GizmoAxis, GizmoAxis) {
+        match self {
+            GizmoAxis::X => (GizmoAxis::Y, GizmoAxis::Z),
+            GizmoAxis::Y => (GizmoAxis::Z, GizmoAxis::X),
+            GizmoAxis::Z => (GizmoAxis::X, GizmoAxis::Y),
+        }
+    }
 }
 
 /// The transform values as they were when a drag began, plus where the pointer
@@ -56,11 +74,30 @@ pub(crate) struct GizmoDrag {
     /// than silently retargeting.
     pub(crate) node: u64,
     pub(crate) start_pos: Vec2,
+    /// Depth is snapshotted like everything else, so a Z drag is a delta from
+    /// where it began rather than an accumulation.
+    pub(crate) start_pos_z: f64,
     pub(crate) start_rot: f64,
+    /// The out-of-plane rotations at grab time, in degrees.
+    pub(crate) start_rot_xy: (f64, f64),
     pub(crate) start_scale: (f64, f64),
     pub(crate) start_anchor: Vec2,
     /// Where the pointer grabbed, in **parent** space.
     pub(crate) grab_parent: Point,
+    /// The gizmo's origin in logical screen points, as it was at grab time.
+    ///
+    /// Snapshotted rather than read live because a depth drag *moves* the
+    /// origin — the layer slides toward the vanishing point as it recedes — and
+    /// a ring angle measured against a moving centre would creep under the
+    /// pointer instead of following it.
+    pub(crate) origin_screen: egui::Pos2,
+    /// Where the pointer grabbed, in logical screen points.
+    ///
+    /// The depth handles need this and cannot use `grab_parent`: parent space
+    /// is two-dimensional, and the whole point of a Z drag is that it moves
+    /// along the one direction that space cannot express. So the 3D handles
+    /// measure on screen, where the projection has already made depth visible.
+    pub(crate) grab_screen: egui::Pos2,
 }
 
 /// Everything the gizmo needs about the selected layer, gathered before the UI
@@ -72,10 +109,20 @@ pub(crate) struct GizmoTarget {
     /// `Scene::places`) with the layer's *own* local matrix divided back out.
     pub(crate) parent: Affine,
     pub(crate) pos: Vec2,
+    pub(crate) pos_z: f64,
     pub(crate) rot_deg: f64,
+    /// The out-of-plane rotations, in degrees.
+    pub(crate) rot_xy: (f64, f64),
     pub(crate) scale: (f64, f64),
     /// Needed to *recover* `parent`, and now to drag the anchor itself.
     pub(crate) anchor: Vec2,
+    /// The comp's eye point and distance, when it has a camera.
+    ///
+    /// **This is what gates the depth handles.** Without a camera there is no
+    /// projection, so depth has no direction on screen and a Z arrow would be a
+    /// control you could drag with nothing happening. The gizmo therefore shows
+    /// exactly the axes the composition can actually express.
+    pub(crate) view: Option<(Point, f64)>,
 }
 
 impl GizmoTarget {
@@ -94,7 +141,12 @@ impl GizmoTarget {
     /// — which is why the anchor has to be in [`NodeInfo`]: leave it out and
     /// `local` is wrong, so the recovered parent is wrong, and the gizmo
     /// tracks the cursor at an offset.
-    pub(crate) fn new(node: u64, world: Affine, info: &NodeInfo) -> Self {
+    pub(crate) fn new(
+        node: u64,
+        world: Affine,
+        info: &NodeInfo,
+        view: Option<(Point, f64)>,
+    ) -> Self {
         let pos = Vec2::new(info.pos.0, info.pos.1);
         let anchor = Vec2::new(info.anchor.0, info.anchor.1);
         // A zero scale collapses `local`, and inverting a singular matrix gives
@@ -111,7 +163,10 @@ impl GizmoTarget {
             node,
             parent: world * local.inverse(),
             pos,
+            pos_z: info.pos.2,
             rot_deg: info.rot,
+            rot_xy: info.rot_xy,
+            view,
             // The in-plane pair only: this gizmo drags handles in screen
             // space, so depth scale is not something it can express or edit.
             scale: (info.scale.0, info.scale.1),
@@ -134,7 +189,32 @@ impl GizmoTarget {
         match axis {
             GizmoAxis::X => Vec2::new(r.cos(), r.sin()),
             GizmoAxis::Y => Vec2::new(-r.sin(), r.cos()),
+            // Depth has no parent-plane direction by construction. Callers that
+            // want it ask the layout, which measures it on screen.
+            GizmoAxis::Z => Vec2::ZERO,
         }
+    }
+
+    /// Where this layer's origin sits in composition space **before** the
+    /// camera, recovered by undoing the projection the placement already
+    /// carries. Needed to measure how far a unit of depth moves on screen.
+    /// The depth used is the layer's **own** `z`, not the total depth of the
+    /// chain above it. Exact for a layer parented to the comp root, and an
+    /// approximation inside a parent that itself carries depth — the arrow
+    /// still points the right way there, its gearing is just measured against
+    /// the wrong rung of the ladder.
+    fn origin_comp_unprojected(&self) -> Option<(Point, Point, f64)> {
+        let (eye, d) = self.view?;
+        let s = d / (d + self.pos_z);
+        if !s.is_finite() || s.abs() < 1e-9 {
+            return None;
+        }
+        // `parent` already carries the camera's scale, so this point is where
+        // the layer landed *after* projection. Dividing that scale back out
+        // recovers where it would sit with the eye at infinity, which is the
+        // point receding actually pivots around.
+        let projected = self.parent * self.origin_parent();
+        Some((eye + (projected - eye) / s, eye, d))
     }
 }
 
@@ -160,6 +240,7 @@ const CORNER_AT: f32 = 46.0;
 
 const X_COL: egui::Color32 = egui::Color32::from_rgb(232, 92, 92);
 const Y_COL: egui::Color32 = egui::Color32::from_rgb(126, 200, 96);
+const Z_COL: egui::Color32 = egui::Color32::from_rgb(120, 170, 235);
 const RING_COL: egui::Color32 = egui::Color32::from_rgb(120, 170, 235);
 const CENTRE_COL: egui::Color32 = egui::Color32::from_rgb(240, 216, 90);
 const HOT_COL: egui::Color32 = egui::Color32::WHITE;
@@ -168,15 +249,40 @@ const HOT_COL: egui::Color32 = egui::Color32::WHITE;
 /// and shared by the painter and the hit-tester so the two cannot drift apart.
 struct Layout {
     origin: egui::Pos2,
-    /// Unit screen directions for the layer's X / Y. Screen Y grows downward
-    /// and `fit` may flip, so these come from the transform rather than being
-    /// assumed.
-    dir: [egui::Vec2; 2],
+    /// Unit screen directions for the layer's X / Y / Z. Screen Y grows
+    /// downward and `fit` may flip, so these come from the transform rather
+    /// than being assumed.
+    ///
+    /// The Z entry is only meaningful when [`Layout::spatial`] is set: it is
+    /// measured toward the vanishing point, which does not exist without a
+    /// camera.
+    dir: [egui::Vec2; 3],
+    /// Logical screen points travelled per unit of depth, and the sign of that
+    /// travel. `None` in a flat comp, or where the layer sits exactly on the
+    /// optical axis and depth moves it nowhere at all — there the drag has no
+    /// gearing to invert, so the depth handles are withheld rather than made
+    /// infinitely sensitive.
+    spatial: Option<f32>,
 }
 
 impl Layout {
     fn tip(&self, axis: GizmoAxis, at: f32) -> egui::Pos2 {
         self.origin + self.dir[axis as usize] * at
+    }
+    /// The axes with handles: X and Y always, Z only where depth reads.
+    fn axes(&self) -> &'static [GizmoAxis] {
+        if self.spatial.is_some() {
+            &[GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z]
+        } else {
+            &[GizmoAxis::X, GizmoAxis::Y]
+        }
+    }
+    /// A point on the ring that turns about `axis`, at parameter `t` radians.
+    fn ring_point(&self, axis: GizmoAxis, t: f32) -> egui::Pos2 {
+        let (u, v) = axis.ring_basis();
+        self.origin
+            + self.dir[u as usize] * (RING_R * t.cos())
+            + self.dir[v as usize] * (RING_R * t.sin())
     }
     fn corner(&self) -> egui::Pos2 {
         self.origin + self.dir[0] * CORNER_AT + self.dir[1] * CORNER_AT
@@ -188,6 +294,7 @@ impl GizmoAxis {
         match self {
             GizmoAxis::X => X_COL,
             GizmoAxis::Y => Y_COL,
+            GizmoAxis::Z => Z_COL,
         }
     }
 }
@@ -215,14 +322,36 @@ fn layout(t: &GizmoTarget, fit: Affine, ppp: f64) -> Layout {
     // renormalise on screen: that way a rotated, flipped or non-uniformly
     // scaled parent still produces arrows pointing the way the layer actually
     // moves, at a fixed on-screen length.
-    let mut dir = [egui::Vec2::X, egui::Vec2::Y];
+    let mut dir = [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::ZERO];
     for (i, axis) in [GizmoAxis::X, GizmoAxis::Y].into_iter().enumerate() {
         let a = t.axis_parent(axis);
         let far = to_screen(t, fit, ppp, o_parent + a);
         let v = far - origin;
         dir[i] = if v.length() > 1e-4 { v.normalized() } else { dir[i] };
     }
-    Layout { origin, dir }
+
+    // Depth, measured rather than derived. Stepping the layer one unit further
+    // away and asking where it lands gives both the on-screen direction of
+    // depth *and* the gearing a drag has to invert — in one finite difference,
+    // through the very projection the frame was drawn with. Deriving it in
+    // closed form would be a second copy of the camera's arithmetic, free to
+    // disagree with the first.
+    let spatial = t.origin_comp_unprojected().and_then(|(p, eye, d)| {
+        let at = |z: f64| {
+            let s = d / (d + z);
+            let c = fit * (eye + (p - eye) * s);
+            egui::pos2((c.x / ppp) as f32, (c.y / ppp) as f32)
+        };
+        let step = at(t.pos_z + 1.0) - at(t.pos_z);
+        let len = step.length();
+        // Too small to point anywhere: the layer is on the optical axis, where
+        // receding moves it nowhere and no drag could be geared back.
+        (len > 1e-5).then(|| {
+            dir[GizmoAxis::Z as usize] = step.normalized();
+            len
+        })
+    });
+    Layout { origin, dir, spatial }
 }
 
 /// Distance from `p` to the segment `a`–`b`, for arrow hit-testing.
@@ -251,21 +380,52 @@ fn hit(l: &Layout, p: egui::Pos2) -> Option<GizmoHandle> {
     if (p - l.corner()).length() <= BOX_HALF + 3.0 {
         return Some(GizmoHandle::ScaleUniform);
     }
+    // Scale has no depth handle: `scale.z` multiplies a dimension the geometry
+    // does not have (every layer is flat in its own space), so a Z scale box
+    // would be a control with nothing behind it.
     for axis in [GizmoAxis::X, GizmoAxis::Y] {
         if (p - l.tip(axis, SCALE_BOX_AT)).length() <= BOX_HALF + 3.0 {
             return Some(GizmoHandle::ScaleAxis(axis));
         }
     }
-    for axis in [GizmoAxis::X, GizmoAxis::Y] {
+    for &axis in l.axes() {
         if dist_to_segment(p, l.origin, l.tip(axis, ARROW_LEN)) <= 6.0 {
             return Some(GizmoHandle::MoveAxis(axis));
         }
     }
-    if ((p - l.origin).length() - RING_R).abs() <= RING_GRAB {
-        return Some(GizmoHandle::Rotate);
+    // Rings last, and Z first among them: it is the one a 2D layer has, so a
+    // click where the rings cross keeps meaning what it always did.
+    for &axis in [GizmoAxis::Z, GizmoAxis::X, GizmoAxis::Y].iter() {
+        if axis != GizmoAxis::Z && l.spatial.is_none() {
+            continue;
+        }
+        if ring_distance(l, axis, p) <= RING_GRAB {
+            return Some(GizmoHandle::RotateAxis(axis));
+        }
     }
     None
 }
+
+/// Distance from `p` to the ring that turns about `axis`, by sampling it.
+///
+/// The ring is a circle in space but an **ellipse** on screen — sometimes a
+/// near-flat one, when the layer is turned almost edge-on to it. Sampling costs
+/// a few dozen distances and stays correct for every degenerate case a closed
+/// form would have to special-case.
+fn ring_distance(l: &Layout, axis: GizmoAxis, p: egui::Pos2) -> f32 {
+    let mut best = f32::MAX;
+    let mut prev = l.ring_point(axis, 0.0);
+    for i in 1..=RING_SAMPLES {
+        let t = i as f32 / RING_SAMPLES as f32 * std::f32::consts::TAU;
+        let next = l.ring_point(axis, t);
+        best = best.min(dist_to_segment(p, prev, next));
+        prev = next;
+    }
+    best
+}
+
+/// How finely a rotation ring is sampled, for both drawing and hit-testing.
+const RING_SAMPLES: usize = 64;
 
 fn paint(painter: &egui::Painter, l: &Layout, hot: Option<GizmoHandle>) {
     let col = |h: GizmoHandle, base: egui::Color32| {
@@ -276,9 +436,39 @@ fn paint(painter: &egui::Painter, l: &Layout, hot: Option<GizmoHandle>) {
         }
     };
 
-    // Rotation ring, drawn first so the arrows sit over it.
-    let ring = col(GizmoHandle::Rotate, RING_COL);
-    painter.circle_stroke(l.origin, RING_R, egui::Stroke::new(1.5, ring));
+    // Rotation rings, drawn first so the arrows sit over them. Each is a circle
+    // in space, so on screen it is an ellipse that flattens as the layer turns
+    // edge-on to it — which is exactly the feedback that tells you which way
+    // the layer is already facing.
+    for &axis in l.axes() {
+        let base = if axis == GizmoAxis::Z { RING_COL } else { axis.colour() };
+        let c = col(GizmoHandle::RotateAxis(axis), base);
+        let pts: Vec<egui::Pos2> = (0..=RING_SAMPLES)
+            .map(|i| l.ring_point(axis, i as f32 / RING_SAMPLES as f32 * std::f32::consts::TAU))
+            .collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, c)));
+    }
+
+    // The depth arrow, toward the vanishing point. Drawn before the in-plane
+    // pair so those stay on top where they overlap — they are the ones you
+    // reach for most.
+    if l.spatial.is_some() {
+        let c = col(GizmoHandle::MoveAxis(GizmoAxis::Z), Z_COL);
+        let tip = l.tip(GizmoAxis::Z, ARROW_LEN);
+        painter.line_segment([l.origin, tip], egui::Stroke::new(2.0, c));
+        let d = l.dir[GizmoAxis::Z as usize];
+        let n = egui::vec2(-d.y, d.x);
+        // Hollow head, so depth never reads as a third in-plane axis at a
+        // glance: the two solid arrows are the ones that move within the frame.
+        painter.add(egui::Shape::closed_line(
+            vec![
+                tip + d * ARROW_HEAD,
+                tip + n * (ARROW_HEAD * 0.42),
+                tip - n * (ARROW_HEAD * 0.42),
+            ],
+            egui::Stroke::new(1.6, c),
+        ));
+    }
 
     for axis in [GizmoAxis::X, GizmoAxis::Y] {
         let c = col(GizmoHandle::MoveAxis(axis), axis.colour());
@@ -337,18 +527,68 @@ fn paint(painter: &egui::Painter, l: &Layout, hot: Option<GizmoHandle>) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Resolved {
     pub(crate) pos: Vec2,
+    pub(crate) pos_z: f64,
     pub(crate) rot: f64,
+    /// The out-of-plane rotations, in degrees.
+    pub(crate) rot_xy: (f64, f64),
     pub(crate) scale: (f64, f64),
     pub(crate) anchor: Vec2,
+}
+
+/// What the depth-aware handles need and parent space cannot give them: where
+/// the pointer is on screen, the screen basis the rings turn in, and the gearing
+/// between a screen point and a unit of depth.
+///
+/// Passed alongside the parent-space point rather than replacing it, so the
+/// in-plane handles keep resolving in the space their values actually live in —
+/// unchanged, and still exact at any zoom.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScreenDrag {
+    pub(crate) now: egui::Pos2,
+    /// Unit screen directions for X / Y / Z.
+    pub(crate) dir: [egui::Vec2; 3],
+    /// Logical screen points travelled per unit of depth. `None` in a flat
+    /// comp, where no depth handle can be grabbed in the first place.
+    pub(crate) z_px: Option<f32>,
+}
+
+impl ScreenDrag {
+    /// A basis with no depth in it — what a flat comp resolves against, and
+    /// what the in-plane tests measure through.
+    #[cfg(test)]
+    pub(crate) fn flat() -> Self {
+        Self {
+            now: egui::Pos2::ZERO,
+            dir: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::ZERO],
+            z_px: None,
+        }
+    }
+
+    /// The angle of `p` about the ring that turns around `axis`, in that ring's
+    /// own basis. `None` where the ring has collapsed to a line on screen and an
+    /// angle around it would mean nothing.
+    fn ring_angle(&self, axis: GizmoAxis, origin: egui::Pos2, p: egui::Pos2) -> Option<f64> {
+        let (u, v) = axis.ring_basis();
+        let (du, dv) = (self.dir[u as usize], self.dir[v as usize]);
+        let w = p - origin;
+        let (a, b) = (w.dot(du) as f64, w.dot(dv) as f64);
+        (a.hypot(b) > 1e-4).then(|| b.atan2(a))
+    }
 }
 
 /// Resolve one frame of a drag, given where the pointer is now in parent space.
 /// Pure — no egui, no `App` — so the arithmetic is unit-testable without a
 /// window, like `apply_fps_edit`.
-pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> Resolved {
+pub(crate) fn resolve_drag(
+    drag: &GizmoDrag,
+    now_parent: Point,
+    screen: ScreenDrag,
+) -> Resolved {
     let base = Resolved {
         pos: drag.start_pos,
+        pos_z: drag.start_pos_z,
         rot: drag.start_rot,
+        rot_xy: drag.start_rot_xy,
         scale: drag.start_scale,
         anchor: drag.start_anchor,
     };
@@ -362,12 +602,26 @@ pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> Resolved {
 
     match drag.handle {
         GizmoHandle::Move => Resolved { pos: pos + delta, ..base },
+        // Depth: measured on screen, then divided by the gearing the layout
+        // measured through the real projection. A drag of N points along the
+        // arrow moves the layer however far actually reads as N points from
+        // here — so a distant layer travels further per point than a near one,
+        // which is what keeps the handle feeling attached to the artwork rather
+        // than to the number behind it.
+        GizmoHandle::MoveAxis(GizmoAxis::Z) => {
+            let Some(px) = screen.z_px.filter(|p| *p > 1e-5) else { return base };
+            let along = (screen.now - drag.grab_screen).dot(screen.dir[GizmoAxis::Z as usize]);
+            Resolved { pos_z: base.pos_z + (along / px) as f64, ..base }
+        }
         GizmoHandle::MoveAxis(axis) => {
             let a = axis_of(rot, axis);
             let along = delta.x * a.x + delta.y * a.y;
             Resolved { pos: pos + a * along, ..base }
         }
-        GizmoHandle::Rotate => {
+        // The in-plane spin keeps resolving in parent space — exact there, and
+        // needing no basis — while the two depth rings measure their angle in
+        // the screen basis, the only place their plane is visible at all.
+        GizmoHandle::RotateAxis(GizmoAxis::Z) => {
             if grab_r < 1e-6 {
                 return base;
             }
@@ -375,6 +629,26 @@ pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> Resolved {
             let a1 = (now_parent - origin).atan2();
             Resolved { rot: rot + (a1 - a0).to_degrees(), ..base }
         }
+        GizmoHandle::RotateAxis(axis) => {
+            let (Some(a0), Some(a1)) = (
+                screen.ring_angle(axis, drag.origin_screen, drag.grab_screen),
+                screen.ring_angle(axis, drag.origin_screen, screen.now),
+            ) else {
+                return base;
+            };
+            // Shortest way round, so dragging across the seam at the back of the
+            // ring does not spin the layer a whole turn in one frame.
+            let d = wrap_pi(a1 - a0).to_degrees();
+            let (rx, ry) = base.rot_xy;
+            let rot_xy = match axis {
+                GizmoAxis::X => (rx + d, ry),
+                _ => (rx, ry + d),
+            };
+            Resolved { rot_xy, ..base }
+        }
+        // Depth scale has no geometry to act on, so it is never offered and
+        // never resolved — see the note in `hit`.
+        GizmoHandle::ScaleAxis(GizmoAxis::Z) => base,
         GizmoHandle::ScaleAxis(axis) => {
             let a = axis_of(rot, axis);
             let d0 = (drag.grab_parent - origin).dot(a);
@@ -385,7 +659,7 @@ pub(crate) fn resolve_drag(drag: &GizmoDrag, now_parent: Point) -> Resolved {
             let f = d1 / d0;
             let s = match axis {
                 GizmoAxis::X => (scale.0 * f, scale.1),
-                GizmoAxis::Y => (scale.0, scale.1 * f),
+                _ => (scale.0, scale.1 * f),
             };
             Resolved { scale: s, ..base }
         }
@@ -433,6 +707,18 @@ fn axis_of(rot_deg: f64, axis: GizmoAxis) -> Vec2 {
     match axis {
         GizmoAxis::X => Vec2::new(r.cos(), r.sin()),
         GizmoAxis::Y => Vec2::new(-r.sin(), r.cos()),
+        GizmoAxis::Z => Vec2::ZERO,
+    }
+}
+
+/// Fold an angle into (-pi, pi] — the shortest way round.
+fn wrap_pi(a: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    let a = (a + PI).rem_euclid(TAU) - PI;
+    if a <= -PI {
+        a + TAU
+    } else {
+        a
     }
 }
 
@@ -500,10 +786,14 @@ pub(crate) fn gizmo_ui(
                     handle,
                     node: target.node,
                     start_pos: target.pos,
+                    start_pos_z: target.pos_z,
                     start_rot: target.rot_deg,
+                    start_rot_xy: target.rot_xy,
                     start_scale: target.scale,
                     start_anchor: target.anchor,
                     grab_parent: to_parent(target, fit, ppp, p),
+                    grab_screen: p,
+                    origin_screen: l.origin,
                 });
             }
         }
@@ -514,23 +804,35 @@ pub(crate) fn gizmo_ui(
 
     let mut snap = Snap::default();
     if let (Some(d), Some(p)) = (*drag, pointer) {
-        let r = resolve_drag(&d, to_parent(target, fit, ppp, p));
+        // The basis is rebuilt from *this* frame's layout, so a depth drag stays
+        // geared to where the layer is now rather than where it started — the
+        // arrow keeps pointing at the vanishing point as the layer recedes.
+        let screen = ScreenDrag { now: p, dir: l.dir, z_px: l.spatial };
+        let r = resolve_drag(&d, to_parent(target, fit, ppp, p), screen);
         let (mut pos, rot, scale, anchor) = (r.pos, r.rot, r.scale, r.anchor);
         // Snapping applies to moves only. Rotating or scaling *to* a guide is a
         // different question with a different answer (an angle, not a point),
         // and pretending a position snap covers it would just make the handles
         // stick for no visible reason.
-        if matches!(d.handle, GizmoHandle::Move | GizmoHandle::MoveAxis(_)) {
+        if matches!(
+            d.handle,
+            GizmoHandle::Move | GizmoHandle::MoveAxis(GizmoAxis::X | GizmoAxis::Y)
+        ) {
             let (snapped, s) = snap_move(target, &d, pos, snap_ctx, fit, ppp);
             pos = snapped;
             snap = s;
         }
         match d.handle {
+            // Depth alone: writing x and y here too would fight the snapper,
+            // which has nothing to say about an axis it cannot see.
+            GizmoHandle::MoveAxis(GizmoAxis::Z) => out.pos_z = Some(r.pos_z),
             GizmoHandle::Move | GizmoHandle::MoveAxis(_) => {
                 out.pos_x = Some(pos.x);
                 out.pos_y = Some(pos.y);
             }
-            GizmoHandle::Rotate => out.rot = Some(rot),
+            GizmoHandle::RotateAxis(GizmoAxis::Z) => out.rot = Some(rot),
+            GizmoHandle::RotateAxis(GizmoAxis::X) => out.rot_x = Some(r.rot_xy.0),
+            GizmoHandle::RotateAxis(GizmoAxis::Y) => out.rot_y = Some(r.rot_xy.1),
             GizmoHandle::ScaleAxis(_) | GizmoHandle::ScaleUniform => {
                 out.scale_x = Some(scale.0);
                 out.scale_y = Some(scale.1);

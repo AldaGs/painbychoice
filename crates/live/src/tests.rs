@@ -1375,10 +1375,14 @@ fn drag_at(handle: GizmoHandle, rot: f64, grab: (f64, f64)) -> GizmoDrag {
         handle,
         node: 1,
         start_pos: Vec2::new(0.0, 0.0),
+        start_pos_z: 0.0,
         start_rot: rot,
+        start_rot_xy: (0.0, 0.0),
         start_scale: (1.0, 1.0),
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(grab.0, grab.1),
+        grab_screen: egui::Pos2::ZERO,
+        origin_screen: egui::Pos2::ZERO,
     }
 }
 
@@ -1387,7 +1391,7 @@ fn drag_at(handle: GizmoHandle, rot: f64, grab: (f64, f64)) -> GizmoDrag {
 #[test]
 fn the_centre_handle_tracks_the_pointer_one_to_one() {
     let d = drag_at(GizmoHandle::Move, 30.0, (10.0, 10.0));
-    let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(35.0, -5.0));
+    let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(35.0, -5.0), ScreenDrag::flat());
     assert_eq!((pos.x, pos.y), (25.0, -15.0));
     assert_eq!(rot, 30.0, "a move must not touch rotation");
     assert_eq!(scale, (1.0, 1.0));
@@ -1399,11 +1403,11 @@ fn the_centre_handle_tracks_the_pointer_one_to_one() {
 #[test]
 fn an_axis_arrow_projects_the_drag_onto_the_rotated_axis() {
     let d = drag_at(GizmoHandle::MoveAxis(GizmoAxis::X), 90.0, (0.0, 0.0));
-    let pos = resolve_drag(&d, Point::new(0.0, 40.0)).pos;
+    let pos = resolve_drag(&d, Point::new(0.0, 40.0), ScreenDrag::flat()).pos;
     assert!((pos.x - 0.0).abs() < 1e-9, "no movement across the axis");
     assert!((pos.y - 40.0).abs() < 1e-9, "the whole drag lands along it");
 
-    let pos = resolve_drag(&d, Point::new(40.0, 0.0)).pos;
+    let pos = resolve_drag(&d, Point::new(40.0, 0.0), ScreenDrag::flat()).pos;
     assert!(pos.hypot() < 1e-9, "a drag square to the axis moves nothing");
 }
 
@@ -1411,9 +1415,9 @@ fn an_axis_arrow_projects_the_drag_onto_the_rotated_axis() {
 /// position and scale alone.
 #[test]
 fn the_ring_adds_the_swept_angle() {
-    let d = drag_at(GizmoHandle::Rotate, 10.0, (100.0, 0.0));
+    let d = drag_at(GizmoHandle::RotateAxis(GizmoAxis::Z), 10.0, (100.0, 0.0));
     // Straight out on +X, swung to +Y: a quarter turn.
-    let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(0.0, 100.0));
+    let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(0.0, 100.0), ScreenDrag::flat());
     assert!((rot - 100.0).abs() < 1e-6, "10° + 90°, got {rot}");
     assert_eq!((pos.x, pos.y), (0.0, 0.0));
     assert_eq!(scale, (1.0, 1.0));
@@ -1424,11 +1428,11 @@ fn the_ring_adds_the_swept_angle() {
 #[test]
 fn scale_handles_use_the_distance_ratio_from_the_pivot() {
     let d = drag_at(GizmoHandle::ScaleUniform, 0.0, (50.0, 0.0));
-    let scale = resolve_drag(&d, Point::new(100.0, 0.0)).scale;
+    let scale = resolve_drag(&d, Point::new(100.0, 0.0), ScreenDrag::flat()).scale;
     assert_eq!(scale, (2.0, 2.0));
 
     let d = drag_at(GizmoHandle::ScaleAxis(GizmoAxis::Y), 0.0, (0.0, 40.0));
-    let scale = resolve_drag(&d, Point::new(0.0, 20.0)).scale;
+    let scale = resolve_drag(&d, Point::new(0.0, 20.0), ScreenDrag::flat()).scale;
     assert!((scale.1 - 0.5).abs() < 1e-9, "Y halved, got {}", scale.1);
     assert_eq!(scale.0, 1.0, "X untouched");
 }
@@ -1438,9 +1442,9 @@ fn scale_handles_use_the_distance_ratio_from_the_pivot() {
 /// the document.
 #[test]
 fn a_grab_on_the_pivot_is_inert_rather_than_nan() {
-    for handle in [GizmoHandle::Rotate, GizmoHandle::ScaleUniform] {
+    for handle in [GizmoHandle::RotateAxis(GizmoAxis::Z), GizmoHandle::ScaleUniform] {
         let d = drag_at(handle, 0.0, (0.0, 0.0));
-        let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(30.0, 30.0));
+        let Resolved { pos, rot, scale, .. } = resolve_drag(&d, Point::new(30.0, 30.0), ScreenDrag::flat());
         assert!(pos.hypot().is_finite() && rot.is_finite());
         assert_eq!(scale, (1.0, 1.0), "{handle:?} held its scale");
         assert_eq!(rot, 0.0, "{handle:?} held its rotation");
@@ -1470,7 +1474,7 @@ fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
         * Affine::translate(Vec2::new(-info.anchor.0, -info.anchor.1));
     let world = parent * local;
 
-    let t = GizmoTarget::new(1, world, &info);
+    let t = GizmoTarget::new(1, world, &info, None);
     // The recovered parent must map `position` to wherever the world matrix
     // puts the anchor point — that is the definition of the pivot.
     let via_parent = t.parent * Point::new(info.pos.0, info.pos.1);
@@ -1727,7 +1731,7 @@ fn a_bare_group_gets_a_gizmo_target_from_its_place() {
     let info = NodeInfo::resolve(n, c, 50.0);
     let place = scene.place(node).expect("a group has a place");
 
-    let target = GizmoTarget::new(node.0, place.world, &info);
+    let target = GizmoTarget::new(node.0, place.world, &info, None);
     let origin = target.parent * Point::new(target.pos.x, target.pos.y);
     let pivot = scene.pivot(node).expect("and a pivot");
     assert!(
@@ -1958,9 +1962,12 @@ fn an_axis_constrained_drag_only_snaps_along_its_axis() {
         node: 1,
         parent: Affine::IDENTITY,
         pos: Vec2::new(0.0, 0.0),
+        pos_z: 0.0,
         rot_deg: 0.0,
+        rot_xy: (0.0, 0.0),
         scale: (1.0, 1.0),
         anchor: Vec2::ZERO,
+        view: None,
     };
     // A vertical guide at x=300 and a horizontal one at y=300: an unconstrained
     // move near their crossing would be pulled on both axes.
@@ -1986,10 +1993,14 @@ fn an_axis_constrained_drag_only_snaps_along_its_axis() {
         handle: GizmoHandle::Move,
         node: 1,
         start_pos: at,
+        start_pos_z: 0.0,
         start_rot: 0.0,
+        start_rot_xy: (0.0, 0.0),
         start_scale: (1.0, 1.0),
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(302.0, 302.0),
+        grab_screen: egui::Pos2::ZERO,
+        origin_screen: egui::Pos2::ZERO,
     };
     let (pos, snap) = snap_move(&target, &free, at, ctx, fit, 1.0);
     assert_eq!((pos.x, pos.y), (300.0, 300.0));
@@ -2020,9 +2031,12 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
         node: 1,
         parent,
         pos: Vec2::ZERO,
+        pos_z: 0.0,
         rot_deg: 0.0,
+        rot_xy: (0.0, 0.0),
         scale: (1.0, 1.0),
         anchor: Vec2::ZERO,
+        view: None,
     };
     let aids = aids_with(false, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
     let ctx = SnapCtx {
@@ -2039,10 +2053,14 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
         handle: GizmoHandle::Move,
         node: 1,
         start_pos: at,
+        start_pos_z: 0.0,
         start_rot: 0.0,
+        start_rot_xy: (0.0, 0.0),
         start_scale: (1.0, 1.0),
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(101.0, 200.0),
+        grab_screen: egui::Pos2::ZERO,
+        origin_screen: egui::Pos2::ZERO,
     };
     let (pos, snap) = snap_move(&target, &drag, at, ctx, Affine::IDENTITY, 1.0);
 
@@ -2062,9 +2080,12 @@ fn the_bypass_modifier_defeats_every_snap_target() {
         node: 1,
         parent: Affine::IDENTITY,
         pos: Vec2::ZERO,
+        pos_z: 0.0,
         rot_deg: 0.0,
+        rot_xy: (0.0, 0.0),
         scale: (1.0, 1.0),
         anchor: Vec2::ZERO,
+        view: None,
     };
     let aids = aids_with(true, vec![Guide { axis: GuideAxis::Vertical, at: 300.0 }]);
     let at = Vec2::new(301.0, 2.0);
@@ -2072,10 +2093,14 @@ fn the_bypass_modifier_defeats_every_snap_target() {
         handle: GizmoHandle::Move,
         node: 1,
         start_pos: at,
+        start_pos_z: 0.0,
         start_rot: 0.0,
+        start_rot_xy: (0.0, 0.0),
         start_scale: (1.0, 1.0),
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(301.0, 2.0),
+        grab_screen: egui::Pos2::ZERO,
+        origin_screen: egui::Pos2::ZERO,
     };
     let ctx = SnapCtx {
         aids: &aids,
@@ -2104,13 +2129,17 @@ fn dragging_the_anchor_moves_the_pivot_but_not_the_artwork() {
         handle: GizmoHandle::Anchor,
         node: 1,
         start_pos: Vec2::new(100.0, 50.0),
+        start_pos_z: 0.0,
         start_rot: rot,
+        start_rot_xy: (0.0, 0.0),
         start_scale: scale,
         start_anchor: Vec2::new(7.0, -3.0),
         grab_parent: Point::new(100.0, 50.0),
+        grab_screen: egui::Pos2::ZERO,
+        origin_screen: egui::Pos2::ZERO,
     };
     let delta = Vec2::new(20.0, -12.0);
-    let r = resolve_drag(&d, Point::new(100.0 + delta.x, 50.0 + delta.y));
+    let r = resolve_drag(&d, Point::new(100.0 + delta.x, 50.0 + delta.y), ScreenDrag::flat());
 
     // The pivot follows the pointer exactly.
     assert!((r.pos - (d.start_pos + delta)).hypot() < 1e-9, "pivot: {:?}", r.pos);
@@ -2143,12 +2172,16 @@ fn an_anchor_drag_on_a_flattened_layer_is_inert() {
         handle: GizmoHandle::Anchor,
         node: 1,
         start_pos: Vec2::new(10.0, 10.0),
+        start_pos_z: 0.0,
         start_rot: 0.0,
+        start_rot_xy: (0.0, 0.0),
         start_scale: (0.0, 1.0),
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(10.0, 10.0),
+        grab_screen: egui::Pos2::ZERO,
+        origin_screen: egui::Pos2::ZERO,
     };
-    let r = resolve_drag(&d, Point::new(60.0, 60.0));
+    let r = resolve_drag(&d, Point::new(60.0, 60.0), ScreenDrag::flat());
     assert_eq!(r.pos, d.start_pos);
     assert_eq!(r.anchor, d.start_anchor);
     assert!(r.anchor.x.is_finite() && r.anchor.y.is_finite());
@@ -4589,4 +4622,111 @@ fn the_step_is_named_after_the_edit_that_caused_it() {
         ),
         "Edit"
     );
+}
+
+/// A drag snapshot for the depth handles, which measure on screen rather than
+/// in parent space.
+fn spatial_drag(handle: GizmoHandle, grab: egui::Pos2) -> GizmoDrag {
+    GizmoDrag {
+        handle,
+        node: 1,
+        start_pos: Vec2::ZERO,
+        start_pos_z: 0.0,
+        start_rot: 0.0,
+        start_rot_xy: (0.0, 0.0),
+        start_scale: (1.0, 1.0),
+        start_anchor: Vec2::ZERO,
+        grab_parent: Point::ZERO,
+        grab_screen: grab,
+        origin_screen: egui::Pos2::ZERO,
+    }
+}
+
+/// A screen basis with depth pointing right and a known gearing, so a test can
+/// state the expected answer in units rather than pixels.
+fn spatial_basis(now: egui::Pos2, z_px: f32) -> ScreenDrag {
+    ScreenDrag {
+        now,
+        dir: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::X],
+        z_px: Some(z_px),
+    }
+}
+
+/// The depth arrow converts screen travel back into depth through the gearing
+/// the layout measured — so the layer moves as far as reads like the drag,
+/// whatever the eye distance and zoom happen to be.
+#[test]
+fn the_depth_arrow_moves_by_the_measured_gearing() {
+    let d = spatial_drag(GizmoHandle::MoveAxis(GizmoAxis::Z), egui::pos2(0.0, 0.0));
+    // Four screen points per unit of depth: a 40-point drag is 10 units.
+    let r = resolve_drag(&d, Point::ZERO, spatial_basis(egui::pos2(40.0, 0.0), 4.0));
+    assert!((r.pos_z - 10.0).abs() < 1e-9, "got {}", r.pos_z);
+    // And the in-plane values are untouched — depth is its own axis.
+    assert_eq!(r.pos, Vec2::ZERO);
+    assert_eq!(r.rot, 0.0);
+}
+
+/// Movement across the arrow does not count: the handle promises one axis.
+#[test]
+fn the_depth_arrow_ignores_movement_across_it() {
+    let d = spatial_drag(GizmoHandle::MoveAxis(GizmoAxis::Z), egui::pos2(0.0, 0.0));
+    let r = resolve_drag(&d, Point::ZERO, spatial_basis(egui::pos2(0.0, 90.0), 4.0));
+    assert_eq!(r.pos_z, 0.0, "perpendicular travel moved the layer in depth");
+}
+
+/// In a flat comp there is no gearing to invert, so a depth drag holds rather
+/// than dividing by a zero that would fling the layer to infinity.
+#[test]
+fn a_depth_drag_holds_without_a_camera() {
+    let d = spatial_drag(GizmoHandle::MoveAxis(GizmoAxis::Z), egui::pos2(0.0, 0.0));
+    let mut basis = spatial_basis(egui::pos2(40.0, 0.0), 4.0);
+    basis.z_px = None;
+    assert_eq!(resolve_drag(&d, Point::ZERO, basis).pos_z, 0.0);
+}
+
+/// The X ring turns the layer about X, measured in the ring's own screen basis
+/// — a quarter turn from the Y direction to the Z direction is 90 degrees.
+#[test]
+fn the_x_ring_rotates_about_x() {
+    // Ring basis for X is (Y, Z); put Y along screen +x and Z along screen -y
+    // so the quarter turn is unambiguous.
+    let basis = |now: egui::Pos2| ScreenDrag {
+        now,
+        dir: [egui::Vec2::ZERO, egui::Vec2::X, egui::vec2(0.0, -1.0)],
+        z_px: Some(4.0),
+    };
+    let d = spatial_drag(GizmoHandle::RotateAxis(GizmoAxis::X), egui::pos2(50.0, 0.0));
+    let r = resolve_drag(&d, Point::ZERO, basis(egui::pos2(0.0, -50.0)));
+    assert!((r.rot_xy.0 - 90.0).abs() < 1e-6, "got {:?}", r.rot_xy);
+    assert_eq!(r.rot_xy.1, 0.0, "Y was not touched");
+    assert_eq!(r.rot, 0.0, "nor was the in-plane spin");
+}
+
+/// Dragging across the back of a ring must take the short way round, or the
+/// layer spins a whole turn in one frame as the angle wraps.
+#[test]
+fn a_ring_drag_takes_the_short_way_round() {
+    let basis = |now: egui::Pos2| ScreenDrag {
+        now,
+        dir: [egui::Vec2::ZERO, egui::Vec2::X, egui::vec2(0.0, -1.0)],
+        z_px: Some(4.0),
+    };
+    // Grab just below the seam at 180 degrees and cross it.
+    let grab = egui::pos2(-50.0, -1.0);
+    let d = spatial_drag(GizmoHandle::RotateAxis(GizmoAxis::X), grab);
+    let r = resolve_drag(&d, Point::ZERO, basis(egui::pos2(-50.0, 1.0)));
+    assert!(
+        r.rot_xy.0.abs() < 10.0,
+        "crossing the seam should be a small step, got {}",
+        r.rot_xy.0
+    );
+}
+
+/// Depth scale is not offered, and is inert if one is somehow resolved: every
+/// layer is flat in its own space, so there is no third dimension to scale.
+#[test]
+fn depth_scale_is_inert() {
+    let d = spatial_drag(GizmoHandle::ScaleAxis(GizmoAxis::Z), egui::pos2(0.0, 0.0));
+    let r = resolve_drag(&d, Point::new(80.0, 0.0), spatial_basis(egui::pos2(80.0, 0.0), 4.0));
+    assert_eq!(r.scale, (1.0, 1.0));
 }

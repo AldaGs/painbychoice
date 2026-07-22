@@ -2600,10 +2600,21 @@ impl App {
         // draws nothing and so has no item, but it is exactly the sort of layer
         // you parent things to and want handles on. `None` here now means only
         // "the layer isn't live on this frame".
+        // The comp's eye, when it has one. This is what turns the gizmo's third
+        // axis on: depth only has a direction on screen once a camera projects
+        // it, so a flat comp gets exactly the two-axis gizmo it always had.
+        let gizmo_view = self.doc().camera.as_ref().map(|c| {
+            let comp = self.doc().clone();
+            let mut ctx = EvalCtx::new(&comp, frame as f64);
+            (
+                kurbo::Point::new(comp.width / 2.0, comp.height / 2.0),
+                c.distance.resolve(&mut ctx),
+            )
+        });
         let gizmo_target = match (self.selected, &sel_info) {
             (Some(id), Some(info)) => scene
                 .place(id)
-                .map(|place| GizmoTarget::new(id.0, place.world, info)),
+                .map(|place| GizmoTarget::new(id.0, place.world, info, gizmo_view)),
             _ => None,
         };
         // One box per drawable item in the selection's subtree — a group shows
