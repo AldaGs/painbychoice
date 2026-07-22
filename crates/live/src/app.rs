@@ -2631,7 +2631,7 @@ impl App {
         // *before* the UI pass (the panel can't borrow `App`), the same way the
         // old panel's `GraphInfo::gather` did it. Taken here, before the `dock`
         // borrow below, because it's a `&self` method rather than a field read.
-        let ng_script_preview = self.script_preview(t).map(|(_, r)| r);
+        let ng_script_preview = self.script_preview(t);
         let dock = &mut self.dock;
         // Borrowed (not cloned) beside `dock`: disjoint fields, and the font
         // list is a few hundred strings we don't want to copy every frame.
