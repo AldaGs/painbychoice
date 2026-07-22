@@ -132,6 +132,21 @@ impl<'a> GraphCtx<'a> {
                 }
                 Some(Cow::Owned(specialized))
             }
+            // A `ref` is `out` read backwards — it *reads* a property instead of
+            // driving one — so its output socket follows the target the same way
+            // its sink counterpart's input does. Without this a ref on `position`
+            // handed a Vec2 down a Number-coloured wire, and the canvas would let
+            // it into a rotation.
+            "ref" => {
+                let Some((_, prop, _)) = node.config.ref_target else {
+                    return Some(Cow::Borrowed(desc));
+                };
+                let mut specialized = desc.clone();
+                if let Some(s) = specialized.outputs.first_mut() {
+                    s.ty = prop.socket_type();
+                }
+                Some(Cow::Owned(specialized))
+            }
             _ => Some(Cow::Borrowed(desc)),
         }
     }
@@ -471,6 +486,16 @@ impl NodeGraph {
     pub fn disconnect_input(&mut self, input: &Endpoint) -> bool {
         let before = self.edges.len();
         self.edges.retain(|e| &e.to != input);
+        self.edges.len() != before
+    }
+
+    /// Drop every wire *leaving* `output`, returning whether any did. The
+    /// mirror of [`Self::disconnect_input`] — an output can feed many inputs, so
+    /// retyping one (a `ref` node changing which property it reads) has to sweep
+    /// them all, not just the first.
+    pub fn disconnect_output(&mut self, output: &Endpoint) -> bool {
+        let before = self.edges.len();
+        self.edges.retain(|e| &e.from != output);
         self.edges.len() != before
     }
 
@@ -951,6 +976,37 @@ mod tests {
             g.connect(&ctx, Endpoint::new(osc, "value"), Endpoint::new(out, "value")),
             Err(ConnectError::TypeMismatch { .. }),
         ));
+    }
+
+    /// The mirror rule: a `ref`'s **output** socket is typed by the property it
+    /// reads, so a `position` read travels as a Vector and can't be dropped into
+    /// a rotation. Before this it handed every property down a Number wire.
+    #[test]
+    fn a_ref_nodes_socket_follows_the_property_it_reads() {
+        use crate::expr::PropPath;
+        use crate::node::NodeId;
+
+        let reg = reg();
+        let ctx = GraphCtx::bare(&reg);
+        let mut g = NodeGraph::new();
+        let r = g.add_node("ref", Vec2::ZERO);
+        // Untargeted: the bare descriptor's resting Number socket.
+        assert_eq!(ctx.descriptor_for(g.node(r).unwrap()).unwrap().outputs[0].ty, SocketType::Number);
+
+        g.node_mut(r).unwrap().config.ref_target = Some((NodeId(0), PropPath::Position, 0.0));
+        assert_eq!(ctx.descriptor_for(g.node(r).unwrap()).unwrap().outputs[0].ty, SocketType::Vector);
+
+        // A vector read into a scalar knob is now refused at the wire.
+        let osc = g.add_node("osc", Vec2::new(0.0, 60.0));
+        assert!(matches!(
+            g.connect(&ctx, Endpoint::new(r, "value"), Endpoint::new(osc, "freq")),
+            Err(ConnectError::TypeMismatch { .. }),
+        ));
+
+        // Reading a colour instead retypes again, and a `join` (Vector out) is
+        // still free to feed a Vector property.
+        g.node_mut(r).unwrap().config.ref_target = Some((NodeId(0), PropPath::Fill, 0.0));
+        assert_eq!(ctx.descriptor_for(g.node(r).unwrap()).unwrap().outputs[0].ty, SocketType::Color);
     }
 
     /// A driver exists only where an `out` node has *both* a target and a wire.

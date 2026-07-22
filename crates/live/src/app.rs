@@ -259,6 +259,31 @@ pub(crate) fn apply_fps_edit(
 /// elsewhere. An output that isn't a shape node's geometry lowers to `None` and
 /// is skipped, so a stale driver leaves the layer's own shape alone.
 ///
+/// Point a `ref` node at a property, sweeping any wire its output can no longer
+/// legally feed.
+///
+/// A ref's output socket is typed by the property it reads
+/// ([`motion_core::GraphCtx::descriptor_for`]), so moving it from `rotation` to
+/// `position` turns every wire leaving it into an edge the descriptor now says
+/// can't exist. Dropped here rather than left to rot — the same discipline
+/// `SetOutTarget` follows on its *input*, except a read can feed many inputs, so
+/// this sweeps them all. A same-kind move (Rotation → Opacity) keeps its wires.
+///
+/// A free fn, like [`compile_drivers`]: document work, testable without a window.
+pub(crate) fn retarget_ref(
+    graph: &mut motion_core::NodeGraph,
+    id: GraphNodeId,
+    target: Option<(NodeId, PropPath, f64)>,
+) {
+    let Some(n) = graph.node_mut(id) else { return };
+    let before = n.config.ref_target.map(|(_, p, _)| p);
+    n.config.ref_target = target;
+    let kind_of = |p: Option<PropPath>| p.map(|p| p.socket_type());
+    if kind_of(before) != kind_of(target.map(|(_, p, _)| p)) {
+        graph.disconnect_output(&Endpoint::new(id, "value"));
+    }
+}
+
 /// Lowering is frame-independent (it builds the recipe, it doesn't sample it),
 /// so this needn't know the frame.
 pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: CompId) {
@@ -855,11 +880,7 @@ impl App {
                     n.set_value(socket, value);
                 }
             }
-            NgOp::SetRef { id, target } => {
-                if let Some(n) = graph.node_mut(id) {
-                    n.config.ref_target = target;
-                }
-            }
+            NgOp::SetRef { id, target } => retarget_ref(graph, id, target),
             NgOp::SetParam { id, name } => {
                 if let Some(n) = graph.node_mut(id) {
                     n.config.param = name;

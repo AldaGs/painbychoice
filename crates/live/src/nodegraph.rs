@@ -318,22 +318,25 @@ fn config_lines(node: &GraphNode, desc: Option<&NodeDescriptor>) -> usize {
 }
 
 /// The screen-space centre of input socket `i` (from the left edge) or output
-/// socket `j` (from the right edge) of a box whose top-left is `origin`.
-fn socket_center(origin: egui::Pos2, index: usize, is_input: bool) -> egui::Pos2 {
-    let y = origin.y + HEADER_H + index as f32 * ROW_H + ROW_H / 2.0;
-    let x = if is_input { origin.x } else { origin.x + NODE_W };
+/// socket `j` (from the right edge) of a box whose **screen** top-left is
+/// `origin`. Row offsets are graph-space constants, so they scale.
+fn socket_center(view: &View, origin: egui::Pos2, index: usize, is_input: bool) -> egui::Pos2 {
+    let y = origin.y + view.s(HEADER_H + index as f32 * ROW_H + ROW_H / 2.0);
+    let x = if is_input { origin.x } else { origin.x + view.s(NODE_W) };
     egui::pos2(x, y)
 }
 
 /// A tidy S-curve from an output to an input, coloured by the wire's type.
-fn wire(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, color: egui::Color32) {
-    let dx = ((to.x - from.x).abs() * 0.5).max(36.0);
+/// Endpoints are already in screen space; the curve's reach and its thickness
+/// scale with the zoom so a zoomed-out graph doesn't turn into a ball of yarn.
+fn wire(painter: &egui::Painter, view: &View, from: egui::Pos2, to: egui::Pos2, color: egui::Color32) {
+    let dx = ((to.x - from.x).abs() * 0.5).max(view.s(36.0));
     let pts = [from, egui::pos2(from.x + dx, from.y), egui::pos2(to.x - dx, to.y), to];
     let shape = egui::epaint::CubicBezierShape::from_points_stroke(
         pts,
         false,
         egui::Color32::TRANSPARENT,
-        egui::Stroke::new(2.0, color),
+        egui::Stroke::new(view.s(2.0).max(1.0), color),
     );
     painter.add(shape);
 }
@@ -383,15 +386,29 @@ pub(crate) fn nodegraph_ui(
         // empty canvas with the middle mouse (or scroll) to pan; a left-drag
         // there rubber-bands a selection.
         ui.separator();
+        let area = read_canvas_rect(ui.ctx(), scope);
         if icon::button(ui, icon::ZOOM_OUT, "Zoom out").clicked() {
-            zoom_scene(ui.ctx(), scope, 1.25);
+            zoom_view(ui.ctx(), scope, 0.8, area);
         }
         if icon::button(ui, icon::ZOOM_IN, "Zoom in").clicked() {
-            zoom_scene(ui.ctx(), scope, 0.8);
+            zoom_view(ui.ctx(), scope, 1.25, area);
         }
         if icon::button(ui, icon::ZOOM_FIT, "Frame all nodes").clicked() {
-            // A zero rect makes `Scene` re-fit to the graph's own bounds.
-            write_scene_rect(ui.ctx(), scope, egui::Rect::ZERO);
+            // No view means "frame the graph on the next draw" — the same state
+            // the canvas starts in, so this is just forgetting where we were.
+            write_view(ui.ctx(), scope, None);
+        }
+        // The zoom readout doubles as a reset: back to 1:1 where text is at its
+        // designed size.
+        let z = read_view(ui.ctx(), scope).map_or(1.0, |v| v.zoom);
+        if ui
+            .button(format!("{:.0}%", z * 100.0))
+            .on_hover_text("Reset to 100%")
+            .clicked()
+        {
+            let mut v = read_view(ui.ctx(), scope).unwrap_or_default();
+            v.zoom_about(1.0 / v.zoom, area.center());
+            write_view(ui.ctx(), scope, Some(v));
         }
     });
     ui.separator();
@@ -1013,89 +1030,241 @@ fn text_editor(ui: &mut egui::Ui, node: &GraphNode, out: &mut NgEdits) {
 /// evaluates yet.
 fn palette_menu(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &mut NgEdits) {
     ui.menu_button(format!("{} Add", icon::ADD), |ui| {
-        for cat in NodeCategory::ALL {
-            let mut kinds = reg.by_category(cat).peekable();
-            if kinds.peek().is_none() {
-                continue;
-            }
-            let title = if cat.is_buildable_now() {
-                cat.label().to_string()
-            } else {
-                format!("{} (needs compositor)", cat.label())
-            };
-            ui.menu_button(title, |ui| {
-                for desc in kinds {
-                    if ui.button(&desc.label).clicked() {
-                        // Stagger fresh nodes so they don't stack exactly; the
-                        // user drags them where they want.
+        palette_items(ui, graph, reg, None, out);
+    });
+}
+
+/// The palette's contents, without the button that opens them — shared by the
+/// toolbar's Add menu and the canvas's right-click menu, so the two can't drift
+/// into offering different nodes.
+///
+/// `at` is where the new node lands, in graph space: the right-click's own
+/// position, so a node appears **where you asked for it**. `None` (the toolbar,
+/// which has no canvas position to speak of) keeps the old staggered corner
+/// placement.
+fn palette_items(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    reg: &NodeRegistry,
+    at: Option<Vec2>,
+    out: &mut NgEdits,
+) {
+    for cat in NodeCategory::ALL {
+        let mut kinds = reg.by_category(cat).peekable();
+        if kinds.peek().is_none() {
+            continue;
+        }
+        let title = if cat.is_buildable_now() {
+            cat.label().to_string()
+        } else {
+            format!("{} (needs compositor)", cat.label())
+        };
+        ui.menu_button(title, |ui| {
+            for desc in kinds {
+                if ui.button(&desc.label).clicked() {
+                    // Stagger fresh nodes so they don't stack exactly; the user
+                    // drags them where they want. Only when there's no asked-for
+                    // position — a right-click means *there*.
+                    let pos = at.unwrap_or_else(|| {
                         let n = graph.nodes.len() as f64;
                         let off = 28.0 * (n % 6.0);
-                        out.op = Some(NgOp::Add {
-                            kind: desc.id.clone(),
-                            pos: Vec2::new(40.0 + off, 40.0 + off),
-                        });
-                    }
+                        Vec2::new(40.0 + off, 40.0 + off)
+                    });
+                    out.op = Some(NgOp::Add { kind: desc.id.clone(), pos });
+                    ui.close();
                 }
-                // Making a shared module is the one palette entry that isn't a
-                // registered kind: it creates a *document* object as well as a
-                // node. It belongs here anyway — what you get is a `use` node
-                // linked to a fresh module, which is a node like any other, and
-                // "New module" being a button in a list somewhere else was the
-                // last reason that list existed.
-                if cat == NodeCategory::Module {
-                    ui.separator();
-                    if ui
-                        .button(format!("{} New module…", icon::ADD))
-                        .on_hover_text(
-                            "Create an empty shared module, link a node to it, and open its body.",
-                        )
-                        .clicked()
-                    {
-                        out.module_op = Some(NgModuleOp::New);
-                    }
+            }
+            // Making a shared module is the one palette entry that isn't a
+            // registered kind: it creates a *document* object as well as a
+            // node. It belongs here anyway — what you get is a `use` node
+            // linked to a fresh module, which is a node like any other, and
+            // "New module" being a button in a list somewhere else was the
+            // last reason that list existed.
+            if cat == NodeCategory::Module {
+                ui.separator();
+                if ui
+                    .button(format!("{} New module…", icon::ADD))
+                    .on_hover_text(
+                        "Create an empty shared module, link a node to it, and open its body.",
+                    )
+                    .clicked()
+                {
+                    out.module_op = Some(NgModuleOp::New);
+                    ui.close();
                 }
-            });
-        }
-    });
+            }
+        });
+    }
 }
 
 // ── Canvas navigation: pan, zoom, and multi-selection view state. ────────────
 //
-// The graph rides inside an [`egui::containers::Scene`] — egui's pan/zoom
-// container. It draws its contents in a transformed layer, so the node boxes and
-// the real egui widgets on them (a `value`'s field, a combo) pan and scale as
-// one, with pointer input mapped back for interaction. `Scene` owns a
-// `scene_rect` — the slice of graph space the view shows — which we persist in
-// egui memory, keyed by scope so the project graph and a module's body keep
-// independent views.
+// The graph used to ride inside an [`egui::containers::Scene`], egui's pan/zoom
+// container. That draws into a *transformed layer*: egui lays the contents out
+// at 1× and scales the finished shapes afterwards. Vector shapes survive that
+// (they're re-tessellated from transformed geometry) but **text does not** — a
+// galley is rasterized at its layout size and then stretched, so every label,
+// field and icon went soft the moment you zoomed past 1:1. egui's own `Scene`
+// caps its zoom range at 1.0 for exactly this reason; we had raised it to 2.0.
+//
+// So the canvas now owns its zoom instead: [`View`] maps graph space to screen
+// space, every geometry constant is scaled through `View::s`, every font through
+// `View::font`, and the in-node widget `Ui`s get a style scaled by
+// [`View::scale_style`]. Nothing is laid out at 1× and stretched — text is laid
+// out at the size it is drawn, so it is crisp at any zoom.
+//
+// The cost is that scaling is no longer free: it has to be threaded through the
+// drawing code. That is the whole difference between "zoom" and "magnify".
 
-/// The memory id holding a scope's `scene_rect` — the view rectangle `Scene`
-/// pans and zooms. Per scope, so entering a module doesn't inherit the project
-/// graph's framing.
-fn scene_rect_id(scope: NgScope) -> egui::Id {
+/// How graph space maps to the screen: a uniform scale about the origin, then a
+/// translation. Held per scope in egui memory (see [`read_view`]) so entering a
+/// module doesn't inherit the project graph's framing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct View {
+    /// Screen pixels per graph unit. 1.0 is 1:1.
+    pub zoom: f32,
+    /// Where graph-space origin lands on screen (absolute, not relative to the
+    /// canvas rect — so a panel resize doesn't shift the graph under the mouse).
+    pub pan: egui::Vec2,
+}
+
+/// Zoom limits. The upper one can afford to be generous now that zooming in
+/// costs sharpness nothing — it's there to stop a stray pinch losing the graph.
+const MIN_ZOOM: f32 = 0.15;
+const MAX_ZOOM: f32 = 4.0;
+
+impl Default for View {
+    fn default() -> Self {
+        Self { zoom: 1.0, pan: egui::Vec2::ZERO }
+    }
+}
+
+impl View {
+    pub(crate) fn to_screen(self, p: egui::Pos2) -> egui::Pos2 {
+        (p.to_vec2() * self.zoom + self.pan).to_pos2()
+    }
+
+    pub(crate) fn to_graph(self, p: egui::Pos2) -> egui::Pos2 {
+        ((p.to_vec2() - self.pan) / self.zoom).to_pos2()
+    }
+
+    /// A length in graph units, in screen pixels. Every padding, radius and row
+    /// height goes through this — a constant that doesn't is a constant that
+    /// won't zoom.
+    pub(crate) fn s(&self, len: f32) -> f32 {
+        len * self.zoom
+    }
+
+    /// A font at its **on-screen** size, which is what makes zoomed text sharp:
+    /// egui rasterizes the glyphs at this size instead of stretching them.
+    fn font(&self, size: f32) -> egui::FontId {
+        egui::FontId::proportional(self.s(size))
+    }
+
+    /// Scale a `Ui`'s text and spacing, for the real egui widgets drawn on a
+    /// node (a combo, a drag field, the script editor). Without this they'd lay
+    /// out at 1× inside a scaled box and spill out of it.
+    fn scale_style(&self, ui: &mut egui::Ui) {
+        let z = self.zoom;
+        let style = ui.style_mut();
+        for (_, f) in style.text_styles.iter_mut() {
+            f.size *= z;
+        }
+        let sp = &mut style.spacing;
+        sp.item_spacing *= z;
+        sp.button_padding *= z;
+        sp.interact_size *= z;
+        sp.icon_width *= z;
+        sp.icon_width_inner *= z;
+        sp.icon_spacing *= z;
+        sp.indent *= z;
+        sp.combo_width *= z;
+        sp.text_edit_width *= z;
+        sp.slider_width *= z;
+    }
+
+    /// Zoom by `factor`, keeping the graph point under `anchor` (a screen
+    /// position) where it is — the wheel-over-cursor gesture, and the toolbar
+    /// buttons with the canvas centre as the anchor.
+    pub(crate) fn zoom_about(&mut self, factor: f32, anchor: egui::Pos2) {
+        let next = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let applied = next / self.zoom;
+        // pan' = anchor - (anchor - pan) * applied — algebra of "this screen
+        // point maps to the same graph point before and after".
+        self.pan = anchor.to_vec2() - (anchor.to_vec2() - self.pan) * applied;
+        self.zoom = next;
+    }
+}
+
+/// The view that frames `bounds` (graph space) inside `area` (screen space),
+/// with a margin, never zooming past 1:1 — "frame all" on a two-node graph
+/// should show two normal-sized nodes, not two billboards.
+///
+/// A free function so the framing is unit-testable without a window.
+pub(crate) fn fit_view(bounds: egui::Rect, area: egui::Rect) -> View {
+    const MARGIN: f32 = 24.0;
+    let inner = area.shrink(MARGIN);
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 || inner.width() <= 0.0 {
+        return View::default();
+    }
+    let zoom = (inner.width() / bounds.width())
+        .min(inner.height() / bounds.height())
+        .clamp(MIN_ZOOM, 1.0);
+    // Centre the scaled bounds in the area.
+    let pan = area.center().to_vec2() - bounds.center().to_vec2() * zoom;
+    View { zoom, pan }
+}
+
+/// The rectangle every node in the graph fits inside, in graph space — what
+/// "frame all" frames. `None` for an empty graph, which has nothing to frame.
+pub(crate) fn graph_bounds(graph: &NodeGraph, ctx: &GraphCtx) -> Option<egui::Rect> {
+    graph
+        .nodes
+        .iter()
+        .map(|n| {
+            let h = node_height(n, ctx.descriptor_for(n).as_deref());
+            egui::Rect::from_min_size(
+                egui::pos2(n.pos.x as f32, n.pos.y as f32),
+                egui::vec2(NODE_W, h),
+            )
+        })
+        .reduce(|a, b| a.union(b))
+}
+
+/// The memory id holding a scope's [`View`]. Per scope, so entering a module
+/// doesn't inherit the project graph's framing.
+fn view_id(scope: NgScope) -> egui::Id {
     match scope {
-        NgScope::Project => egui::Id::new("ng_scene_rect_project"),
-        NgScope::Module(m) => egui::Id::new(("ng_scene_rect_mod", m.0)),
+        NgScope::Project => egui::Id::new("ng_view_project"),
+        NgScope::Module(m) => egui::Id::new(("ng_view_mod", m.0)),
     }
 }
 
-fn read_scene_rect(ctx: &egui::Context, scope: NgScope) -> egui::Rect {
-    ctx.data(|d| d.get_temp(scene_rect_id(scope))).unwrap_or(egui::Rect::ZERO)
+/// A scope's view, or `None` if it has never been framed — the state "frame all
+/// on first sight" is drawn from, so a saved graph opens showing its nodes
+/// rather than wherever the origin happens to be.
+fn read_view(ctx: &egui::Context, scope: NgScope) -> Option<View> {
+    ctx.data(|d| d.get_temp::<Option<View>>(view_id(scope))).flatten()
 }
 
-fn write_scene_rect(ctx: &egui::Context, scope: NgScope, rect: egui::Rect) {
-    ctx.data_mut(|d| d.insert_temp(scene_rect_id(scope), rect));
+fn write_view(ctx: &egui::Context, scope: NgScope, view: Option<View>) {
+    ctx.data_mut(|d| d.insert_temp(view_id(scope), view));
 }
 
-/// Scale the view about its centre — the toolbar's zoom buttons. `factor < 1`
-/// shrinks the shown rectangle (zoom **in**); `> 1` grows it (zoom **out**). A
-/// zero rect is the uninitialised state `Scene` re-fits from, so it's left be.
-fn zoom_scene(ctx: &egui::Context, scope: NgScope, factor: f32) {
-    let r = read_scene_rect(ctx, scope);
-    if r.size() == egui::Vec2::ZERO {
-        return;
-    }
-    write_scene_rect(ctx, scope, egui::Rect::from_center_size(r.center(), r.size() * factor));
+/// Zoom the canvas about its centre — the toolbar's buttons. `factor > 1` zooms
+/// **in**. A never-framed view is left alone: it re-fits on the next draw, and
+/// zooming a framing that doesn't exist yet has nothing to be about.
+fn zoom_view(ctx: &egui::Context, scope: NgScope, factor: f32, area: egui::Rect) {
+    let Some(mut v) = read_view(ctx, scope) else { return };
+    v.zoom_about(factor, area.center());
+    write_view(ctx, scope, Some(v));
+}
+
+/// The canvas rect, remembered from the last draw so the toolbar (drawn *before*
+/// the canvas) can zoom about its centre. One frame stale by construction —
+/// exactly like the preview panel's canvas rect, and for the same reason.
+fn read_canvas_rect(ctx: &egui::Context, scope: NgScope) -> egui::Rect {
+    ctx.data(|d| d.get_temp(view_id(scope).with("rect"))).unwrap_or(egui::Rect::ZERO)
 }
 
 /// The marquee/multi-selection set — every node the box-select or a click chose.
@@ -1128,10 +1297,12 @@ pub(crate) fn nodes_in_rect(graph: &NodeGraph, ctx: &GraphCtx, sel: egui::Rect) 
         .collect()
 }
 
-/// The pan/zoom host. Wraps [`draw_graph`] in a [`Scene`], then resolves a
-/// marquee drag against the background the scene reports.
+/// The pan/zoom host. Owns the [`View`], resolves navigation input against the
+/// empty background, then draws the graph through it.
 ///
-/// [`Scene`]: egui::containers::Scene
+/// The background is allocated **first** so every node widget drawn afterwards
+/// takes pointer priority over it: a drag that lands on a field is that field's,
+/// and only a drag on genuinely empty canvas reaches the marquee.
 #[allow(clippy::too_many_arguments)]
 fn canvas(
     ui: &mut egui::Ui,
@@ -1143,28 +1314,82 @@ fn canvas(
     script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     out: &mut NgEdits,
 ) {
-    let mut scene_rect = read_scene_rect(ui.ctx(), scope);
     let mut selset = read_selset(ui.ctx());
+    // `available_rect_before_wrap`, not `max_rect`: egui shrinks a Ui's
+    // *available* region for the panels already shown above, but leaves
+    // `max_rect` at the full window — the same trap the preview canvas hit.
+    let area = ui.available_rect_before_wrap();
+    ui.ctx().data_mut(|d| d.insert_temp(view_id(scope).with("rect"), area));
 
-    // Middle-drag (and scroll) pans; pinch / ctrl-scroll zooms. Left-drag is left
-    // free — a node header claims it to move, and the empty background reports it
-    // for the marquee below.
-    let scene = egui::containers::Scene::new()
-        .zoom_range(egui::Rangef::new(0.2, 2.0))
-        // Room for a large graph; the boxes are placed by explicit rects, so this
-        // only bounds the inner ui's nominal size, not where nodes may sit.
-        .max_inner_size(egui::Vec2::splat(100_000.0))
-        .drag_pan_buttons(egui::containers::DragPanButtons::MIDDLE);
-
-    let response = scene.show(ui, &mut scene_rect, |ui| {
-        draw_graph(ui, graph, ctx, layers, modules, script_preview, &mut selset, out)
+    // Never framed (first sight, or "frame all"): fit the graph now that the
+    // canvas rect is known. An empty graph gets the identity view — there is
+    // nothing to frame, and a fit of nothing would be an arbitrary zoom.
+    let mut view = read_view(ui.ctx(), scope).unwrap_or_else(|| {
+        graph_bounds(graph, ctx).map_or_else(View::default, |b| fit_view(b, area))
     });
-    let scene_layer = response.inner;
 
-    marquee(ui, &response.response, scene_layer, graph, ctx, &mut selset);
+    // `allocate_rect`, not `interact`: the canvas must also *claim* the space,
+    // or the panel Ui thinks the graph is a few pixels tall.
+    let bg = ui.allocate_rect(area, egui::Sense::click_and_drag());
+    // Middle-drag pans. Left-drag is left free: a node header claims it to move,
+    // and on empty canvas it becomes the marquee below.
+    if bg.dragged_by(egui::PointerButton::Middle) {
+        view.pan += bg.drag_delta();
+    }
+    if let Some(ptr) = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p)) {
+        let (scroll, zoom_delta, ctrl) =
+            ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.ctrl));
+        // Pinch / ctrl-scroll zooms about the cursor; a plain wheel pans, which
+        // is what it did under `Scene`.
+        if zoom_delta != 1.0 {
+            view.zoom_about(zoom_delta, ptr);
+        } else if ctrl && scroll.y != 0.0 {
+            view.zoom_about(1.0 + scroll.y * 0.01, ptr);
+        } else if scroll != egui::Vec2::ZERO {
+            view.pan += scroll;
+        }
+    }
+
+    // Clipped to the canvas rect, so a node panned past the edge is cut off at
+    // the panel boundary instead of drawing over the neighbouring panels.
+    let builder = egui::UiBuilder::new().max_rect(area).id_salt(("ng_canvas", scope_salt(scope)));
+    ui.scope_builder(builder, |ui| {
+        ui.set_clip_rect(area.intersect(ui.clip_rect()));
+        draw_graph(ui, graph, ctx, &view, layers, modules, script_preview, &mut selset, out);
+    });
+
+    marquee(ui, &bg, &view, graph, ctx, &mut selset);
+
+    // Right-click the canvas for the palette, placing the node **where you
+    // clicked** — the gesture every node editor has, and the reason `Add` needed
+    // a position at all.
+    //
+    // The position is captured when the menu *opens*: by the time an entry is
+    // clicked the pointer is over the menu, so reading it then would drop every
+    // node under the menu instead of under the click.
+    let at_id = view_id(scope).with("menu_at");
+    if bg.secondary_clicked() {
+        if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+            ui.ctx().data_mut(|d| d.insert_temp(at_id, view.to_graph(p)));
+        }
+    }
+    bg.context_menu(|ui| {
+        let at: egui::Pos2 = ui.ctx().data(|d| d.get_temp(at_id)).unwrap_or_default();
+        palette_items(ui, graph, ctx.reg, Some(Vec2::new(at.x as f64, at.y as f64)), out);
+    });
 
     write_selset(ui.ctx(), selset);
-    write_scene_rect(ui.ctx(), scope, scene_rect);
+    write_view(ui.ctx(), scope, Some(view));
+}
+
+/// A stable per-scope discriminant for egui ids — two scopes must not share a
+/// background or canvas id, or switching between them would inherit the other's
+/// drag state.
+fn scope_salt(scope: NgScope) -> u64 {
+    match scope {
+        NgScope::Project => 0,
+        NgScope::Module(m) => m.0 + 1,
+    }
 }
 
 /// Resolve a **marquee**: a left-drag that began on the empty canvas (a node
@@ -1172,21 +1397,18 @@ fn canvas(
 /// empty-space drags). Draws the rubber band and, on release, selects every node
 /// it covers. A plain click on the background clears the selection.
 ///
-/// `pan` is the scene's background response; its layer carries the view
-/// transform, so we map the global pointer into graph space with it rather than
-/// trusting a single coordinate space.
+/// `pan` is the background response. The band is tracked in **graph** space, so
+/// it stays over the same nodes if the view moves mid-drag, and painted back
+/// through the view.
 fn marquee(
     ui: &mut egui::Ui,
     pan: &egui::Response,
-    scene_layer: egui::LayerId,
+    view: &View,
     graph: &NodeGraph,
     ctx: &GraphCtx,
     selset: &mut std::collections::HashSet<GraphNodeId>,
 ) {
-    let to_global =
-        ui.ctx().layer_transform_to_global(scene_layer).unwrap_or(egui::emath::TSTransform::IDENTITY);
-    let from_global = to_global.inverse();
-    let ptr_scene = ui.input(|i| i.pointer.interact_pos()).map(|p| from_global.mul_pos(p));
+    let ptr_scene = ui.input(|i| i.pointer.interact_pos()).map(|p| view.to_graph(p));
     let shift = ui.input(|i| i.modifiers.shift);
 
     let mid = egui::Id::new("ng_marquee");
@@ -1202,9 +1424,8 @@ fn marquee(
     }
     if pan.dragged_by(egui::PointerButton::Primary) {
         if let (Some(a), Some(c)) = (anchor, ptr_scene) {
-            // Painted in graph space *inside* the scene layer so it pans/zooms
-            // with the nodes; mapped to global for the parent-layer painter.
-            let r = egui::Rect::from_two_pos(to_global.mul_pos(a), to_global.mul_pos(c));
+            // Held in graph space so it tracks the nodes, drawn through the view.
+            let r = egui::Rect::from_two_pos(view.to_screen(a), view.to_screen(c));
             ui.painter().rect(
                 r,
                 0.0,
@@ -1231,33 +1452,26 @@ fn marquee(
     ui.data_mut(|d| d.insert_temp(mid, anchor));
 }
 
-/// Lay the graph out and interact with it, in **graph coordinates** (the `Scene`
-/// layer maps them to the screen). Node positions come from the model (they're
-/// saved), so a drag emits a `Move` — or a `MoveBy` for a whole selection — and,
+/// Lay the graph out and interact with it, in **screen coordinates** mapped
+/// through `view`. Node positions come from the model (they're saved, in graph
+/// space), so a drag emits a `Move` — or a `MoveBy` for a whole selection — and,
 /// for the frame in hand, the delta is applied locally so the box tracks the
-/// pointer without a lag. Returns the layer it drew into, so the caller can map
-/// the pointer for the marquee.
+/// pointer without a lag. A drag delta arrives in screen pixels and is divided
+/// by the zoom on its way back into the model.
 #[allow(clippy::too_many_arguments)]
 fn draw_graph(
     ui: &mut egui::Ui,
     graph: &NodeGraph,
     ctx: &GraphCtx,
+    view: &View,
     layers: &[LayerInfo],
     modules: &[(ModuleId, String)],
     script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     selset: &mut std::collections::HashSet<GraphNodeId>,
     out: &mut NgEdits,
-) -> egui::LayerId {
-    // Graph space is the model's own space now — no screen origin to add, since
-    // the scene layer's transform places and scales everything.
-    let origin = egui::Pos2::ZERO;
-
+) {
     // Pending wire (an in-flight connection drag): ephemeral view state in egui
-    // memory. The pointer arrives in global space, so map it into graph space
-    // with this layer's transform for every hit test.
-    let layer = ui.layer_id();
-    let from_global = ui.ctx().layer_transform_from_global(layer);
-    let map_ptr = |p: egui::Pos2| from_global.map_or(p, |t| t.mul_pos(p));
+    // memory. Everything here is screen space, so the pointer needs no mapping.
     let pending_id = egui::Id::new("ng_pending");
     let mut pending: Option<Endpoint> = ui.data(|d| d.get_temp(pending_id)).flatten();
 
@@ -1270,12 +1484,12 @@ fn draw_graph(
     // loop so nodes processed later still move this frame.
     let mut group_delta: Option<egui::Vec2> = None;
     for n in &graph.nodes {
-        let base = origin + egui::vec2(n.pos.x as f32, n.pos.y as f32);
-        let h = node_height(n, ctx.descriptor_for(n).as_deref());
-        let rect = egui::Rect::from_min_size(base, egui::vec2(NODE_W, h));
+        let base = view.to_screen(egui::pos2(n.pos.x as f32, n.pos.y as f32));
+        let h = view.s(node_height(n, ctx.descriptor_for(n).as_deref()));
+        let rect = egui::Rect::from_min_size(base, egui::vec2(view.s(NODE_W), h));
         // The header bar is the drag handle (like Blender); sockets sit below it
         // and take pointer priority in their own spots.
-        let header = egui::Rect::from_min_size(rect.min, egui::vec2(NODE_W, HEADER_H));
+        let header = egui::Rect::from_min_size(rect.min, egui::vec2(view.s(NODE_W), view.s(HEADER_H)));
         let resp =
             ui.interact(header, ui.id().with(("ng_drag", n.id.0)), egui::Sense::click_and_drag());
         // A click (no drag) selects just this node.
@@ -1287,12 +1501,14 @@ fn draw_graph(
         let mut pos = base;
         if resp.dragged_by(egui::PointerButton::Primary) {
             let delta = resp.drag_delta();
+            // The model is in graph units; the pointer moved in screen pixels.
+            let model_delta = delta / view.zoom;
             if selset.contains(&n.id) && selset.len() > 1 {
                 // Dragging one of many selected moves them all, as one op.
                 group_delta = Some(delta);
                 out.op = Some(NgOp::MoveBy {
                     ids: selset.iter().copied().collect(),
-                    delta: Vec2::new(delta.x as f64, delta.y as f64),
+                    delta: Vec2::new(model_delta.x as f64, model_delta.y as f64),
                 });
             } else {
                 // Dragging a lone (or unselected) node selects and moves it.
@@ -1302,8 +1518,9 @@ fn draw_graph(
                     write_selection(ui.ctx(), Some(n.id));
                 }
                 pos += delta;
+                let model = view.to_graph(pos);
                 out.op =
-                    Some(NgOp::Move { id: n.id, pos: Vec2::new(pos.x as f64, pos.y as f64) });
+                    Some(NgOp::Move { id: n.id, pos: Vec2::new(model.x as f64, model.y as f64) });
             }
         }
         live_pos.insert(n.id, pos);
@@ -1325,10 +1542,10 @@ fn draw_graph(
         let Some(desc) = ctx.descriptor_for(n) else { continue };
         let top = live_pos[&n.id];
         for (i, s) in desc.inputs.iter().enumerate() {
-            in_pos.insert(Endpoint::new(n.id, &s.id), socket_center(top, i, true));
+            in_pos.insert(Endpoint::new(n.id, &s.id), socket_center(view, top, i, true));
         }
         for (j, s) in desc.outputs.iter().enumerate() {
-            out_pos.insert(Endpoint::new(n.id, &s.id), socket_center(top, j, false));
+            out_pos.insert(Endpoint::new(n.id, &s.id), socket_center(view, top, j, false));
         }
     }
 
@@ -1342,7 +1559,7 @@ fn draw_graph(
                 .and_then(|n| ctx.descriptor_for(n))
                 .and_then(|d| d.find_output(&e.from.socket).map(|s| s.ty));
             let c = ty.map_or(egui::Color32::GRAY, |t| col32(t.color()));
-            wire(&painter, a, b, c);
+            wire(&painter, view, a, b, c);
         }
     }
 
@@ -1351,16 +1568,13 @@ fn draw_graph(
     for n in &graph.nodes {
         let top = live_pos[&n.id];
         let desc = ctx.descriptor_for(n);
-        let h = node_height(n, desc.as_deref());
-        let rect = egui::Rect::from_min_size(top, egui::vec2(NODE_W, h));
+        let h = view.s(node_height(n, desc.as_deref()));
+        let rect = egui::Rect::from_min_size(top, egui::vec2(view.s(NODE_W), h));
         let is_sel = selset.contains(&n.id);
         draw_node(
-            ui, &painter, n, desc.as_deref(), rect, is_sel, graph, layers, modules,
+            ui, &painter, view, n, desc.as_deref(), rect, is_sel, graph, layers, modules,
             script_preview, out, &mut pending, &in_pos, &out_pos,
         );
-        // The boxes are painted, not allocated, so tell the ui they're there —
-        // otherwise `Scene`'s "frame all" and its initial fit see an empty graph.
-        ui.expand_to_include_rect(rect);
     }
 
     // A pending wire follows the pointer until it's dropped.
@@ -1368,7 +1582,7 @@ fn draw_graph(
         if let (Some(&from), Some(ptr)) =
             (out_pos.get(src), ui.input(|i| i.pointer.interact_pos()))
         {
-            wire(&painter, from, map_ptr(ptr), egui::Color32::from_gray(200));
+            wire(&painter, view, from, ptr, egui::Color32::from_gray(200));
         }
     }
 
@@ -1379,8 +1593,10 @@ fn draw_graph(
     let released = ui.input(|i| i.pointer.any_released());
     if released {
         if let Some(src) = pending.take() {
-            if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()).map(map_ptr) {
-                if let Some((ep, _)) = in_pos.iter().find(|(_, &p)| p.distance(ptr) <= DOT_HIT) {
+            if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()) {
+                // The drop tolerance is a screen distance, so it scales too — a
+                // zoomed-out socket is a smaller target, as it looks.
+                if let Some((ep, _)) = in_pos.iter().find(|(_, &p)| p.distance(ptr) <= view.s(DOT_HIT)) {
                     out.op = Some(NgOp::Connect { from: src, to: ep.clone() });
                 }
             }
@@ -1388,7 +1604,6 @@ fn draw_graph(
     }
 
     ui.data_mut(|d| d.insert_temp(pending_id, pending));
-    layer
 }
 
 /// Draw one node box and interact with its header button and sockets.
@@ -1396,6 +1611,7 @@ fn draw_graph(
 fn draw_node(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
+    view: &View,
     node: &GraphNode,
     desc: Option<&NodeDescriptor>,
     rect: egui::Rect,
@@ -1409,7 +1625,7 @@ fn draw_node(
     in_pos: &std::collections::HashMap<Endpoint, egui::Pos2>,
     out_pos: &std::collections::HashMap<Endpoint, egui::Pos2>,
 ) {
-    let rounding = 6.0;
+    let rounding = view.s(6.0);
     let bg = ui.visuals().extreme_bg_color;
     // The body fill and the border are painted **last**, once the in-node config
     // below has reported how tall the node really is — so the box grows to fit a
@@ -1417,7 +1633,7 @@ fn draw_node(
     // header, border in front of it) and filled in at the end via `paint_box`.
     let body_idx = painter.add(egui::Shape::Noop);
     // Header band, tinted by category (or red for an unknown kind).
-    let header = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), HEADER_H));
+    let header = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), view.s(HEADER_H)));
     let tint = desc.map_or(egui::Color32::from_rgb(120, 52, 52), |d| category_tint(d.category));
     painter.rect_filled(header, rounding, tint);
     // A flat lower edge under the rounded header so it reads as a band.
@@ -1427,7 +1643,7 @@ fn draw_node(
         tint,
     );
     let border_stroke = if selected {
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 160, 60))
+        egui::Stroke::new(view.s(2.0).max(1.0), egui::Color32::from_rgb(220, 160, 60))
     } else {
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
@@ -1446,15 +1662,15 @@ fn draw_node(
     // Title, and a delete button at the header's right.
     let title = node_title(node, desc, layers);
     painter.text(
-        egui::pos2(header.min.x + 8.0, header.center().y),
+        egui::pos2(header.min.x + view.s(8.0), header.center().y),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::proportional(13.0),
+        view.font(13.0),
         egui::Color32::from_gray(235),
     );
     let del = egui::Rect::from_center_size(
-        egui::pos2(header.max.x - 12.0, header.center().y),
-        egui::vec2(16.0, 16.0),
+        egui::pos2(header.max.x - view.s(12.0), header.center().y),
+        egui::Vec2::splat(view.s(16.0)),
     );
     let del_resp = ui.interact(del, ui.id().with(("ng_del", node.id.0)), egui::Sense::click());
     let del_col = if del_resp.hovered() { egui::Color32::from_gray(255) } else { egui::Color32::from_gray(200) };
@@ -1465,7 +1681,7 @@ fn draw_node(
         del.center(),
         egui::Align2::CENTER_CENTER,
         icon::CLOSE,
-        egui::FontId::new(12.0, egui::FontFamily::Name(icon::FAMILY.into())),
+        egui::FontId::new(view.s(12.0), egui::FontFamily::Name(icon::FAMILY.into())),
         del_col,
     );
     if del_resp.clicked() {
@@ -1486,23 +1702,23 @@ fn draw_node(
         let ep = Endpoint::new(node.id, &s.id);
         let c = in_pos[&ep];
         let connected = graph.incoming(&ep).is_some();
-        socket_dot(painter, c, s.ty, connected);
+        socket_dot(painter, view, c, s.ty, connected);
         painter.text(
-            egui::pos2(c.x + DOT_R + 5.0, c.y),
+            egui::pos2(c.x + view.s(DOT_R + 5.0), c.y),
             egui::Align2::LEFT_CENTER,
             &s.label,
-            egui::FontId::proportional(11.0),
+            view.font(11.0),
             egui::Color32::from_gray(190),
         );
         if let Some(cur) = row_literal(graph, node, s, true) {
-            let row = field_rect(rect, c, true);
-            if let Some(v) = socket_field(ui, row, (node.id.0, s.id.as_str()), cur) {
+            let row = field_rect(view, rect, c, true);
+            if let Some(v) = socket_field(ui, view, row, (node.id.0, s.id.as_str()), cur) {
                 out.op = Some(NgOp::SetValue { id: node.id, socket: s.id.clone(), value: v });
             }
         }
         // After the field, so the socket's own hit area wins where they touch:
         // dropping a wire on a dot must not be swallowed by a drag field.
-        let hit = egui::Rect::from_center_size(c, egui::vec2(DOT_HIT * 2.0, DOT_HIT * 2.0));
+        let hit = egui::Rect::from_center_size(c, egui::Vec2::splat(view.s(DOT_HIT) * 2.0));
         let resp = ui.interact(hit, ui.id().with(("ng_in", node.id.0, i)), egui::Sense::click());
         if resp.secondary_clicked() {
             if let Some(edge) = graph.incoming(&ep) {
@@ -1516,21 +1732,21 @@ fn draw_node(
     for (j, s) in desc.outputs.iter().enumerate() {
         let ep = Endpoint::new(node.id, &s.id);
         let c = out_pos[&ep];
-        socket_dot(painter, c, s.ty, false);
+        socket_dot(painter, view, c, s.ty, false);
         painter.text(
-            egui::pos2(c.x - DOT_R - 5.0, c.y),
+            egui::pos2(c.x - view.s(DOT_R + 5.0), c.y),
             egui::Align2::RIGHT_CENTER,
             &s.label,
-            egui::FontId::proportional(11.0),
+            view.font(11.0),
             egui::Color32::from_gray(190),
         );
         if let Some(cur) = row_literal(graph, node, s, false) {
-            let row = field_rect(rect, c, false);
-            if let Some(v) = socket_field(ui, row, (node.id.0, s.id.as_str()), cur) {
+            let row = field_rect(view, rect, c, false);
+            if let Some(v) = socket_field(ui, view, row, (node.id.0, s.id.as_str()), cur) {
                 out.op = Some(NgOp::SetValue { id: node.id, socket: s.id.clone(), value: v });
             }
         }
-        let hit = egui::Rect::from_center_size(c, egui::vec2(DOT_HIT * 2.0, DOT_HIT * 2.0));
+        let hit = egui::Rect::from_center_size(c, egui::Vec2::splat(view.s(DOT_HIT) * 2.0));
         let resp = ui.interact(hit, ui.id().with(("ng_out", node.id.0, j)), egui::Sense::drag());
         if resp.drag_started() {
             *pending = Some(ep);
@@ -1541,19 +1757,23 @@ fn draw_node(
     // box is then painted to fit whatever they measured to, so a `ref`'s combos
     // or a script's editor are never clipped.
     let rows = desc.inputs.len().max(desc.outputs.len()).max(1);
-    let sockets_bottom = rect.top() + HEADER_H + rows as f32 * ROW_H;
+    let sockets_bottom = rect.top() + view.s(HEADER_H + rows as f32 * ROW_H);
     let mut content_bottom = sockets_bottom;
     if config_lines(node, Some(desc)) > 0 {
         let cfg_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + BODY_PAD, sockets_bottom + CFG_TOP_GAP),
-            egui::pos2(rect.right() - BODY_PAD, sockets_bottom + CFG_TOP_GAP + 600.0),
+            egui::pos2(rect.left() + view.s(BODY_PAD), sockets_bottom + view.s(CFG_TOP_GAP)),
+            egui::pos2(rect.right() - view.s(BODY_PAD), sockets_bottom + view.s(CFG_TOP_GAP + 600.0)),
         );
         let builder = egui::UiBuilder::new()
             .max_rect(cfg_rect)
             .id_salt(("ng_cfg", node.id.0))
             .layout(egui::Layout::top_down(egui::Align::Min));
         let used = ui.scope_builder(builder, |ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
+            // The editors are ordinary egui widgets, so the *style* carries the
+            // zoom for them — laid out at the size they're drawn, which is what
+            // keeps their text sharp.
+            view.scale_style(ui);
+            ui.spacing_mut().item_spacing.y = view.s(3.0);
             node_editors(ui, graph, node, desc, layers, modules, script_preview, out);
             ui.min_rect()
         });
@@ -1561,7 +1781,7 @@ fn draw_node(
     }
     paint_box(egui::Rect::from_min_max(
         rect.min,
-        egui::pos2(rect.right(), content_bottom + BODY_PAD),
+        egui::pos2(rect.right(), content_bottom + view.s(BODY_PAD)),
     ));
 }
 
@@ -1573,15 +1793,16 @@ fn draw_node(
 /// at the same x and a node reads as a column of values rather than a ragged
 /// edge. A label longer than the column is clipped by the painter, which is the
 /// same thing that happened before there were fields.
-fn field_rect(node: egui::Rect, socket: egui::Pos2, is_input: bool) -> egui::Rect {
+fn field_rect(view: &View, node: egui::Rect, socket: egui::Pos2, is_input: bool) -> egui::Rect {
     let (x0, x1) = if is_input {
-        (socket.x + DOT_R + 5.0 + LABEL_W, node.right() - FIELD_PAD)
+        (socket.x + view.s(DOT_R + 5.0 + LABEL_W), node.right() - view.s(FIELD_PAD))
     } else {
-        (node.left() + FIELD_PAD, socket.x - DOT_R - 5.0 - LABEL_W)
+        (node.left() + view.s(FIELD_PAD), socket.x - view.s(DOT_R + 5.0 + LABEL_W))
     };
+    let half = view.s(FIELD_H) / 2.0;
     egui::Rect::from_min_max(
-        egui::pos2(x0, socket.y - FIELD_H / 2.0),
-        egui::pos2(x1.max(x0), socket.y + FIELD_H / 2.0),
+        egui::pos2(x0, socket.y - half),
+        egui::pos2(x1.max(x0), socket.y + half),
     )
 }
 
@@ -1753,6 +1974,14 @@ fn node_title(node: &GraphNode, desc: Option<&NodeDescriptor>, layers: &[LayerIn
             .map(|l| l.name.clone())
             .unwrap_or_else(|| format!("#{}", t.0))
     };
+    // A configured ref reads as the mirror of its sink: `boxA → Position`
+    // against the out node's `Position → boxA`, arrow pointing the way the
+    // value travels in both cases.
+    if node.kind == "ref" {
+        if let Some((t, p, _)) = node.config.ref_target {
+            return format!("{} → {}", layer_name(t), prop_path_label(p));
+        }
+    }
     match (node.kind.as_str(), node.config.out_target, node.config.out_shape) {
         ("out", Some((t, p)), _) => format!("{} → {}", prop_path_label(p), layer_name(t)),
         ("shapeOut", _, Some(t)) => format!("Shape → {}", layer_name(t)),
@@ -1873,6 +2102,7 @@ pub(crate) fn row_literal(
 /// sink's property — which is a much clearer remit than "some of the values".
 fn socket_field(
     ui: &mut egui::Ui,
+    view: &View,
     row: egui::Rect,
     salt: (u64, &str),
     cur: ExprValue,
@@ -1884,9 +2114,12 @@ fn socket_field(
         .id_salt(salt)
         .layout(egui::Layout::left_to_right(egui::Align::Center));
     ui.scope_builder(builder, |ui| {
+        // Text and padding scale with the zoom; the row's own height already
+        // does, since its rect came through the view.
+        view.scale_style(ui);
         // No spacing worth the name at this size, and no visible frame gap —
         // the node body is the frame.
-        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().item_spacing.x = view.s(2.0);
         ui.style_mut().spacing.interact_size.y = row.height();
         match cur {
             ExprValue::Num(n) => {
@@ -1899,7 +2132,7 @@ fn socket_field(
             ExprValue::Vec2(p) => {
                 let (mut x, mut y) = (p.x, p.y);
                 // Halved, less the one gap between them.
-                let w = (ui.available_width() - 2.0) / 2.0;
+                let w = (ui.available_width() - view.s(2.0)) / 2.0;
                 let mut changed = false;
                 changed |= ui
                     .add_sized([w, row.height()], egui::DragValue::new(&mut x).speed(0.5))
@@ -1937,11 +2170,12 @@ fn socket_field(
 
 /// A socket dot: a filled circle in the type's colour, ringed. A connected input
 /// is filled solid; an unconnected one is hollow, so you can see what's wired.
-fn socket_dot(painter: &egui::Painter, c: egui::Pos2, ty: SocketType, filled: bool) {
+fn socket_dot(painter: &egui::Painter, view: &View, c: egui::Pos2, ty: SocketType, filled: bool) {
     let color = col32(ty.color());
+    let r = view.s(DOT_R);
     if filled {
-        painter.circle_filled(c, DOT_R, color);
+        painter.circle_filled(c, r, color);
     } else {
-        painter.circle(c, DOT_R, egui::Color32::from_gray(40), egui::Stroke::new(1.5, color));
+        painter.circle(c, r, egui::Color32::from_gray(40), egui::Stroke::new(view.s(1.5).max(0.5), color));
     }
 }

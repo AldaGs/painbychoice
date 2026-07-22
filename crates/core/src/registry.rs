@@ -339,7 +339,6 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
         // output socket (edited inline as two drag fields), so a graph can pin a
         // `position` or `scale` without wiring two `join` inputs by hand.
         NodeDescriptor::new("vec2", Cat::Input, "Vector").output("value", "Value", Vector),
-        NodeDescriptor::new("ref", Cat::Input, "Reference").output("value", "Value", Number),
         NodeDescriptor::new("param", Cat::Input, "Parameter").output("value", "Value", Number),
         // A leaf holding Rhai source — pulls from `frame`, not wired inputs.
         NodeDescriptor::new("script", Cat::Input, "Script").output("value", "Value", Number),
@@ -372,10 +371,20 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .output("value", "Value", Number),
         // ── Module reuse. ────────────────────────────────────────────────────
         NodeDescriptor::new("use", Cat::Module, "Module").output("value", "Value", Number),
-        // ── Sinks: where the graph meets the scene. ──────────────────────────
+        // ── Where the graph meets the scene: one node reads a layer property,
+        //    one drives it. They're a pair and they live together — `ref` used
+        //    to sit off in Input as "Reference", which hid the only node that
+        //    answers "what is that layer doing right now?" from anyone looking
+        //    for the counterpart of Property Out.
         //
-        // These are the only nodes with no outputs, and that is the point: a
-        // driver *ends* the dataflow. Binding a graph output to a layer used to
+        // Like `out`, its socket is typed by the property it names rather than
+        // by its kind (`GraphCtx::descriptor_for`), so reading a `position`
+        // hands down a Vector wire and reading a `fill` a Colour one. `Number`
+        // is only its unconfigured resting shape.
+        NodeDescriptor::new("ref", Cat::Layer, "Property In").output("value", "Value", Number),
+        //
+        // The sinks below are the only nodes with no outputs, and that is the
+        // point: a driver *ends* the dataflow. Binding a graph output to a layer used to
         // be a row in a side list, which made the one edit that gives a graph
         // any effect the one edit you couldn't make on the canvas. As nodes,
         // binding is the same gesture as every other wire.
