@@ -1381,8 +1381,27 @@ fn drag_at(handle: GizmoHandle, rot: f64, grab: (f64, f64)) -> GizmoDrag {
         start_scale: (1.0, 1.0),
         start_anchor: Vec2::ZERO,
         grab_parent: Point::new(grab.0, grab.1),
-        grab_screen: egui::Pos2::ZERO,
+        // At 1:1 zoom in a flat comp the two spaces coincide, so the grab is
+        // the same point in both. Keeping them consistent matters: the arrows
+        // measure on screen and the ring measures in parent space.
+        grab_screen: egui::pos2(grab.0 as f32, grab.1 as f32),
         origin_screen: egui::Pos2::ZERO,
+    }
+}
+
+/// The screen basis of a layer spun `rot` degrees about Z, at 1:1 zoom in a
+/// flat comp — where a unit along an axis is a point on screen, so each axis'
+/// screen step is just its unit vector.
+fn basis_at(rot: f64, now: (f64, f64)) -> ScreenDrag {
+    let r = rot.to_radians();
+    ScreenDrag {
+        now: egui::pos2(now.0 as f32, now.1 as f32),
+        axis: [
+            egui::vec2(r.cos() as f32, r.sin() as f32),
+            egui::vec2(-r.sin() as f32, r.cos() as f32),
+            egui::Vec2::ZERO,
+        ],
+        ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
     }
 }
 
@@ -1403,11 +1422,11 @@ fn the_centre_handle_tracks_the_pointer_one_to_one() {
 #[test]
 fn an_axis_arrow_projects_the_drag_onto_the_rotated_axis() {
     let d = drag_at(GizmoHandle::MoveAxis(GizmoAxis::X), 90.0, (0.0, 0.0));
-    let pos = resolve_drag(&d, Point::new(0.0, 40.0), ScreenDrag::flat()).pos;
+    let pos = resolve_drag(&d, Point::new(0.0, 40.0), basis_at(90.0, (0.0, 40.0))).pos;
     assert!((pos.x - 0.0).abs() < 1e-9, "no movement across the axis");
     assert!((pos.y - 40.0).abs() < 1e-9, "the whole drag lands along it");
 
-    let pos = resolve_drag(&d, Point::new(40.0, 0.0), ScreenDrag::flat()).pos;
+    let pos = resolve_drag(&d, Point::new(40.0, 0.0), basis_at(90.0, (40.0, 0.0))).pos;
     assert!(pos.hypot() < 1e-9, "a drag square to the axis moves nothing");
 }
 
@@ -4642,14 +4661,22 @@ fn spatial_drag(handle: GizmoHandle, grab: egui::Pos2) -> GizmoDrag {
     }
 }
 
-/// A screen basis with depth pointing right and a known gearing, so a test can
-/// state the expected answer in units rather than pixels.
+/// A screen basis with depth pointing right at a known gearing, so a test can
+/// state its expected answer in units rather than pixels.
 fn spatial_basis(now: egui::Pos2, z_px: f32) -> ScreenDrag {
     ScreenDrag {
         now,
-        dir: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::X],
-        z_px: Some(z_px),
+        axis: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::X * z_px],
+        ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
     }
+}
+
+/// A basis whose X ring spans screen +x and screen -y, so a quarter turn from
+/// one to the other is unambiguous.
+fn ring_basis(now: egui::Pos2) -> ScreenDrag {
+    let mut b = spatial_basis(now, 4.0);
+    b.ring[GizmoAxis::X as usize] = (egui::Vec2::X, egui::vec2(0.0, -1.0));
+    b
 }
 
 /// The depth arrow converts screen travel back into depth through the gearing
@@ -4680,7 +4707,8 @@ fn the_depth_arrow_ignores_movement_across_it() {
 fn a_depth_drag_holds_without_a_camera() {
     let d = spatial_drag(GizmoHandle::MoveAxis(GizmoAxis::Z), egui::pos2(0.0, 0.0));
     let mut basis = spatial_basis(egui::pos2(40.0, 0.0), 4.0);
-    basis.z_px = None;
+    // No camera: depth has no screen step at all, so nothing can be geared back.
+    basis.axis[GizmoAxis::Z as usize] = egui::Vec2::ZERO;
     assert_eq!(resolve_drag(&d, Point::ZERO, basis).pos_z, 0.0);
 }
 
@@ -4688,13 +4716,7 @@ fn a_depth_drag_holds_without_a_camera() {
 /// — a quarter turn from the Y direction to the Z direction is 90 degrees.
 #[test]
 fn the_x_ring_rotates_about_x() {
-    // Ring basis for X is (Y, Z); put Y along screen +x and Z along screen -y
-    // so the quarter turn is unambiguous.
-    let basis = |now: egui::Pos2| ScreenDrag {
-        now,
-        dir: [egui::Vec2::ZERO, egui::Vec2::X, egui::vec2(0.0, -1.0)],
-        z_px: Some(4.0),
-    };
+    let basis = ring_basis;
     let d = spatial_drag(GizmoHandle::RotateAxis(GizmoAxis::X), egui::pos2(50.0, 0.0));
     let r = resolve_drag(&d, Point::ZERO, basis(egui::pos2(0.0, -50.0)));
     assert!((r.rot_xy.0 - 90.0).abs() < 1e-6, "got {:?}", r.rot_xy);
@@ -4706,11 +4728,7 @@ fn the_x_ring_rotates_about_x() {
 /// layer spins a whole turn in one frame as the angle wraps.
 #[test]
 fn a_ring_drag_takes_the_short_way_round() {
-    let basis = |now: egui::Pos2| ScreenDrag {
-        now,
-        dir: [egui::Vec2::ZERO, egui::Vec2::X, egui::vec2(0.0, -1.0)],
-        z_px: Some(4.0),
-    };
+    let basis = ring_basis;
     // Grab just below the seam at 180 degrees and cross it.
     let grab = egui::pos2(-50.0, -1.0);
     let d = spatial_drag(GizmoHandle::RotateAxis(GizmoAxis::X), grab);
@@ -4729,4 +4747,80 @@ fn depth_scale_is_inert() {
     let d = spatial_drag(GizmoHandle::ScaleAxis(GizmoAxis::Z), egui::pos2(0.0, 0.0));
     let r = resolve_drag(&d, Point::new(80.0, 0.0), spatial_basis(egui::pos2(80.0, 0.0), 4.0));
     assert_eq!(r.scale, (1.0, 1.0));
+}
+
+/// Compare a direction against an expected one, loosely enough for the
+/// trigonometry and tightly enough to catch a wrong axis.
+fn vclose(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+    (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6 && (a.2 - b.2).abs() < 1e-6
+}
+
+/// An arrow points where the layer points. Tip the layer about Y and its own X
+/// axis leaves the plane, so a move along it changes depth as well as x — the
+/// arrow and the movement are the same vector by construction.
+#[test]
+fn an_axis_arrow_follows_the_layers_own_orientation() {
+    let mut d = spatial_drag(GizmoHandle::MoveAxis(GizmoAxis::X), egui::pos2(0.0, 0.0));
+    // 90 degrees about Y swings local X all the way onto the depth axis.
+    d.start_rot_xy = (0.0, 90.0);
+    // The layer's X now steps along screen +x at one point per unit (whatever
+    // the projection made of it); the drag is 30 points.
+    let basis = ScreenDrag {
+        now: egui::pos2(30.0, 0.0),
+        axis: [egui::Vec2::X, egui::Vec2::Y, egui::Vec2::X],
+        ring: [(egui::Vec2::X, egui::Vec2::Y); 3],
+    };
+    let r = resolve_drag(&d, Point::ZERO, basis);
+    assert!(r.pos.x.abs() < 1e-9, "local X no longer points along parent x: {:?}", r.pos);
+    // Rotating +90 about Y takes X to -Z, so the layer comes toward the eye.
+    assert!((r.pos_z + 30.0).abs() < 1e-6, "the move went into depth: {}", r.pos_z);
+}
+
+/// The rings are a **gimbal**, not three independent circles: rotation is Euler
+/// Z-Y-X, so each ring turns inside the ones applied before it.
+///
+/// Z is outermost and never moves. Y turns inside Z. X turns inside both. This
+/// asserts the frames directly, because the alternative — three fixed circles —
+/// would draw a picture of which numbers a drag changes that is simply false.
+#[test]
+fn the_rotation_rings_are_a_gimbal() {
+    // Spin the layer about Z. The Z ring is unaffected (it is the outer one),
+    // but the Y ring rides on it.
+    let z_only = gimbal_axes(90.0, (0.0, 0.0));
+    assert!(
+        vclose(z_only[GizmoAxis::Z as usize], (0.0, 0.0, 1.0)),
+        "the outermost ring never moves: {:?}",
+        z_only[GizmoAxis::Z as usize]
+    );
+    // A quarter turn about Z carries +y round to -x, and the Y ring goes with
+    // it — that is what "the inner ring rides on the outer" means.
+    assert!(
+        vclose(z_only[GizmoAxis::Y as usize], (-1.0, 0.0, 0.0)),
+        "Y rode on Z: {:?}",
+        z_only[GizmoAxis::Y as usize]
+    );
+
+    // Now add a Y rotation: the innermost ring, X, rides on both.
+    let both = gimbal_axes(0.0, (0.0, 90.0));
+    assert!(
+        vclose(both[GizmoAxis::Y as usize], (0.0, 1.0, 0.0)),
+        "Y is unmoved by its own angle: {:?}",
+        both[GizmoAxis::Y as usize]
+    );
+    assert!(
+        vclose(both[GizmoAxis::X as usize], (0.0, 0.0, -1.0)),
+        "X rode on Y onto the depth axis: {:?}",
+        both[GizmoAxis::X as usize]
+    );
+}
+
+/// Gimbal lock is a real state of Euler angles and the gizmo must be able to
+/// show it: at 90 degrees about Y, the X and Z rings turn about the *same*
+/// line, so two of the three angles stop being independent.
+#[test]
+fn the_gimbal_locks_where_euler_angles_do() {
+    let axes = gimbal_axes(0.0, (0.0, 90.0));
+    let (x, z) = (axes[GizmoAxis::X as usize], axes[GizmoAxis::Z as usize]);
+    let dot = x.0 * z.0 + x.1 * z.1 + x.2 * z.2;
+    assert!(dot.abs() > 0.999, "X and Z rings should be collinear, dot = {dot}");
 }
