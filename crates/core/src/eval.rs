@@ -6,6 +6,7 @@ use kurbo::{Affine, BezPath, Rect, Shape as _};
 
 use crate::camera::Projector;
 use crate::mat4::Xf;
+use crate::warp::warp_path;
 
 use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
@@ -340,6 +341,25 @@ fn walk(
         return None;
     };
     let flat = viewed.to_affine_lossy();
+
+    // **Foreshortening.** A layer still spatial after projection has been tipped
+    // out of the plane, and no affine can draw it. Its geometry is instead
+    // pushed through the exact projective map into composition space and emitted
+    // under an identity transform — see `crate::warp` for why that beats a
+    // render-to-texture quad here.
+    //
+    // Built from the *unprojected* world matrix: the homography does the camera
+    // itself, so handing it the already-projected one would apply perspective
+    // twice.
+    let warp = match (view, viewed) {
+        (Some(v), Xf::Spatial(_)) => {
+            let h = v.homography(&xf.to_mat4());
+            // `is_affine` catches the layer that carries depth but never turned:
+            // `flat` already draws it correctly and more cheaply.
+            (!h.is_affine()).then_some(h)
+        }
+        _ => None,
+    };
     // An isolated layer's opacity belongs to the *group*, applied once to the
     // finished image, so the subtree below it draws at full strength and the
     // fade happens on the way out. `full` is what accumulated down to here;
@@ -386,16 +406,41 @@ fn walk(
                 .warnings
                 .push((node.id, "transform resolved to a non-finite value".into()));
         } else {
-            bounds = Some((flat * path.clone()).bounding_box());
-            scene.items.push(RenderItem {
-                source: node.id,
-                transform: flat,
-                path,
-                fill,
-                stroke,
-                image,
-                opacity,
-            });
+            // A warped path is already in composition space, so it draws under
+            // the identity. Footage is the exception: its pixels are painted
+            // into the rectangle by the backend under an affine, and warping
+            // only the rectangle would leave the image inside it unturned — so
+            // a tipped raster layer keeps the flat reading rather than growing
+            // a shape its content does not match.
+            let warped = warp.filter(|_| image.is_none()).map(|h| warp_path(&path, &h));
+            match warped {
+                // Crossed the eye plane: refused rather than drawn torn.
+                Some(None) => {}
+                Some(Some(p)) => {
+                    bounds = Some(p.bounding_box());
+                    scene.items.push(RenderItem {
+                        source: node.id,
+                        transform: Affine::IDENTITY,
+                        path: p,
+                        fill,
+                        stroke,
+                        image,
+                        opacity,
+                    });
+                }
+                None => {
+                    bounds = Some((flat * path.clone()).bounding_box());
+                    scene.items.push(RenderItem {
+                        source: node.id,
+                        transform: flat,
+                        path,
+                        fill,
+                        stroke,
+                        image,
+                        opacity,
+                    });
+                }
+            }
         }
     }
 
@@ -481,8 +526,7 @@ fn walk(
         });
     }
 
-    let mut i = 0;
-    while i < node.children.len() {
+    for i in draw_order(node, xf, view, ctx) {
         let child = &node.children[i];
         let child_start = scene.items.len();
         // `full`, not `opacity`: a child is outside its parent's group, so the
@@ -536,7 +580,6 @@ fn walk(
                 (Some(a), Some(b)) => Some(a.union(b)),
                 (a, b) => a.or(b),
             };
-            i += 2;
             continue;
         }
 
@@ -544,13 +587,71 @@ fn walk(
             (Some(a), Some(b)) => Some(a.union(b)),
             (a, b) => a.or(b),
         };
-        i += 1;
     }
     scene.places[place_at].1.bounds = bounds;
 
     ctx.frame = prev_frame;
     ctx.timing = prev_timing;
     bounds
+}
+
+
+/// The order a node's children are drawn in, as indices into `children`.
+///
+/// # Units, not layers
+///
+/// Sibling *adjacency* carries meaning: a layer with a track matte takes its
+/// coverage from the next sibling, and the walk consumes both together. So the
+/// list returned holds only the leader of each such pair — a matte's partner is
+/// drawn by its leader and must never be reordered away from it, or the pair
+/// would come apart and both layers would draw wrong.
+///
+/// # Sorting
+///
+/// Without a camera the answer is document order, exactly as before: a flat comp
+/// has no depth to sort by and stacking order is the author's explicit choice.
+///
+/// With one, siblings are ordered **far to near** so a receding layer is
+/// overdrawn by a closer one. The sort is stable, so layers at the same depth —
+/// which is *every* layer in a comp where nobody has touched Z — keep the order
+/// they were authored in. That is what makes switching a camera on leave an
+/// existing composition looking identical.
+///
+/// The depth used is the child's own origin, one number per layer, matching the
+/// billboard approximation the projection itself makes. It is a painter's
+/// algorithm and it inherits the classic failure: layers that interpenetrate, or
+/// cyclically overlap, cannot be ordered correctly by any single depth per
+/// layer.
+fn draw_order(
+    node: &Node,
+    parent_xf: Xf,
+    view: Option<Projector>,
+    ctx: &mut EvalCtx,
+) -> Vec<usize> {
+    let n = node.children.len();
+    let mut units: Vec<usize> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        units.push(i);
+        // A matte leader swallows the sibling above it.
+        i += if node.children[i].matte.is_some() && i + 1 < n { 2 } else { 1 };
+    }
+    if view.is_none() || units.len() < 2 {
+        return units;
+    }
+
+    let mut keyed: Vec<(usize, f64)> = units
+        .into_iter()
+        .map(|i| {
+            let (local, _) = node.children[i].transform.resolve(ctx);
+            // The translation column of the composed world matrix: where this
+            // layer's origin sits in depth.
+            (i, (parent_xf * local).to_mat4().0[14])
+        })
+        .collect();
+    // Descending: the largest depth is the furthest away, and goes down first.
+    keyed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    keyed.into_iter().map(|(i, _)| i).collect()
 }
 
 #[cfg(test)]
@@ -2200,5 +2301,172 @@ mod tests {
         let p = Project::single(comp);
 
         assert!(evaluate_project(&p, 0.0).items.is_empty(), "nothing drawn from behind the lens");
+    }
+
+    /// End-to-end foreshortening: a tipped layer reaches the draw list as warped
+    /// geometry under an identity transform, and its two vertical edges differ
+    /// in height — the thing no affine could have produced.
+    #[test]
+    fn a_tipped_layer_reaches_the_scene_foreshortened() {
+        use crate::node::Project;
+        let card = Node::shape(
+            1,
+            "card",
+            Shape::Rect {
+                size: Value::constant(kurbo::Vec2::new(200.0, 200.0)),
+                radius: Value::constant(0.0),
+            },
+        )
+        .with_transform(Transform {
+            position: Value::constant(Vec3::flat(100.0, 100.0)),
+            rotation: Value::constant(Vec3::new(0.0, 40.0, 0.0)),
+            ..Transform::default()
+        });
+        let mut comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(card));
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(400.0) });
+
+        let scene = evaluate_project(&Project::single(comp), 0.0);
+        assert_eq!(scene.items.len(), 1);
+        let item = &scene.items[0];
+        assert_eq!(
+            item.transform,
+            Affine::IDENTITY,
+            "warped geometry is already in comp space"
+        );
+
+        let pts: Vec<kurbo::Point> = item
+            .path
+            .elements()
+            .iter()
+            .filter_map(|e| match e {
+                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert!(pts.len() > 4, "subdivided, not just four corners");
+        let (min_x, max_x) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.x), hi.max(p.x)));
+        let span = |x: f64| {
+            let ys: Vec<f64> =
+                pts.iter().filter(|p| (p.x - x).abs() < 1.0).map(|p| p.y).collect();
+            ys.iter().cloned().fold(f64::MIN, f64::max)
+                - ys.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        let (near, far) = (span(min_x), span(max_x));
+        assert!(
+            (near - far).abs() > 5.0,
+            "the two edges must differ in height: {near} vs {far}"
+        );
+    }
+
+    /// The same layer in a comp with no camera is *not* warped: without a
+    /// projection there is no perspective to foreshorten with, so it keeps the
+    /// cheap affine reading.
+    #[test]
+    fn without_a_camera_a_tipped_layer_is_not_warped() {
+        use crate::node::Project;
+        let card = dot(1).with_transform(Transform {
+            rotation: Value::constant(Vec3::new(0.0, 40.0, 0.0)),
+            ..Transform::default()
+        });
+        let comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(card));
+        let scene = evaluate_project(&Project::single(comp), 0.0);
+        assert_ne!(scene.items[0].transform, Affine::IDENTITY, "still affine-placed");
+    }
+
+    /// A far layer draws before a near one, whatever order they were authored
+    /// in — the painter's algorithm the camera makes possible.
+    #[test]
+    fn a_camera_draws_far_layers_first() {
+        use crate::node::Project;
+        let at = |id: u64, z: f64| {
+            dot(id).with_transform(Transform {
+                position: Value::constant(Vec3::new(0.0, 0.0, z)),
+                ..Transform::default()
+            })
+        };
+        // Authored near-first, which is the wrong drawing order.
+        let mut comp = Comp::new(
+            200.0,
+            200.0,
+            Node::group(0, "root").with_child(at(1, 0.0)).with_child(at(2, 500.0)),
+        );
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        let scene = evaluate_project(&Project::single(comp), 0.0);
+        let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
+        assert_eq!(ids, vec![2, 1], "the far layer goes down first");
+    }
+
+    /// The promise that makes the camera safe to switch on: with nobody having
+    /// touched Z, a stable sort leaves the author's stacking order alone.
+    #[test]
+    fn equal_depths_keep_their_authored_order() {
+        use crate::node::Project;
+        let mut comp = Comp::new(
+            200.0,
+            200.0,
+            Node::group(0, "root")
+                .with_child(dot(1))
+                .with_child(dot(2))
+                .with_child(dot(3)),
+        );
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        let scene = evaluate_project(&Project::single(comp), 0.0);
+        let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
+        assert_eq!(ids, vec![1, 2, 3], "a camera alone must not restack a flat comp");
+    }
+
+    /// Without a camera, depth is inert here too: draw order stays the author's
+    /// even when the layers carry Z.
+    #[test]
+    fn without_a_camera_draw_order_ignores_depth() {
+        use crate::node::Project;
+        let at = |id: u64, z: f64| {
+            dot(id).with_transform(Transform {
+                position: Value::constant(Vec3::new(0.0, 0.0, z)),
+                ..Transform::default()
+            })
+        };
+        let comp = Comp::new(
+            200.0,
+            200.0,
+            Node::group(0, "root").with_child(at(1, 0.0)).with_child(at(2, 500.0)),
+        );
+        let scene = evaluate_project(&Project::single(comp), 0.0);
+        let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
+        assert_eq!(ids, vec![1, 2], "document order, untouched");
+    }
+
+    /// Sorting must not tear a track matte off the layer it mattes. The pair is
+    /// one unit: it moves in the order together or the matte cuts the wrong
+    /// layer.
+    #[test]
+    fn sorting_keeps_a_matte_next_to_its_layer() {
+        use crate::node::Project;
+        let at = |id: u64, z: f64| {
+            dot(id).with_transform(Transform {
+                position: Value::constant(Vec3::new(0.0, 0.0, z)),
+                ..Transform::default()
+            })
+        };
+        // Layer 1 is matted by layer 2 (its next sibling); layer 3 is far away
+        // and must sort in front of the whole pair.
+        let mut matted = at(1, 0.0);
+        matted.matte = Some(MatteMode::Alpha);
+        let mut comp = Comp::new(
+            200.0,
+            200.0,
+            Node::group(0, "root").with_child(matted).with_child(at(2, 0.0)).with_child(at(3, 900.0)),
+        );
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        let scene = evaluate_project(&Project::single(comp), 0.0);
+        let ids: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
+        assert_eq!(ids, vec![3, 1, 2], "the pair stayed adjacent and in order");
+        // And the matte groups still exist, i.e. the pairing actually happened.
+        assert!(
+            scene.groups.iter().any(|g| g.compose != ComposeMode::SrcOver),
+            "the matte still composites as a matte"
+        );
     }
 }

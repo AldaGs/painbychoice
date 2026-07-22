@@ -84,6 +84,15 @@ pub struct Projector {
 }
 
 impl Projector {
+    /// The layer-local → screen projective map for a world matrix.
+    ///
+    /// This is the exact projection, unlike [`Self::project`], which collapses
+    /// a layer to a single depth. Used for the layers that need foreshortening;
+    /// [`Homography::is_affine`] says when it would have made no difference.
+    pub fn homography(&self, m: &crate::mat4::Mat4) -> crate::warp::Homography {
+        crate::warp::homography_for(m, self.eye, self.distance)
+    }
+
     /// A layer at this depth is at or behind the eye. Nothing in front of the
     /// camera can be seen through it, and the scale factor would be infinite or
     /// negative (an inside-out layer), so it is culled instead.

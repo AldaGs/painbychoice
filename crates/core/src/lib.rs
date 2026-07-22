@@ -25,6 +25,7 @@ pub mod socket;
 pub mod text;
 pub mod timebase;
 pub mod value;
+pub mod warp;
 pub mod vec3;
 
 pub use asset::{
@@ -57,4 +58,5 @@ pub use socket::{Socket, SocketType};
 pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;
 pub use vec3::Vec3;
+pub use warp::{homography_for, warp_path, Homography};
 pub use value::{mirror_handle, Animatable, Color, EasePreset, Handle, Interp, Keyframe, Track, Value};
