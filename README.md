@@ -1252,6 +1252,75 @@ still the structural spine; the graph authors and drives it. Making a node's
 existence create a layer is the composition-graph step, still gated behind the
 compositor.
 
+### The node canvas zooms, it doesn't magnify
+
+Added 2026-07-22, after the UI was reported to lose quality when zoomed in. The
+canvas used to ride inside `egui::containers::Scene`, which draws into a
+**transformed layer**: egui lays the contents out at 1× and scales the finished
+shapes afterwards. Vector shapes survive that (they're re-tessellated from
+transformed geometry), but a text galley is *rasterized at its layout size and
+then stretched* — so every label, field and icon went soft the moment you passed
+1:1. egui's own `Scene` caps its zoom range at 1.0 for exactly this reason; we
+had raised it to 2.0 and inherited the blur. There is no per-layer rasterization
+scale to turn on: `Context::set_zoom_factor` is global to the whole app.
+
+So the canvas owns its zoom now (`nodegraph.rs`):
+
+- **`View { zoom, pan }`** maps graph space to screen space — `to_screen` /
+  `to_graph`, `s(len)` for a scaled length, `font(size)` for a font at its
+  *on-screen* size. Node positions stay in graph units in the model (they're
+  saved); only the drawing is in screen units. A drag delta arrives in screen
+  pixels and is divided by the zoom on its way back into the document.
+- **Every geometry constant goes through `View::s`.** A constant that doesn't is
+  a constant that won't zoom, which is why the socket-hit radius, the wire
+  thickness and the drop tolerance are all scaled too — the drop target should
+  be as big as it looks.
+- **The in-node widgets are scaled through their `Style`**, not through a
+  transform: `View::scale_style` multiplies the text styles and the spacing, so
+  a combo or a `DragValue` on a zoomed node is laid out at the size it is drawn.
+  That is the whole trick — nothing is laid out small and stretched.
+- **Navigation is ours**: middle-drag pans, wheel pans, ctrl-wheel/pinch zooms
+  about the cursor (`View::zoom_about`, unit-tested to keep the point under the
+  cursor fixed, *including when the zoom clamps* — the pan has to follow the
+  applied factor, not the requested one). Zoom range is 0.15–4.0; zooming in
+  costs sharpness nothing now.
+- **"Frame all" is `fit_view(graph_bounds(..), area)`**, both free functions and
+  both unit-tested without a window. It never magnifies past 1:1 — a two-node
+  graph should frame as two normal nodes, not two billboards. The view is stored
+  per scope as an `Option<View>`, and `None` means "frame on the next draw", so
+  the toolbar button is just *forgetting where we were*.
+- The canvas rect is measured with `available_rect_before_wrap()`, not
+  `max_rect()` — the same egui trap the preview canvas hit — and remembered in
+  memory so the toolbar (drawn *before* the canvas) can zoom about its centre.
+  One frame stale by construction, like the preview's.
+
+**Right-click the canvas for the palette.** The Add menu's contents live in
+`palette_items`, shared by the toolbar button and the canvas context menu so the
+two can't drift into offering different nodes. The right-click form passes the
+click position, so a node lands **where you asked for it** rather than in the
+staggered corner the toolbar still uses (it has no canvas position to speak of).
+The position is captured when the menu *opens*, not when an entry is clicked —
+by then the pointer is over the menu, and reading it there would drop every node
+under the menu instead of under the click.
+
+### Property In: the read half of the scene seam
+
+Also 2026-07-22. The `ref` node had been filed under Input as "Reference", which
+hid the only node that answers *"what is that layer doing right now?"* from
+anyone looking for the counterpart of Property Out. It's now **`Property In`** in
+the Layer category beside its sink, and a configured one titles itself
+`boxA → Position` against the sink's `Position → boxA` — arrow pointing the way
+the value travels in both cases.
+
+The real bug behind the reframing: **a ref's output socket was always `Number`**,
+whatever it read. `GraphCtx::descriptor_for` now retypes it from the target
+property exactly as it does an `out` node's *input*, so reading a `position`
+hands down a Vector wire and a `fill` a Colour one, and the canvas refuses the
+wires that never made sense. Retargeting across types sweeps the wires that no
+longer fit (`retarget_ref` + the new `NodeGraph::disconnect_output` — a read can
+feed many inputs, so unlike the sink's single incoming wire it has to sweep them
+all); a same-kind move (Rotation → Opacity) keeps them.
+
 ### The string value type
 
 Added 2026-07-21. `ExprValue` gained a fourth kind, `Str(String)`, so text is a

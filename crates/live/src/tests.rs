@@ -3113,6 +3113,35 @@ fn a_property_another_driver_still_writes_is_left_alone() {
     assert!(rot.is_expr(), "the surviving driver still owns the property");
 }
 
+/// Pointing a `ref` at a property of a different *type* drops the wires its
+/// output can no longer legally feed — a rotation read into an `osc.freq` is
+/// fine, the same node re-pointed at `position` is a Vector into a scalar knob.
+/// Moving between two Number properties keeps the wire.
+#[test]
+fn repointing_a_ref_across_types_sweeps_its_stale_wires() {
+    let (mut project, _comp, reg, _sink) = out_node_project();
+    let ctx = GraphCtx::bare(&reg);
+    let r = project.graph.add_node("ref", Vec2::new(0.0, 300.0));
+    let osc = project.graph.add_node("osc", Vec2::new(200.0, 300.0));
+    retarget_ref(&mut project.graph, r, Some((NodeId(1), PropPath::Rotation, 0.0)));
+    project
+        .graph
+        .connect(&ctx, Endpoint::new(r, "value"), Endpoint::new(osc, "freq"))
+        .expect("a scalar read feeds a scalar knob");
+
+    // Rotation → Opacity: both Numbers, so the wire is untouched.
+    retarget_ref(&mut project.graph, r, Some((NodeId(1), PropPath::Opacity, 0.0)));
+    assert_eq!(project.graph.edges_from(r).count(), 1, "a same-type move keeps the wire");
+
+    // Opacity → Position: Number becomes Vector, and the wire goes with it.
+    retarget_ref(&mut project.graph, r, Some((NodeId(1), PropPath::Position, 0.0)));
+    assert_eq!(project.graph.edges_from(r).count(), 0, "the stale wire was swept");
+    assert!(
+        project.graph.validate(&ctx).is_empty(),
+        "and nothing is left for validate to complain about"
+    );
+}
+
 /// A sink with a target but nothing wired in, or a wire but no target, is
 /// **inert** — the resting state of a node you just dropped on the canvas. It
 /// must not seize the property it names.
@@ -3355,6 +3384,64 @@ fn a_marquee_selects_the_nodes_its_box_covers() {
     assert!(nodes_in_rect(&g, &ctx, empty).is_empty());
 }
 
+/// Zooming keeps the graph point under the cursor under the cursor — the whole
+/// contract of wheel-zoom. Checked on the view maths directly, since the canvas
+/// now owns its zoom instead of borrowing egui's layer transform.
+#[test]
+fn zooming_keeps_the_point_under_the_cursor_fixed() {
+    use crate::nodegraph::View;
+    let mut v = View { zoom: 1.0, pan: egui::vec2(30.0, -12.0) };
+    let anchor = egui::pos2(220.0, 140.0);
+    let before = v.to_graph(anchor);
+
+    v.zoom_about(1.25, anchor);
+    let after = v.to_graph(anchor);
+    assert!((after - before).length() < 1e-3, "{before:?} moved to {after:?}");
+    assert!((v.zoom - 1.25).abs() < 1e-6);
+
+    // …and repeatedly, in both directions, without drifting.
+    for f in [0.8, 0.8, 1.6, 0.5] {
+        v.zoom_about(f, anchor);
+    }
+    assert!((v.to_graph(anchor) - before).length() < 1e-3);
+
+    // The zoom is clamped, and a clamped zoom still doesn't shift the anchor —
+    // the pan has to follow the *applied* factor, not the requested one.
+    for _ in 0..20 {
+        v.zoom_about(2.0, anchor);
+    }
+    assert!(v.zoom <= 4.0, "zoom clamps at the maximum");
+    assert!((v.to_graph(anchor) - before).length() < 1e-2);
+}
+
+/// "Frame all" shows every node, and never magnifies past 1:1 — a two-node
+/// graph should frame as two normal nodes, not two billboards.
+#[test]
+fn framing_all_nodes_fits_them_and_never_magnifies() {
+    use crate::nodegraph::{fit_view, graph_bounds};
+    let reg = NodeRegistry::with_builtins();
+    let ctx = GraphCtx::bare(&reg);
+    let mut g = NodeGraph::new();
+    assert!(graph_bounds(&g, &ctx).is_none(), "an empty graph has nothing to frame");
+
+    g.add_node("value", Vec2::new(0.0, 0.0));
+    g.add_node("value", Vec2::new(2000.0, 1500.0));
+    let bounds = graph_bounds(&g, &ctx).unwrap();
+    let area = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(800.0, 600.0));
+    let v = fit_view(bounds, area);
+
+    // Every corner of the graph lands inside the canvas.
+    for p in [bounds.left_top(), bounds.right_bottom()] {
+        assert!(area.contains(v.to_screen(p)), "{p:?} fell outside the canvas");
+    }
+    assert!(v.zoom < 1.0, "a graph bigger than the canvas zooms out to fit");
+
+    // A tiny graph in a big canvas rests at 1:1 rather than blowing up.
+    let mut small = NodeGraph::new();
+    small.add_node("value", Vec2::ZERO);
+    let v = fit_view(graph_bounds(&small, &ctx).unwrap(), area);
+    assert_eq!(v.zoom, 1.0);
+}
 
 // --- Curve editor ------------------------------------------------------
 
