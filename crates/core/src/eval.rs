@@ -4,6 +4,7 @@
 
 use kurbo::{Affine, BezPath, Rect, Shape as _};
 
+use crate::camera::Projector;
 use crate::mat4::Xf;
 
 use crate::asset::ImagePaint;
@@ -196,7 +197,7 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     // and warnings sink. Expression warnings gathered during the walk are folded
     // into the scene's provenance-tagged list afterward.
     let mut ctx = EvalCtx::new(doc, frame);
-    walk(&doc.root, Xf::IDENTITY, 1.0, &mut ctx, None, &mut Vec::new(), &mut scene);
+    walk(&doc.root, Xf::IDENTITY, 1.0, None, &mut ctx, None, &mut Vec::new(), &mut scene);
     scene.warnings.append(&mut ctx.take_warnings());
     scene
 }
@@ -209,7 +210,7 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
 /// deliberately out of scope for v1.
 pub fn evaluate_comp(project: &Project, comp: CompId, frame: f64) -> Scene {
     let mut scene = Scene::default();
-    eval_comp(project, comp, frame, Xf::IDENTITY, 1.0, &mut Vec::new(), &mut scene);
+    eval_comp(project, comp, frame, Xf::IDENTITY, 1.0, None, &mut Vec::new(), &mut scene);
     scene
 }
 
@@ -226,6 +227,7 @@ fn eval_comp(
     frame: f64,
     xf: Xf,
     opacity: f64,
+    view: Option<Projector>,
     stack: &mut Vec<CompId>,
     scene: &mut Scene,
 ) {
@@ -243,8 +245,15 @@ fn eval_comp(
     ctx.modules = Some(&project.modules);
     // So is footage — one import, shown from any comp.
     ctx.assets = Some(&project.assets);
+    // A comp's own camera wins; without one it inherits the view it was placed
+    // in, so a flat precomp dropped into a 3D comp still recedes with it rather
+    // than punching a stubbornly orthographic hole in the scene.
+    let view = match &comp.camera {
+        Some(cam) => Some(cam.resolve(&mut ctx, comp.width, comp.height)),
+        None => view,
+    };
     stack.push(id);
-    walk(&comp.root, xf, opacity, &mut ctx, Some(project), stack, scene);
+    walk(&comp.root, xf, opacity, view, &mut ctx, Some(project), stack, scene);
     stack.pop();
     scene.warnings.append(&mut ctx.take_warnings());
 }
@@ -271,6 +280,7 @@ fn walk(
     node: &Node,
     parent_xf: Xf,
     parent_opacity: f64,
+    view: Option<Projector>,
     ctx: &mut EvalCtx,
     project: Option<&Project>,
     stack: &mut Vec<CompId>,
@@ -312,7 +322,24 @@ fn walk(
     // `to_affine_lossy` hands the affine straight back. For a layer rotated
     // about X or Y it is an orthographic reading — the card is drawn turned but
     // not foreshortened — which is where the projected pipeline will attach.
-    let flat = xf.to_affine_lossy();
+    //
+    // The camera applies **here and only here**. `xf` descends to the children
+    // unprojected, because projection is a view, not a placement: applying it
+    // per level would compound it once per generation and shrink a deep
+    // hierarchy into nothing.
+    let Some(viewed) = (match view {
+        Some(v) => v.project(xf),
+        None => Some(xf),
+    }) else {
+        // At or behind the eye. The layer and its whole subtree are culled —
+        // a child in front of the camera whose parent is behind it has no
+        // coherent place in frame either.
+        ctx.frame = prev_frame;
+        ctx.timing = prev_timing;
+        ctx.exit_node(prev_node);
+        return None;
+    };
+    let flat = viewed.to_affine_lossy();
     // An isolated layer's opacity belongs to the *group*, applied once to the
     // finished image, so the subtree below it draws at full strength and the
     // fade happens on the way out. `full` is what accumulated down to here;
@@ -383,7 +410,7 @@ fn walk(
             // is also where nested timing becomes properly relative — a comp
             // boundary is what stage 1 left open.
             Some(project) if !stack.contains(&id) => {
-                eval_comp(project, id, ctx.frame, xf, opacity, stack, scene);
+                eval_comp(project, id, ctx.frame, xf, opacity, view, stack, scene);
             }
             // Comp-level cycle guard, mirroring the expression one: a comp that
             // contains itself warns and stops rather than recursing forever.
@@ -462,7 +489,7 @@ fn walk(
         // parent's fade has to reach it the ordinary way. Taking the isolated
         // content's 1.0 here would make children of a faded layer draw at full
         // strength.
-        let child_bounds = walk(child, xf, full, ctx, project, stack, scene);
+        let child_bounds = walk(child, xf, full, view, ctx, project, stack, scene);
 
         // A track matte: this layer takes its coverage from the one above it,
         // which is the next sibling in document order. Handled here rather than
@@ -470,7 +497,7 @@ fn walk(
         // both layers — a layer has no idea what sits above it.
         let matted = child.matte.zip(node.children.get(i + 1)).and_then(|(mode, above)| {
             let matte_start = scene.items.len();
-            walk(above, xf, full, ctx, project, stack, scene);
+            walk(above, xf, full, view, ctx, project, stack, scene);
             let end = scene.items.len();
             // Nothing to take a shape from, or nothing to cut: leave both
             // layers drawing normally rather than emitting a group that would
@@ -1480,7 +1507,7 @@ mod tests {
     /// nesting could never express.
     #[test]
     fn one_comp_instanced_twice_renders_twice() {
-        use crate::node::{CompId, Project};
+        use crate::node::Project;
         let inner = Document::new(100.0, 100.0, Node::group(0, "inner-root").with_child(dot(1)));
         let mut project = Project::single(inner);
         let inner_id = project.root;
@@ -1597,7 +1624,7 @@ mod tests {
     /// comps being evaluated, so it catches a cycle of any length.
     #[test]
     fn a_mutual_comp_cycle_warns() {
-        use crate::node::{CompId, Project};
+        use crate::node::Project;
         let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "a")));
         let a = project.root;
         let b = project.insert(Document::new(100.0, 100.0, Node::group(10, "b")));
@@ -1620,7 +1647,7 @@ mod tests {
     /// silently — a blank frame is indistinguishable from a broken one.
     #[test]
     fn a_dangling_precomp_reference_warns() {
-        use crate::node::{CompId, Project};
+        use crate::node::Project;
         let mut project = Project::single(Document::new(100.0, 100.0, Node::group(0, "a")));
         let id = project.root;
         project
@@ -2083,5 +2110,95 @@ mod tests {
         let json = serde_json::to_string(&doc).unwrap();
         let back: Document = serde_json::from_str(&json).unwrap();
         assert_eq!(back.root.children.len(), 1);
+    }
+
+    /// A comp with no camera ignores depth entirely — the promise that makes
+    /// `Vec3` channels safe to have shipped before any of this existed.
+    #[test]
+    fn without_a_camera_depth_changes_nothing() {
+        use crate::node::Project;
+        let build = |z: f64| {
+            let mut comp = Comp::new(
+                200.0,
+                200.0,
+                Node::group(0, "root").with_child(dot(1).with_transform(Transform {
+                    position: Value::constant(Vec3::new(50.0, 50.0, z)),
+                    ..Transform::default()
+                })),
+            );
+            comp.camera = None;
+            evaluate_project(&Project::single(comp), 0.0)
+        };
+        let flat = build(0.0).items[0].transform.as_coeffs();
+        let deep = build(500.0).items[0].transform.as_coeffs();
+        assert_eq!(flat, deep, "no camera, no projection");
+    }
+
+    /// With a camera, depth reaches the drawn item: it shrinks and converges on
+    /// the eye. This is the end-to-end version of the projector's unit tests —
+    /// it proves the view is actually threaded down the walk.
+    #[test]
+    fn a_camera_makes_depth_shrink_a_layer_toward_frame_centre() {
+        use crate::node::Project;
+        let mut comp = Comp::new(
+            200.0,
+            200.0,
+            Node::group(0, "root").with_child(dot(1).with_transform(Transform {
+                position: Value::constant(Vec3::new(0.0, 0.0, 1000.0)),
+                ..Transform::default()
+            })),
+        );
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        let p = Project::single(comp);
+
+        let scene = evaluate_project(&p, 0.0);
+        let c = scene.items[0].transform.as_coeffs();
+        assert!((c[0] - 0.5).abs() < 1e-9, "half size at one camera-distance back");
+        // The eye is the comp centre (100, 100); the layer's origin was at 0,0
+        // and lands halfway to it.
+        assert!((c[4] - 50.0).abs() < 1e-9, "converged on the eye: {c:?}");
+        assert!((c[5] - 50.0).abs() < 1e-9);
+    }
+
+    /// Projection is a view, not a placement. A child inside a parent that has
+    /// depth must be projected **once**, not once per generation — the bug this
+    /// pins is a deep hierarchy collapsing toward the eye as it nests.
+    #[test]
+    fn projection_does_not_compound_down_a_hierarchy() {
+        use crate::node::Project;
+        let child = dot(2);
+        let parent = Node::group(1, "parent")
+            .with_transform(Transform {
+                position: Value::constant(Vec3::new(0.0, 0.0, 1000.0)),
+                ..Transform::default()
+            })
+            .with_child(child);
+        let mut comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(parent));
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        let p = Project::single(comp);
+
+        let scene = evaluate_project(&p, 0.0);
+        let c = scene.items[0].transform.as_coeffs();
+        // The child sits at its parent's depth and so takes its parent's scale
+        // — 0.5, not 0.25.
+        assert!((c[0] - 0.5).abs() < 1e-9, "projected once, not twice: {c:?}");
+    }
+
+    /// A layer at or behind the eye is culled rather than drawn inside out.
+    #[test]
+    fn a_layer_behind_the_eye_is_culled() {
+        use crate::node::Project;
+        let mut comp = Comp::new(
+            200.0,
+            200.0,
+            Node::group(0, "root").with_child(dot(1).with_transform(Transform {
+                position: Value::constant(Vec3::new(0.0, 0.0, -2000.0)),
+                ..Transform::default()
+            })),
+        );
+        comp.camera = Some(crate::camera::Camera { distance: Value::constant(1000.0) });
+        let p = Project::single(comp);
+
+        assert!(evaluate_project(&p, 0.0).items.is_empty(), "nothing drawn from behind the lens");
     }
 }

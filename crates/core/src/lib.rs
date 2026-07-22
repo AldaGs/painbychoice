@@ -10,6 +10,7 @@
 //! must be testable by rendering a frame in a `cargo test`, not a window.
 
 pub mod asset;
+pub mod camera;
 pub mod composite;
 pub mod demo;
 pub mod eval;
@@ -50,6 +51,7 @@ pub use raise::{raise, raise_geometry, RaiseShapeError};
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };
+pub use camera::{Camera, Projector};
 pub use mat4::{Mat4, Xf};
 pub use socket::{Socket, SocketType};
 pub use text::{text_bounds, text_to_path, TextAlign};

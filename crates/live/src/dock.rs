@@ -554,6 +554,11 @@ pub(crate) struct CompEdits {
     pub(crate) passepartout: Option<f64>,
     /// A new motion-path half-window, in frames.
     pub(crate) motion_path_range: Option<i64>,
+    /// The comp's camera, changed. `Some(None)` removes it (back to a flat
+    /// comp); `Some(Some(d))` adds one or dollies the existing one to `d`.
+    /// The double option is the point: "no change" and "no camera" are
+    /// different answers and collapsing them would make the toggle one-way.
+    pub(crate) camera: Option<Option<f64>>,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -590,6 +595,7 @@ pub(crate) fn comp_ui(
     bg: MColor,
     passepartout: f64,
     motion_path_range: i64,
+    camera: Option<f64>,
     out: &mut CompEdits,
     presets: &[String],
     name_buf: &mut String,
@@ -699,6 +705,42 @@ pub(crate) fn comp_ui(
             .changed()
         {
             out.bg = Some(rgb);
+        }
+
+        // The 2.5D switch. A comp is flat until you add a camera; with one, a
+        // layer's Z becomes perspective rather than an inert number. Shown as
+        // one toggle plus a distance, because those are the only two decisions
+        // there are — everything else about the projection follows from the
+        // comp's own size.
+        ui.separator();
+        let mut on = camera.is_some();
+        if ui
+            .toggle_value(&mut on, "3D")
+            .on_hover_text("Give this comp a camera, so layer Z reads as depth")
+            .changed()
+        {
+            // A new camera is sized to the comp here, where the comp's own
+            // dimensions are already in hand — no sentinel value has to travel
+            // to the caller meaning "you pick".
+            out.camera =
+                Some(on.then(|| motion_core::Camera::default_distance(width, height)));
+        }
+        if let Some(d) = camera {
+            let mut d = d;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut d)
+                        .speed(10.0)
+                        .range(1.0..=1_000_000.0)
+                        .prefix("eye "),
+                )
+                .on_hover_text(
+                    "Distance from the eye to the z=0 plane, in comp pixels.                      Larger is flatter.",
+                )
+                .changed()
+            {
+                out.camera = Some(Some(d));
+            }
         }
 
         // Passepartout: how hard the preview dims outside the frame. Shown as a

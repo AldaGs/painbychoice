@@ -2619,6 +2619,13 @@ impl App {
         let comp_bg = self.doc().bg;
         let comp_pp = self.doc().passepartout;
         let comp_path_range = self.doc().motion_path_range;
+        // The camera's *resolved* distance at this frame — the bar edits the
+        // number you can see, so a keyframed dolly reads back as it plays.
+        let comp_camera = self.doc().camera.as_ref().map(|c| {
+            let comp = self.doc().clone();
+            let mut ctx = EvalCtx::new(&comp, frame as f64);
+            c.distance.resolve(&mut ctx)
+        });
         let timebase = self.doc().timebase();
         let view = self.view;
         let work_area = self.work_area;
@@ -2752,6 +2759,7 @@ impl App {
                         comp_bg,
                         comp_pp,
                         comp_path_range,
+                        comp_camera,
                         &mut comp,
                         &preset_names,
                         &mut preset_name_buf,
@@ -3237,6 +3245,11 @@ impl App {
         }
         if let Some(r) = comp.motion_path_range {
             self.doc_mut().motion_path_range = r.clamp(0, MAX_RANGE);
+            dirty = true;
+        }
+        if let Some(cam) = comp.camera {
+            self.doc_mut().camera =
+                cam.map(|d| motion_core::Camera { distance: Value::constant(d) });
             dirty = true;
         }
         if let Some(delta) = dope.move_by {

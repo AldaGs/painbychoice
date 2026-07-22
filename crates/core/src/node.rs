@@ -871,6 +871,16 @@ pub struct Comp {
     /// they exist to do.
     #[serde(default)]
     pub aids: ViewAids,
+    /// The comp's camera, or `None` for a flat composition.
+    ///
+    /// **This is the 2.5D switch.** Absent means depth is stored but never
+    /// read, and the render path is the one that existed before 2.5D — which
+    /// is why `#[serde(default)]` is the whole migration for every existing
+    /// `.pbc`. Present means the comp projects. There is no separate "3D
+    /// enabled" flag to fall out of sync with, because the camera's absence
+    /// *is* the absence of projection.
+    #[serde(default)]
+    pub camera: Option<crate::camera::Camera>,
     pub root: Node,
 }
 
@@ -1080,6 +1090,10 @@ impl Comp {
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
             name: String::new(),
+            // A new comp is flat: depth exists on every layer but nothing
+            // reads it until you add a camera. New work behaves like old work
+            // until you ask for otherwise.
+            camera: None,
             width,
             height,
             fps: 60.0,

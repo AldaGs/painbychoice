@@ -117,6 +117,29 @@ impl Mat4 {
         planar.then(|| kurbo::Affine::new([m[0], m[1], m[4], m[5], m[12], m[13]]))
     }
 
+    /// Recover the in-plane affine of a matrix that **may** carry depth, as
+    /// long as it is still screen-parallel: no out-of-plane rotation and no
+    /// perspective, but any `z` translation allowed.
+    ///
+    /// This is the billboard test. [`Self::as_affine`] asks "did this never
+    /// leave the plane at all", which a layer merely pushed back in Z fails —
+    /// yet such a layer is exactly the one a camera can draw with a plain
+    /// scale. The depth is dropped here because the caller has already spent it
+    /// on the projection; calling this without doing so would silently flatten
+    /// the scene.
+    pub fn as_affine_ignoring_depth(&self) -> Option<kurbo::Affine> {
+        let m = &self.0;
+        let parallel = m[2] == 0.0
+            && m[6] == 0.0
+            && m[8] == 0.0
+            && m[9] == 0.0
+            && m[3] == 0.0
+            && m[7] == 0.0
+            && m[11] == 0.0
+            && m[15] == 1.0;
+        parallel.then(|| kurbo::Affine::new([m[0], m[1], m[4], m[5], m[12], m[13]]))
+    }
+
     /// Transform a point (w = 1), dividing through by w so a later perspective
     /// matrix works without a second code path.
     pub fn transform_point(&self, p: Vec3) -> Vec3 {
