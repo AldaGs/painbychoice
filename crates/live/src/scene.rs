@@ -219,6 +219,8 @@ pub(crate) fn to_vello(
     canvas: kurbo::Rect,
     ghosts: &[Ghost],
     selected: Option<NodeId>,
+    footage: &mut FootageCache,
+    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
 ) -> VScene {
     let mut vs = VScene::new();
 
@@ -252,8 +254,17 @@ pub(crate) fn to_vello(
 
     for item in &scene.items {
         let xf = fit * item.transform;
+        // Footage draws *instead of* the fill: the fill colour is what a
+        // rectangle would paint, and a clip covers it entirely. A stroke still
+        // applies, so a bordered video layer works like a bordered rect.
+        let drew_footage = match item.image {
+            Some(paint) => draw_footage(&mut vs, item, xf, paint, footage, assets),
+            None => false,
+        };
         if let Some(fill) = item.fill {
-            vs.fill(Fill::NonZero, xf, to_peniko(fill, item.opacity), None, &item.path);
+            if !drew_footage {
+                vs.fill(Fill::NonZero, xf, to_peniko(fill, item.opacity), None, &item.path);
+            }
         }
         if let Some((color, width)) = item.stroke {
             vs.stroke(
@@ -453,4 +464,35 @@ pub(crate) fn nav_zoom_about(
         dy - (cy - doc.height * scale * 0.5),
     );
     CanvasNav { zoom: Some(scale / ppp), pan }
+}
+
+/// Draw one footage item, returning whether pixels actually landed.
+///
+/// `false` means the caller should paint the layer's plain rectangle instead —
+/// a missing file or a frame that wouldn't decode still has a *place*, and
+/// showing it is how a broken import stays findable rather than looking like a
+/// layer that silently stopped existing.
+fn draw_footage(
+    vs: &mut VScene,
+    item: &motion_core::RenderItem,
+    xf: Affine,
+    paint: motion_core::ImagePaint,
+    footage: &mut FootageCache,
+    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+) -> bool {
+    let Some(asset) = assets.get(&paint.asset) else { return false };
+    let opacity = item.opacity.clamp(0.0, 1.0) as f32;
+    let Some(image) = footage.image(asset, paint) else { return false };
+    // `draw_image` fills the source's own 0..w × 0..h rect, so the transform has
+    // to carry the image onto the item's rectangle: scale native pixels to the
+    // layer's size, then shift the centred rect's corner to the origin. Squeezed
+    // rather than letterboxed, because the layer's `size` is what the user set
+    // and what every overlay already draws.
+    let target = item.path.bounding_box();
+    let (nw, nh) = (image.width.max(1) as f64, image.height.max(1) as f64);
+    let place = Affine::translate((target.x0, target.y0))
+        * Affine::scale_non_uniform(target.width() / nw, target.height() / nh);
+    let brush = vello::peniko::ImageBrush::new(image.clone()).with_alpha(opacity);
+    vs.draw_image(&brush, xf * place);
+    true
 }

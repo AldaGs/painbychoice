@@ -3784,3 +3784,167 @@ fn a_group_has_no_shape_to_split_and_says_so() {
     assert!(err.contains("no shape"), "{err}");
     assert!(project.root_comp().root.find(NodeId(1)).unwrap().children.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Footage: import, time remapping, and the frame cache.
+// ---------------------------------------------------------------------------
+
+/// A decoder that invents frames, so the cache can be tested without files,
+/// ffmpeg, or a GPU — the same reason `core`'s tests never touch a disk.
+struct FakeDecoder {
+    side: u32,
+}
+
+impl motion_core::Decoder for FakeDecoder {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    fn probe(&self, _path: &std::path::Path) -> bool {
+        true
+    }
+    fn open(&self, _path: &std::path::Path) -> Result<motion_core::AssetMeta, motion_core::DecodeError> {
+        Ok(motion_core::AssetMeta {
+            kind: motion_core::AssetKind::Video,
+            width: self.side as f64,
+            height: self.side as f64,
+            frames: 1000,
+            fps: 24.0,
+        })
+    }
+    fn frame(
+        &self,
+        _path: &std::path::Path,
+        _source_frame: i64,
+    ) -> Result<motion_core::Frame, motion_core::DecodeError> {
+        motion_core::Frame::new(self.side, self.side, vec![0u8; (self.side * self.side * 4) as usize])
+    }
+}
+
+/// An empty file on disk for the fake decoder to "read".
+///
+/// A real path, because `DecoderRegistry` checks existence before dispatching —
+/// that check is what turns moved footage into "not found" instead of a decoder
+/// error, so the test honours it rather than working around it.
+fn fake_file(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, b"").expect("write the fixture");
+    path
+}
+
+fn fake_cache(side: u32) -> FootageCache {
+    let mut reg = motion_core::DecoderRegistry::new();
+    reg.register(Box::new(FakeDecoder { side }));
+    FootageCache::new(reg)
+}
+
+fn seed() -> LayerSeed {
+    LayerSeed { id: 7, transform: Transform::default(), fill: MColor::rgb(1.0, 0.0, 0.0) }
+}
+
+fn clip_meta() -> motion_core::AssetMeta {
+    motion_core::AssetMeta {
+        kind: motion_core::AssetKind::Video,
+        width: 1920.0,
+        height: 1080.0,
+        frames: 48,
+        fps: 24.0,
+    }
+}
+
+/// Footage lands at 100%: the layer is sized to the source's native pixels, so
+/// scaling it afterwards is a deliberate act rather than something the importer
+/// guessed at.
+#[test]
+fn importing_footage_sizes_the_layer_to_its_native_pixels() {
+    let mut project = MProject::single(Comp::new(640.0, 360.0, MNode::group(0, "root")));
+    let comp = project.root;
+    let node = import_footage(&mut project, clip_meta(), "clip.mp4".into(), seed(), comp);
+
+    let Some(MShape::Image { size, .. }) = &node.shape else {
+        panic!("an import makes an image layer");
+    };
+    let mut ctx = EvalCtx::at(0.0);
+    assert_eq!(size.resolve(&mut ctx), Vec2::new(1920.0, 1080.0));
+    assert_eq!(project.assets.len(), 1, "the source is registered once");
+}
+
+/// A clip arrives with its own length — the first time the layer time model has
+/// had a real content duration to seed from. The comp here runs at 60fps and
+/// the footage at 24, so the window is wall-clock, not a frame count copied
+/// across.
+#[test]
+fn an_imported_clip_gets_a_layer_window_its_own_length() {
+    let mut project = MProject::single(Comp::new(640.0, 360.0, MNode::group(0, "root")));
+    let comp = project.root;
+    // Comp::new defaults to 60fps; 48 frames at 24fps is two seconds = 120.
+    let node = import_footage(&mut project, clip_meta(), "clip.mp4".into(), seed(), comp);
+    let timing = node.timing.expect("a clip is as long as it is");
+    assert_eq!((timing.in_, timing.out), (0, 120));
+}
+
+/// A still holds until you trim it, so it gets no window at all. "As long as
+/// you like" and "one frame" are different answers.
+#[test]
+fn an_imported_still_gets_no_layer_window() {
+    let mut project = MProject::single(Comp::new(640.0, 360.0, MNode::group(0, "root")));
+    let comp = project.root;
+    let meta = motion_core::AssetMeta {
+        kind: motion_core::AssetKind::Image,
+        width: 512.0,
+        height: 512.0,
+        frames: 1,
+        fps: 0.0,
+    };
+    let node = import_footage(&mut project, meta, "logo.png".into(), seed(), comp);
+    assert!(node.timing.is_none());
+}
+
+/// Only a *remapped* clip has a time-remap property. An unremapped one plays at
+/// its natural rate and has no curve to key — the same rule that gives an
+/// ellipse no corner radius.
+#[test]
+fn time_remap_is_a_property_only_once_it_is_enabled() {
+    let mut project = MProject::single(Comp::new(640.0, 360.0, MNode::group(0, "root")));
+    let comp = project.root;
+    let mut node = import_footage(&mut project, clip_meta(), "clip.mp4".into(), seed(), comp);
+    assert!(prop_of(&node, PropKind::TimeRemap).is_none(), "natural playback has no curve");
+
+    if let Some(MShape::Image { time_remap, .. }) = node.shape.as_mut() {
+        *time_remap = Some(Value::constant(12.0));
+    }
+    assert!(prop_of(&node, PropKind::TimeRemap).is_some(), "enabling it makes it animatable");
+    // And footage shares the ordinary size property, so the gizmo and the
+    // dopesheet need no footage-specific case.
+    assert!(prop_of(&node, PropKind::ShapeSize).is_some());
+}
+
+/// The cache holds decoded frames and reports what it is holding, so the budget
+/// that keeps 4K footage from eating memory has something to measure.
+#[test]
+fn the_frame_cache_keeps_what_it_decodes() {
+    let mut cache = fake_cache(4);
+    let file = fake_file("pbc_cache_keeps.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+    let paint = motion_core::ImagePaint { asset: asset.id, source_frame: 3 };
+
+    assert!(cache.image(&asset, paint).is_some());
+    assert_eq!(cache.resident_bytes(), 4 * 4 * 4);
+    // A second ask for the same frame is served from the cache, not re-decoded.
+    assert!(cache.image(&asset, paint).is_some());
+    assert_eq!(cache.resident_bytes(), 4 * 4 * 4);
+}
+
+/// Asset ids are per-project, so opening another project must drop every
+/// cached frame — keeping them would draw the previous project's pixels under
+/// this one's layers.
+#[test]
+fn loading_another_project_drops_the_cached_frames() {
+    let mut cache = fake_cache(4);
+    let file = fake_file("pbc_cache_clear.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+    cache.image(&asset, motion_core::ImagePaint { asset: asset.id, source_frame: 0 });
+    assert!(cache.resident_bytes() > 0);
+
+    cache.clear();
+    assert_eq!(cache.resident_bytes(), 0);
+}

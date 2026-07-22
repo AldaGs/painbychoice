@@ -126,6 +126,10 @@ pub(crate) struct TreeEdits {
     /// up/down buttons invert this via [`reorder_delta`].
     pub(crate) reorder: Option<(NodeId, i32)>,
     pub(crate) add: Option<NewShape>,
+    /// Open a file dialog and import footage. A bare flag rather than a path
+    /// because the dialog is blocking and must not run during the UI pass —
+    /// same discipline as save/load.
+    pub(crate) import_footage: bool,
     pub(crate) delete: Option<NodeId>,
     pub(crate) save: bool,
     pub(crate) load: bool,
@@ -161,6 +165,9 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
         if icon::button(ui, icon::GROUP, "Add a group").clicked() {
             out.add = Some(NewShape::Group);
+        }
+        if icon::button(ui, icon::IMPORT, "Import footage (image or video)").clicked() {
+            out.import_footage = true;
         }
     });
     ui.weak("Adds into the selected node, else the root.");

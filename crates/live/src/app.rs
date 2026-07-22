@@ -182,6 +182,9 @@ pub(crate) struct App {
     /// nothing. Cleared by the next successful graph edit so a stale complaint
     /// can't outlive the thing it was complaining about.
     pub(crate) ng_status: Option<String>,
+    /// Decoded footage frames. Editor state, never saved: the document holds
+    /// references and these are the pixels behind them.
+    pub(crate) footage: FootageCache,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -420,6 +423,53 @@ pub(crate) fn create_layer_from_geometry(
         .with_transform(seed.transform);
     project.graph.bind_geometry(output, NodeId(seed.id));
     Some(node)
+}
+
+/// Register `path` as an asset and build the layer that shows it.
+///
+/// Two decisions live here. The layer is **sized to the footage's native
+/// pixels**, so an import lands at 100% and scaling it afterwards is a
+/// deliberate act rather than something the importer guessed at. And a clip is
+/// given a [`LayerTiming`] spanning its own length, which is the first time the
+/// layer time model has had a real content duration to seed from — a still gets
+/// none, because "holds until you trim it" is what a still does.
+///
+/// It keeps a fill even though footage covers it: the fill is what shows when a
+/// file goes missing (so a broken import stays *findable* rather than becoming
+/// an invisible layer), and picking requires one — see `scene::pick`.
+///
+/// Free-standing, like [`create_layer_from_geometry`], so the document work is
+/// testable without a window; the caller parents and selects the node.
+pub(crate) fn import_footage(
+    project: &mut MProject,
+    meta: motion_core::AssetMeta,
+    path: std::path::PathBuf,
+    seed: LayerSeed,
+    comp: CompId,
+) -> MNode {
+    let fps = project.comp(comp).map(|c| c.fps).unwrap_or(0.0);
+    let asset = project.add_asset(meta.into_asset(motion_core::AssetId(0), path));
+    let name = project.asset(asset).map(|a| a.name.clone()).unwrap_or_default();
+    let duration = project.asset(asset).and_then(|a| a.duration_in_comp(fps));
+
+    let mut node = MNode::shape(
+        seed.id,
+        name,
+        MShape::Image {
+            asset,
+            size: Value::constant(Vec2::new(meta.width, meta.height)),
+            time_remap: None,
+        },
+    )
+    .with_fill(seed.fill)
+    .with_transform(seed.transform);
+    // A clip is as long as it is. Placed at frame 0 rather than at the playhead:
+    // an import is a source arriving in the project, and where it sits in time
+    // is an editing decision the strips view is for.
+    if let Some(frames) = duration {
+        node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
+    }
+    node
 }
 
 /// The properties that live on a node's **artwork** rather than its placement,
@@ -699,6 +749,7 @@ impl App {
             node_registry: NodeRegistry::with_builtins(),
             ng_scope: NgScope::Project,
             ng_status: None,
+            footage: FootageCache::new(motion_render::default_registry()),
         }
     }
 
@@ -1570,6 +1621,28 @@ impl App {
             }
         }
 
+        // Footage. Turning time remapping on seeds a constant at the frame
+        // currently showing, so the picture doesn't jump the moment you enable
+        // it; turning it off drops the whole curve, which is what "play at the
+        // natural rate" means. Dialling a value goes through `set_at`, so it
+        // auto-keys like every other animatable property.
+        if let Some(MShape::Image { time_remap, .. }) = node.shape.as_mut() {
+            match e.time_remap {
+                Some(Some(v)) => {
+                    match time_remap {
+                        Some(t) => t.set_at(frame, v),
+                        None => *time_remap = Some(Value::constant(v)),
+                    }
+                    changed = true;
+                }
+                Some(None) => {
+                    *time_remap = None;
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+
         // Stopwatch clicks: insert a keyframe at the playhead (promoting a
         // constant to a track the first time). Driven off `PropKind` so a new
         // animatable property needs no new branch here.
@@ -1914,6 +1987,40 @@ impl App {
         true
     }
 
+    /// Import footage and drop it in as a layer.
+    ///
+    /// The `App` half: run the (blocking) file dialog, probe the file, then
+    /// hand the document work to the window-free [`import_footage`] so it stays
+    /// testable — the same split `compile_drivers` and `import_shape` follow.
+    ///
+    /// A failure is reported through `ng_status` rather than `eprintln!`, which
+    /// is invisible in a GUI and once made a refusal indistinguishable from a
+    /// dead button.
+    pub(crate) fn import_footage(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Footage", &[
+                "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "tga", "qoi", "mp4",
+                "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "ogv",
+            ])
+            .pick_file()
+        else {
+            return false;
+        };
+        let meta = match self.footage.probe(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                self.ng_status = Some(format!("Couldn't import {}: {e}", path.display()));
+                return false;
+            }
+        };
+        let (id, at_center, fill) = self.new_layer_look();
+        let seed = LayerSeed { id, transform: at_center, fill };
+        let node = import_footage(&mut self.project, meta, path, seed, self.current);
+        self.push_layer(node, self.selected);
+        self.ng_status = None;
+        true
+    }
+
     /// Create a layer whose shape **is** a graph geometry output — the other
     /// half of the geometry fold, and the thing that lets the node canvas bring
     /// something into existence rather than only decorate a layer you already
@@ -2080,6 +2187,10 @@ impl App {
         // The work area is view state, not saved with the document.
         self.work_area = None;
         self.project = project;
+        // Asset ids are per-project, so every cached frame is now keyed to
+        // footage that no longer exists. Keeping them would draw the previous
+        // project's pixels under this one's layers.
+        self.footage.clear();
         self.current = self.project.root;
         self.selected = None;
         self.selected_keys.clear();
@@ -2154,8 +2265,19 @@ impl App {
         // Warnings are re-derived every frame, so print only when the set
         // actually changes — a broken script would otherwise spam stderr at the
         // refresh rate. The current set is kept for the comp bar's indicator.
-        let warnings: Vec<(u64, String)> =
+        let mut warnings: Vec<(u64, String)> =
             scene.warnings.iter().map(|(id, m)| (id.0, m.clone())).collect();
+        // Decode failures are the shell's to report, not the engine's:
+        // `evaluate` never opens a file, so a corrupt frame or a missing
+        // ffmpeg can only be noticed here. Folded into the same list so they
+        // reach the comp bar's warning indicator like everything else.
+        for item in &scene.items {
+            if let Some(paint) = item.image {
+                if let Some(msg) = self.footage.error(paint) {
+                    warnings.push((item.source.0, msg.to_string()));
+                }
+            }
+        }
         if warnings != self.warnings {
             for (id, msg) in &warnings {
                 eprintln!("warning [node {id}]: {msg}");
@@ -2211,16 +2333,24 @@ impl App {
         let bg = self.doc().bg;
         let pp = self.doc().passepartout;
         self.vscene =
-            to_vello(
-                &scene,
-                fit,
-                (self.doc().width, self.doc().height),
-                bg,
-                pp,
-                canvas,
-                &self.onion.ghosts,
-                self.selected,
-            );
+            {
+                // Comp dimensions read *before* the call: `to_vello` borrows
+                // the footage cache mutably, and `self.doc()` inside the
+                // argument list would be an overlapping shared borrow of self.
+                let dims = (self.doc().width, self.doc().height);
+                to_vello(
+                    &scene,
+                    fit,
+                    dims,
+                    bg,
+                    pp,
+                    canvas,
+                    &self.onion.ghosts,
+                    self.selected,
+                    &mut self.footage,
+                    &self.project.assets,
+                )
+            };
 
         // Motion path: only for a layer whose *position* is actually animated —
         // a constant position has no trajectory, and drawing one dot under the
@@ -2250,7 +2380,8 @@ impl App {
         let sel_node = self.selected.and_then(|id| self.doc().root.find(id));
         // Pass the doc so an expression-driven property resolves against the
         // scene (a doc-less context would show its fallback instead).
-        let sel_info = sel_node.map(|node| NodeInfo::resolve(node, self.doc(), t));
+        let sel_info =
+            sel_node.map(|node| NodeInfo::resolve_with(node, self.doc(), t, &self.project.assets));
         // The gizmo needs the selected layer's *world* matrix, which only the
         // evaluated scene knows (it is the whole parent chain multiplied out).
         // Taken from `Scene::places`, not from a `RenderItem`: a group or null
@@ -3014,6 +3145,9 @@ impl App {
         if tree_edits.load {
             dirty |= self.load();
         }
+        if tree_edits.import_footage {
+            dirty |= self.import_footage();
+        }
         if dirty {
             // Every document change invalidates the motion-path cache.
             self.doc_rev = self.doc_rev.wrapping_add(1);
@@ -3026,16 +3160,24 @@ impl App {
             let bg = self.doc().bg;
             let pp = self.doc().passepartout;
         self.vscene =
-            to_vello(
-                &scene,
-                fit,
-                (self.doc().width, self.doc().height),
-                bg,
-                pp,
-                canvas,
-                &self.onion.ghosts,
-                self.selected,
-            );
+            {
+                // Comp dimensions read *before* the call: `to_vello` borrows
+                // the footage cache mutably, and `self.doc()` inside the
+                // argument list would be an overlapping shared borrow of self.
+                let dims = (self.doc().width, self.doc().height);
+                to_vello(
+                    &scene,
+                    fit,
+                    dims,
+                    bg,
+                    pp,
+                    canvas,
+                    &self.onion.ghosts,
+                    self.selected,
+                    &mut self.footage,
+                    &self.project.assets,
+                )
+            };
         }
 
         self.egui_state

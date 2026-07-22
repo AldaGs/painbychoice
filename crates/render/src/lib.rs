@@ -5,6 +5,10 @@
 //! real-time GPU backend (vello on wgpu) slots in behind the same `Scene`
 //! input later without touching `motion-core`.
 
+pub mod decode;
+
+pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
+
 use kurbo::Shape as _;
 use motion_core::{Asset, Color, Scene};
 
@@ -66,25 +70,22 @@ pub fn scene_to_svg(
                 .iter()
                 .find(|a| a.id == paint.asset)
                 .map(|a| a.path.to_string_lossy().replace('&', "&amp;"));
-            match href {
-                Some(href) => {
-                    let b = item.path.bounding_box();
-                    out.push_str(&format!(
-                        "  <image transform=\"{matrix}\" x=\"{}\" y=\"{}\" width=\"{}\" \
-                         height=\"{}\" preserveAspectRatio=\"none\" opacity=\"{:.3}\" \
-                         href=\"{href}\"/>\n",
-                        b.x0,
-                        b.y0,
-                        b.width(),
-                        b.height(),
-                        item.opacity.clamp(0.0, 1.0),
-                    ));
-                    continue;
-                }
-                // Footage the project no longer has. `evaluate` already warned;
-                // fall through and draw the plain rectangle so the layer's
-                // place on screen is still visible.
-                None => {}
+            // A `None` here is footage the project no longer has. `evaluate`
+            // already warned; fall through and draw the plain rectangle so the
+            // layer's place on screen is still visible.
+            if let Some(href) = href {
+                let b = item.path.bounding_box();
+                out.push_str(&format!(
+                    "  <image transform=\"{matrix}\" x=\"{}\" y=\"{}\" width=\"{}\" \
+                     height=\"{}\" preserveAspectRatio=\"none\" opacity=\"{:.3}\" \
+                     href=\"{href}\"/>\n",
+                    b.x0,
+                    b.y0,
+                    b.width(),
+                    b.height(),
+                    item.opacity.clamp(0.0, 1.0),
+                ));
+                continue;
             }
         }
 

@@ -8,3 +8,7 @@ description = "Turns an evaluated Scene into pixels. SVG backend today; vello/wg
 [dependencies]
 motion-core.workspace = true
 kurbo.workspace = true
+# Stills only. Default features minus the ones that pull in heavy or
+# rarely-wanted formats would be a later tightening; footage import wants the
+# common set to just work.
+image = "0.25"

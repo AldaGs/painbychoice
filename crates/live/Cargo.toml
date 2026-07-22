@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 motion-core.workspace = true
+motion-render.workspace = true
 kurbo.workspace = true
 vello = "0.9"
 winit = "0.30"

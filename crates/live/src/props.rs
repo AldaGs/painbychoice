@@ -28,6 +28,8 @@ pub(crate) struct Transport {
 /// gathered before the egui closure so the UI never borrows `App`. The `*_anim`
 /// flags mark properties backed by a keyframe track (edits auto-key those).
 pub(crate) struct NodeInfo {
+    /// Footage facts, for an image layer. `None` for everything else.
+    pub(crate) footage: Option<FootageInfo>,
     pub(crate) name: String,
     pub(crate) id: u64,
     pub(crate) pos: (f64, f64),
@@ -72,6 +74,26 @@ pub(crate) struct NodeInfo {
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
 /// (and so keyframable and scriptable); family, alignment, and wrap width are
 /// plain data, edited directly.
+/// What the properties panel shows for a footage layer.
+///
+/// Everything here is *read* from the asset registry rather than editable:
+/// the source, its shape and its length are facts about a file. The one control
+/// is time remapping, which is a property of the layer, not of the footage.
+pub(crate) struct FootageInfo {
+    pub(crate) name: String,
+    pub(crate) missing: bool,
+    /// Native pixels — what the layer's size was seeded from, kept visible so a
+    /// scaled clip can be put back to 100%.
+    pub(crate) native: (f64, f64),
+    /// Source length and rate. `None` for a still, which has neither.
+    pub(crate) rate: Option<(i64, f64)>,
+    /// The frame of the source showing right now.
+    pub(crate) source_frame: i64,
+    /// `Some(v)` when time-remapped, with the curve's value this frame.
+    pub(crate) remap: Option<f64>,
+    pub(crate) remap_anim: bool,
+}
+
 pub(crate) struct TextInfo {
     /// The string **as resolved this frame**, not the recipe — so a keyframed
     /// or scripted content shows what is actually on screen, the same way
@@ -189,8 +211,21 @@ pub(crate) fn is_anim(node: &MNode, kind: PropKind) -> bool {
 }
 
 impl NodeInfo {
+    /// Resolve against a comp with no footage registry — every image layer
+    /// then reads as missing, which is honest for a bare comp.
+    #[cfg(test)]
     pub(crate) fn resolve(node: &motion_core::Node, doc: &Document, t: f64) -> Self {
+        Self::resolve_with(node, doc, t, &Default::default())
+    }
+
+    pub(crate) fn resolve_with(
+        node: &motion_core::Node,
+        doc: &Document,
+        t: f64,
+        assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+    ) -> Self {
         let mut ctx = EvalCtx::new(doc, t);
+        ctx.assets = Some(assets);
         // Mark the node, as `evaluate`'s walk does: a `param("x")` with no
         // explicit owner reads this node's knobs, so the panel would otherwise
         // show a fallback where the canvas shows the real value.
@@ -215,7 +250,9 @@ impl NodeInfo {
                 [c.r as f32, c.g as f32, c.b as f32]
             }),
             size: match node.shape.as_ref() {
-                Some(MShape::Rect { size, .. }) | Some(MShape::Ellipse { size }) => {
+                Some(MShape::Rect { size, .. })
+                | Some(MShape::Ellipse { size })
+                | Some(MShape::Image { size, .. }) => {
                     let s = size.resolve(ctx);
                     Some((s.x, s.y))
                 }
@@ -255,9 +292,47 @@ impl NodeInfo {
                 }),
                 _ => None,
             },
+            footage: footage_info(node, ctx),
             knobs: node.params.iter().map(crate::nodegraph::knob_info).collect(),
         }
     }
+}
+
+/// The footage facts for an image layer, read out of the context's asset
+/// registry.
+///
+/// A free function because the asset fields have to be copied out *before* the
+/// `Value`s are resolved: the registry is borrowed from `ctx`, and resolving
+/// takes `&mut ctx`. Reading them in one place makes that ordering obvious
+/// instead of something a future edit trips over.
+fn footage_info(node: &motion_core::Node, ctx: &mut EvalCtx) -> Option<FootageInfo> {
+    let MShape::Image { asset, time_remap, .. } = node.shape.as_ref()? else {
+        return None;
+    };
+    let facts = ctx.asset(*asset).map(|a| {
+        (
+            a.name.clone(),
+            (a.width, a.height),
+            (a.kind == motion_core::AssetKind::Video).then_some((a.frames, a.fps)),
+        )
+    });
+    let time_remap = time_remap.clone();
+    let missing = facts.is_none();
+    // Named by id when it's gone, because that is genuinely all that is left to
+    // say about footage the project no longer has.
+    let (name, native, rate) = facts
+        .unwrap_or_else(|| (format!("missing footage #{}", asset.0), (0.0, 0.0), None));
+    Some(FootageInfo {
+        missing,
+        // Asked of the shape rather than recomputed here, so the readout can't
+        // drift from the frame actually being drawn.
+        source_frame: node.shape.as_ref().and_then(|sh| sh.image_paint(ctx)).map_or(0, |p| p.source_frame),
+        remap: time_remap.as_ref().map(|v| v.resolve(ctx)),
+        remap_anim: is_anim(node, PropKind::TimeRemap),
+        name,
+        native,
+        rate,
+    })
 }
 
 /// Edits collected from the properties panel this frame. Any `Some` field is a
@@ -294,6 +369,11 @@ pub(crate) struct PropEdits {
     pub(crate) text_align: Option<TextAlign>,
     #[allow(clippy::option_option)]
     pub(crate) text_max_width: Option<Option<f64>>,
+    /// Time remapping. `Some(None)` turns it off (back to natural playback),
+    /// `Some(Some(f))` turns it on or dials it to source frame `f`. The nested
+    /// option is the same shape `text_max_width` uses for an optional field.
+    #[allow(clippy::option_option)]
+    pub(crate) time_remap: Option<Option<f64>>,
     // Insert-keyframe-at-playhead requests (the "stopwatch"). Keyed by
     // `PropKind` rather than one bool per property, so adding an animatable
     // property doesn't grow this struct.
@@ -732,6 +812,58 @@ pub(crate) fn properties_ui(
                 edits.key.insert(PropKind::ShapeRadius);
             }
             ui.end_row();
+        }
+
+        // --- Footage. The source is a read-only fact about a file; the only
+        // control is time remapping, which belongs to the layer. ---
+        if let Some(f) = &n.footage {
+            ui.label("Source");
+            ui.horizontal(|ui| {
+                if f.missing {
+                    ui.colored_label(WARN_COLOR, icon::WARNING);
+                }
+                ui.label(&f.name);
+            });
+            ui.end_row();
+
+            ui.label("");
+            ui.weak(match f.rate {
+                Some((frames, fps)) => {
+                    format!("{}×{} · {frames} frames @ {fps:.3} fps", f.native.0, f.native.1)
+                }
+                None => format!("{}×{} still", f.native.0, f.native.1),
+            });
+            ui.end_row();
+
+            // Only a clip can be remapped: a still has one frame, so a curve
+            // over it would be a control that does nothing.
+            if f.rate.is_some() {
+                ui.label("Time remap");
+                ui.horizontal(|ui| {
+                    let mut on = f.remap.is_some();
+                    // Switching on seeds the curve at the frame currently
+                    // showing, so enabling it never jumps the picture.
+                    if ui.checkbox(&mut on, "").changed() {
+                        edits.time_remap =
+                            Some(on.then_some(f.source_frame as f64));
+                    }
+                    if let Some(v) = f.remap {
+                        let mut v = v;
+                        if ui
+                            .add(egui::DragValue::new(&mut v).speed(0.25).suffix(" f"))
+                            .changed()
+                        {
+                            edits.time_remap = Some(Some(v));
+                        }
+                    } else {
+                        ui.weak(format!("playing frame {}", f.source_frame));
+                    }
+                });
+                if key_button(ui, f.remap_anim) {
+                    edits.key.insert(PropKind::TimeRemap);
+                }
+                ui.end_row();
+            }
         }
 
         // --- Text. Content and font size are `Value`s and carry stopwatches;
