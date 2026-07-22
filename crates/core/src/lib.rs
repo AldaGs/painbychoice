@@ -16,6 +16,7 @@ pub mod eval;
 pub mod expr;
 pub mod graph;
 pub mod lower;
+pub mod mat4;
 pub mod node;
 pub mod raise;
 pub mod registry;
@@ -23,6 +24,7 @@ pub mod socket;
 pub mod text;
 pub mod timebase;
 pub mod value;
+pub mod vec3;
 
 pub use asset::{
     Asset, AssetId, AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, FrameStream,
@@ -32,7 +34,7 @@ pub use composite::{BlendMode, ComposeMode, Mask, MatteMode};
 pub use eval::{evaluate, evaluate_comp, evaluate_project, LayerGroup, MaskPath, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
-    MathOp, UnOp,
+    Axis, MathOp, UnOp,
     PropPath, ToExpr, Waveform,
 };
 pub use node::{
@@ -48,7 +50,9 @@ pub use raise::{raise, raise_geometry, RaiseShapeError};
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };
+pub use mat4::{Mat4, Xf};
 pub use socket::{Socket, SocketType};
 pub use text::{text_bounds, text_to_path, TextAlign};
 pub use timebase::Timebase;
+pub use vec3::Vec3;
 pub use value::{mirror_handle, Animatable, Color, EasePreset, Handle, Interp, Keyframe, Track, Value};

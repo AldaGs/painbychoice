@@ -4,6 +4,8 @@
 
 use kurbo::{Affine, BezPath, Rect, Shape as _};
 
+use crate::mat4::Xf;
+
 use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
 use crate::expr::EvalCtx;
@@ -194,7 +196,7 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
     // and warnings sink. Expression warnings gathered during the walk are folded
     // into the scene's provenance-tagged list afterward.
     let mut ctx = EvalCtx::new(doc, frame);
-    walk(&doc.root, Affine::IDENTITY, 1.0, &mut ctx, None, &mut Vec::new(), &mut scene);
+    walk(&doc.root, Xf::IDENTITY, 1.0, &mut ctx, None, &mut Vec::new(), &mut scene);
     scene.warnings.append(&mut ctx.take_warnings());
     scene
 }
@@ -207,7 +209,7 @@ pub fn evaluate(doc: &Document, frame: f64) -> Scene {
 /// deliberately out of scope for v1.
 pub fn evaluate_comp(project: &Project, comp: CompId, frame: f64) -> Scene {
     let mut scene = Scene::default();
-    eval_comp(project, comp, frame, Affine::IDENTITY, 1.0, &mut Vec::new(), &mut scene);
+    eval_comp(project, comp, frame, Xf::IDENTITY, 1.0, &mut Vec::new(), &mut scene);
     scene
 }
 
@@ -222,7 +224,7 @@ fn eval_comp(
     project: &Project,
     id: CompId,
     frame: f64,
-    xf: Affine,
+    xf: Xf,
     opacity: f64,
     stack: &mut Vec<CompId>,
     scene: &mut Scene,
@@ -267,7 +269,7 @@ fn content_bounds(scene: &Scene, start: usize, end: usize) -> Option<kurbo::Rect
 
 fn walk(
     node: &Node,
-    parent_xf: Affine,
+    parent_xf: Xf,
     parent_opacity: f64,
     ctx: &mut EvalCtx,
     project: Option<&Project>,
@@ -300,6 +302,17 @@ fn walk(
     let prev_node = ctx.enter_node(node.id);
     let (local_xf, local_opacity) = node.transform.resolve(ctx);
     let xf = parent_xf * local_xf;
+    // **The 2.5D seam.** `xf` is the true placement and is what descends to the
+    // children, so a depth-carrying hierarchy composes correctly all the way
+    // down. `flat` is that placement as an affine, which is all the current
+    // renderer, the mask path, the gizmo overlay, and hit-testing can consume.
+    //
+    // For every document that exists today the two are the same value: a
+    // transform that never leaves the plane resolves to `Xf::Flat` and
+    // `to_affine_lossy` hands the affine straight back. For a layer rotated
+    // about X or Y it is an orthographic reading — the card is drawn turned but
+    // not foreshortened — which is where the projected pipeline will attach.
+    let flat = xf.to_affine_lossy();
     // An isolated layer's opacity belongs to the *group*, applied once to the
     // finished image, so the subtree below it draws at full strength and the
     // fade happens on the way out. `full` is what accumulated down to here;
@@ -323,8 +336,8 @@ fn walk(
     scene.places.push((
         node.id,
         Placement {
-            world: xf,
-            pivot: xf * kurbo::Point::new(anchor.x, anchor.y),
+            world: flat,
+            pivot: flat * kurbo::Point::new(anchor.x, anchor.y),
             bounds: None,
         },
     ));
@@ -341,15 +354,15 @@ fn walk(
 
         // Provenance-tagged sanity check: surface non-finite geometry instead
         // of silently emitting a broken frame.
-        if !xf.as_coeffs().iter().all(|c| c.is_finite()) {
+        if !flat.as_coeffs().iter().all(|c| c.is_finite()) {
             scene
                 .warnings
                 .push((node.id, "transform resolved to a non-finite value".into()));
         } else {
-            bounds = Some((xf * path.clone()).bounding_box());
+            bounds = Some((flat * path.clone()).bounding_box());
             scene.items.push(RenderItem {
                 source: node.id,
-                transform: xf,
+                transform: flat,
                 path,
                 fill,
                 stroke,
@@ -418,16 +431,16 @@ fn walk(
                 // Measured in comp space, then brought back into layer space,
                 // where the mask shape lives.
                 let mut outer = content_bounds(scene, group_at, content_end)
-                    .map(|b| xf.inverse().transform_rect_bbox(b))
+                    .map(|b| flat.inverse().transform_rect_bbox(b))
                     .unwrap_or(Rect::ZERO);
                 // A hair of margin: a rectangle exactly on the content's edge
                 // can drop the outermost pixel to rounding.
                 outer = outer.inflate(1.0, 1.0);
                 let mut combined = outer.to_path(0.1);
                 combined.extend(path.iter());
-                MaskPath { path: combined, transform: xf, even_odd: true }
+                MaskPath { path: combined, transform: flat, even_odd: true }
             } else {
-                MaskPath { path, transform: xf, even_odd: false }
+                MaskPath { path, transform: flat, even_odd: false }
             }
         });
         scene.groups.push(LayerGroup {
@@ -516,6 +529,7 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vec3::Vec3;
     use crate::expr::BinOp;
     use crate::composite::{Mask, MatteMode};
     use crate::node::{Comp, Node, Project, Shape, Transform};
@@ -529,7 +543,7 @@ mod tests {
             radius: Value::constant(0.0),
         });
         n.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
-        n.transform.position = Value::constant(Vec2::new(x, 0.0));
+        n.transform.position = Value::constant(Vec3::flat(x, 0.0));
         n
     }
 
@@ -970,7 +984,7 @@ mod tests {
     #[test]
     fn a_group_has_no_render_item_but_still_has_a_pivot() {
         let mut group = Node::group(1, "null");
-        group.transform.position = Value::constant(Vec2::new(30.0, 40.0));
+        group.transform.position = Value::constant(Vec3::flat(30.0, 40.0));
         let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(group));
 
         let scene = evaluate(&doc, 0.0);
@@ -985,11 +999,11 @@ mod tests {
     #[test]
     fn a_groups_world_matrix_carries_the_parent_chain() {
         let mut child = Node::group(2, "child");
-        child.transform.position = Value::constant(Vec2::new(10.0, 0.0));
+        child.transform.position = Value::constant(Vec3::flat(10.0, 0.0));
 
         let mut parent = Node::group(1, "parent");
-        parent.transform.position = Value::constant(Vec2::new(100.0, 0.0));
-        parent.transform.rotation_deg = Value::constant(90.0);
+        parent.transform.position = Value::constant(Vec3::flat(100.0, 0.0));
+        parent.transform.rotation = Value::constant(Vec3::new(0.0, 0.0, 90.0));
 
         let doc = Document::new(
             500.0,
@@ -1015,11 +1029,11 @@ mod tests {
     #[test]
     fn a_pivot_is_the_anchor_through_the_whole_parent_chain() {
         let mut child = Node::group(2, "child");
-        child.transform.position = Value::constant(Vec2::new(10.0, 0.0));
-        child.transform.anchor = Value::constant(Vec2::new(5.0, 5.0));
+        child.transform.position = Value::constant(Vec3::flat(10.0, 0.0));
+        child.transform.anchor = Value::constant(Vec3::flat(5.0, 5.0));
 
         let mut parent = Node::group(1, "parent");
-        parent.transform.position = Value::constant(Vec2::new(100.0, 100.0));
+        parent.transform.position = Value::constant(Vec3::flat(100.0, 100.0));
         let doc = Document::new(
             500.0,
             500.0,
@@ -1041,7 +1055,7 @@ mod tests {
     fn a_trimmed_layer_has_no_pivot_outside_its_window() {
         use crate::node::LayerTiming;
         let mut layer = Node::group(1, "clip");
-        layer.transform.position = Value::constant(Vec2::new(20.0, 20.0));
+        layer.transform.position = Value::constant(Vec3::flat(20.0, 20.0));
         layer.timing = Some(LayerTiming { start: 0, in_: 10, out: 20 });
         let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(layer));
 
@@ -1066,8 +1080,8 @@ mod tests {
         .with_fill(Color::rgb(1.0, 0.0, 0.0))
         .with_transform(Transform {
             position: Value::Keyframed(Track::new(vec![
-                Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-                Keyframe::linear(24, Vec2::new(200.0, 100.0)),
+                Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+                Keyframe::linear(24, Vec3::flat(200.0, 100.0)),
             ])),
             ..Transform::default()
         });
@@ -1242,8 +1256,8 @@ mod tests {
             .with_timing(LayerTiming::new(at, at + 24))
             .with_transform(Transform {
                 position: Value::Keyframed(Track::new(vec![
-                    Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-                    Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                    Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+                    Keyframe::linear(24, Vec3::flat(240.0, 0.0)),
                 ])),
                 ..Transform::default()
             })
@@ -1282,8 +1296,8 @@ mod tests {
             .with_timing(LayerTiming { start, in_: 0, out: 24 })
             .with_transform(Transform {
                 position: Value::Keyframed(Track::new(vec![
-                    Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-                    Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                    Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+                    Keyframe::linear(24, Vec3::flat(240.0, 0.0)),
                 ])),
                 ..Transform::default()
             })
@@ -1312,8 +1326,8 @@ mod tests {
             )
             .with_transform(Transform {
                 position: Value::Keyframed(Track::new(vec![
-                    Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-                    Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                    Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+                    Keyframe::linear(24, Vec3::flat(240.0, 0.0)),
                 ])),
                 ..Transform::default()
             })
@@ -1475,7 +1489,7 @@ mod tests {
             Node::group(id, "instance")
                 .with_precomp(inner_id)
                 .with_transform(Transform {
-                    position: Value::constant(Vec2::new(x, 0.0)),
+                    position: Value::constant(Vec3::flat(x, 0.0)),
                     ..Transform::default()
                 })
         };
@@ -1533,8 +1547,8 @@ mod tests {
         // Inner comp: a dot sliding 0 -> 240 over 24 frames of *its* time.
         let inner_child = dot(1).with_transform(Transform {
             position: Value::Keyframed(Track::new(vec![
-                Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-                Keyframe::linear(24, Vec2::new(240.0, 0.0)),
+                Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+                Keyframe::linear(24, Vec3::flat(240.0, 0.0)),
             ])),
             ..Transform::default()
         });

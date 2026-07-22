@@ -978,7 +978,7 @@ fn precomposing_does_not_double_the_layers_transform() {
         .find_mut(NodeId(2))
         .unwrap()
         .transform
-        .position = Value::constant(Vec2::new(100.0, 50.0));
+        .position = Value::constant(motion_core::Vec3::flat(100.0, 50.0));
 
     let before = motion_core::evaluate_comp(&project, current, 0.0);
     let x_of = |scene: &MScene, src: u64| {
@@ -1011,9 +1011,9 @@ fn the_root_cannot_be_precomposed() {
 fn comp_at_fps(fps: f64, frame: i64) -> motion_core::node::Comp {
     use motion_core::value::{Keyframe, Track};
     let mut transform = motion_core::node::Transform::default();
-    transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, 0.0),
-        Keyframe::linear(frame, 90.0),
+    transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
+        Keyframe::linear(frame, motion_core::Vec3::new(0.0, 0.0, 90.0)),
     ]));
     let layer = MNode::group(1, "layer").with_transform(transform);
     let mut comp =
@@ -1023,7 +1023,7 @@ fn comp_at_fps(fps: f64, frame: i64) -> motion_core::node::Comp {
 }
 
 fn rot_keys(comp: &motion_core::node::Comp) -> Vec<i64> {
-    comp.root.children[0].transform.rotation_deg.key_frames()
+    comp.root.children[0].transform.rotation.key_frames()
 }
 
 /// `apply_fps_edit` with no node selected — the selection remap is exercised
@@ -1065,10 +1065,10 @@ fn a_long_drag_does_not_compound_rounding() {
     use motion_core::value::{Keyframe, Track};
     // Keys one frame apart @ 60fps cannot all survive a 7fps grid.
     let mut comp = comp_at_fps(60.0, 120);
-    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, 0.0),
-        Keyframe::linear(120, 45.0),
-        Keyframe::linear(121, 90.0),
+    comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
+        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 45.0)),
+        Keyframe::linear(121, motion_core::Vec3::new(0.0, 0.0, 90.0)),
     ]));
     let mut drag = None;
     let mut start = fps_edit(59.0);
@@ -1249,10 +1249,10 @@ fn a_fitting_label_width_is_left_alone() {
 fn the_key_selection_survives_a_retime() {
     use motion_core::value::{Keyframe, Track};
     let mut comp = comp_at_fps(60.0, 120);
-    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, 0.0),
-        Keyframe::linear(60, 30.0),
-        Keyframe::linear(120, 90.0),
+    comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
+        Keyframe::linear(60, motion_core::Vec3::new(0.0, 0.0, 30.0)),
+        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 90.0)),
     ]));
     let mut sel = KeySelection::new();
     sel.insert((PropKind::Rotation, 2)); // the key at frame 120
@@ -1278,11 +1278,11 @@ fn the_key_selection_survives_a_retime() {
 fn a_selection_follows_keys_that_merge() {
     use motion_core::value::{Keyframe, Track};
     let mut comp = comp_at_fps(60.0, 120);
-    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, 0.0),
-        Keyframe::linear(120, 45.0),
-        Keyframe::linear(121, 60.0),
-        Keyframe::linear(240, 90.0),
+    comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
+        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 45.0)),
+        Keyframe::linear(121, motion_core::Vec3::new(0.0, 0.0, 60.0)),
+        Keyframe::linear(240, motion_core::Vec3::new(0.0, 0.0, 90.0)),
     ]));
     let mut sel = KeySelection::new();
     sel.insert((PropKind::Rotation, 2)); // frame 121
@@ -1314,10 +1314,10 @@ fn a_selection_follows_keys_that_merge() {
 fn the_selection_does_not_drift_over_a_drag() {
     use motion_core::value::{Keyframe, Track};
     let mut comp = comp_at_fps(60.0, 120);
-    comp.root.children[0].transform.rotation_deg = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, 0.0),
-        Keyframe::linear(120, 45.0),
-        Keyframe::linear(121, 60.0),
+    comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
+        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 45.0)),
+        Keyframe::linear(121, motion_core::Vec3::new(0.0, 0.0, 60.0)),
     ]));
     let mut sel = KeySelection::new();
     sel.insert((PropKind::Rotation, 2));
@@ -1615,8 +1615,8 @@ fn moving_project() -> (MProject, NodeId, CompId) {
     // track directly — the same idiom `comp_at_fps` uses.
     let mut layer = MNode::group(1, "mover");
     layer.transform.position = Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-        Keyframe::linear(100, Vec2::new(100.0, 200.0)),
+        Keyframe::linear(0, motion_core::Vec3::flat(0.0, 0.0)),
+        Keyframe::linear(100, motion_core::Vec3::flat(100.0, 200.0)),
     ]));
     // Deliberately a bare group with no shape: a null/group draws nothing and
     // so has no `RenderItem`, and it is exactly the sort of layer you animate
@@ -2165,7 +2165,7 @@ fn the_selection_boxes_cover_each_item_in_a_group() {
         radius: Value::constant(0.0),
     });
     a.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
-    a.transform.position = Value::constant(Vec2::new(0.0, 0.0));
+    a.transform.position = Value::constant(motion_core::Vec3::flat(0.0, 0.0));
 
     let mut b = MNode::group(2, "b");
     b.shape = Some(MShape::Rect {
@@ -2173,7 +2173,7 @@ fn the_selection_boxes_cover_each_item_in_a_group() {
         radius: Value::constant(0.0),
     });
     b.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
-    b.transform.position = Value::constant(Vec2::new(200.0, 0.0));
+    b.transform.position = Value::constant(motion_core::Vec3::flat(200.0, 0.0));
 
     let group = MNode::group(3, "group").with_child(a).with_child(b);
     let comp = Comp::new(1000.0, 1000.0, MNode::group(0, "root").with_child(group));
@@ -2233,8 +2233,8 @@ fn boxed_project() -> (MProject, NodeId, CompId) {
     use motion_core::value::{Keyframe, Track};
     let mut layer = MNode::group(1, "mover");
     layer.transform.position = Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-        Keyframe::linear(200, Vec2::new(400.0, 400.0)),
+        Keyframe::linear(0, motion_core::Vec3::flat(0.0, 0.0)),
+        Keyframe::linear(200, motion_core::Vec3::flat(400.0, 400.0)),
     ]));
     layer.shape = Some(MShape::Rect {
         size: Value::constant(Vec2::new(50.0, 50.0)),
@@ -2461,7 +2461,7 @@ fn a_groups_bounds_cover_its_children() {
         radius: Value::constant(0.0),
     });
     b.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
-    b.transform.position = Value::constant(Vec2::new(200.0, 0.0));
+    b.transform.position = Value::constant(motion_core::Vec3::flat(200.0, 0.0));
 
     let group = MNode::group(3, "group").with_child(a).with_child(b);
     let comp = Comp::new(1000.0, 1000.0, MNode::group(0, "root").with_child(group));
@@ -2575,7 +2575,7 @@ fn a_property_driver_overrides_one_param_of_a_graph_authored_shape() {
     let reg = NodeRegistry::with_builtins();
     let rect = project.graph.add_node("rect", Vec2::new(0.0, 0.0));
     let v = project.graph.add_node("value", Vec2::new(-200.0, 0.0));
-    project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Vec2(Vec2::new(50.0, 50.0)));
+    project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Vec3(motion_core::Vec3::flat(50.0, 50.0)));
     project.graph.bind_geometry(Endpoint::new(rect, "geometry"), target);
     project.graph.bind_output(Endpoint::new(v, "value"), target, PropPath::ShapeSize);
 
@@ -3026,7 +3026,7 @@ fn out_node_project() -> (MProject, CompId, NodeRegistry, GraphNodeId) {
 #[test]
 fn an_out_node_drives_the_property_it_targets() {
     let (project, comp, ..) = out_node_project();
-    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation;
     assert!(rot.is_expr(), "the sink node drove it");
     assert!((placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6);
 }
@@ -3044,7 +3044,7 @@ fn deleting_a_sink_node_bakes_the_property_it_was_driving() {
     assert!(project.graph.bindings().is_empty(), "the driver went with the node");
     assert!(bake_unbound(&mut project, comp, 0, &before, &before_shapes));
 
-    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation;
     assert!(!rot.is_expr(), "the property is a hand-editable constant again");
     // Frozen at what the graph was giving it, not reset to zero.
     assert!(
@@ -3053,7 +3053,7 @@ fn deleting_a_sink_node_bakes_the_property_it_was_driving() {
     );
     // And a recompile can't resurrect it — there is no driver left to run.
     compile_drivers(&mut project, &reg, comp);
-    assert!(!project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg.is_expr());
+    assert!(!project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation.is_expr());
 }
 
 /// Pulling the *wire* out of a sink unbinds just as deleting the node does —
@@ -3068,7 +3068,7 @@ fn pulling_a_sinks_wire_unbinds_and_bakes_it_too() {
     assert!(project.graph.bindings().is_empty());
     assert!(bake_unbound(&mut project, comp, 0, &before, &[]));
 
-    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation;
     assert!(!rot.is_expr());
     assert!((placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6);
 }
@@ -3087,7 +3087,7 @@ fn retargeting_a_sink_bakes_the_property_it_left() {
     compile_drivers(&mut project, &reg, comp);
 
     let layer = project.comp(comp).unwrap().root.find(NodeId(1)).unwrap();
-    assert!(!layer.transform.rotation_deg.is_expr(), "the abandoned property was frozen");
+    assert!(!layer.transform.rotation.is_expr(), "the abandoned property was frozen");
     assert!(layer.transform.opacity.is_expr(), "and the new one picked the driver up");
     assert!((placed_angle_deg(&evaluate_comp(&project, comp, 0.0), NodeId(1)) - 30.0).abs() < 1e-6);
 }
@@ -3109,7 +3109,7 @@ fn a_property_another_driver_still_writes_is_left_alone() {
     assert!(!bake_unbound(&mut project, comp, 0, &before, &[]), "nothing to bake");
     compile_drivers(&mut project, &reg, comp);
 
-    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation_deg;
+    let rot = &project.comp(comp).unwrap().root.find(NodeId(1)).unwrap().transform.rotation;
     assert!(rot.is_expr(), "the surviving driver still owns the property");
 }
 
@@ -3153,7 +3153,7 @@ fn a_half_configured_sink_drives_nothing() {
     project.graph.node_mut(sink).unwrap().config.out_target = Some((target, PropPath::Rotation));
 
     compile_drivers(&mut project, &reg, comp);
-    let rot = &project.comp(comp).unwrap().root.find(target).unwrap().transform.rotation_deg;
+    let rot = &project.comp(comp).unwrap().root.find(target).unwrap().transform.rotation;
     assert!(!rot.is_expr(), "a targeted but unwired sink drives nothing");
 }
 
@@ -3166,7 +3166,7 @@ fn a_property_expression_imports_into_the_sink_that_drives_it() {
     let (mut project, comp, target) = shape_driver_project();
     let reg = NodeRegistry::with_builtins();
     // A hand-written expression on the layer's rotation: 2 + 3.
-    project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().transform.rotation_deg =
+    project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().transform.rotation =
         Value::expr(Expr::bin(BinOp::Add,Expr::Lit(ExprValue::Num(2.0)),Expr::Lit(ExprValue::Num(3.0))));
     let sink = project.graph.add_node("out", Vec2::new(360.0, 40.0));
     project.graph.node_mut(sink).unwrap().config.out_target = Some((target, PropPath::Rotation));
@@ -3449,8 +3449,8 @@ fn framing_all_nodes_fits_them_and_never_magnifies() {
 fn node_with_position_keys() -> MNode {
     let mut transform = Transform::default();
     transform.position = Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, Vec2::new(0.0, 10.0)),
-        Keyframe::linear(12, Vec2::new(100.0, 50.0)),
+        Keyframe::linear(0, motion_core::Vec3::flat(0.0, 10.0)),
+        Keyframe::linear(12, motion_core::Vec3::flat(100.0, 50.0)),
     ]));
     MNode::group(1, "layer").with_transform(transform)
 }
@@ -3459,8 +3459,11 @@ fn node_with_position_keys() -> MNode {
 fn a_vector_property_plots_one_curve_per_axis() {
     let node = node_with_position_keys();
     let chans = prop_of(&node, PropKind::Position).unwrap().channels();
-    assert_eq!(chans.len(), 2);
-    assert_eq!((chans[0].name, chans[1].name), ("X", "Y"));
+    // Three since 2.5D: a transform channel plots depth alongside X and Y,
+    // even on a layer authored flat — the Z curve is simply a flat line at 0,
+    // which is the honest picture of a layer sitting in the plane.
+    assert_eq!(chans.len(), 3);
+    assert_eq!((chans[0].name, chans[1].name, chans[2].name), ("X", "Y", "Z"));
     // Each channel carries its own values...
     assert_eq!(chans[0].track.keys()[1].value, 100.0);
     assert_eq!(chans[1].track.keys()[1].value, 50.0);
@@ -3644,8 +3647,8 @@ fn framing_ignores_hidden_curves() {
     // the window to a curve that isn't drawn.
     let mut transform = Transform::default();
     transform.position = Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, Vec2::new(0.0, 0.0)),
-        Keyframe::linear(10, Vec2::new(1000.0, 1000.0)),
+        Keyframe::linear(0, motion_core::Vec3::flat(0.0, 0.0)),
+        Keyframe::linear(10, motion_core::Vec3::flat(1000.0, 1000.0)),
     ]));
     transform.opacity = Value::Keyframed(Track::new(vec![
         Keyframe::linear(0, 0.0),
@@ -3665,8 +3668,10 @@ fn framing_ignores_hidden_curves() {
 /// A comp root holding a group with one child, both keyed, for the strip tests.
 fn root_with_nested_layers() -> MNode {
     let mut transform = Transform::default();
-    transform.rotation_deg =
-        Value::Keyframed(Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(8, 90.0)]));
+    transform.rotation = Value::Keyframed(Track::new(vec![
+        Keyframe::linear(0, motion_core::Vec3::ZERO),
+        Keyframe::linear(8, motion_core::Vec3::new(0.0, 0.0, 90.0)),
+    ]));
     let mut child = MNode::group(2, "child").with_transform(transform);
     child.timing = Some(LayerTiming::new(4, 20));
     let group = MNode::group(1, "group").with_child(child);
@@ -3709,8 +3714,8 @@ fn a_strips_keys_are_deduped_across_properties() {
     // property stacked on itself.
     let mut transform = Transform::default();
     transform.position = Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, Vec2::ZERO),
-        Keyframe::linear(5, Vec2::new(1.0, 1.0)),
+        Keyframe::linear(0, motion_core::Vec3::ZERO),
+        Keyframe::linear(5, motion_core::Vec3::flat(1.0, 1.0)),
     ]));
     transform.opacity =
         Value::Keyframed(Track::new(vec![Keyframe::linear(0, 1.0), Keyframe::linear(5, 0.0)]));
@@ -3844,7 +3849,7 @@ fn splitting_does_not_move_the_transform() {
     // what the *other* children do, which a restack has no business doing.
     let mut project = project_with_hybrid_layer();
     let root_id = project.root;
-    let at = Vec2::new(30.0, 70.0);
+    let at = motion_core::Vec3::flat(30.0, 70.0);
     project.comps.get_mut(&project.root).unwrap().root.find_mut(NodeId(1)).unwrap()
         .transform
         .position = Value::constant(at);
@@ -3857,7 +3862,7 @@ fn splitting_does_not_move_the_transform() {
     // shape was already drawn with — the frame is unchanged.
     assert_eq!(
         root.find(child).unwrap().transform.position.resolve(&mut ctx),
-        Vec2::ZERO
+        motion_core::Vec3::ZERO
     );
 }
 
@@ -4220,7 +4225,7 @@ fn blended_box(id: u64, x: f64, blend: MBlendMode) -> MNode {
         },
     )
     .with_fill(MColor::rgb(1.0, 1.0, 1.0));
-    n.transform.position = Value::constant(Vec2::new(x, 0.0));
+    n.transform.position = Value::constant(motion_core::Vec3::flat(x, 0.0));
     n.blend = blend;
     n
 }

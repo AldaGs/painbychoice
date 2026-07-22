@@ -3,6 +3,8 @@
 
 use kurbo::Vec2;
 
+use crate::vec3::Vec3;
+
 use crate::node::{Document, Node, Shape, Transform};
 use crate::value::{Color, Keyframe, Track, Value};
 
@@ -23,10 +25,10 @@ pub fn demo_document() -> Document {
     )
     .with_fill(Color::rgb(1.0, 1.0, 1.0))
     .with_transform(Transform {
-        position: Value::constant(Vec2::new(0.0, -120.0)),
-        rotation_deg: Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0, 0.0),
-            Keyframe::linear(END, 360.0),
+        position: Value::constant(Vec3::flat(0.0, -120.0)),
+        rotation: Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, Vec3::ZERO),
+            Keyframe::linear(END, Vec3::new(0.0, 0.0, 360.0)),
         ])),
         ..Transform::default()
     });
@@ -45,12 +47,12 @@ pub fn demo_document() -> Document {
     .with_fill(Color::rgb(0.90, 0.25, 0.25))
     .with_transform(Transform {
         position: Value::Keyframed(Track::new(vec![
-            Keyframe::smooth(0, Vec2::new(300.0, 540.0)),
-            Keyframe::smooth(END, Vec2::new(1620.0, 540.0)),
+            Keyframe::smooth(0, Vec3::flat(300.0, 540.0)),
+            Keyframe::smooth(END, Vec3::flat(1620.0, 540.0)),
         ])),
-        rotation_deg: Value::Keyframed(Track::new(vec![
-            Keyframe::smooth(0, 0.0),
-            Keyframe::smooth(END, 90.0),
+        rotation: Value::Keyframed(Track::new(vec![
+            Keyframe::smooth(0, Vec3::ZERO),
+            Keyframe::smooth(END, Vec3::new(0.0, 0.0, 90.0)),
         ])),
         ..Transform::default()
     })

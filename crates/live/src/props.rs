@@ -33,7 +33,15 @@ pub(crate) struct NodeInfo {
     pub(crate) name: String,
     pub(crate) id: u64,
     pub(crate) pos: (f64, f64),
+    /// The in-plane spin, in degrees — what the canvas gizmo's rotate handle
+    /// drives and what a 2D layer has always had. Kept a scalar of its own
+    /// (rather than folded into a triple) because it is the *screen* rotation:
+    /// the gizmo, hit-testing, and every 2D reader want exactly this one.
     pub(crate) rot: f64,
+    /// The out-of-plane pair, in degrees — the 2.5D channels. Zero on every
+    /// layer authored flat, and a layer with either non-zero is the one the
+    /// renderer has to project rather than draw.
+    pub(crate) rot_xy: (f64, f64),
     pub(crate) scale: (f64, f64),
     /// The pivot the layer rotates and scales about. It sits inside the local
     /// matrix, so the gizmo needs it to reconstruct that matrix — and it is an
@@ -269,11 +277,13 @@ impl NodeInfo {
         let pos = tr.position.resolve(ctx);
         let scale = tr.scale.resolve(ctx);
         let anchor = tr.anchor.resolve(ctx);
+        let rot = tr.rotation.resolve(ctx);
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
             pos: (pos.x, pos.y),
-            rot: tr.rotation_deg.resolve(ctx),
+            rot: rot.z,
+            rot_xy: (rot.x, rot.y),
             scale: (scale.x, scale.y),
             anchor: (anchor.x, anchor.y),
             opacity: tr.opacity.resolve(ctx),
@@ -321,7 +331,7 @@ impl NodeInfo {
             }),
             anchor_anim: tr.anchor.is_animated(),
             pos_anim: tr.position.is_animated(),
-            rot_anim: tr.rotation_deg.is_animated(),
+            rot_anim: tr.rotation.is_animated(),
             scale_anim: tr.scale.is_animated(),
             opacity_anim: tr.opacity.is_animated(),
             // Whether each optional property is animated. `prop_of` already
@@ -397,6 +407,9 @@ pub(crate) struct PropEdits {
     pub(crate) pos_x: Option<f64>,
     pub(crate) pos_y: Option<f64>,
     pub(crate) rot: Option<f64>,
+    /// The out-of-plane rotations, edited independently of the in-plane spin.
+    pub(crate) rot_x: Option<f64>,
+    pub(crate) rot_y: Option<f64>,
     pub(crate) scale_x: Option<f64>,
     pub(crate) scale_y: Option<f64>,
     pub(crate) opacity: Option<f64>,
@@ -742,14 +755,23 @@ pub(crate) fn properties_ui(
         }
         ui.end_row();
 
+        // Z first, then X and Y. Reversed from the usual axis order on
+        // purpose: Z is the rotation a 2D layer has, so it keeps the position
+        // and the muscle memory the single field used to own, and the depth
+        // pair reads as the addition it is.
         ui.label("Rotation");
-        let mut rot = n.rot;
-        if ui
-            .add(egui::DragValue::new(&mut rot).speed(0.5).suffix("°"))
-            .changed()
-        {
-            edits.rot = Some(rot);
-        }
+        ui.horizontal(|ui| {
+            let (mut z, mut rx, mut ry) = (n.rot, n.rot_xy.0, n.rot_xy.1);
+            if ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ").suffix("°")).changed() {
+                edits.rot = Some(z);
+            }
+            if ui.add(egui::DragValue::new(&mut rx).speed(0.5).prefix("x ").suffix("°")).changed() {
+                edits.rot_x = Some(rx);
+            }
+            if ui.add(egui::DragValue::new(&mut ry).speed(0.5).prefix("y ").suffix("°")).changed() {
+                edits.rot_y = Some(ry);
+            }
+        });
         if key_button(ui, n.rot_anim) {
             edits.key.insert(PropKind::Rotation);
         }
@@ -1242,6 +1264,9 @@ impl PropKind {
 /// animatable property is then a `PropKind` variant plus two match arms, rather
 /// than an edit to eight call sites that all have to agree.
 pub(crate) enum PropRef<'a> {
+    /// A transform channel: position, anchor, scale. Three components.
+    Vec3(&'a Value<motion_core::Vec3>),
+    /// A planar property: a shape's size, a mask's size. Still two.
     Vec2(&'a Value<Vec2>),
     Num(&'a Value<f64>),
     Color(&'a Value<MColor>),
@@ -1259,6 +1284,9 @@ pub(crate) const CH_Y: egui::Color32 = egui::Color32::from_rgb(120, 210, 120);
 pub(crate) const CH_R: egui::Color32 = CH_X;
 pub(crate) const CH_G: egui::Color32 = CH_Y;
 pub(crate) const CH_B: egui::Color32 = egui::Color32::from_rgb(110, 160, 240);
+/// Depth shares blue with the colour editor's B channel — the axis colour
+/// convention (X red, Y green, Z blue) the viewport gizmo already draws.
+pub(crate) const CH_Z: egui::Color32 = CH_B;
 
 /// One numeric channel of an animated property, as its own scalar track.
 pub(crate) struct Channel {
@@ -1294,6 +1322,7 @@ impl Channel {
 }
 
 pub(crate) enum PropRefMut<'a> {
+    Vec3(&'a mut Value<motion_core::Vec3>),
     Vec2(&'a mut Value<Vec2>),
     Num(&'a mut Value<f64>),
     Color(&'a mut Value<MColor>),
@@ -1306,6 +1335,7 @@ pub(crate) enum PropRefMut<'a> {
 macro_rules! on_prop {
     ($p:expr, $v:ident => $body:expr) => {
         match $p {
+            PropRef::Vec3($v) => $body,
             PropRef::Vec2($v) => $body,
             PropRef::Num($v) => $body,
             PropRef::Color($v) => $body,
@@ -1317,6 +1347,7 @@ macro_rules! on_prop {
 macro_rules! on_prop_mut {
     ($p:expr, $v:ident => $body:expr) => {
         match $p {
+            PropRefMut::Vec3($v) => $body,
             PropRefMut::Vec2($v) => $body,
             PropRefMut::Num($v) => $body,
             PropRefMut::Color($v) => $body,
@@ -1351,6 +1382,11 @@ impl PropRef<'_> {
     /// the drawn curve can't drift from what plays back.
     pub(crate) fn channels(&self) -> Vec<Channel> {
         match self {
+            PropRef::Vec3(v) => vec![
+                Channel::from(v.keys(), "X", CH_X, |p: &motion_core::Vec3| p.x),
+                Channel::from(v.keys(), "Y", CH_Y, |p: &motion_core::Vec3| p.y),
+                Channel::from(v.keys(), "Z", CH_Z, |p: &motion_core::Vec3| p.z),
+            ],
             PropRef::Vec2(v) => vec![
                 Channel::from(v.keys(), "X", CH_X, |p: &Vec2| p.x),
                 Channel::from(v.keys(), "Y", CH_Y, |p: &Vec2| p.y),
@@ -1367,6 +1403,7 @@ impl PropRef<'_> {
     /// Copy the keys at `idxs` onto the clipboard, tagged with their type.
     pub(crate) fn keys_at(&self, idxs: &[usize]) -> ClipTrack {
         match self {
+            PropRef::Vec3(v) => ClipTrack::Vec3(v.keys_at(idxs)),
             PropRef::Vec2(v) => ClipTrack::Vec2(v.keys_at(idxs)),
             PropRef::Num(v) => ClipTrack::Num(v.keys_at(idxs)),
             PropRef::Color(v) => ClipTrack::Color(v.keys_at(idxs)),
@@ -1409,6 +1446,17 @@ impl PropRefMut<'_> {
     /// index should do nothing, not silently edit the wrong axis.
     pub(crate) fn set_channel_value(&mut self, index: usize, channel: usize, value: f64) {
         match self {
+            PropRefMut::Vec3(v) => {
+                let Some(k) = v.keys().get(index) else { return };
+                let mut p = k.value;
+                match channel {
+                    0 => p.x = value,
+                    1 => p.y = value,
+                    2 => p.z = value,
+                    _ => return,
+                }
+                v.set_key_value(index, p);
+            }
             PropRefMut::Vec2(v) => {
                 let Some(k) = v.keys().get(index) else { return };
                 let mut p = k.value;
@@ -1455,6 +1503,7 @@ impl PropRefMut<'_> {
     /// the UI (a clip is tagged at copy time) so they're simply ignored.
     pub(crate) fn insert_keys(&mut self, clip: &ClipTrack, offset: i64) -> Vec<usize> {
         match (self, clip) {
+            (PropRefMut::Vec3(v), ClipTrack::Vec3(k)) => v.insert_keys(k, offset),
             (PropRefMut::Vec2(v), ClipTrack::Vec2(k)) => v.insert_keys(k, offset),
             (PropRefMut::Num(v), ClipTrack::Num(k)) => v.insert_keys(k, offset),
             (PropRefMut::Color(v), ClipTrack::Color(k)) => v.insert_keys(k, offset),
@@ -1470,10 +1519,10 @@ impl PropRefMut<'_> {
 pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
     let tr = &node.transform;
     Some(match kind {
-        PropKind::Anchor => PropRef::Vec2(&tr.anchor),
-        PropKind::Position => PropRef::Vec2(&tr.position),
-        PropKind::Rotation => PropRef::Num(&tr.rotation_deg),
-        PropKind::Scale => PropRef::Vec2(&tr.scale),
+        PropKind::Anchor => PropRef::Vec3(&tr.anchor),
+        PropKind::Position => PropRef::Vec3(&tr.position),
+        PropKind::Rotation => PropRef::Vec3(&tr.rotation),
+        PropKind::Scale => PropRef::Vec3(&tr.scale),
         PropKind::Opacity => PropRef::Num(&tr.opacity),
         PropKind::Fill => PropRef::Color(node.fill.as_ref()?),
         PropKind::StrokeColor => PropRef::Color(&node.stroke.as_ref()?.color),
@@ -1517,10 +1566,10 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
 pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut<'_>> {
     let tr = &mut node.transform;
     Some(match kind {
-        PropKind::Anchor => PropRefMut::Vec2(&mut tr.anchor),
-        PropKind::Position => PropRefMut::Vec2(&mut tr.position),
-        PropKind::Rotation => PropRefMut::Num(&mut tr.rotation_deg),
-        PropKind::Scale => PropRefMut::Vec2(&mut tr.scale),
+        PropKind::Anchor => PropRefMut::Vec3(&mut tr.anchor),
+        PropKind::Position => PropRefMut::Vec3(&mut tr.position),
+        PropKind::Rotation => PropRefMut::Vec3(&mut tr.rotation),
+        PropKind::Scale => PropRefMut::Vec3(&mut tr.scale),
         PropKind::Opacity => PropRefMut::Num(&mut tr.opacity),
         PropKind::Fill => PropRefMut::Color(node.fill.as_mut()?),
         PropKind::StrokeColor => PropRefMut::Color(&mut node.stroke.as_mut()?.color),

@@ -68,17 +68,23 @@ fn lower_out(
         // stored under the output socket; an unset one rests at the zero vector,
         // not the scalar 0 wearing a vector socket.
         "vec2" => Expr::Lit(
-            node.value(&output.socket).unwrap_or(ExprValue::Vec2(kurbo::Vec2::ZERO)),
+            node.value(&output.socket).unwrap_or(ExprValue::Vec3(crate::vec3::Vec3::ZERO)),
         ),
         // Build a vector from two scalars, and read one axis back out — the join /
         // split pair. `join` combines its `x`/`y` inputs; `split` picks the axis
         // its output socket names, off whatever feeds its `value` input.
-        "join" => Expr::Vec2 {
+        "join" => Expr::Vec3 {
             x: b(lower_in(graph, ctx, output.node, "x", visiting)),
             y: b(lower_in(graph, ctx, output.node, "y", visiting)),
+            z: b(lower_in(graph, ctx, output.node, "z", visiting)),
         },
         "split" => {
-            let axis = if output.socket == "y" { Axis::Y } else { Axis::X };
+            // Unknown socket names fall to X, as before — a graph saved against
+            // an older socket set still lowers rather than failing.
+            let axis = Axis::ALL
+                .into_iter()
+                .find(|a| a.name() == output.socket)
+                .unwrap_or(Axis::X);
             Expr::Comp { a: b(lower_in(graph, ctx, output.node, "value", visiting)), axis }
         }
         // One node for every operator, so this is one arm: which operator is
@@ -316,7 +322,7 @@ fn neutral() -> Expr {
 fn neutral_for(ty: SocketType) -> ExprValue {
     match ty {
         SocketType::Number | SocketType::Time => ExprValue::Num(0.0),
-        SocketType::Vector => ExprValue::Vec2(kurbo::Vec2::ZERO),
+        SocketType::Vector => ExprValue::Vec3(crate::vec3::Vec3::ZERO),
         SocketType::Color => ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0)),
         SocketType::Text => ExprValue::Str(String::new()),
         // No scalar literal — these inputs are meant to be wired. Degenerate
@@ -332,6 +338,7 @@ fn b(e: Expr) -> Box<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vec3::Vec3;
     use crate::expr::{BinOp, UnOp};
     use crate::expr::{eval_expr, EvalCtx};
     use crate::graph::Endpoint;
@@ -757,9 +764,9 @@ mod tests {
         g.connect(ctx, Endpoint::new(y, "value"), Endpoint::new(join, "y")).unwrap();
 
         let vexpr = lower_output(&g, ctx, &Endpoint::new(join, "value"));
-        assert_eq!(vexpr.to_string(), "vec2(3, 4)");
+        assert_eq!(vexpr.to_string(), "vec3(3, 4, 0)");
         let mut c = EvalCtx::at(0.0);
-        assert_eq!(eval_expr(&vexpr, &mut c), ExprValue::Vec2(Vec2::new(3.0, 4.0)));
+        assert_eq!(eval_expr(&vexpr, &mut c), ExprValue::Vec3(Vec3::flat(3.0, 4.0)));
 
         // Wire the vector into a `split` and read each axis back as a scalar.
         let split = g.add_node("split", Vec2::new(400.0, 0.0));
@@ -776,10 +783,10 @@ mod tests {
         let ctx = &GraphCtx::bare(&reg);
         let mut g = NodeGraph::new();
         let v = g.add_node("vec2", Vec2::ZERO);
-        g.node_mut(v).unwrap().set_value("value", ExprValue::Vec2(Vec2::new(10.0, 20.0)));
+        g.node_mut(v).unwrap().set_value("value", ExprValue::Vec3(Vec3::flat(10.0, 20.0)));
         let expr = lower_output(&g, ctx, &Endpoint::new(v, "value"));
         let mut c = EvalCtx::at(0.0);
-        assert_eq!(eval_expr(&expr, &mut c), ExprValue::Vec2(Vec2::new(10.0, 20.0)));
+        assert_eq!(eval_expr(&expr, &mut c), ExprValue::Vec3(Vec3::flat(10.0, 20.0)));
     }
 
     /// The layer-clock leaves lower to their `Expr::Time` readings.

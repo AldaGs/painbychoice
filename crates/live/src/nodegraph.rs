@@ -649,12 +649,13 @@ fn literal_field(
                 .changed()
                 .then_some(ExprValue::Str(v))
         }
-        ExprValue::Vec2(p) => {
-            let (mut x, mut y) = (p.x, p.y);
+        ExprValue::Vec3(p) => {
+            let (mut x, mut y, mut z) = (p.x, p.y, p.z);
             let mut changed = false;
             changed |= ui.add(egui::DragValue::new(&mut x).speed(0.5).prefix("x ")).changed();
             changed |= ui.add(egui::DragValue::new(&mut y).speed(0.5).prefix("y ")).changed();
-            changed.then(|| ExprValue::Vec2(Vec2::new(x, y)))
+            changed |= ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ")).changed();
+            changed.then(|| ExprValue::Vec3(motion_core::Vec3::new(x, y, z)))
         }
         ExprValue::Color(c) => {
             let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
@@ -953,7 +954,7 @@ fn knob_rows(
 /// of the socket's own shape, so the field that appears is the right kind.
 fn neutral_literal(ty: SocketType) -> ExprValue {
     match ty {
-        SocketType::Vector => ExprValue::Vec2(Vec2::ZERO),
+        SocketType::Vector => ExprValue::Vec3(motion_core::Vec3::ZERO),
         SocketType::Color => ExprValue::Color(MColor::rgba(0.0, 0.0, 0.0, 1.0)),
         SocketType::Text => ExprValue::Str(String::new()),
         // Number/Time, and the three that have no literal at all — a caller
@@ -2129,10 +2130,10 @@ fn socket_field(
                     .changed()
                     .then_some(ExprValue::Num(v))
             }
-            ExprValue::Vec2(p) => {
-                let (mut x, mut y) = (p.x, p.y);
-                // Halved, less the one gap between them.
-                let w = (ui.available_width() - view.s(2.0)) / 2.0;
+            ExprValue::Vec3(p) => {
+                let (mut x, mut y, mut z) = (p.x, p.y, p.z);
+                // Split three ways, less the two gaps between them.
+                let w = (ui.available_width() - view.s(4.0)) / 3.0;
                 let mut changed = false;
                 changed |= ui
                     .add_sized([w, row.height()], egui::DragValue::new(&mut x).speed(0.5))
@@ -2140,7 +2141,10 @@ fn socket_field(
                 changed |= ui
                     .add_sized([w, row.height()], egui::DragValue::new(&mut y).speed(0.5))
                     .changed();
-                changed.then(|| ExprValue::Vec2(Vec2::new(x, y)))
+                changed |= ui
+                    .add_sized([w, row.height()], egui::DragValue::new(&mut z).speed(0.5))
+                    .changed();
+                changed.then(|| ExprValue::Vec3(motion_core::Vec3::new(x, y, z)))
             }
             ExprValue::Color(c) => {
                 let mut rgb = [c.r as f32, c.g as f32, c.b as f32];

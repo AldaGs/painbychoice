@@ -246,6 +246,21 @@ impl<T> Keyframe<T> {
             broken: false,
         }
     }
+
+    /// Re-type the value, keeping the timing exactly. Used to widen a scalar
+    /// track into a vector one when a property gains a dimension — the 2.5D
+    /// rotation migration is the reason this exists.
+    pub fn map_value<U>(self, f: impl FnOnce(T) -> U) -> Keyframe<U> {
+        Keyframe {
+            frame: self.frame,
+            legacy_seconds: self.legacy_seconds,
+            value: f(self.value),
+            out_handle: self.out_handle,
+            in_handle: self.in_handle,
+            interp: self.interp,
+            broken: self.broken,
+        }
+    }
 }
 
 /// A sorted list of keyframes. Sampling clamps outside the first/last key
@@ -263,6 +278,12 @@ impl<T: Animatable> Track<T> {
 
     pub fn keys(&self) -> &[Keyframe<T>] {
         &self.keys
+    }
+
+    /// Re-type every key's value, keeping the timing. Widening only — the
+    /// mapped track is still sorted, so it skips the re-sort `new` does.
+    pub fn map_value<U: Animatable>(self, f: impl Fn(T) -> U) -> Track<U> {
+        Track { keys: self.keys.into_iter().map(|k| k.map_value(&f)).collect() }
     }
 
     pub fn len(&self) -> usize {

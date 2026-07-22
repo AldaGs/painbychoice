@@ -298,7 +298,8 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
         .iter()
         .map(|b| {
             let expr = lower_output(&project.graph, &ctx, &b.output);
-            (b.target, PropKind::from_path(b.prop), expr)
+            // The wire's type is the socket's; the property's may be wider.
+            (b.target, PropKind::from_path(b.prop), b.prop.adapt_driver(expr))
         })
         .collect();
     let shapes: Vec<(NodeId, MShape)> = project
@@ -1587,23 +1588,32 @@ impl App {
 
         if e.anchor_x.is_some() || e.anchor_y.is_some() {
             let cur = tr.anchor.resolve(&mut ctx);
-            let v = Vec2::new(e.anchor_x.unwrap_or(cur.x), e.anchor_y.unwrap_or(cur.y));
+            let v = motion_core::Vec3::new(e.anchor_x.unwrap_or(cur.x), e.anchor_y.unwrap_or(cur.y), cur.z);
             tr.anchor.set_at(frame, v);
             changed = true;
         }
         if e.pos_x.is_some() || e.pos_y.is_some() {
             let cur = tr.position.resolve(&mut ctx);
-            let v = Vec2::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y));
+            let v = motion_core::Vec3::new(e.pos_x.unwrap_or(cur.x), e.pos_y.unwrap_or(cur.y), cur.z);
             tr.position.set_at(frame, v);
             changed = true;
         }
-        if let Some(r) = e.rot {
-            tr.rotation_deg.set_at(frame, r);
+        if e.rot.is_some() || e.rot_x.is_some() || e.rot_y.is_some() {
+            // One track, three channels: keying any axis keys all of them, so
+            // the untouched axes hold their current value rather than snapping
+            // to whatever the neighbouring keys interpolate to.
+            let cur = tr.rotation.resolve(&mut ctx);
+            let v = motion_core::Vec3::new(
+                e.rot_x.unwrap_or(cur.x),
+                e.rot_y.unwrap_or(cur.y),
+                e.rot.unwrap_or(cur.z),
+            );
+            tr.rotation.set_at(frame, v);
             changed = true;
         }
         if e.scale_x.is_some() || e.scale_y.is_some() {
             let cur = tr.scale.resolve(&mut ctx);
-            let v = Vec2::new(e.scale_x.unwrap_or(cur.x), e.scale_y.unwrap_or(cur.y));
+            let v = motion_core::Vec3::new(e.scale_x.unwrap_or(cur.x), e.scale_y.unwrap_or(cur.y), cur.z);
             tr.scale.set_at(frame, v);
             changed = true;
         }
@@ -2035,7 +2045,7 @@ impl App {
     fn new_layer_look(&mut self) -> (u64, Transform, MColor) {
         let id = self.next_id;
         self.next_id += 1;
-        let center = Vec2::new(self.doc().width / 2.0, self.doc().height / 2.0);
+        let center = motion_core::Vec3::flat(self.doc().width / 2.0, self.doc().height / 2.0);
         let at_center =
             Transform { position: Value::constant(center), ..Transform::default() };
         let palette = [

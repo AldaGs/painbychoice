@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::{Document, Module, ModuleId, NodeId, Shape};
 use crate::value::Color;
+use crate::vec3::Vec3;
+
+/// A boxed literal zero — the neutral child every `join` slot starts from, and
+/// what serde fills a pre-2.5D join's missing `z` with.
+fn zero_expr() -> Box<Expr> {
+    Box::new(Expr::num(0.0))
+}
 
 /// A value flowing through an expression, before it's converted back to a
 /// property's concrete `T`. Dynamic on purpose: an expression mixes scalars,
@@ -27,7 +34,16 @@ use crate::value::Color;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ExprValue {
     Num(f64),
-    Vec2(kurbo::Vec2),
+    /// The vector kind — three components since 2.5D. There is deliberately
+    /// only *one* vector kind in the IR: a 2D property (a rect's size, a mask)
+    /// converts in and out with `z = 0` rather than forking `Axis`, the join and
+    /// split nodes, and every socket-type rule into 2D and 3D flavours.
+    ///
+    /// The serde tag stays `Vec2` so every `.pbc` written before the third
+    /// component existed still parses — the payload is a `{x, y}` map either
+    /// way, and [`Vec3`]'s `z` defaults to zero.
+    #[serde(rename = "Vec2")]
+    Vec3(Vec3),
     Color(Color),
     /// Text. The odd one out: it has no arithmetic, so `Mul`/`Neg` pass it
     /// through untouched and only `Add` means anything (concatenation, handled
@@ -46,11 +62,11 @@ impl ExprValue {
         use ExprValue::*;
         match (self, other) {
             (Num(a), Num(b)) => Num(f(a, b)),
-            (Vec2(a), Vec2(b)) => Vec2(kurbo::Vec2::new(f(a.x, b.x), f(a.y, b.y))),
+            (Vec3(a), Vec3(b)) => Vec3(a.zip(b, &f)),
             (Color(a), Color(b)) => {
                 Color(self::Color::rgba(f(a.r, b.r), f(a.g, b.g), f(a.b, b.b), f(a.a, b.a)))
             }
-            (Num(s), Vec2(v)) | (Vec2(v), Num(s)) => Vec2(kurbo::Vec2::new(f(v.x, s), f(v.y, s))),
+            (Num(s), Vec3(v)) | (Vec3(v), Num(s)) => Vec3(v.map(|c| f(c, s))),
             (Num(s), Color(c)) | (Color(c), Num(s)) => {
                 Color(self::Color::rgba(f(c.r, s), f(c.g, s), f(c.b, s), f(c.a, s)))
             }
@@ -66,7 +82,7 @@ impl ExprValue {
         use ExprValue::*;
         match self {
             Num(a) => Num(f(a)),
-            Vec2(v) => Vec2(kurbo::Vec2::new(f(v.x), f(v.y))),
+            Vec3(v) => Vec3(v.map(f)),
             Color(c) => Color(self::Color::rgba(f(c.r), f(c.g), f(c.b), f(c.a))),
             Str(s) => Str(s),
         }
@@ -79,7 +95,7 @@ impl ExprValue {
         match self {
             ExprValue::Str(s) => s.clone(),
             ExprValue::Num(n) => format!("{n}"),
-            ExprValue::Vec2(v) => format!("[{}, {}]", v.x, v.y),
+            ExprValue::Vec3(v) => format!("[{}, {}, {}]", v.x, v.y, v.z),
             ExprValue::Color(c) => format!("[{}, {}, {}, {}]", c.r, c.g, c.b, c.a),
         }
     }
@@ -118,15 +134,41 @@ impl FromExpr for f64 {
     }
 }
 
+impl ToExpr for Vec3 {
+    fn to_expr(&self) -> ExprValue {
+        ExprValue::Vec3(*self)
+    }
+}
+impl FromExpr for Vec3 {
+    fn from_expr(v: ExprValue) -> Option<Self> {
+        match v {
+            ExprValue::Vec3(v) => Some(v),
+            _ => None,
+        }
+    }
+    fn fallback() -> Self {
+        Vec3::ZERO
+    }
+}
+
+/// The bridge for properties that are genuinely two-dimensional — a rect's
+/// size, a mask's size, anything living inside the layer's own plane.
+///
+/// They still travel through the IR as the one vector kind, gaining a `z` of
+/// zero on the way in and dropping it on the way out. Silently discarding a
+/// component is normally a smell, but here it is the correct reading: a graph
+/// that wires a 3-vector into `size` is asking for a width and a height, and
+/// depth has no meaning at that socket. The alternative — a second vector kind
+/// and a second join/split — buys nothing and doubles the type rules.
 impl ToExpr for kurbo::Vec2 {
     fn to_expr(&self) -> ExprValue {
-        ExprValue::Vec2(*self)
+        ExprValue::Vec3(Vec3::from_xy(*self))
     }
 }
 impl FromExpr for kurbo::Vec2 {
     fn from_expr(v: ExprValue) -> Option<Self> {
         match v {
-            ExprValue::Vec2(v) => Some(v),
+            ExprValue::Vec3(v) => Some(v.xy()),
             _ => None,
         }
     }
@@ -269,10 +311,12 @@ impl PropPath {
     fn zero(self) -> ExprValue {
         match self {
             PropPath::Position | PropPath::Scale | PropPath::Anchor | PropPath::ShapeSize | PropPath::MaskSize => {
-                ExprValue::Vec2(kurbo::Vec2::ZERO)
+                ExprValue::Vec3(Vec3::ZERO)
             }
-            PropPath::Rotation
-            | PropPath::Opacity
+            // Rotation's *value* is a 3-vector since 2.5D, even though the
+            // graph still wires it as a scalar — see `socket_type`.
+            PropPath::Rotation => ExprValue::Vec3(Vec3::ZERO),
+            PropPath::Opacity
             | PropPath::StrokeWidth
             | PropPath::ShapeRadius
             | PropPath::TextSize
@@ -284,20 +328,45 @@ impl PropPath {
         }
     }
 
-    /// The socket type a wire must carry to drive this property — the same kind
-    /// split [`Self::zero`] makes, said in the graph's vocabulary.
+    /// The socket type a wire must carry to drive this property.
     ///
     /// This is what lets an `out` node be typed by the property it targets: pick
     /// Fill and its input socket turns colour, so the canvas refuses a number
     /// wire at authoring time rather than resolving it to a fallback at render
     /// time.
+    ///
+    /// It follows [`Self::zero`] for every property but one. **Rotation is
+    /// authored as a number and stored as a vector**: the overwhelmingly common
+    /// graph is an oscillator or a script spinning a layer in the screen plane,
+    /// and forcing that through a `join` to reach the Z input would tax the
+    /// common case to spell out a depth nobody asked for. The scalar is lifted
+    /// onto Z at the binding — see [`Self::adapt_driver`], which is the only
+    /// thing that makes this divergence safe.
     pub fn socket_type(self) -> crate::socket::SocketType {
         use crate::socket::SocketType as S;
+        if self == PropPath::Rotation {
+            return S::Number;
+        }
         match self.zero() {
             ExprValue::Num(_) => S::Number,
-            ExprValue::Vec2(_) => S::Vector,
+            ExprValue::Vec3(_) => S::Vector,
             ExprValue::Color(_) => S::Color,
             ExprValue::Str(_) => S::Text,
+        }
+    }
+
+    /// Fit an expression lowered from the graph to this property's value type.
+    ///
+    /// A no-op everywhere the socket type and the value type already agree,
+    /// which is everywhere but rotation: there the wire carried a number (the
+    /// in-plane spin) and the property holds a 3-vector, so the scalar is lifted
+    /// onto Z with the other two axes pinned flat. Unambiguous precisely
+    /// *because* [`Self::socket_type`] refuses anything but a number there — a
+    /// vector wire can never reach this and be mis-read as a spin.
+    pub fn adapt_driver(self, e: Expr) -> Expr {
+        match self {
+            PropPath::Rotation => Expr::Vec3 { x: zero_expr(), y: zero_expr(), z: Box::new(e) },
+            _ => e,
         }
     }
 }
@@ -516,24 +585,34 @@ impl MathOp {
     }
 }
 
-/// Which component of a 2-vector a [`Expr::Comp`] reads, and the axis a `split`
-/// node's two outputs name. Two axes because the values here are 2-vectors —
-/// position, scale, size, anchor — the dimensionality the whole app is built on.
+/// Which component of a vector a [`Expr::Comp`] reads, and the axis a `split`
+/// node's outputs name. Three axes since 2.5D: position, scale, and anchor are
+/// 3-vectors, and the flat properties (size, mask size) simply always read
+/// `z = 0` — see the `kurbo::Vec2` bridge in [`FromExpr`].
+///
+/// `Z` is last in every list so a picker's existing muscle memory survives, and
+/// so `Axis::default()`-shaped code paths still land on X.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Axis {
     X,
     Y,
+    Z,
 }
 
 impl Axis {
     /// The socket id a `split` node's output carries, and the suffix
-    /// [`fmt::Display`] prints (`v.x` / `v.y`).
+    /// [`fmt::Display`] prints (`v.x` / `v.y` / `v.z`).
     pub fn name(self) -> &'static str {
         match self {
             Axis::X => "x",
             Axis::Y => "y",
+            Axis::Z => "z",
         }
     }
+
+    /// The three axes in socket order — what a `split` node enumerates to build
+    /// its outputs, and a `join` node to label its inputs.
+    pub const ALL: [Axis; 3] = [Axis::X, Axis::Y, Axis::Z];
 }
 
 /// Replace a non-finite result with zero — the guard that keeps arithmetic from
@@ -611,15 +690,25 @@ pub enum Expr {
     /// after parameters. Always resolves to a `Num`; feed it through `Mul` to
     /// broadcast onto a vec/colour property.
     Gen(Generator),
-    /// Build a 2-vector from two scalar sub-expressions — what a `join` node
+    /// Build a vector from three scalar sub-expressions — what a `join` node
     /// lowers to. Each child resolves to a number (a vec/colour coerces to a
-    /// component, a string to zero) and the pair becomes a `Vec2`. The one IR
-    /// node that *raises* dimensionality, so a graph can drive `position` or
-    /// `scale` from two independently-built scalars.
-    Vec2 { x: Box<Expr>, y: Box<Expr> },
+    /// component, a string to zero). The one IR node that *raises*
+    /// dimensionality, so a graph can drive `position` or `scale` from
+    /// independently-built scalars.
+    ///
+    /// Serialized under its old `Vec2` tag, and `z` defaults to a literal zero
+    /// when absent: a pre-2.5D join reloads as a join whose depth is pinned to
+    /// the plane, which is what it always meant.
+    #[serde(rename = "Vec2")]
+    Vec3 {
+        x: Box<Expr>,
+        y: Box<Expr>,
+        #[serde(default = "zero_expr")]
+        z: Box<Expr>,
+    },
     /// One component of a vector-valued sub-expression — what a `split` node's
-    /// `x`/`y` outputs lower to. The inverse of [`Expr::Vec2`]: a `Vec2` yields
-    /// the named axis, a colour reads r/g, and a scalar passes through.
+    /// `x`/`y`/`z` outputs lower to. The inverse of [`Expr::Vec3`]: a vector
+    /// yields the named axis, a colour reads r/g/b, and a scalar passes through.
     Comp { a: Box<Expr>, axis: Axis },
 }
 
@@ -928,7 +1017,7 @@ impl Expr {
             Expr::Use { .. } => ExprKind::Use,
             Expr::Time(t) => t.kind(),
             Expr::Gen(g) => g.kind(),
-            Expr::Vec2 { .. } => ExprKind::Vec2,
+            Expr::Vec3 { .. } => ExprKind::Vec3,
             Expr::Comp { .. } => ExprKind::Comp,
         }
     }
@@ -958,7 +1047,9 @@ impl Expr {
             ExprKind::Oscillator | ExprKind::Noise | ExprKind::Ramp | ExprKind::Bounce => {
                 Expr::Gen(Generator::seed(kind))
             }
-            ExprKind::Vec2 => Expr::Vec2 { x: Box::new(Expr::num(0.0)), y: Box::new(Expr::num(0.0)) },
+            ExprKind::Vec3 => {
+                Expr::Vec3 { x: zero_expr(), y: zero_expr(), z: zero_expr() }
+            }
             ExprKind::Comp => Expr::Comp { a: Box::new(Expr::num(0.0)), axis: Axis::X },
         }
     }
@@ -968,7 +1059,8 @@ impl Expr {
     /// kind.
     pub fn arity(&self) -> usize {
         match self {
-            Expr::Bin { .. } | Expr::Vec2 { .. } => 2,
+            Expr::Bin { .. } => 2,
+            Expr::Vec3 { .. } => 3,
             Expr::Un { .. } | Expr::Comp { .. } => 1,
             Expr::Gen(g) => g.arity(),
             // A link's children are its overrides, in order — so the canvas
@@ -990,8 +1082,9 @@ impl Expr {
         match (self, slot) {
             (Expr::Bin { a, .. } | Expr::Un { a, .. } | Expr::Comp { a, .. }, 0) => Some(a),
             (Expr::Bin { b, .. }, 1) => Some(b),
-            (Expr::Vec2 { x, .. }, 0) => Some(x),
-            (Expr::Vec2 { y, .. }, 1) => Some(y),
+            (Expr::Vec3 { x, .. }, 0) => Some(x),
+            (Expr::Vec3 { y, .. }, 1) => Some(y),
+            (Expr::Vec3 { z, .. }, 2) => Some(z),
             (Expr::Gen(g), _) => g.knob(slot),
             (Expr::Use { overrides, .. }, _) => overrides.get(slot).map(|(_, e)| e),
             _ => None,
@@ -1003,7 +1096,7 @@ impl Expr {
     pub fn slot_label(&self, slot: usize) -> Option<&'static str> {
         match self {
             Expr::Gen(g) => g.knob_labels().get(slot).copied(),
-            Expr::Vec2 { .. } => ["x", "y"].get(slot).copied(),
+            Expr::Vec3 { .. } => Axis::ALL.get(slot).map(|a| a.name()),
             _ => None,
         }
     }
@@ -1017,8 +1110,9 @@ impl Expr {
         let child = match (self, slot) {
             (Expr::Bin { a, .. } | Expr::Un { a, .. } | Expr::Comp { a, .. }, 0) => a.as_ref(),
             (Expr::Bin { b, .. }, 1) => b.as_ref(),
-            (Expr::Vec2 { x, .. }, 0) => x.as_ref(),
-            (Expr::Vec2 { y, .. }, 1) => y.as_ref(),
+            (Expr::Vec3 { x, .. }, 0) => x.as_ref(),
+            (Expr::Vec3 { y, .. }, 1) => y.as_ref(),
+            (Expr::Vec3 { z, .. }, 2) => z.as_ref(),
             (Expr::Gen(g), _) => g.knob(slot)?,
             (Expr::Use { overrides, .. }, _) => &overrides.get(slot)?.1,
             _ => return None,
@@ -1035,8 +1129,9 @@ impl Expr {
         let child = match (self, slot) {
             (Expr::Bin { a, .. } | Expr::Un { a, .. } | Expr::Comp { a, .. }, 0) => a.as_mut(),
             (Expr::Bin { b, .. }, 1) => b.as_mut(),
-            (Expr::Vec2 { x, .. }, 0) => x.as_mut(),
-            (Expr::Vec2 { y, .. }, 1) => y.as_mut(),
+            (Expr::Vec3 { x, .. }, 0) => x.as_mut(),
+            (Expr::Vec3 { y, .. }, 1) => y.as_mut(),
+            (Expr::Vec3 { z, .. }, 2) => z.as_mut(),
             (Expr::Gen(g), _) => g.knob_mut(slot)?,
             (Expr::Use { overrides, .. }, _) => &mut overrides.get_mut(slot)?.1,
             _ => return None,
@@ -1071,12 +1166,12 @@ pub enum ExprKind {
     Noise,
     Ramp,
     Bounce,
-    /// Build a vector from two scalars — the `join` node. Like [`ExprKind::Use`],
-    /// kept out of [`ExprKind::ALL`]: it's created by placing the graph node, not
-    /// by the generic kind picker.
-    Vec2,
+    /// Build a vector from three scalars — the `join` node. Like
+    /// [`ExprKind::Use`], kept out of [`ExprKind::ALL`]: it's created by placing
+    /// the graph node, not by the generic kind picker.
+    Vec3,
     /// Read one axis of a vector — the `split` node. Out of `ALL` for the same
-    /// reason as [`ExprKind::Vec2`].
+    /// reason as [`ExprKind::Vec3`].
     Comp,
 }
 
@@ -1116,7 +1211,7 @@ impl ExprKind {
             ExprKind::Noise => "noise",
             ExprKind::Ramp => "ramp",
             ExprKind::Bounce => "bounce",
-            ExprKind::Vec2 => "join",
+            ExprKind::Vec3 => "join",
             ExprKind::Comp => "split",
         }
     }
@@ -1131,7 +1226,7 @@ impl fmt::Display for ExprValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExprValue::Num(n) => write!(f, "{n}"),
-            ExprValue::Vec2(v) => write!(f, "[{}, {}]", v.x, v.y),
+            ExprValue::Vec3(v) => write!(f, "[{}, {}, {}]", v.x, v.y, v.z),
             ExprValue::Color(c) => write!(f, "rgba({}, {}, {}, {})", c.r, c.g, c.b, c.a),
             // Quoted and escaped, so a printed expression round-trips visually
             // and an empty string is visible rather than a gap.
@@ -1172,7 +1267,7 @@ impl fmt::Display for Expr {
             }
             Expr::Time(t) => f.write_str(t.label()),
             Expr::Gen(g) => write!(f, "{g}"),
-            Expr::Vec2 { x, y } => write!(f, "vec2({x}, {y})"),
+            Expr::Vec3 { x, y, z } => write!(f, "vec3({x}, {y}, {z})"),
             Expr::Comp { a, axis } => write!(f, "{a}.{}", axis.name()),
         }
     }
@@ -1381,9 +1476,10 @@ fn expr_value_to_dynamic(v: ExprValue) -> rhai::Dynamic {
         // which is what makes the whole Rhai string library (`sub_string`, `+`,
         // `len`) available to a text property for free.
         ExprValue::Str(s) => rhai::Dynamic::from(s),
-        ExprValue::Vec2(v) => rhai::Dynamic::from_array(vec![
+        ExprValue::Vec3(v) => rhai::Dynamic::from_array(vec![
             rhai::Dynamic::from_float(v.x),
             rhai::Dynamic::from_float(v.y),
+            rhai::Dynamic::from_float(v.z),
         ]),
         ExprValue::Color(c) => rhai::Dynamic::from_array(vec![
             rhai::Dynamic::from_float(c.r),
@@ -1446,7 +1542,12 @@ fn dynamic_to_expr_value(d: &rhai::Dynamic) -> Result<ExprValue, String> {
         let arr = d.clone().into_array().map_err(|_| "expected an array".to_string())?;
         let nums = arr.iter().map(dynamic_to_num).collect::<Result<Vec<f64>, String>>()?;
         return match nums.as_slice() {
-            [x, y] => Ok(ExprValue::Vec2(kurbo::Vec2::new(*x, *y))),
+            [x, y] => Ok(ExprValue::Vec3(Vec3::flat(*x, *y))),
+            // Three numbers stay a colour, not a 3-vector. This is ambiguous by
+            // construction and the tie goes to the older meaning: scripts in
+            // the wild return `[r, g, b]` for fills, and silently turning those
+            // into vectors would break them. A script that wants depth writes
+            // `vec3(x, y, z)` — see `register_helpers`.
             [r, g, b] => Ok(ExprValue::Color(Color::rgb(*r, *g, *b))),
             [r, g, b, a] => Ok(ExprValue::Color(Color::rgba(*r, *g, *b, *a))),
             _ => Err("array must have 2 (vec), 3 or 4 (color) numbers".into()),
@@ -1765,7 +1866,7 @@ impl<'a> EvalCtx<'a> {
         let tr = &node.transform;
         match prop {
             PropPath::Position => tr.position.resolve(self).to_expr(),
-            PropPath::Rotation => tr.rotation_deg.resolve(self).to_expr(),
+            PropPath::Rotation => tr.rotation.resolve(self).to_expr(),
             PropPath::Scale => tr.scale.resolve(self).to_expr(),
             PropPath::Opacity => tr.opacity.resolve(self).to_expr(),
             PropPath::Anchor => tr.anchor.resolve(self).to_expr(),
@@ -1914,9 +2015,11 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
         // Two scalars up into a vector, or one axis down out of one — the join /
         // split pair. Both coerce, so a mismatched wire lowers dimensionality
         // gracefully rather than failing a frame.
-        Expr::Vec2 { x, y } => {
-            let (x, y) = (as_scalar(eval_expr(x, ctx)), as_scalar(eval_expr(y, ctx)));
-            ExprValue::Vec2(kurbo::Vec2::new(x, y))
+        Expr::Vec3 { x, y, z } => {
+            let x = as_scalar(eval_expr(x, ctx));
+            let y = as_scalar(eval_expr(y, ctx));
+            let z = as_scalar(eval_expr(z, ctx));
+            ExprValue::Vec3(Vec3::new(x, y, z))
         }
         Expr::Comp { a, axis } => ExprValue::Num(component(&eval_expr(a, ctx), *axis)),
     }
@@ -1928,21 +2031,23 @@ pub fn eval_expr(expr: &Expr, ctx: &mut EvalCtx) -> ExprValue {
 fn as_scalar(v: ExprValue) -> f64 {
     match v {
         ExprValue::Num(n) => n,
-        ExprValue::Vec2(p) => p.x,
+        ExprValue::Vec3(p) => p.x,
         ExprValue::Color(c) => c.r,
         ExprValue::Str(_) => 0.0,
     }
 }
 
-/// One axis of a value, for [`Expr::Comp`]. A vector gives x/y, a colour reads
-/// r/g, and a scalar has no axes so it passes through. Total and non-failing,
+/// One axis of a value, for [`Expr::Comp`]. A vector gives x/y/z, a colour
+/// reads r/g/b, and a scalar has no axes so it passes through. Total and non-failing,
 /// like every other coercion here.
 fn component(v: &ExprValue, axis: Axis) -> f64 {
     match (v, axis) {
-        (ExprValue::Vec2(p), Axis::X) => p.x,
-        (ExprValue::Vec2(p), Axis::Y) => p.y,
+        (ExprValue::Vec3(p), Axis::X) => p.x,
+        (ExprValue::Vec3(p), Axis::Y) => p.y,
+        (ExprValue::Vec3(p), Axis::Z) => p.z,
         (ExprValue::Color(c), Axis::X) => c.r,
         (ExprValue::Color(c), Axis::Y) => c.g,
+        (ExprValue::Color(c), Axis::Z) => c.b,
         (ExprValue::Num(n), _) => *n,
         (ExprValue::Str(_), _) => 0.0,
     }
@@ -1951,6 +2056,7 @@ fn component(v: &ExprValue, axis: Axis) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vec3::Vec3;
     use crate::node::{Document, Node, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
@@ -1996,7 +2102,7 @@ mod tests {
         // b.opacity references a *Vec2* (position) — a colour/vec can't become a
         // scalar, so it falls back to 0.0 instead of poisoning the frame.
         let a = Node::group(1, "a").with_transform(Transform {
-            position: Value::constant(Vec2::new(10.0, 20.0)),
+            position: Value::constant(Vec3::flat(10.0, 20.0)),
             ..Transform::default()
         });
         let b = Node::group(2, "b").with_transform(Transform {
@@ -2095,11 +2201,11 @@ mod tests {
     fn an_operator_broadcasts_a_scalar_over_a_vector() {
         let e = Expr::bin(
             BinOp::Div,
-            Expr::Lit(ExprValue::Vec2(Vec2::new(10.0, 20.0))),
+            Expr::Lit(ExprValue::Vec3(Vec3::flat(10.0, 20.0))),
             Expr::num(2.0),
         );
-        let v: Value<Vec2> = Value::expr(e);
-        assert_eq!(v.resolve(&mut EvalCtx::at(0.0)), Vec2::new(5.0, 10.0));
+        let v: Value<Vec3> = Value::expr(e);
+        assert_eq!(v.resolve(&mut EvalCtx::at(0.0)), Vec3::flat(5.0, 10.0));
     }
 
     /// `+` concatenates when either side is text — but **only** `+`. Subtracting
@@ -2190,9 +2296,9 @@ mod tests {
                     e.arity()
                 }
                 // Not in `ALL` (created by placing the graph node), but the match
-                // must still cover them: a `join` takes two scalars, a `split` one
-                // vector.
-                ExprKind::Vec2 => 2,
+                // must still cover them: a `join` takes three scalars, a `split`
+                // one vector.
+                ExprKind::Vec3 => 3,
                 ExprKind::Comp => 1,
             };
             assert_eq!(e.arity(), expected, "{k:?}");
@@ -2267,7 +2373,9 @@ mod tests {
     fn a_script_array_becomes_a_vec_or_color() {
         assert_eq!(
             eval_script("[frame, frame * 2.0]", 3.0).unwrap(),
-            ExprValue::Vec2(kurbo::Vec2::new(3.0, 6.0))
+            // A two-element array is planar: the script named a width and a
+            // height, and depth is not something it left out.
+            ExprValue::Vec3(Vec3::flat(3.0, 6.0))
         );
         assert_eq!(
             eval_script("[1.0, 0.5, 0.0]", 0.0).unwrap(),
@@ -2321,7 +2429,7 @@ mod tests {
     #[test]
     fn a_script_reads_a_vec_property_as_an_array() {
         let a = Node::group(1, "a").with_transform(Transform {
-            position: Value::constant(Vec2::new(30.0, 4.0)),
+            position: Value::constant(Vec3::flat(30.0, 4.0)),
             ..Transform::default()
         });
         // Take the x of a's position: an array subscript, straight from Rhai.
@@ -2493,7 +2601,7 @@ mod tests {
         )
         .with_transform(T {
             opacity: Value::expr(Expr::Param { node: None, name: "size".into() }),
-            scale: Value::expr(Expr::bin(BinOp::Mul,Expr::Lit(ExprValue::Vec2(Vec2::new(1.0, 1.0))),Expr::Param { node: None, name: "size".into() })),
+            scale: Value::expr(Expr::bin(BinOp::Mul,Expr::Lit(ExprValue::Vec3(Vec3::splat(1.0))),Expr::Param { node: None, name: "size".into() })),
             ..T::default()
         });
         n.set_param("size", ParamValue::Num(Value::constant(0.4)));
@@ -2502,7 +2610,9 @@ mod tests {
         let mut ctx = EvalCtx::new(&doc, 0.0);
         ctx.in_node(node.id, |ctx| {
             assert_eq!(node.transform.opacity.resolve(ctx), 0.4);
-            assert_eq!(node.transform.scale.resolve(ctx), Vec2::new(0.4, 0.4));
+            // All three axes: the scale's identity is `splat(1)`, so a param
+            // broadcast over it scales depth alongside width and height.
+            assert_eq!(node.transform.scale.resolve(ctx), Vec3::splat(0.4));
         });
     }
 

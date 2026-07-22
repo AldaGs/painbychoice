@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::asset::{Asset, AssetId, ImagePaint};
 use crate::composite::{BlendMode, Mask, MatteMode};
-use crate::expr::EvalCtx;
+use crate::expr::{EvalCtx, Expr};
+use crate::mat4::{Mat4, Xf};
 use crate::text::TextAlign;
 use crate::value::{Color, Value};
+use crate::vec3::Vec3;
 
 /// Stable identity for a node, used for selection and for tracing an evaluated
 /// render item back to its source (EBN's line→nodeId map idea, applied to a
@@ -17,48 +19,133 @@ use crate::value::{Color, Value};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
 
-/// An affine transform, every channel animatable. Resolves to a
-/// `kurbo::Affine` plus a scalar opacity at a given time.
+/// A transform, every channel animatable and every spatial channel a [`Vec3`].
+/// Resolves to an [`Xf`] plus a scalar opacity at a given time.
+///
+/// The channels are 3D but the *result* is not necessarily: a transform whose
+/// depth and out-of-plane rotations are all zero resolves to `Xf::Flat`, a plain
+/// `kurbo::Affine`, exactly as before 2.5D existed. See [`crate::mat4`] for why
+/// that distinction is load-bearing rather than an optimisation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transform {
-    pub anchor: Value<Vec2>,
-    pub position: Value<Vec2>,
-    pub rotation_deg: Value<f64>,
-    pub scale: Value<Vec2>,
+    pub anchor: Value<Vec3>,
+    pub position: Value<Vec3>,
+    /// Euler angles in **degrees**, applied Z · Y · X. `z` is the in-plane spin
+    /// every 2D document already had; `x`/`y` are the ones that tip the layer
+    /// out of the plane and force the projected pipeline.
+    ///
+    /// Renamed from the old scalar `rotation_deg`, which a `.pbc` may still be
+    /// keyed on: the `alias` accepts the old name and [`de_rotation`] accepts
+    /// the old *shape*, widening a scalar track into the Z channel.
+    #[serde(default = "zero_rotation", alias = "rotation_deg", deserialize_with = "de_rotation")]
+    pub rotation: Value<Vec3>,
+    pub scale: Value<Vec3>,
     pub opacity: Value<f64>,
+}
+
+fn zero_rotation() -> Value<Vec3> {
+    Value::constant(Vec3::ZERO)
+}
+
+/// Accept either spelling of a transform's rotation: the 3-vector it is now, or
+/// the bare scalar a pre-2.5D `.pbc` wrote. Untagged, and the vector arm is
+/// tried first — the two payloads are structurally distinct (`{"Const": {"x":
+/// …}}` against `{"Const": 1.5}`), so there is nothing to disambiguate by hand.
+fn de_rotation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Value<Vec3>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Spatial(Value<Vec3>),
+        Planar(Value<f64>),
+    }
+    Ok(match Repr::deserialize(d)? {
+        Repr::Spatial(v) => v,
+        Repr::Planar(deg) => widen_rotation(deg),
+    })
+}
+
+/// Widen a pre-2.5D scalar rotation into the Z channel of a 3D one, preserving
+/// keyframe timing and expression wiring. The old value *was* the Z spin, so an
+/// upgraded document animates identically — that is the acceptance criterion for
+/// this whole migration.
+fn widen_rotation(legacy: Value<f64>) -> Value<Vec3> {
+    match legacy {
+        Value::Const(deg) => Value::Const(Vec3::new(0.0, 0.0, deg)),
+        Value::Keyframed(track) => {
+            Value::Keyframed(track.map_value(|deg| Vec3::new(0.0, 0.0, deg)))
+        }
+        // The expression drove a scalar; it now drives one component of a join.
+        Value::Expr(e) => Value::Expr(Expr::Vec3 {
+            x: Box::new(Expr::num(0.0)),
+            y: Box::new(Expr::num(0.0)),
+            z: Box::new(e),
+        }),
+    }
 }
 
 impl Default for Transform {
     fn default() -> Self {
         Self {
-            anchor: Value::constant(Vec2::ZERO),
-            position: Value::constant(Vec2::ZERO),
-            rotation_deg: Value::constant(0.0),
-            scale: Value::constant(Vec2::new(1.0, 1.0)),
+            anchor: Value::constant(Vec3::ZERO),
+            position: Value::constant(Vec3::ZERO),
+            rotation: zero_rotation(),
+            scale: Value::constant(Vec3::ONE),
             opacity: Value::constant(1.0),
         }
     }
 }
 
 impl Transform {
-    /// Resolve to (matrix, opacity) against `ctx`. The matrix maps local space
-    /// to parent space: translate(position) · rotate · scale · translate(-anchor).
-    pub fn resolve(&self, ctx: &mut EvalCtx) -> (kurbo::Affine, f64) {
+    /// Resolve to (transform, opacity) against `ctx`. The transform maps local
+    /// space to parent space: translate(position) · rotate · scale ·
+    /// translate(-anchor) — the same construction as before, evaluated in
+    /// whichever of the two tiers the channels actually need.
+    pub fn resolve(&self, ctx: &mut EvalCtx) -> (Xf, f64) {
         let anchor = self.anchor.resolve(ctx);
         let position = self.position.resolve(ctx);
-        let rot = self.rotation_deg.resolve(ctx).to_radians();
+        let rot = self.rotation.resolve(ctx);
         let scale = self.scale.resolve(ctx);
-        let m = kurbo::Affine::translate(position)
-            * kurbo::Affine::rotate(rot)
-            * kurbo::Affine::scale_non_uniform(scale.x, scale.y)
-            * kurbo::Affine::translate(-anchor);
-        (m, self.opacity.resolve(ctx))
+        let opacity = self.opacity.resolve(ctx);
+
+        // The fast path, and the one every existing document takes: no depth in
+        // the translations, no out-of-plane rotation. Scale's z is ignored here
+        // because scaling depth with nothing in depth is a no-op.
+        if anchor.is_flat() && position.is_flat() && rot.x == 0.0 && rot.y == 0.0 {
+            let m = kurbo::Affine::translate(position.xy())
+                * kurbo::Affine::rotate(rot.z.to_radians())
+                * kurbo::Affine::scale_non_uniform(scale.x, scale.y)
+                * kurbo::Affine::translate(-anchor.xy());
+            return (Xf::Flat(m), opacity);
+        }
+
+        // Z · Y · X: yaw last so a layer tipped in depth still spins about the
+        // screen axis the way the 2D rotation handle implies.
+        let m = Mat4::translate(position)
+            * Mat4::rotate_z(rot.z.to_radians())
+            * Mat4::rotate_y(rot.y.to_radians())
+            * Mat4::rotate_x(rot.x.to_radians())
+            * Mat4::scale(Vec3::new(scale.x, scale.y, if scale.z == 0.0 { 1.0 } else { scale.z }))
+            * Mat4::translate(-anchor);
+        (Xf::Spatial(m), opacity)
+    }
+
+    /// True when this transform can never leave the plane on any frame — every
+    /// spatial channel is a flat constant. Cheaper and stricter than resolving:
+    /// an animated channel counts as spatial even if it happens to be flat now,
+    /// so a comp can be classified once instead of per frame.
+    pub fn is_statically_flat(&self) -> bool {
+        fn flat(v: &Value<Vec3>) -> bool {
+            matches!(v, Value::Const(c) if c.is_flat())
+        }
+        flat(&self.anchor)
+            && flat(&self.position)
+            && matches!(&self.rotation, Value::Const(r) if r.x == 0.0 && r.y == 0.0)
     }
 
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
         self.anchor.migrate_frames(fps);
         self.position.migrate_frames(fps);
-        self.rotation_deg.migrate_frames(fps);
+        self.rotation.migrate_frames(fps);
         self.scale.migrate_frames(fps);
         self.opacity.migrate_frames(fps);
     }
@@ -66,7 +153,7 @@ impl Transform {
     pub(crate) fn retime(&mut self, ratio: f64) {
         self.anchor.retime(ratio);
         self.position.retime(ratio);
-        self.rotation_deg.retime(ratio);
+        self.rotation.retime(ratio);
         self.scale.retime(ratio);
         self.opacity.retime(ratio);
     }
@@ -369,7 +456,7 @@ impl ParamValue {
         use crate::expr::ExprValue as E;
         match (self, v) {
             (ParamValue::Num(slot), E::Num(n)) => *slot = Value::constant(n),
-            (ParamValue::Vec(slot), E::Vec2(p)) => *slot = Value::constant(p),
+            (ParamValue::Vec(slot), E::Vec3(p)) => *slot = Value::constant(p.xy()),
             (ParamValue::Color(slot), E::Color(c)) => *slot = Value::constant(c),
             (ParamValue::Str(slot), E::Str(s)) => *slot = Value::constant(s),
             _ => {}
@@ -1320,14 +1407,15 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vec3::Vec3;
     use crate::value::{Keyframe, Track};
 
     /// Build a one-layer comp at `fps` with a position key on `frame`.
     fn comp_with_key(fps: f64, frame: i64) -> Comp {
         let mut transform = Transform::default();
-        transform.rotation_deg = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0, 0.0),
-            Keyframe::linear(frame, 90.0),
+        transform.rotation = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, Vec3::ZERO),
+            Keyframe::linear(frame, Vec3::new(0.0, 0.0, 90.0)),
         ]));
         let layer = Node::group(1, "layer").with_transform(transform);
         let mut comp = Comp::new(1920.0, 1080.0, Node::group(0, "root").with_child(layer));
@@ -1336,7 +1424,7 @@ mod tests {
     }
 
     fn key_frames(comp: &Comp) -> Vec<i64> {
-        comp.root.children[0].transform.rotation_deg.key_frames()
+        comp.root.children[0].transform.rotation.key_frames()
     }
 
     /// The comp background is a setting, so it round-trips — and a `.pbc`
@@ -1516,6 +1604,7 @@ mod tests {
 #[cfg(test)]
 mod knob_tests {
     use super::*;
+    use crate::vec3::Vec3;
     use crate::expr::ExprValue;
 
 
@@ -1537,7 +1626,7 @@ mod knob_tests {
     fn a_mistyped_literal_does_not_retype_the_knob() {
         let mut p = ParamValue::Vec(Value::constant(Vec2::new(1.0, 2.0)));
         p.set_const(ExprValue::Num(9.0));
-        assert_eq!(p.as_const(), Some(ExprValue::Vec2(Vec2::new(1.0, 2.0))), "unchanged");
+        assert_eq!(p.as_const(), Some(ExprValue::Vec3(Vec3::flat(1.0, 2.0))), "unchanged");
         assert_eq!(p.kind_name(), "vector");
     }
 
@@ -1569,5 +1658,83 @@ mod knob_tests {
         let stripped = json.replace("\"eases\"", "\"eases_was_here\"");
         let old: Project = serde_json::from_str(&stripped).unwrap();
         assert!(old.eases.is_empty(), "a pre-library file loads with no presets");
+    }
+
+    /// The 2.5D migration's load-bearing promise: a `.pbc` written when
+    /// rotation was one number and the vectors were two, opens as the *same*
+    /// animation — flat, spinning about Z, and on the affine fast path.
+    #[test]
+    fn a_pre_2_5d_transform_loads_flat_and_unchanged() {
+        let legacy = r#"{
+            "anchor": {"Const": {"x": 5.0, "y": 6.0}},
+            "position": {"Const": {"x": 10.0, "y": 20.0}},
+            "rotation_deg": {"Const": 90.0},
+            "scale": {"Const": {"x": 2.0, "y": 3.0}},
+            "opacity": {"Const": 1.0}
+        }"#;
+        let tr: Transform = serde_json::from_str(legacy).unwrap();
+        let Value::Const(rot) = tr.rotation else { panic!("still a constant") };
+        assert_eq!(rot, Vec3::new(0.0, 0.0, 90.0), "the spin moved to Z");
+        assert!(tr.is_statically_flat());
+
+        // And it resolves to the very matrix the old engine built.
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root"));
+        let mut ctx = EvalCtx::new(&doc, 0.0);
+        let (xf, _) = tr.resolve(&mut ctx);
+        assert!(xf.is_flat(), "no depth anywhere, so no 4x4 and no projection");
+        let expected = kurbo::Affine::translate((10.0, 20.0))
+            * kurbo::Affine::rotate(90f64.to_radians())
+            * kurbo::Affine::scale_non_uniform(2.0, 3.0)
+            * kurbo::Affine::translate((-5.0, -6.0));
+        for (l, r) in xf.to_affine().unwrap().as_coeffs().iter().zip(expected.as_coeffs().iter()) {
+            assert!((l - r).abs() < 1e-12, "{l} vs {r}");
+        }
+    }
+
+    /// A legacy *keyframed* rotation keeps its timing, not just its values —
+    /// widening a track must not quietly re-ease it.
+    #[test]
+    fn a_legacy_rotation_track_widens_without_retiming() {
+        let legacy = r#"{
+            "anchor": {"Const": {"x": 0.0, "y": 0.0}},
+            "position": {"Const": {"x": 0.0, "y": 0.0}},
+            "rotation_deg": {"Keyframed": {"keys": [
+                {"frame": 0, "value": 0.0, "out_handle": {"x": 0.0, "y": 0.0},
+                 "in_handle": {"x": 0.0, "y": 0.0}},
+                {"frame": 24, "value": 180.0, "out_handle": {"x": 0.0, "y": 0.0},
+                 "in_handle": {"x": 0.0, "y": 0.0}}
+            ]}},
+            "scale": {"Const": {"x": 1.0, "y": 1.0}},
+            "opacity": {"Const": 1.0}
+        }"#;
+        let tr: Transform = serde_json::from_str(legacy).unwrap();
+        let Value::Keyframed(track) = &tr.rotation else { panic!("still a track") };
+        assert_eq!(track.keys().len(), 2);
+        assert_eq!(track.keys()[0].frame, 0);
+        assert_eq!(track.keys()[1].frame, 24);
+        assert_eq!(track.keys()[1].value, Vec3::new(0.0, 0.0, 180.0));
+    }
+
+    /// Depth is what forces the expensive tier — and only depth. Asserted from
+    /// the outside so the fast-path condition can't drift from its intent.
+    #[test]
+    fn only_out_of_plane_channels_escalate_to_a_matrix() {
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root"));
+        let resolve = |tr: &Transform| {
+            let mut ctx = EvalCtx::new(&doc, 0.0);
+            tr.resolve(&mut ctx).0
+        };
+
+        let mut tr = Transform::default();
+        tr.rotation = Value::constant(Vec3::new(0.0, 0.0, 45.0));
+        assert!(resolve(&tr).is_flat(), "a Z spin is in-plane");
+
+        let mut tr = Transform::default();
+        tr.position = Value::constant(Vec3::new(0.0, 0.0, 5.0));
+        assert!(!resolve(&tr).is_flat(), "depth in position leaves the plane");
+
+        let mut tr = Transform::default();
+        tr.rotation = Value::constant(Vec3::new(30.0, 0.0, 0.0));
+        assert!(!resolve(&tr).is_flat(), "an X tilt leaves the plane");
     }
 }

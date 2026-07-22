@@ -264,7 +264,9 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
     // Unwired input defaults (math operands, generator knobs) mirror the IR's
     // own seed values, so lowering a fresh node reproduces `Expr::seed`.
     let num = crate::expr::ExprValue::Num;
-    let vec2 = |x, y| crate::expr::ExprValue::Vec2(kurbo::Vec2::new(x, y));
+    // Shape sizes are planar, so the two-argument spelling stays — it just
+    // builds the one vector kind with a zero depth.
+    let vec2 = |x, y| crate::expr::ExprValue::Vec3(crate::vec3::Vec3::flat(x, y));
     let text = |s: &str| crate::expr::ExprValue::Str(s.to_string());
     vec![
         // ── Geometry: a shape's params are inputs; it outputs its geometry and
@@ -315,20 +317,26 @@ pub fn builtin_descriptors() -> Vec<NodeDescriptor> {
             .input_def("a", "A", Number, num(0.0))
             .input_def("b", "B", Number, num(0.0))
             .output("result", "Result", Number),
-        // ── Vector plumbing: build a 2-vector from two scalars, and take it
-        //    apart again. These are what let a graph reach *inside* a
+        // ── Vector plumbing: build a vector from scalars, and take it apart
+        //    again. These are what let a graph reach *inside* a
         //    multidimensional property — drive `position.x` from one recipe and
         //    `position.y` from another, or read a layer's scale apart to react to
-        //    just its width. `join` mirrors `math`'s two-in-one-out shape; `split`
-        //    is the only built-in with two value outputs, one per axis. ─────────
+        //    just its width. `split` is the built-in with the most value
+        //    outputs, one per axis.
+        //
+        //    Three axes since 2.5D. A graph built when there were two reloads
+        //    with its `z` input unwired, resting on the `0.0` default — i.e. in
+        //    the plane, exactly where it was authored. ─────────────────────────
         NodeDescriptor::new("join", Cat::Math, "Join Vector")
             .input_def("x", "X", Number, num(0.0))
             .input_def("y", "Y", Number, num(0.0))
+            .input_def("z", "Z", Number, num(0.0))
             .output("value", "Vector", Vector),
         NodeDescriptor::new("split", Cat::Math, "Split Vector")
             .input("value", "Vector", Vector)
             .output("x", "X", Number)
-            .output("y", "Y", Number),
+            .output("y", "Y", Number)
+            .output("z", "Z", Number),
         // ── Inputs: leaves that read a value in. ─────────────────────────────
         NodeDescriptor::new("value", Cat::Input, "Value").output("value", "Value", Number),
         // A text literal. Separate from `value` rather than a mode of it: the

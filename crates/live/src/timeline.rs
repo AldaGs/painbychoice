@@ -193,6 +193,11 @@ pub(crate) fn remap_selection(
 /// a `Vec2` property.
 #[derive(Clone)]
 pub(crate) enum ClipTrack {
+    /// A transform channel — three components since 2.5D. Distinct from
+    /// [`ClipTrack::Vec2`] so a position clip can never paste onto a rect's
+    /// size: the tag is the only thing enforcing that, and the two are no
+    /// longer the same type.
+    Vec3(Vec<Keyframe<motion_core::Vec3>>),
     Vec2(Vec<Keyframe<Vec2>>),
     Num(Vec<Keyframe<f64>>),
     Color(Vec<Keyframe<MColor>>),
@@ -203,6 +208,7 @@ impl ClipTrack {
     /// Frame of the earliest copied key, or `None` if nothing was copied.
     pub(crate) fn first_frame(&self) -> Option<i64> {
         match self {
+            ClipTrack::Vec3(k) => k.first().map(|k| k.frame),
             ClipTrack::Vec2(k) => k.first().map(|k| k.frame),
             ClipTrack::Num(k) => k.first().map(|k| k.frame),
             ClipTrack::Color(k) => k.first().map(|k| k.frame),

@@ -60,7 +60,7 @@ fn raise_rec(
             // the wrong colour and refuse a legal wire into a Vector input.
             let kind = match v {
                 ExprValue::Str(_) => "string",
-                ExprValue::Vec2(_) => "vec2",
+                ExprValue::Vec3(_) => "vec2",
                 _ => "value",
             };
             let (id, y) = leaf(graph, kind);
@@ -93,13 +93,15 @@ fn raise_rec(
         Expr::Un { op, a } => raise_math(graph, ctx, MathOp::Un(*op), a, None, x, cursor_y),
         Expr::Gen(g) => raise_generator(graph, ctx, g, x, cursor_y),
         // Build-a-vector: raise both scalars into a `join` centred on them.
-        Expr::Vec2 { x: xe, y: ye } => {
+        Expr::Vec3 { x: xe, y: ye, z: ze } => {
             let (ex, yx) = raise_rec(graph, ctx, xe, x - COL, cursor_y);
             let (ey, yy) = raise_rec(graph, ctx, ye, x - COL, cursor_y);
-            let center = (yx + yy) / 2.0;
+            let (ez, yz) = raise_rec(graph, ctx, ze, x - COL, cursor_y);
+            let center = (yx + yy + yz) / 3.0;
             let id = graph.add_node("join", Vec2::new(x, center));
             let _ = graph.connect(ctx, ex, Endpoint::new(id, "x"));
             let _ = graph.connect(ctx, ey, Endpoint::new(id, "y"));
+            let _ = graph.connect(ctx, ez, Endpoint::new(id, "z"));
             (Endpoint::new(id, "value"), center)
         }
         // Read-an-axis: raise the source into a `split`, take the named output.
@@ -385,7 +387,7 @@ impl ShapeParam<'_> {
             | ShapeParam::Vec2(Value::Expr(e))
             | ShapeParam::Str(Value::Expr(e)) => ParamSource::Expr(e),
             ShapeParam::Num(_) => ParamSource::Const(ExprValue::Num(0.0)),
-            ShapeParam::Vec2(_) => ParamSource::Const(ExprValue::Vec2(Vec2::ZERO)),
+            ShapeParam::Vec2(_) => ParamSource::Const(ExprValue::Vec3(crate::vec3::Vec3::ZERO)),
             ShapeParam::Str(_) => ParamSource::Const(ExprValue::Str(String::new())),
         }
     }
@@ -394,6 +396,7 @@ impl ShapeParam<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vec3::Vec3;
     use crate::expr::{BinOp, UnOp};
     use crate::expr::{ExprValue, PropPath, Waveform};
     use crate::lower::lower_output;
@@ -424,10 +427,11 @@ mod tests {
     #[test]
     fn the_vector_nodes_round_trip() {
         use crate::expr::Axis;
-        let expr = Expr::Vec2 {
+        let expr = Expr::Vec3 {
             x: Box::new(Expr::Lit(ExprValue::Num(3.0))),
+            z: Box::new(Expr::num(0.0)),
             y: Box::new(Expr::Comp {
-                a: Box::new(Expr::Lit(ExprValue::Vec2(Vec2::new(5.0, 6.0)))),
+                a: Box::new(Expr::Lit(ExprValue::Vec3(Vec3::flat(5.0, 6.0)))),
                 axis: Axis::Y,
             }),
         };
