@@ -4232,3 +4232,39 @@ fn a_groups_clip_bounds_include_the_stroke_width() {
     assert_eq!(bounds.width(), 18.0);
     assert_eq!(bounds.height(), 18.0);
 }
+
+/// Adding a mask seeds it to the layer's own size, so it starts covering what
+/// it masks. A zero-sized mask would hide the layer completely and read as
+/// "adding a mask deleted my artwork".
+#[test]
+fn a_new_mask_is_seeded_to_the_layers_own_size() {
+    let n = MNode::shape(
+        1,
+        "box",
+        MShape::Rect {
+            size: Value::constant(Vec2::new(320.0, 180.0)),
+            radius: Value::constant(0.0),
+        },
+    );
+    assert_eq!(mask_seed_size(&n), Vec2::new(320.0, 180.0));
+
+    // A layer with no parametric size still gets something visible rather than
+    // a mask of nothing.
+    let g = MNode::group(2, "holder");
+    let fallback = mask_seed_size(&g);
+    assert!(fallback.x > 0.0 && fallback.y > 0.0);
+}
+
+/// A mask makes its layer composite in isolation even with no blend mode: the
+/// clip has to apply to the finished content, not to each item, or a stroke
+/// would survive where the fill was cut.
+#[test]
+fn a_masked_layer_opens_its_own_composited_layer() {
+    let mut n = blended_box(1, 0.0, MBlendMode::Normal);
+    n.mask = Some(Mask::new(MShape::Ellipse { size: Value::constant(Vec2::new(6.0, 6.0)) }));
+    let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(n));
+    let scene = motion_core::evaluate(&comp, 0.0);
+
+    assert_eq!(composite_events(&scene), vec!["push1", "draw1", "pop"]);
+    assert!(scene.groups[0].clip.is_some(), "and it clips to the mask");
+}

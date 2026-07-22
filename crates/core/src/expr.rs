@@ -211,6 +211,9 @@ pub enum PropPath {
     /// `Shape::Image` whose `time_remap` is set has one — an unremapped clip
     /// plays at its natural rate and has no curve to read.
     TimeRemap,
+    /// A mask's size. Animatable like the shape it is — which is the point of a
+    /// mask being a [`crate::node::Shape`] rather than a fixed outline.
+    MaskSize,
 }
 
 impl PropPath {
@@ -232,12 +235,13 @@ impl PropPath {
             PropPath::TextSize => "text_size",
             PropPath::TextContent => "content",
             PropPath::TimeRemap => "time_remap",
+            PropPath::MaskSize => "mask_size",
         }
     }
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 13] = [
+    pub const ALL: [PropPath; 14] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -251,6 +255,7 @@ impl PropPath {
         PropPath::TextSize,
         PropPath::TextContent,
         PropPath::TimeRemap,
+        PropPath::MaskSize,
     ];
 
     /// Parse a script-facing property name, case-insensitively.
@@ -263,7 +268,7 @@ impl PropPath {
     /// node, no document, or a cycle) where there's no real value to return.
     fn zero(self) -> ExprValue {
         match self {
-            PropPath::Position | PropPath::Scale | PropPath::Anchor | PropPath::ShapeSize => {
+            PropPath::Position | PropPath::Scale | PropPath::Anchor | PropPath::ShapeSize | PropPath::MaskSize => {
                 ExprValue::Vec2(kurbo::Vec2::ZERO)
             }
             PropPath::Rotation
@@ -1752,6 +1757,12 @@ impl<'a> EvalCtx<'a> {
             },
             PropPath::TimeRemap => match &node.shape {
                 Some(Shape::Image { time_remap: Some(t), .. }) => t.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::MaskSize => match node.mask.as_ref().map(|m| &m.shape) {
+                Some(Shape::Rect { size, .. }) | Some(Shape::Ellipse { size }) => {
+                    size.resolve(self).to_expr()
+                }
                 _ => prop.zero(),
             },
         }

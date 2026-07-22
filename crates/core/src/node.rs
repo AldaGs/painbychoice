@@ -6,7 +6,7 @@ use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::asset::{Asset, AssetId, ImagePaint};
-use crate::composite::BlendMode;
+use crate::composite::{BlendMode, Mask};
 use crate::expr::EvalCtx;
 use crate::text::TextAlign;
 use crate::value::{Color, Value};
@@ -497,7 +497,30 @@ pub struct Node {
     /// does.
     #[serde(default)]
     pub blend: BlendMode,
+    /// A shape limiting where this layer draws.
+    ///
+    /// Scoped exactly like [`Node::blend`] — the layer's own content, and the
+    /// comp it instances, but **not** its children. A mask on a group is
+    /// therefore a no-op for the same reason a blend mode on one is: children
+    /// are separate layers, not content.
+    ///
+    /// Masking forces isolation, because a clip has to apply to the finished
+    /// content rather than to each item: a layer with a fill and a stroke is
+    /// one picture, and clipping the two separately would let the stroke
+    /// survive where the fill was cut.
+    #[serde(default)]
+    pub mask: Option<Mask>,
     pub children: Vec<Node>,
+}
+
+impl Node {
+    /// Whether this layer must be composited as its own image.
+    ///
+    /// The single place that answers it, so the walk and any future backend
+    /// can't disagree about which layers cost an offscreen target.
+    pub fn needs_isolation(&self) -> bool {
+        self.blend.needs_isolation() || self.mask.is_some()
+    }
 }
 
 impl Node {
@@ -513,6 +536,7 @@ impl Node {
             timing: None,
             precomp: None,
             blend: BlendMode::default(),
+            mask: None,
             children: Vec::new(),
         }
     }
@@ -529,6 +553,7 @@ impl Node {
             timing: None,
             precomp: None,
             blend: BlendMode::default(),
+            mask: None,
             children: Vec::new(),
         }
     }
@@ -666,6 +691,11 @@ impl Node {
         if let Some(shape) = &mut self.shape {
             shape.migrate_frames(fps);
         }
+        // A mask's shape is parametric like any other, so its keys live on the
+        // same grid and migrate with everything else.
+        if let Some(mask) = &mut self.mask {
+            mask.shape.migrate_frames(fps);
+        }
         if let Some(fill) = &mut self.fill {
             fill.migrate_frames(fps);
         }
@@ -684,6 +714,9 @@ impl Node {
         self.transform.retime(ratio);
         if let Some(shape) = &mut self.shape {
             shape.retime(ratio);
+        }
+        if let Some(mask) = &mut self.mask {
+            mask.shape.retime(ratio);
         }
         if let Some(fill) = &mut self.fill {
             fill.retime(ratio);

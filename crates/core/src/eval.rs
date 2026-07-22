@@ -2,7 +2,7 @@
 //! time is just calling this with a different `t`; nothing is cached or baked,
 //! which is what makes the whole thing non-linear and non-destructive.
 
-use kurbo::{Affine, BezPath, Shape as _};
+use kurbo::{Affine, BezPath, Rect, Shape as _};
 
 use crate::asset::ImagePaint;
 use crate::composite::BlendMode;
@@ -88,7 +88,7 @@ impl Scene {
 }
 
 /// One isolated layer: which items belong to it, and how the result combines.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayerGroup {
     pub source: NodeId,
     /// Half-open range into [`Scene::items`]. May be empty, in which case
@@ -105,6 +105,32 @@ pub struct LayerGroup {
     /// composited first and faded as a unit. The second is what every
     /// compositing tool does, and what a blend mode requires anyway.
     pub alpha: f64,
+    /// The layer's mask, already resolved to geometry: the outline, and the
+    /// transform that places it in composition space.
+    ///
+    /// Resolved here rather than left as a `Shape` so that backends need no
+    /// `EvalCtx` and no idea that masks are parametric — the same reason
+    /// `RenderItem` carries a `BezPath` instead of a `Shape`.
+    ///
+    /// Already **inverted if the mask is**: the path is a donut of the clip
+    /// bounds minus the shape, to be filled even-odd. Doing that here keeps
+    /// every backend from re-deriving the same trick and disagreeing about it.
+    pub clip: Option<MaskPath>,
+}
+
+/// A resolved mask: the outline to clip to, and how to fill it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskPath {
+    pub path: BezPath,
+    /// Local → composition space, the layer's own matrix. The mask lives in
+    /// layer space, so it moves and rotates with what it masks.
+    pub transform: Affine,
+    /// Whether the path must be filled **even-odd** rather than non-zero.
+    ///
+    /// True for an inverted mask, where the path is an enclosing rectangle with
+    /// the mask shape punched out of it — even-odd is what makes the hole a
+    /// hole rather than a second solid region.
+    pub even_odd: bool,
 }
 
 /// Where one node sits in composition space on this frame.
@@ -214,6 +240,24 @@ fn eval_comp(
     scene.warnings.append(&mut ctx.take_warnings());
 }
 
+/// The extent of a run of items in composition space, strokes included.
+///
+/// Used to size an inverted mask's cut-out. Strokes straddle their path, so
+/// half a width is added back — otherwise inverting a mask on an outlined shape
+/// would clip the outer half of its own stroke away.
+fn content_bounds(scene: &Scene, start: usize, end: usize) -> Option<kurbo::Rect> {
+    scene.items[start..end].iter().fold(None, |acc, item| {
+        let mut b = (item.transform * item.path.clone()).bounding_box();
+        if let Some((_, width)) = item.stroke {
+            b = b.inflate(width / 2.0, width / 2.0);
+        }
+        Some(match acc {
+            Some(a) => a.union(b),
+            None => b,
+        })
+    })
+}
+
 fn walk(
     node: &Node,
     parent_xf: Affine,
@@ -254,7 +298,7 @@ fn walk(
     // fade happens on the way out. `full` is what accumulated down to here;
     // since entering an isolated layer resets the running value to 1.0, an
     // isolated layer nested inside another can't double-count its ancestors.
-    let isolated = node.blend.needs_isolation();
+    let isolated = node.needs_isolation();
     let full = parent_opacity * local_opacity.clamp(0.0, 1.0);
     // Two opacities, because isolation covers the layer's *content* but not its
     // children. Content draws at full strength and the group fades the
@@ -354,12 +398,38 @@ fn walk(
     // blended before any child draws. Emitted here rather than after the
     // children for exactly that reason.
     if isolated && content_end > group_at {
+        // Resolved after the content, so the enclosing rectangle an inverted
+        // mask needs can be measured from what is actually being masked rather
+        // than guessed at.
+        let clip = node.mask.as_ref().map(|mask| {
+            let path = mask.shape.to_path(ctx);
+            if mask.inverted {
+                // Everything *but* the shape. Built as one path — the content's
+                // extent with the shape appended — filled even-odd, so the
+                // shape becomes a hole. Sized from the content's own bounds so
+                // the cut-out covers exactly what could have drawn.
+                // Measured in comp space, then brought back into layer space,
+                // where the mask shape lives.
+                let mut outer = content_bounds(scene, group_at, content_end)
+                    .map(|b| xf.inverse().transform_rect_bbox(b))
+                    .unwrap_or(Rect::ZERO);
+                // A hair of margin: a rectangle exactly on the content's edge
+                // can drop the outermost pixel to rounding.
+                outer = outer.inflate(1.0, 1.0);
+                let mut combined = outer.to_path(0.1);
+                combined.extend(path.iter());
+                MaskPath { path: combined, transform: xf, even_odd: true }
+            } else {
+                MaskPath { path, transform: xf, even_odd: false }
+            }
+        });
         scene.groups.push(LayerGroup {
             source: node.id,
             start: group_at,
             end: content_end,
             blend: node.blend,
             alpha: full,
+            clip,
         });
     }
 
@@ -385,6 +455,7 @@ fn walk(
 mod tests {
     use super::*;
     use crate::expr::BinOp;
+    use crate::composite::Mask;
     use crate::node::{Comp, Node, Project, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
@@ -587,6 +658,80 @@ mod tests {
         empty.blend = BlendMode::Multiply;
         let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(empty));
         assert!(evaluate(&doc, 0.0).groups.is_empty());
+    }
+
+    /// A mask forces isolation even with no blend mode: a clip has to apply to
+    /// the finished content, not to each item. Clipping a fill and a stroke
+    /// separately would let the stroke survive where the fill was cut.
+    #[test]
+    fn a_mask_isolates_the_layer_on_its_own() {
+        let mut n = box_at(1, 0.0);
+        n.mask = Some(Mask::new(Shape::Ellipse { size: Value::constant(Vec2::new(6.0, 6.0)) }));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(n));
+
+        let scene = evaluate(&doc, 0.0);
+        let g = scene.groups.first().expect("a mask needs an offscreen target");
+        assert_eq!(g.blend, BlendMode::Normal, "isolated without a blend mode");
+        let clip = g.clip.as_ref().expect("the mask resolved to geometry");
+        assert!(!clip.even_odd, "an ordinary mask keeps what is inside it");
+        // Resolved to the ellipse's own outline, in layer space.
+        assert_eq!(clip.path.bounding_box().size(), kurbo::Size::new(6.0, 6.0));
+    }
+
+    /// The mask travels in the layer's space, so moving the layer moves its
+    /// mask with it — what makes a mask feel attached rather than overlapping.
+    #[test]
+    fn a_mask_rides_the_layers_own_transform() {
+        let mut n = box_at(1, 40.0);
+        n.mask = Some(Mask::new(Shape::Rect {
+            size: Value::constant(Vec2::new(4.0, 4.0)),
+            radius: Value::constant(0.0),
+        }));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(n));
+
+        let scene = evaluate(&doc, 0.0);
+        let clip = scene.groups[0].clip.as_ref().unwrap();
+        // Layer space is centred on the layer, so the mask's own path is
+        // centred on the origin and the transform carries it out to x=40.
+        assert_eq!(clip.path.bounding_box().center(), kurbo::Point::ZERO);
+        assert_eq!(clip.transform.translation(), Vec2::new(40.0, 0.0));
+    }
+
+    /// An inverted mask is the same geometry with the fill rule changed: the
+    /// content's extent with the shape punched out, filled even-odd. Built in
+    /// core so no backend re-derives the trick and disagrees about it.
+    #[test]
+    fn an_inverted_mask_becomes_a_hole_in_the_contents_extent() {
+        let mut n = box_at(1, 0.0);
+        n.mask = Some(Mask {
+            shape: Shape::Ellipse { size: Value::constant(Vec2::new(4.0, 4.0)) },
+            inverted: true,
+        });
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(n));
+
+        let scene = evaluate(&doc, 0.0);
+        let clip = scene.groups[0].clip.as_ref().unwrap();
+        assert!(clip.even_odd, "the hole is a hole, not a second solid region");
+        // The outline now spans the whole 10×10 box (plus the rounding margin)
+        // rather than the 4×4 ellipse — the ellipse is the part removed.
+        assert!(clip.path.bounding_box().width() >= 10.0);
+    }
+
+    /// A mask is scoped exactly like a blend mode: the layer's own content,
+    /// never its children.
+    #[test]
+    fn a_mask_does_not_clip_the_layers_children() {
+        let mut parent = box_at(1, 0.0);
+        parent.mask = Some(Mask::new(Shape::Ellipse {
+            size: Value::constant(Vec2::new(2.0, 2.0)),
+        }));
+        parent.children.push(box_at(2, 40.0));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(parent));
+
+        let scene = evaluate(&doc, 0.0);
+        let g = &scene.groups[0];
+        assert_eq!((g.start, g.end), (0, 1), "the child is outside the clip");
+        assert_eq!(scene.items[1].source, NodeId(2));
     }
 
     /// Footage is a rectangle that names some pixels: it produces an ordinary

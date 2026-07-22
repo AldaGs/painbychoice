@@ -105,6 +105,35 @@ impl BlendMode {
     }
 }
 
+/// A shape that limits where a layer draws.
+///
+/// The mask is an ordinary [`Shape`](crate::node::Shape), which is the whole
+/// design: it is parametric, so its size and corner radius are `Value`s that
+/// keyframe and can be driven by the node graph exactly like a rectangle
+/// layer's. A mask needed no new geometry model, no new animation path, and no
+/// new editor concepts — it is a shape that clips instead of filling.
+///
+/// It lives in the **layer's own space**, sharing the layer's transform, so
+/// moving or rotating a layer moves its mask with it. That is what makes a mask
+/// feel attached rather than merely overlapping.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Mask {
+    pub shape: crate::node::Shape,
+    /// Hide what is *inside* the shape instead of outside it.
+    ///
+    /// A flag rather than a second mask kind because it is the same geometry
+    /// either way — only the fill rule changes.
+    #[serde(default)]
+    pub inverted: bool,
+}
+
+impl Mask {
+    /// A mask from a shape, masking everything outside it.
+    pub fn new(shape: crate::node::Shape) -> Self {
+        Self { shape, inverted: false }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

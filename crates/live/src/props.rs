@@ -43,6 +43,8 @@ pub(crate) struct NodeInfo {
     /// How this layer combines with the backdrop. Anything but `Normal` makes
     /// it composite in isolation — see [`motion_core::BlendMode`].
     pub(crate) blend: MBlendMode,
+    /// The layer's mask, if it has one.
+    pub(crate) mask: Option<MaskInfo>,
     pub(crate) fill: Option<[f32; 3]>,
     /// Parametric geometry, `None` for a group or a hand-drawn `Path`.
     pub(crate) size: Option<(f64, f64)>,
@@ -95,6 +97,27 @@ pub(crate) struct FootageInfo {
     /// `Some(v)` when time-remapped, with the curve's value this frame.
     pub(crate) remap: Option<f64>,
     pub(crate) remap_anim: bool,
+}
+
+/// The mask shapes the panel can create.
+///
+/// A small enum rather than reusing `NewShape`, because the two answer
+/// different questions — what layer to add, versus what outline to clip with —
+/// and a mask has no use for `Group` or `Text`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum MaskKind {
+    Rect,
+    Ellipse,
+}
+
+/// What the properties panel shows for a layer's mask.
+pub(crate) struct MaskInfo {
+    /// Which parametric shape is doing the masking.
+    pub(crate) kind: &'static str,
+    /// `None` for a shape with no size to edit (a hand-drawn path).
+    pub(crate) size: Option<(f64, f64)>,
+    pub(crate) size_anim: bool,
+    pub(crate) inverted: bool,
 }
 
 pub(crate) struct TextInfo {
@@ -249,6 +272,22 @@ impl NodeInfo {
             anchor: (anchor.x, anchor.y),
             opacity: tr.opacity.resolve(ctx),
             blend: node.blend,
+            mask: node.mask.as_ref().map(|m| MaskInfo {
+                kind: match &m.shape {
+                    MShape::Rect { .. } => "Rectangle",
+                    MShape::Ellipse { .. } => "Ellipse",
+                    _ => "Path",
+                },
+                size: match &m.shape {
+                    MShape::Rect { size, .. } | MShape::Ellipse { size } => {
+                        let s = size.resolve(ctx);
+                        Some((s.x, s.y))
+                    }
+                    _ => None,
+                },
+                size_anim: is_anim(node, PropKind::MaskSize),
+                inverted: m.inverted,
+            }),
             fill: node.fill.as_ref().map(|f| {
                 let c = f.resolve(ctx);
                 [c.r as f32, c.g as f32, c.b as f32]
@@ -352,6 +391,13 @@ pub(crate) struct PropEdits {
     pub(crate) scale_y: Option<f64>,
     pub(crate) opacity: Option<f64>,
     pub(crate) blend: Option<MBlendMode>,
+    /// `Some(None)` removes the mask; `Some(Some(kind))` adds or replaces one.
+    /// The nested option is the same shape `text_max_width` uses.
+    #[allow(clippy::option_option)]
+    pub(crate) mask: Option<Option<MaskKind>>,
+    pub(crate) mask_size_x: Option<f64>,
+    pub(crate) mask_size_y: Option<f64>,
+    pub(crate) mask_inverted: Option<bool>,
     pub(crate) fill: Option<[f32; 3]>,
     pub(crate) size_x: Option<f64>,
     pub(crate) size_y: Option<f64>,
@@ -835,6 +881,51 @@ pub(crate) fn properties_ui(
             ui.end_row();
         }
 
+        // --- Mask. A shape that limits where this layer draws. Scoped to the
+        // layer's own content like the blend mode, which is why the two belong
+        // together. ---
+        ui.label("Mask");
+        ui.horizontal(|ui| {
+            let none = n.mask.is_none();
+            if ui.selectable_label(none, "None").clicked() && !none {
+                edits.mask = Some(None);
+            }
+            let is_rect = n.mask.as_ref().is_some_and(|m| m.kind == "Rectangle");
+            if ui.selectable_label(is_rect, "Rect").clicked() && !is_rect {
+                edits.mask = Some(Some(MaskKind::Rect));
+            }
+            let is_ellipse = n.mask.as_ref().is_some_and(|m| m.kind == "Ellipse");
+            if ui.selectable_label(is_ellipse, "Ellipse").clicked() && !is_ellipse {
+                edits.mask = Some(Some(MaskKind::Ellipse));
+            }
+        });
+        ui.end_row();
+
+        if let Some(m) = &n.mask {
+            if let Some((w, h)) = m.size {
+                ui.label("Mask size");
+                ui.horizontal(|ui| {
+                    let (mut w, mut h) = (w, h);
+                    if ui.add(egui::DragValue::new(&mut w).speed(1.0)).changed() {
+                        edits.mask_size_x = Some(w);
+                    }
+                    if ui.add(egui::DragValue::new(&mut h).speed(1.0)).changed() {
+                        edits.mask_size_y = Some(h);
+                    }
+                });
+                if key_button(ui, m.size_anim) {
+                    edits.key.insert(PropKind::MaskSize);
+                }
+                ui.end_row();
+            }
+            ui.label("Invert");
+            let mut inv = m.inverted;
+            if ui.checkbox(&mut inv, "hide what's inside").changed() {
+                edits.mask_inverted = Some(inv);
+            }
+            ui.end_row();
+        }
+
         // --- Footage. The source is a read-only fact about a file; the only
         // control is time remapping, which belongs to the layer. ---
         if let Some(f) = &n.footage {
@@ -1030,11 +1121,12 @@ pub(crate) enum PropKind {
     TextSize,
     TextContent,
     TimeRemap,
+    MaskSize,
 }
 
 impl PropKind {
     /// Every property that can be animated, in row order.
-    pub(crate) const ALL: [PropKind; 13] = [
+    pub(crate) const ALL: [PropKind; 14] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -1048,6 +1140,7 @@ impl PropKind {
         PropKind::TextSize,
         PropKind::TextContent,
         PropKind::TimeRemap,
+        PropKind::MaskSize,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -1065,6 +1158,7 @@ impl PropKind {
             PropKind::TextSize => "Font Size",
             PropKind::TextContent => "Content",
             PropKind::TimeRemap => "Time Remap",
+            PropKind::MaskSize => "Mask Size",
         }
     }
 
@@ -1088,6 +1182,7 @@ impl PropKind {
             PropPath::TextSize => PropKind::TextSize,
             PropPath::TextContent => PropKind::TextContent,
             PropPath::TimeRemap => PropKind::TimeRemap,
+            PropPath::MaskSize => PropKind::MaskSize,
         }
     }
 }
@@ -1352,6 +1447,10 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Image { time_remap, .. } => PropRef::Num(time_remap.as_ref()?),
             _ => return None,
         },
+        PropKind::MaskSize => match &node.mask.as_ref()?.shape {
+            MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRef::Vec2(size),
+            _ => return None,
+        },
         PropKind::ShapeRadius => match node.shape.as_ref()? {
             MShape::Rect { radius, .. } => PropRef::Num(radius),
             _ => return None,
@@ -1388,6 +1487,10 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         },
         PropKind::TimeRemap => match node.shape.as_mut()? {
             MShape::Image { time_remap, .. } => PropRefMut::Num(time_remap.as_mut()?),
+            _ => return None,
+        },
+        PropKind::MaskSize => match &mut node.mask.as_mut()?.shape {
+            MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRefMut::Vec2(size),
             _ => return None,
         },
         PropKind::ShapeRadius => match node.shape.as_mut()? {

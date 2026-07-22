@@ -268,18 +268,28 @@ pub(crate) fn to_vello(
         // composites as one image, which is what a blend mode needs and what
         // masks and effects will hang off next.
         while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
-            vs.push_layer(
-                Fill::NonZero,
-                to_peniko_blend(g.blend),
-                g.alpha.clamp(0.0, 1.0) as f32,
-                fit,
-                // No mask yet, so the clip is just the layer's own extent —
-                // bounded rather than "everything", because vello rasterizes
-                // the clip shape and an unbounded one would cost the whole
-                // frame per group. Outside its own bounds a layer contributes
-                // nothing anyway, so this clips away only what can't show.
-                &group_bounds(scene, g),
-            );
+            // A masked layer clips to its mask; an unmasked one clips to its
+            // own extent — bounded rather than "everything", because vello
+            // rasterizes the clip shape and an unbounded one would cost the
+            // whole frame per group. Outside its own bounds a layer
+            // contributes nothing anyway, so that clips away only what could
+            // not have shown.
+            match &g.clip {
+                Some(mask) => vs.push_layer(
+                    if mask.even_odd { Fill::EvenOdd } else { Fill::NonZero },
+                    to_peniko_blend(g.blend),
+                    g.alpha.clamp(0.0, 1.0) as f32,
+                    fit * mask.transform,
+                    &mask.path,
+                ),
+                None => vs.push_layer(
+                    Fill::NonZero,
+                    to_peniko_blend(g.blend),
+                    g.alpha.clamp(0.0, 1.0) as f32,
+                    fit,
+                    &group_bounds(scene, g),
+                ),
+            }
             open.push(g.end);
             next_group += 1;
         }

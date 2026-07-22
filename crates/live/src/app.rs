@@ -472,13 +472,31 @@ pub(crate) fn import_footage(
     node
 }
 
+/// How big a freshly added mask should be.
+///
+/// The layer's own artwork if it has a measurable size, so the mask starts
+/// covering exactly what it masks and the user adjusts from there. A layer with
+/// no parametric size (a group, a hand-drawn path) falls back to a visible
+/// default — anything is better than a zero-sized mask, which hides the layer
+/// completely and reads as "adding a mask deleted my artwork".
+pub(crate) fn mask_seed_size(node: &MNode) -> Vec2 {
+    const FALLBACK: f64 = 200.0;
+    let mut ctx = EvalCtx::at(0.0);
+    match node.shape.as_ref() {
+        Some(MShape::Rect { size, .. })
+        | Some(MShape::Ellipse { size })
+        | Some(MShape::Image { size, .. }) => size.resolve(&mut ctx),
+        _ => Vec2::new(FALLBACK, FALLBACK),
+    }
+}
+
 /// The properties that live on a node's **artwork** rather than its placement,
 /// and so move with the shape when a layer is split.
 ///
 /// Transform is deliberately absent: it stays on the parent, where it goes on
 /// governing the whole subtree. Moving it would change what the *other*
 /// children do, which a restack has no business doing.
-const ARTWORK_PROPS: [PropPath; 8] = [
+const ARTWORK_PROPS: [PropPath; 9] = [
     PropPath::Fill,
     PropPath::StrokeColor,
     PropPath::StrokeWidth,
@@ -487,6 +505,7 @@ const ARTWORK_PROPS: [PropPath; 8] = [
     PropPath::TextSize,
     PropPath::TextContent,
     PropPath::TimeRemap,
+    PropPath::MaskSize,
 ];
 
 /// Move a node's own shape into a new child layer, leaving the node a pure
@@ -1549,6 +1568,46 @@ impl App {
         if let Some(mode) = e.blend {
             node.blend = mode;
             changed = true;
+        }
+        // A fresh mask is seeded to the layer's own size, so it starts covering
+        // what it masks rather than as a speck at the origin the user has to
+        // find and grow. Switching kind keeps the size for the same reason.
+        if let Some(kind) = e.mask {
+            node.mask = kind.map(|kind| {
+                let size = mask_seed_size(node);
+                Mask::new(match kind {
+                    MaskKind::Rect => MShape::Rect {
+                        size: Value::constant(size),
+                        radius: Value::constant(0.0),
+                    },
+                    MaskKind::Ellipse => MShape::Ellipse { size: Value::constant(size) },
+                })
+            });
+            changed = true;
+        }
+        if let Some(mask) = node.mask.as_mut() {
+            if let Some(inv) = e.mask_inverted {
+                mask.inverted = inv;
+                changed = true;
+            }
+        }
+        if e.mask_size_x.is_some() || e.mask_size_y.is_some() {
+            // Read the current value before borrowing mutably, so a drag on one
+            // axis leaves the other where it was.
+            let cur = prop_of(node, PropKind::MaskSize).and_then(|p| match p {
+                PropRef::Vec2(v) => Some(v.resolve(&mut EvalCtx::at(t))),
+                _ => None,
+            });
+            if let (Some(cur), Some(PropRefMut::Vec2(size))) =
+                (cur, prop_of_mut(node, PropKind::MaskSize))
+            {
+                let v = Vec2::new(
+                    e.mask_size_x.unwrap_or(cur.x),
+                    e.mask_size_y.unwrap_or(cur.y),
+                );
+                size.set_at(frame, v);
+                changed = true;
+            }
         }
         if let Some(rgb) = e.fill {
             if let Some(fill) = node.fill.as_mut() {

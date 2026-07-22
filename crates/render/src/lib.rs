@@ -44,8 +44,34 @@ pub fn scene_to_svg(
 
     for (i, item) in scene.items.iter().enumerate() {
         while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
+            // A mask becomes a `<clipPath>` defined inline and referenced by
+            // the group it clips. `clipRule` carries the even-odd rule an
+            // inverted mask needs — core has already built the donut, so this
+            // backend doesn't re-derive the inversion and can't disagree with
+            // the GPU one about it.
+            let clip_ref = match &g.clip {
+                Some(mask) => {
+                    let id = format!("mask{}_{}", g.source.0, i);
+                    let c = mask.transform.as_coeffs();
+                    out.push_str(&format!(
+                        "  <clipPath id=\"{id}\" clipPathUnits=\"userSpaceOnUse\">\
+                         <path transform=\"matrix({} {} {} {} {} {})\" d=\"{}\" \
+                         clip-rule=\"{}\"/></clipPath>\n",
+                        c[0],
+                        c[1],
+                        c[2],
+                        c[3],
+                        c[4],
+                        c[5],
+                        mask.path.to_svg(),
+                        if mask.even_odd { "evenodd" } else { "nonzero" },
+                    ));
+                    format!(" clip-path=\"url(#{id})\"")
+                }
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "  <g style=\"mix-blend-mode:{}\" opacity=\"{:.3}\">\n",
+                "  <g style=\"mix-blend-mode:{}\" opacity=\"{:.3}\"{clip_ref}>\n",
                 css_blend(g.blend),
                 g.alpha.clamp(0.0, 1.0)
             ));
@@ -221,5 +247,51 @@ mod svg_tests {
     fn an_unblended_document_emits_no_groups() {
         let svg = render(Node::group(0, "root").with_child(blended(1, BlendMode::Normal)));
         assert!(!svg.contains("<g "), "{svg}");
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use motion_core::{Comp, Mask, Node, Shape, Value};
+
+    fn masked(inverted: bool) -> String {
+        let mut n = Node::group(1, "n");
+        n.shape = Some(Shape::Rect {
+            size: Value::constant(kurbo::Vec2::new(10.0, 10.0)),
+            radius: Value::constant(0.0),
+        });
+        n.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        n.mask = Some(Mask {
+            shape: Shape::Ellipse { size: Value::constant(kurbo::Vec2::new(4.0, 4.0)) },
+            inverted,
+        });
+        let comp = Comp::new(100.0, 100.0, Node::group(0, "root").with_child(n));
+        scene_to_svg(
+            &motion_core::evaluate(&comp, 0.0),
+            100.0,
+            100.0,
+            Color::rgb(0.0, 0.0, 0.0),
+            &[],
+        )
+    }
+
+    /// A mask reaches the offline render as a `<clipPath>`, so an exported
+    /// frame agrees with the preview instead of silently drawing the unmasked
+    /// layer.
+    #[test]
+    fn a_mask_becomes_a_clip_path() {
+        let svg = masked(false);
+        assert!(svg.contains("<clipPath"), "{svg}");
+        assert!(svg.contains("clip-path=\"url(#"), "{svg}");
+        assert!(svg.contains("clip-rule=\"nonzero\""), "{svg}");
+    }
+
+    /// An inverted mask carries the even-odd rule, which is what makes the
+    /// punched-out shape a hole rather than a second solid region. Core builds
+    /// the geometry, so both backends invert identically.
+    #[test]
+    fn an_inverted_mask_clips_even_odd() {
+        assert!(masked(true).contains("clip-rule=\"evenodd\""));
     }
 }
