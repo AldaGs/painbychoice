@@ -45,6 +45,12 @@ pub(crate) struct NodeInfo {
     pub(crate) blend: MBlendMode,
     /// The layer's mask, if it has one.
     pub(crate) mask: Option<MaskInfo>,
+    pub(crate) matte: Option<MatteMode>,
+    /// The name of the layer supplying the matte — the one directly above.
+    /// `None` when there isn't one, which is what makes a matte a no-op and is
+    /// worth saying out loud rather than leaving as a control that does
+    /// nothing. Filled in by the caller, which can see the tree.
+    pub(crate) matte_source: Option<String>,
     pub(crate) fill: Option<[f32; 3]>,
     /// Parametric geometry, `None` for a group or a hand-drawn `Path`.
     pub(crate) size: Option<(f64, f64)>,
@@ -272,6 +278,10 @@ impl NodeInfo {
             anchor: (anchor.x, anchor.y),
             opacity: tr.opacity.resolve(ctx),
             blend: node.blend,
+            matte: node.matte,
+            // The caller fills this in; `resolve_in` only sees one node, and a
+            // layer has no idea what sits above it.
+            matte_source: None,
             mask: node.mask.as_ref().map(|m| MaskInfo {
                 kind: match &m.shape {
                     MShape::Rect { .. } => "Rectangle",
@@ -398,6 +408,8 @@ pub(crate) struct PropEdits {
     pub(crate) mask_size_x: Option<f64>,
     pub(crate) mask_size_y: Option<f64>,
     pub(crate) mask_inverted: Option<bool>,
+    #[allow(clippy::option_option)]
+    pub(crate) matte: Option<Option<MatteMode>>,
     pub(crate) fill: Option<[f32; 3]>,
     pub(crate) size_x: Option<f64>,
     pub(crate) size_y: Option<f64>,
@@ -922,6 +934,40 @@ pub(crate) fn properties_ui(
             let mut inv = m.inverted;
             if ui.checkbox(&mut inv, "hide what's inside").changed() {
                 edits.mask_inverted = Some(inv);
+            }
+            ui.end_row();
+        }
+
+        // --- Track matte: take coverage from the layer above. Sits with the
+        // mask because they answer the same question — what shape limits this
+        // layer — from two different places. ---
+        ui.label("Matte");
+        ui.horizontal(|ui| {
+            let none = n.matte.is_none();
+            if ui.selectable_label(none, "None").clicked() && !none {
+                edits.matte = Some(None);
+            }
+            for mode in MatteMode::ALL {
+                let on = n.matte == Some(mode);
+                if ui.selectable_label(on, mode.label()).clicked() && !on {
+                    edits.matte = Some(Some(mode));
+                }
+            }
+        });
+        ui.end_row();
+
+        // Naming the source turns "the layer above" from a rule you have to
+        // remember into something you can read off the panel — and says so
+        // plainly when there is no layer above to take a shape from.
+        if n.matte.is_some() {
+            ui.label("");
+            match &n.matte_source {
+                Some(name) => {
+                    ui.weak(format!("shaped by \"{name}\" above"));
+                }
+                None => {
+                    ui.colored_label(WARN_COLOR, "no layer above to take a shape from");
+                }
             }
             ui.end_row();
         }

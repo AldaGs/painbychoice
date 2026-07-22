@@ -10,7 +10,7 @@ pub mod decode;
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
 
 use kurbo::Shape as _;
-use motion_core::{Asset, BlendMode, Color, Scene};
+use motion_core::{Asset, BlendMode, Color, ComposeMode, Scene};
 
 /// Serialize an evaluated scene to an SVG string sized to the composition.
 ///
@@ -42,8 +42,28 @@ pub fn scene_to_svg(
     let mut next_group = 0usize;
     let mut open: Vec<usize> = Vec::new();
 
+    // Track mattes are **not** implemented here yet: SVG expresses them with
+    // `<mask>` rather than a coverage rule, which is a different construction
+    // from the `<g>` nesting above. Until that lands, the matte layer's items
+    // are skipped rather than drawn — an unmatted layer is wrong, but a matte
+    // painted as a solid shape over the content is wrong *and* unrecognisable.
+    // The GPU backend does mattes properly; see `to_vello`.
+    let matte_ranges: Vec<(usize, usize)> = scene
+        .groups
+        .iter()
+        .filter(|g| g.compose != ComposeMode::SrcOver)
+        .map(|g| (g.start, g.end))
+        .collect();
+    let is_matte = |i: usize| matte_ranges.iter().any(|(s, e)| i >= *s && i < *e);
+
     for (i, item) in scene.items.iter().enumerate() {
         while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
+            // Advance first: a matte group is consumed rather than opened, and
+            // leaving the cursor on it would stall every group after it.
+            next_group += 1;
+            if g.compose != ComposeMode::SrcOver {
+                continue;
+            }
             // A mask becomes a `<clipPath>` defined inline and referenced by
             // the group it clips. `clipRule` carries the even-odd rule an
             // inverted mask needs — core has already built the donut, so this
@@ -76,7 +96,15 @@ pub fn scene_to_svg(
                 g.alpha.clamp(0.0, 1.0)
             ));
             open.push(g.end);
-            next_group += 1;
+        }
+
+        if is_matte(i) {
+            // Consumed by a matte this backend can't yet express; see above.
+            while open.last() == Some(&(i + 1)) {
+                out.push_str("  </g>\n");
+                open.pop();
+            }
+            continue;
         }
 
         // kurbo emits SVG path data directly; we push the node transform as an

@@ -28,7 +28,7 @@ pub use asset::{
     Asset, AssetId, AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, FrameStream,
     ImagePaint,
 };
-pub use composite::{BlendMode, Mask};
+pub use composite::{BlendMode, ComposeMode, Mask, MatteMode};
 pub use eval::{evaluate, evaluate_comp, evaluate_project, LayerGroup, MaskPath, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,

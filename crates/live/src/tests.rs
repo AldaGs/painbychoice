@@ -4268,3 +4268,61 @@ fn a_masked_layer_opens_its_own_composited_layer() {
     assert_eq!(composite_events(&scene), vec!["push1", "draw1", "pop"]);
     assert!(scene.groups[0].clip.is_some(), "and it clips to the mask");
 }
+
+/// A track matte takes its shape from the layer **above** — the next sibling in
+/// document order, which the front-first layers panel draws above it. The
+/// panel names that layer, so this has to find the right one.
+#[test]
+fn the_layer_above_is_the_next_sibling_in_document_order() {
+    let root = MNode::group(0, "root")
+        .with_child(MNode::group(1, "bottom"))
+        .with_child(MNode::group(2, "middle"))
+        .with_child(MNode::group(3, "top"));
+
+    assert_eq!(layer_above(&root, NodeId(1)).map(|n| n.name.as_str()), Some("middle"));
+    assert_eq!(layer_above(&root, NodeId(2)).map(|n| n.name.as_str()), Some("top"));
+    // The topmost has nothing above it, so a matte on it is a no-op — the
+    // panel says so rather than leaving a control that quietly does nothing.
+    assert!(layer_above(&root, NodeId(3)).is_none());
+}
+
+/// The search must not wander into another branch. A layer that is topmost
+/// among *its* siblings has nothing above it, even if the tree continues
+/// elsewhere — matching a layer from an unrelated group would cut it against
+/// something the user never pointed at.
+#[test]
+fn the_layer_above_does_not_escape_its_own_branch() {
+    let root = MNode::group(0, "root")
+        .with_child(
+            MNode::group(1, "group a")
+                .with_child(MNode::group(10, "a lower"))
+                .with_child(MNode::group(11, "a upper")),
+        )
+        .with_child(MNode::group(2, "group b"));
+
+    assert_eq!(layer_above(&root, NodeId(10)).map(|n| n.name.as_str()), Some("a upper"));
+    assert!(layer_above(&root, NodeId(11)).is_none(), "topmost of its own group");
+}
+
+/// A matted layer and its matte composite as a pair: the outer layer isolates
+/// them so the coverage rule cuts only this content, and the inner one applies
+/// the matte. Without the isolation, `DestIn` would erase the whole backdrop.
+#[test]
+fn a_matted_pair_composites_as_one_isolated_unit() {
+    let mut content = blended_box(1, 0.0, MBlendMode::Normal);
+    content.matte = Some(MatteMode::Alpha);
+    let comp = Comp::new(
+        100.0,
+        100.0,
+        MNode::group(0, "root")
+            .with_child(content)
+            .with_child(blended_box(2, 5.0, MBlendMode::Normal)),
+    );
+    let scene = motion_core::evaluate(&comp, 0.0);
+
+    assert_eq!(
+        composite_events(&scene),
+        vec!["push1", "draw1", "push2", "draw2", "pop", "pop"],
+        "the pair wraps the matte, which is drawn last and consumed"
+    );
+}

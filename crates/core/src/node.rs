@@ -6,7 +6,7 @@ use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::asset::{Asset, AssetId, ImagePaint};
-use crate::composite::{BlendMode, Mask};
+use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::expr::EvalCtx;
 use crate::text::TextAlign;
 use crate::value::{Color, Value};
@@ -510,6 +510,18 @@ pub struct Node {
     /// survive where the fill was cut.
     #[serde(default)]
     pub mask: Option<Mask>,
+    /// Take coverage from the layer **above** this one — the next sibling in
+    /// document order, which the layers panel shows directly above it.
+    ///
+    /// The matte layer is consumed rather than drawn: it contributes its shape
+    /// and not its pixels. Set on the layer being cut, not on the one doing the
+    /// cutting, which is the After Effects convention and reads correctly in
+    /// the panel ("this layer is matted by the one above").
+    ///
+    /// `None`, and no next sibling, both mean no matte — a matte on the topmost
+    /// layer of a group has nothing to take its shape from, so it simply draws.
+    #[serde(default)]
+    pub matte: Option<MatteMode>,
     pub children: Vec<Node>,
 }
 
@@ -537,6 +549,7 @@ impl Node {
             precomp: None,
             blend: BlendMode::default(),
             mask: None,
+            matte: None,
             children: Vec::new(),
         }
     }
@@ -554,6 +567,7 @@ impl Node {
             precomp: None,
             blend: BlendMode::default(),
             mask: None,
+            matte: None,
             children: Vec::new(),
         }
     }

@@ -105,6 +105,65 @@ impl BlendMode {
     }
 }
 
+/// How a layer borrows the shape of the layer above it.
+///
+/// A **track matte**: the layer above supplies coverage, and is consumed rather
+/// than drawn. It is the standard way to cut one layer to the shape of another —
+/// text filled with footage, a logo revealed by a moving gradient — and unlike
+/// [`Mask`] the cutting shape can be anything a layer can be, including a whole
+/// animated composition.
+///
+/// "The layer above" is the After Effects convention, and here it means the next
+/// sibling in document order, which the layers panel draws directly above (it
+/// lists front-first). Adjacency is also what makes this cheap: the pair is
+/// already contiguous in the draw list, so a matte costs the same range
+/// machinery every other isolated layer uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MatteMode {
+    /// Show this layer where the layer above is opaque.
+    Alpha,
+    /// Show this layer where the layer above is *transparent*.
+    AlphaInverted,
+}
+
+impl MatteMode {
+    pub const ALL: [MatteMode; 2] = [MatteMode::Alpha, MatteMode::AlphaInverted];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MatteMode::Alpha => "Alpha",
+            MatteMode::AlphaInverted => "Alpha Inverted",
+        }
+    }
+
+    /// How the matte layer composites onto the content beneath it.
+    pub fn compose(self) -> ComposeMode {
+        match self {
+            MatteMode::Alpha => ComposeMode::DestIn,
+            MatteMode::AlphaInverted => ComposeMode::DestOut,
+        }
+    }
+}
+
+/// Porter-Duff coverage rules — how a layer's *alpha* meets the backdrop's,
+/// as distinct from how their colours mix ([`BlendMode`]).
+///
+/// Only the three the compositor currently produces. A matte works by
+/// compositing the matte layer onto the content with `DestIn`, which keeps the
+/// content where the matte is opaque and discards the matte's own colour: the
+/// matte contributes shape, not pixels, which is exactly what "consumed rather
+/// than drawn" means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComposeMode {
+    /// Ordinary painting.
+    #[default]
+    SrcOver,
+    /// Keep the backdrop only where this layer is opaque.
+    DestIn,
+    /// Keep the backdrop only where this layer is transparent.
+    DestOut,
+}
+
 /// A shape that limits where a layer draws.
 ///
 /// The mask is an ordinary [`Shape`](crate::node::Shape), which is the whole

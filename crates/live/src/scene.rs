@@ -277,14 +277,14 @@ pub(crate) fn to_vello(
             match &g.clip {
                 Some(mask) => vs.push_layer(
                     if mask.even_odd { Fill::EvenOdd } else { Fill::NonZero },
-                    to_peniko_blend(g.blend),
+                    to_peniko_blend(g.blend, g.compose),
                     g.alpha.clamp(0.0, 1.0) as f32,
                     fit * mask.transform,
                     &mask.path,
                 ),
                 None => vs.push_layer(
                     Fill::NonZero,
-                    to_peniko_blend(g.blend),
+                    to_peniko_blend(g.blend, g.compose),
                     g.alpha.clamp(0.0, 1.0) as f32,
                     fit,
                     &group_bounds(scene, g),
@@ -524,7 +524,7 @@ pub(crate) fn nav_zoom_about(
 /// defined as the standard sixteen rather than a bespoke set — so this is a
 /// rename, not an approximation. Compositing stays `SrcOver`: these modes
 /// change how colours combine, not how coverage does.
-fn to_peniko_blend(mode: MBlendMode) -> vello::peniko::BlendMode {
+fn to_peniko_blend(mode: MBlendMode, compose: MComposeMode) -> vello::peniko::BlendMode {
     use vello::peniko::{BlendMode as B, Compose, Mix};
     let mix = match mode {
         MBlendMode::Normal => Mix::Normal,
@@ -544,7 +544,14 @@ fn to_peniko_blend(mode: MBlendMode) -> vello::peniko::BlendMode {
         MBlendMode::Color => Mix::Color,
         MBlendMode::Luminosity => Mix::Luminosity,
     };
-    B::new(mix, Compose::SrcOver)
+    // Coverage is the other half: a matte layer composites with `DestIn` or
+    // `DestOut` so it contributes its shape and not its colour.
+    let compose = match compose {
+        MComposeMode::SrcOver => Compose::SrcOver,
+        MComposeMode::DestIn => Compose::DestIn,
+        MComposeMode::DestOut => Compose::DestOut,
+    };
+    B::new(mix, compose)
 }
 
 /// The extent of an isolated layer's contents, in composition space.

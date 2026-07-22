@@ -472,6 +472,26 @@ pub(crate) fn import_footage(
     node
 }
 
+/// The layer directly **above** `id` — its next sibling in document order.
+///
+/// Document order is draw order, so a later sibling paints on top; the layers
+/// panel lists front-first, which puts that sibling visually above. This is the
+/// layer a track matte takes its shape from, and naming it is what lets the
+/// properties panel say which one rather than leaving the user to recall the
+/// rule.
+pub(crate) fn layer_above(root: &MNode, id: NodeId) -> Option<&MNode> {
+    if let Some(i) = root.children.iter().position(|c| c.id == id) {
+        if let Some(above) = root.children.get(i + 1) {
+            return Some(above);
+        }
+        // Found it, but it is the topmost of its siblings — nothing above it.
+        // Returning `None` here rather than recursing stops the search finding
+        // some unrelated layer deeper in another branch.
+        return None;
+    }
+    root.children.iter().find_map(|c| layer_above(c, id))
+}
+
 /// How big a freshly added mask should be.
 ///
 /// The layer's own artwork if it has a measurable size, so the mask starts
@@ -1569,6 +1589,10 @@ impl App {
             node.blend = mode;
             changed = true;
         }
+        if let Some(mode) = e.matte {
+            node.matte = mode;
+            changed = true;
+        }
         // A fresh mask is seeded to the layer's own size, so it starts covering
         // what it masks rather than as a speck at the origin the user has to
         // find and grow. Switching kind keeps the size for the same reason.
@@ -2460,8 +2484,14 @@ impl App {
         let sel_node = self.selected.and_then(|id| self.doc().root.find(id));
         // Pass the doc so an expression-driven property resolves against the
         // scene (a doc-less context would show its fallback instead).
-        let sel_info =
+        let mut sel_info =
             sel_node.map(|node| NodeInfo::resolve_with(node, self.doc(), t, &self.project.assets));
+        // Which layer supplies a track matte. Filled in here rather than in
+        // `resolve_in`, which sees one node and can't know what sits above it.
+        if let (Some(info), Some(id)) = (sel_info.as_mut(), self.selected) {
+            info.matte_source = layer_above(&self.doc().root, id).map(|n| n.name.clone());
+        }
+        let sel_info = sel_info;
         // The gizmo needs the selected layer's *world* matrix, which only the
         // evaluated scene knows (it is the whole parent chain multiplied out).
         // Taken from `Scene::places`, not from a `RenderItem`: a group or null

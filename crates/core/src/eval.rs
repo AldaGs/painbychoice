@@ -5,7 +5,7 @@
 use kurbo::{Affine, BezPath, Rect, Shape as _};
 
 use crate::asset::ImagePaint;
-use crate::composite::BlendMode;
+use crate::composite::{BlendMode, ComposeMode};
 use crate::expr::EvalCtx;
 use crate::node::{CompId, Document, Node, NodeId, Project};
 use crate::value::Color;
@@ -96,6 +96,13 @@ pub struct LayerGroup {
     pub start: usize,
     pub end: usize,
     pub blend: BlendMode,
+    /// How this layer's coverage meets the backdrop's.
+    ///
+    /// `SrcOver` for every ordinary layer. A **matte** layer uses `DestIn` or
+    /// `DestOut`, which keeps the content beneath it where the matte is opaque
+    /// (or transparent) and discards the matte's own colour — the matte
+    /// contributes shape, not pixels.
+    pub compose: ComposeMode,
     /// The layer's own opacity, applied **once to the composited result**
     /// rather than to each item.
     ///
@@ -428,21 +435,76 @@ fn walk(
             start: group_at,
             end: content_end,
             blend: node.blend,
+            compose: ComposeMode::SrcOver,
             alpha: full,
             clip,
         });
     }
 
-    for child in &node.children {
+    let mut i = 0;
+    while i < node.children.len() {
+        let child = &node.children[i];
+        let child_start = scene.items.len();
         // `full`, not `opacity`: a child is outside its parent's group, so the
         // parent's fade has to reach it the ordinary way. Taking the isolated
         // content's 1.0 here would make children of a faded layer draw at full
         // strength.
         let child_bounds = walk(child, xf, full, ctx, project, stack, scene);
+
+        // A track matte: this layer takes its coverage from the one above it,
+        // which is the next sibling in document order. Handled here rather than
+        // inside the child's own walk because it is the one place that can see
+        // both layers — a layer has no idea what sits above it.
+        let matted = child.matte.zip(node.children.get(i + 1)).and_then(|(mode, above)| {
+            let matte_start = scene.items.len();
+            walk(above, xf, full, ctx, project, stack, scene);
+            let end = scene.items.len();
+            // Nothing to take a shape from, or nothing to cut: leave both
+            // layers drawing normally rather than emitting a group that would
+            // erase one of them.
+            (end > matte_start && matte_start > child_start).then_some((mode, matte_start, end))
+        });
+
+        if let Some((mode, matte_start, end)) = matted {
+            // Two groups. The outer one isolates the pair, so the matte's
+            // coverage rule reaches only this content and not the whole
+            // backdrop behind it — without it, `DestIn` would erase everything
+            // already drawn outside the matte.
+            scene.groups.push(LayerGroup {
+                source: child.id,
+                start: child_start,
+                end,
+                blend: BlendMode::Normal,
+                compose: ComposeMode::SrcOver,
+                alpha: 1.0,
+                clip: None,
+            });
+            // The inner one is the matte layer itself, composited onto the
+            // content with a coverage rule instead of being painted.
+            scene.groups.push(LayerGroup {
+                source: node.children[i + 1].id,
+                start: matte_start,
+                end,
+                blend: BlendMode::Normal,
+                compose: mode.compose(),
+                alpha: 1.0,
+                clip: None,
+            });
+            // The matte contributes shape, not extent: a layer cut to a smaller
+            // shape did not get bigger, so only the content's bounds count.
+            bounds = match (bounds, child_bounds) {
+                (Some(a), Some(b)) => Some(a.union(b)),
+                (a, b) => a.or(b),
+            };
+            i += 2;
+            continue;
+        }
+
         bounds = match (bounds, child_bounds) {
             (Some(a), Some(b)) => Some(a.union(b)),
             (a, b) => a.or(b),
         };
+        i += 1;
     }
     scene.places[place_at].1.bounds = bounds;
 
@@ -455,7 +517,7 @@ fn walk(
 mod tests {
     use super::*;
     use crate::expr::BinOp;
-    use crate::composite::Mask;
+    use crate::composite::{Mask, MatteMode};
     use crate::node::{Comp, Node, Project, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
@@ -732,6 +794,86 @@ mod tests {
         let g = &scene.groups[0];
         assert_eq!((g.start, g.end), (0, 1), "the child is outside the clip");
         assert_eq!(scene.items[1].source, NodeId(2));
+    }
+
+    /// A track matte pairs a layer with the one **above** it: two groups, an
+    /// outer one isolating the pair and an inner one applying the matte's
+    /// coverage to the content. Without the outer group, `DestIn` would erase
+    /// the whole backdrop outside the matte rather than just cutting this
+    /// layer.
+    #[test]
+    fn a_track_matte_isolates_the_pair_and_cuts_only_the_content() {
+        let mut content = box_at(1, 0.0);
+        content.matte = Some(MatteMode::Alpha);
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root")
+                .with_child(box_at(9, 90.0)) // an untouched layer behind
+                .with_child(content)
+                .with_child(box_at(2, 5.0)), // the matte, directly above
+        );
+
+        let scene = evaluate(&doc, 0.0);
+        let outer = scene.groups.iter().find(|g| g.source == NodeId(1)).expect("the pair");
+        let inner = scene.groups.iter().find(|g| g.source == NodeId(2)).expect("the matte");
+
+        assert_eq!(outer.compose, ComposeMode::SrcOver, "the pair paints normally");
+        assert_eq!(inner.compose, ComposeMode::DestIn, "the matte contributes coverage");
+        // The pair spans both layers; the matte spans only itself, inside it.
+        assert_eq!((outer.start, outer.end), (1, 3));
+        assert_eq!((inner.start, inner.end), (2, 3));
+        // The layer behind is outside, so the matte can't cut it away.
+        assert_eq!(scene.items[0].source, NodeId(9));
+    }
+
+    /// Inverting shows the content where the matte is *transparent*.
+    #[test]
+    fn an_inverted_matte_keeps_what_falls_outside_it() {
+        let mut content = box_at(1, 0.0);
+        content.matte = Some(MatteMode::AlphaInverted);
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(content).with_child(box_at(2, 5.0)),
+        );
+        let scene = evaluate(&doc, 0.0);
+        let inner = scene.groups.iter().find(|g| g.source == NodeId(2)).unwrap();
+        assert_eq!(inner.compose, ComposeMode::DestOut);
+    }
+
+    /// A matte on the topmost layer has nothing above it to take a shape from,
+    /// so it simply draws. Emitting a group anyway would cut the layer against
+    /// nothing and erase it.
+    #[test]
+    fn a_matte_with_no_layer_above_it_draws_normally() {
+        let mut content = box_at(1, 0.0);
+        content.matte = Some(MatteMode::Alpha);
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(content));
+
+        let scene = evaluate(&doc, 0.0);
+        assert_eq!(scene.items.len(), 1);
+        assert!(scene.groups.is_empty(), "nothing to matte against");
+    }
+
+    /// The matte contributes shape, not extent: a layer cut to a smaller shape
+    /// did not get bigger. Snapping and the selection box read these bounds, so
+    /// folding the matte's extent in would make a matted layer measure wrong.
+    #[test]
+    fn a_matte_does_not_grow_the_bounds_of_what_it_cuts() {
+        let mut content = box_at(1, 0.0);
+        content.matte = Some(MatteMode::Alpha);
+        let doc = Document::new(
+            100.0,
+            100.0,
+            // The matte sits far away, where its extent would be obvious.
+            Node::group(0, "root").with_child(content).with_child(box_at(2, 500.0)),
+        );
+
+        let scene = evaluate(&doc, 0.0);
+        let root = scene.place(NodeId(0)).expect("the root has a place");
+        let bounds = root.bounds.expect("and an extent");
+        assert!(bounds.x1 < 100.0, "the distant matte didn't stretch the group: {bounds:?}");
     }
 
     /// Footage is a rectangle that names some pixels: it produces an ordinary
