@@ -914,6 +914,73 @@ and two sets of arms could be dragged into disagreeing.
   per-project library, beside `modules` and `graph`: an ease is a house style
   and has to travel with the `.pbc`.
 
+## Undo / redo: snapshots, not inverse operations
+
+`live/src/history.rs`. The history stores **whole-document snapshots**. That is
+a deliberate choice over an op-based (inverse-command) history, and it works
+because of a property the editor already had: **every panel reports its intent
+and all document mutation happens in one contiguous phase after the UI pass**.
+So one copy taken before that phase and one comparison after it covers every
+edit site there is:
+
+```rust
+let before = self.project.clone();
+// ... the whole apply phase: props, dopesheet, tree, comp, node graph, aids ...
+if self.project != before {
+    self.history.record(before, edit_label, pointer_down);
+}
+```
+
+The consequences are the point:
+
+- **A new edit site gets undo for free.** Nothing has to opt in, and nothing can
+  be forgotten. An op-based history fails the other way: a missing inverse is
+  silent and *corrupts* the stack rather than losing one step.
+- **`PartialEq` is derived across the document types** (`Project`, `Comp`,
+  `Node`, `Transform`, `Shape`, `Value`, `Track`, `Expr`, `Mask`, `Camera`, …)
+  purely to make that comparison cheap — it early-outs at the first difference.
+- The cost is a clone per frame. Acceptable because the document is a *recipe*:
+  shapes, tracks, expressions. **Footage is a path and a size, never pixels**
+  (the asset registry's rule), so importing a 4K clip does not make a snapshot
+  any bigger. `MAX_STEPS = 128`; old steps fall off the bottom.
+
+**Coalescing is per pointer-down session.** A `Step` carries `open: bool`, true
+while the pointer that started it is down, and a record that lands on an open
+step is merged into it — keeping the *oldest* `before` of the run. So a gizmo
+drag, a `DragValue` drag or a curve-handle drag is **one** undo, rewinding to
+where the gesture began rather than to its previous frame. `end_interaction()`
+is called every frame the pointer is up, which is what closes the run. A step
+pushed by *redo* is closed on arrival — otherwise the next drag would merge into
+it and one undo would rewind both.
+
+Three ordering rules in `App::update`, each load-bearing:
+
+1. The snapshot and the **label** are taken at the *top* of the apply phase,
+   because several edit intents are `take`n as they are applied. `edit_label`
+   is only a nicety (it names the tooltip); an unrecognised edit is `"Edit"`,
+   and nothing in it may gate whether a step is *taken*.
+2. **Undo/redo are applied after the record**, so the swap they perform is never
+   itself mistaken for an edit and pushed back onto the stack.
+3. **Loading a project clears the history.** Opening a different document is not
+   an edit *of* the open one, and undoing across that boundary would resurrect a
+   document the user has moved on from.
+
+A restored snapshot is internally consistent on its own — it carries the graph
+*and* the properties that graph lowered into — so **there is no recompile after
+an undo**. What does need re-deriving is everything pointing *at* the document
+from outside it, which is `App::after_history_jump`: a missing open comp falls
+back to the root, `next_id` is raised (never lowered — a redo can bring back
+nodes that still hold their ids), the timeline window is re-clamped, a selection
+naming a deleted layer is dropped, and the keyframe selection is cleared
+(a `KeyRef` is an *index*, so a step that adds or merges keys shifts what it
+names).
+
+Keys are Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, read off egui's input and suppressed
+while a text field has focus (same rule as keyframe copy/paste — Ctrl+Z in a
+name field belongs to the field). The comp bar carries Undo/Redo buttons whose
+tooltips name the step; they are words rather than icons because a glyph would
+mean regenerating the icon font subset.
+
 ## Stacking order
 
 **There is no z-index.** `eval::walk` pushes a node's own `RenderItem` and *then*

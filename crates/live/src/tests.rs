@@ -4448,3 +4448,145 @@ fn a_matted_pair_composites_as_one_isolated_unit() {
         "the pair wraps the matte, which is drawn last and consumed"
     );
 }
+
+// --- Undo / redo ---------------------------------------------------------
+//
+// The history is snapshot-based, so what is worth pinning is not "does the
+// document come back" (a clone always does) but the *step boundaries*: a drag
+// must cost one step, a new edit must burn the redo stack, and a redone step
+// must not swallow the next gesture.
+
+/// A project that differs from the next one by a single, easily-named field.
+fn history_project(width: f64) -> MProject {
+    MProject::single(Document::new(width, 480.0, MNode::group(0, "root")))
+}
+
+#[test]
+fn a_pointer_drag_collapses_into_one_undo_step() {
+    let mut h = History::default();
+    // Three frames of one drag: pointer down throughout.
+    h.record(history_project(100.0), "Move", true);
+    h.record(history_project(110.0), "Move", true);
+    h.record(history_project(120.0), "Move", true);
+    assert_eq!(h.depth(), (1, 0), "a gesture is one step, not one per frame");
+
+    let mut now = history_project(130.0);
+    h.undo(&mut now);
+    assert_eq!(now.root_comp().width, 100.0, "undo returns to where the drag began");
+}
+
+#[test]
+fn releasing_the_pointer_starts_a_fresh_step() {
+    let mut h = History::default();
+    h.record(history_project(100.0), "Move", true);
+    h.end_interaction();
+    h.record(history_project(110.0), "Move", true);
+    assert_eq!(h.depth(), (2, 0), "two gestures are two steps even under one label");
+}
+
+#[test]
+fn a_keyboard_edit_never_merges_into_the_previous_one() {
+    let mut h = History::default();
+    // Pointer up: every edit stands alone, however fast they arrive.
+    h.record(history_project(100.0), "Edit", false);
+    h.record(history_project(110.0), "Edit", false);
+    assert_eq!(h.depth(), (2, 0));
+}
+
+#[test]
+fn undo_and_redo_walk_the_same_line() {
+    let mut h = History::default();
+    let mut now = history_project(300.0);
+    h.record(history_project(100.0), "First", false);
+    h.record(history_project(200.0), "Second", false);
+
+    assert_eq!(h.undo_label(), Some("Second"));
+    assert_eq!(h.undo(&mut now).as_deref(), Some("Second"));
+    assert_eq!(now.root_comp().width, 200.0);
+    assert_eq!(h.undo(&mut now).as_deref(), Some("First"));
+    assert_eq!(now.root_comp().width, 100.0);
+    assert!(h.undo(&mut now).is_none(), "the bottom of the stack is not a wrap-around");
+
+    assert_eq!(h.redo(&mut now).as_deref(), Some("First"));
+    assert_eq!(now.root_comp().width, 200.0);
+    assert_eq!(h.redo(&mut now).as_deref(), Some("Second"));
+    assert_eq!(now.root_comp().width, 300.0, "redo lands back where undo started");
+    assert!(h.redo(&mut now).is_none());
+}
+
+#[test]
+fn a_new_edit_burns_the_redo_stack() {
+    let mut h = History::default();
+    let mut now = history_project(200.0);
+    h.record(history_project(100.0), "First", false);
+    h.undo(&mut now);
+    assert_eq!(h.depth(), (0, 1));
+
+    h.record(now.clone(), "Different", false);
+    assert_eq!(h.depth(), (1, 0), "history is a line, not a tree");
+}
+
+#[test]
+fn a_redone_step_does_not_absorb_the_next_drag() {
+    let mut h = History::default();
+    let mut now = history_project(200.0);
+    h.record(history_project(100.0), "First", false);
+    h.undo(&mut now);
+    h.redo(&mut now);
+    // The step redo pushed must be closed, or this drag would merge into it and
+    // undoing once would rewind both.
+    h.record(now.clone(), "Drag", true);
+    assert_eq!(h.depth(), (2, 0));
+}
+
+#[test]
+fn the_history_is_bounded() {
+    let mut h = History::default();
+    for i in 0..MAX_STEPS + 10 {
+        h.record(history_project(i as f64), "Edit", false);
+    }
+    assert_eq!(h.depth(), (MAX_STEPS, 0), "old steps fall off the bottom");
+    let mut now = history_project(0.0);
+    h.undo(&mut now);
+    assert!(h.undo_label().is_some(), "the newest steps are the ones kept");
+}
+
+#[test]
+fn the_step_is_named_after_the_edit_that_caused_it() {
+    let tree = TreeEdits { add: Some(NewShape::Ellipse), ..Default::default() };
+    assert_eq!(
+        edit_label(
+            &tree,
+            &NgEdits::default(),
+            &DopeEdits::default(),
+            &CompEdits::default(),
+            &AidEdits::default()
+        ),
+        "Add ellipse"
+    );
+
+    let dope = DopeEdits { move_by: Some(3), ..Default::default() };
+    assert_eq!(
+        edit_label(
+            &TreeEdits::default(),
+            &NgEdits::default(),
+            &dope,
+            &CompEdits::default(),
+            &AidEdits::default()
+        ),
+        "Move keyframes"
+    );
+
+    // An edit nothing here recognises is still an edit: a vague label must
+    // never be a reason to drop the step.
+    assert_eq!(
+        edit_label(
+            &TreeEdits::default(),
+            &NgEdits::default(),
+            &DopeEdits::default(),
+            &CompEdits::default(),
+            &AidEdits::default()
+        ),
+        "Edit"
+    );
+}

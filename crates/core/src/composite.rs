@@ -175,7 +175,7 @@ pub enum ComposeMode {
 /// It lives in the **layer's own space**, sharing the layer's transform, so
 /// moving or rotating a layer moves its mask with it. That is what makes a mask
 /// feel attached rather than merely overlapping.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mask {
     pub shape: crate::node::Shape,
     /// Hide what is *inside* the shape instead of outside it.

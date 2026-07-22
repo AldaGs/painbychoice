@@ -633,7 +633,7 @@ fn finite_or_zero(v: f64) -> f64 {
 /// looks like an operator needn't *be* one — `mix(a, b, t)` is
 /// `a + (b - a) * t` in this IR, not an arm of it. Keeping that line is what
 /// stops the graph becoming a second evaluator.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Lit(ExprValue),
     /// Another node's property, sampled at `frame + time_offset`. The offset is
@@ -814,7 +814,7 @@ impl Waveform {
 /// can be rewired to a `Param`/`Ref`/expression like any other node. All four
 /// are pure functions of the frame — deterministic, so scrubbing is stable and a
 /// render matches the preview, the same contract as `wiggle`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Generator {
     /// `offset + amp · wave(freq · frame + phase)`. `freq` is cycles per frame,
     /// `phase` is in cycles. A steady periodic wobble.

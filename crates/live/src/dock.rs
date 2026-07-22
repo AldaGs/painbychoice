@@ -564,6 +564,10 @@ pub(crate) struct CompEdits {
     pub(crate) open: Option<CompId>,
     /// Rename the open comp.
     pub(crate) rename: Option<String>,
+    /// Undo or redo was clicked in the bar. The keyboard route bypasses this —
+    /// it is read straight off egui's input — but a button has to report like
+    /// every other panel intent.
+    pub(crate) history: Option<HistoryCmd>,
 }
 
 /// One entry in the comp switcher: its id and the label to show.
@@ -604,6 +608,8 @@ pub(crate) fn comp_ui(
     comps: &[CompEntry],
     current: CompId,
     comp_name_buf: &mut String,
+    undo: Option<&str>,
+    redo: Option<&str>,
 ) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -776,6 +782,27 @@ pub(crate) fn comp_ui(
             .changed()
         {
             out.motion_path_range = Some(range);
+        }
+        ui.separator();
+
+        // Undo / redo. The keyboard is the real route (Ctrl+Z / Ctrl+Shift+Z),
+        // but a disabled button is how you find out there is nothing to undo,
+        // and the tooltip names the step. No icon: the glyph would need a font
+        // subset regeneration, and two short words read better in a bar of
+        // numbers anyway.
+        if ui
+            .add_enabled(undo.is_some(), egui::Button::new("Undo"))
+            .on_hover_text(format!("Undo {} (Ctrl+Z)", undo.unwrap_or_default()))
+            .clicked()
+        {
+            out.history = Some(HistoryCmd::Undo);
+        }
+        if ui
+            .add_enabled(redo.is_some(), egui::Button::new("Redo"))
+            .on_hover_text(format!("Redo {} (Ctrl+Shift+Z)", redo.unwrap_or_default()))
+            .clicked()
+        {
+            out.history = Some(HistoryCmd::Redo);
         }
         ui.separator();
 

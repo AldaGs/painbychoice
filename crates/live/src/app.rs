@@ -185,6 +185,9 @@ pub(crate) struct App {
     /// Decoded footage frames. Editor state, never saved: the document holds
     /// references and these are the pixels behind them.
     pub(crate) footage: FootageCache,
+    /// Undo / redo. Whole-document snapshots taken around the edit phase —
+    /// see [`crate::history`] for why that rather than inverse operations.
+    pub(crate) history: History,
 }
 
 /// Apply the comp bar's FPS edit, keeping keyframes on their wall-clock time.
@@ -815,7 +818,56 @@ impl App {
             ng_scope: NgScope::Project,
             ng_status: None,
             footage: FootageCache::new(motion_render::default_registry()),
+            history: History::default(),
         }
+    }
+
+    /// Step back one edit. Returns whether the document moved, so the caller
+    /// can mark the scene dirty exactly as an ordinary edit does.
+    pub(crate) fn undo(&mut self) -> bool {
+        // `history` and `project` are disjoint fields, so the swap borrows both.
+        let done = self.history.undo(&mut self.project).is_some();
+        if done {
+            self.after_history_jump();
+        }
+        done
+    }
+
+    /// The mirror of [`undo`](Self::undo).
+    pub(crate) fn redo(&mut self) -> bool {
+        let done = self.history.redo(&mut self.project).is_some();
+        if done {
+            self.after_history_jump();
+        }
+        done
+    }
+
+    /// Re-derive the editor state that hangs off the document after a snapshot
+    /// has been swapped in.
+    ///
+    /// The document is internally consistent on its own — a snapshot carries
+    /// the graph *and* the properties it lowered into, so there is nothing to
+    /// recompile. What can be stale is everything pointing *at* it by id or by
+    /// index: a selected layer the step deletes, a comp that no longer exists,
+    /// the id counter, and keyframe references (a `KeyRef` is an index, so a
+    /// step that adds or merges keys shifts what it names).
+    fn after_history_jump(&mut self) {
+        // An open comp that the step removes would leave `doc()` panicking, so
+        // fall back to the root rather than to the missing id.
+        if self.project.comp(self.current).is_none() {
+            self.current = self.project.root;
+        }
+        let comp = self.doc();
+        let (next_id, frames) = (max_id(&comp.root) + 1, comp.duration_frames());
+        // Never *lower* the counter: a redo can bring back nodes that were
+        // deleted, and reusing an id they still hold would alias two layers.
+        self.next_id = self.next_id.max(next_id);
+        self.view = self.view.clamped(frames);
+        if self.selected.is_some_and(|id| self.doc().root.find(id).is_none()) {
+            self.selected = None;
+        }
+        self.selected_keys.clear();
+        self.shown_props.clear();
     }
 
     /// Apply one node-graph edit after the UI pass. A free-standing method, like
@@ -2708,6 +2760,9 @@ impl App {
         // Borrowed as a `&str` beside `dock`, like the font list — disjoint
         // fields, so no clone.
         let ng_status = self.ng_status.as_deref();
+        // What Undo/Redo would do, for the bar's buttons. Borrowed beside
+        // `dock` like the status line — disjoint fields, so no clone.
+        let (undo_label, redo_label) = (self.history.undo_label(), self.history.redo_label());
         let node_graph =
             scoped_graph(&self.project, ng_scope).unwrap_or(&self.project.graph);
         // The panel resolves each node's descriptor per placed node (a `use`
@@ -2768,6 +2823,8 @@ impl App {
                         &comp_entries,
                         current_comp,
                         &mut comp_name_buf,
+                        undo_label,
+                        redo_label,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Transport => transport_ui(
@@ -2941,6 +2998,13 @@ impl App {
                 &mut dock_cmd,
             );
         });
+        // --- Undo: the document as it stands *before* this frame's edits. ---
+        // Everything from here to the `history.record` below is the apply
+        // phase; a snapshot around the whole of it is what makes undo cover
+        // every edit site at once. Taken here, where the edit structs are still
+        // whole, so the label can read intents that are `take`n further down.
+        let before = self.project.clone();
+        let edit_label = edit_label(&tree_edits, &ng_edits, &dope, &comp, &aid_edits);
         // Apply a composition node-graph edit (add/move/remove/connect/
         // disconnect/set-value). Connection validity is enforced inside the model.
         // A driver recompiles only when the *lowered result* could have changed —
@@ -3315,12 +3379,58 @@ impl App {
         if tree_edits.save {
             self.save();
         }
+        // Opening a different project is not an edit *of* the open one: undoing
+        // across that boundary would resurrect a document the user has moved on
+        // from, and the layout/selection restored with it are gone anyway.
+        let mut replaced = false;
         if tree_edits.load {
-            dirty |= self.load();
+            replaced = self.load();
+            dirty |= replaced;
         }
         if tree_edits.import_footage {
             dirty |= self.import_footage();
         }
+        // --- Undo: close the phase opened by `before`. ---------------------
+        // One comparison covers every edit above. `PartialEq` on the document
+        // early-outs at the first difference, so an idle frame costs a few
+        // field reads; the clone is only kept when it actually differs.
+        let pointer_down = self.egui_ctx.input(|i| i.pointer.any_down());
+        if replaced {
+            self.history.clear();
+        } else if self.project != before {
+            self.history.record(before, edit_label, pointer_down);
+        }
+        // The gesture that was gathering edits is over, so the next one starts
+        // its own step. Done after the record, or a drag's own frames would each
+        // close themselves.
+        if !pointer_down {
+            self.history.end_interaction();
+        }
+        // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. Applied *after* the record, so the
+        // swap this performs is never itself mistaken for an edit. Suppressed
+        // while a text field has focus, like keyframe copy/paste — Ctrl+Z in a
+        // name field belongs to the field.
+        if !self.egui_ctx.egui_wants_keyboard_input() {
+            let (undo, redo) = self.egui_ctx.input(|i| {
+                (
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                    i.modifiers.command
+                        && (i.key_pressed(egui::Key::Y)
+                            || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
+                )
+            });
+            if undo {
+                dirty |= self.undo();
+            } else if redo {
+                dirty |= self.redo();
+            }
+        }
+        match comp.history {
+            Some(HistoryCmd::Undo) => dirty |= self.undo(),
+            Some(HistoryCmd::Redo) => dirty |= self.redo(),
+            None => {}
+        }
+
         if dirty {
             // Every document change invalidates the motion-path cache.
             self.doc_rev = self.doc_rev.wrapping_add(1);

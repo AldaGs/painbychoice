@@ -26,7 +26,7 @@ pub struct NodeId(pub u64);
 /// depth and out-of-plane rotations are all zero resolves to `Xf::Flat`, a plain
 /// `kurbo::Affine`, exactly as before 2.5D existed. See [`crate::mat4`] for why
 /// that distinction is load-bearing rather than an optimisation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
     pub anchor: Value<Vec3>,
     pub position: Value<Vec3>,
@@ -189,7 +189,7 @@ where
 
 /// A drawable shape. Parametric variants resolve their geometry at time `t`,
 /// so a rectangle's size can itself be keyframed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Shape {
     /// A pre-built path (imported / drawn by hand).
     Path(BezPath),
@@ -382,7 +382,7 @@ impl Shape {
 }
 
 /// A stroke: animatable color and width.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub color: Value<Color>,
     pub width: Value<f64>,
@@ -396,7 +396,7 @@ pub struct Stroke {
 /// composition can be nested) it's what a pre-comp exposes to its parent.
 /// A parameter is a `Value` like any property, so it keyframes and can itself
 /// be expression-driven.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Param {
     /// How a script names it. Unique per node — [`Node::set_param`] enforces
     /// that, since a duplicate would make `param("x")` ambiguous.
@@ -406,7 +406,7 @@ pub struct Param {
 
 /// A parameter's type. Mirrors the `ExprValue` kinds, so a parameter can drive
 /// any property an expression can — including a text one.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamValue {
     Num(Value<f64>),
     Vec(Value<Vec2>),
@@ -537,7 +537,7 @@ impl LayerTiming {
 
 /// One node in the scene graph. A group (no shape) just composes its children;
 /// a leaf carries a shape + paint.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
     pub name: String,
@@ -841,7 +841,7 @@ impl Node {
 /// multi-comp step. A project holds several of these, and a layer can *instance*
 /// one (see [`Node::precomp`]), which is what makes a comp reusable rather than
 /// merely nested.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Comp {
     /// What the comp switcher shows. `#[serde(default)]` so a pre-project
     /// `.pbc` loads with an empty name and falls back to a generated label.
@@ -1182,7 +1182,7 @@ pub struct ModuleId(pub u64);
 /// A module is deliberately just an [`crate::expr::Expr`] plus its knobs: the
 /// procedural generators are the ready-made bodies, and nothing new is needed in
 /// the evaluator beyond the link itself.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Module {
     pub name: String,
     /// The tunables a link may override. A knob left unset at the link site
@@ -1261,7 +1261,7 @@ pub struct CompId(pub u64);
 /// [`CompId`], so the same comp can be placed twice and edited once — inline
 /// nesting would be less code but could never instance. It's also the shape the
 /// shared-module story needs later: a comp *is* a graph node.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     /// Keyed, not a `Vec`: a precomp layer holds an id, and ids must survive
     /// a comp being removed from the middle.

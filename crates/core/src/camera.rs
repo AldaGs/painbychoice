@@ -35,7 +35,7 @@ use crate::value::Value;
 
 /// A composition's camera. Present means the comp projects; absent means it is
 /// flat, and the engine behaves exactly as it did before depth existed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Camera {
     /// How far in front of the `z = 0` plane the eye sits, in composition
     /// pixels. Animatable, so a dolly is a keyframed value like anything else.

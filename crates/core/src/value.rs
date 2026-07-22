@@ -176,7 +176,7 @@ pub fn mirror_handle(h: Handle) -> Handle {
 /// sits between frames can never be reached by playback, and float times
 /// forced every comparison through an epsilon fudge. The frame *grid* lives in
 /// [`crate::timebase::Timebase`]; a key knows only its index on that grid.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe<T> {
     #[serde(default)]
     pub frame: i64,
@@ -265,7 +265,7 @@ impl<T> Keyframe<T> {
 
 /// A sorted list of keyframes. Sampling clamps outside the first/last key
 /// (hold), and eases + lerps within a segment.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct Track<T> {
     keys: Vec<Keyframe<T>>,
 }
@@ -588,7 +588,7 @@ impl<T: Animatable> Track<T> {
 /// arm — an expression computed from other values. Expressions and a node graph
 /// are two front-ends that lower to the same [`Expr`] IR; this is where a
 /// resolved property picks up whatever that IR produces.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Value<T> {
     Const(T),
     Keyframed(Track<T>),
