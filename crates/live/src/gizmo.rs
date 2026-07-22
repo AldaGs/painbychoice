@@ -146,8 +146,18 @@ pub(crate) struct GizmoDrag {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GizmoTarget {
     pub(crate) node: u64,
-    /// Parent space → comp space. Built from the node's world matrix (from
-    /// `Scene::places`) with the layer's *own* local matrix divided back out.
+    /// Parent space → composition space, **unprojected and three-dimensional**.
+    ///
+    /// This is the real chain, straight from `Placement`, not a 2D shadow of it.
+    /// The gizmo used to recover a `parent` affine by dividing the layer's own
+    /// local matrix out of its *projected, flattened* world matrix — which for a
+    /// tipped layer divided out of a matrix that had already thrown the
+    /// foreshortening away, so every direction it derived was wrong by however
+    /// much the layer was turned. Handles wandered, and a rotation ring could
+    /// jump.
+    pub(crate) parent_xf: motion_core::mat4::Xf,
+    /// Parent space → comp space, flattened. Retained **only** for snapping,
+    /// which reasons about guides in the composition plane.
     pub(crate) parent: Affine,
     pub(crate) pos: Vec2,
     pub(crate) pos_z: f64,
@@ -167,42 +177,18 @@ pub(crate) struct GizmoTarget {
 }
 
 impl GizmoTarget {
-    /// The layer's own local matrix, exactly as `Transform::resolve` builds it.
-    /// Kept in lockstep with that function by construction — if the composition
-    /// order there changes, this must change with it.
-    fn local(pos: Vec2, rot_deg: f64, scale: (f64, f64), anchor: Vec2) -> Affine {
-        Affine::translate(pos)
-            * Affine::rotate(rot_deg.to_radians())
-            * Affine::scale_non_uniform(scale.0, scale.1)
-            * Affine::translate(-anchor)
-    }
-
-    /// Build a target from a node's world transform and the layer's resolved
-    /// values. `world = parent · local`, so `parent = world · local⁻¹`
-    /// — which is why the anchor has to be in [`NodeInfo`]: leave it out and
-    /// `local` is wrong, so the recovered parent is wrong, and the gizmo
-    /// tracks the cursor at an offset.
     pub(crate) fn new(
         node: u64,
-        world: Affine,
+        parent_xf: motion_core::mat4::Xf,
         info: &NodeInfo,
         view: Option<(Point, f64)>,
     ) -> Self {
         let pos = Vec2::new(info.pos.0, info.pos.1);
         let anchor = Vec2::new(info.anchor.0, info.anchor.1);
-        // A zero scale collapses `local`, and inverting a singular matrix gives
-        // infinities that would put the handles at NaN. Fall back to a scale of
-        // 1 for the *recovery* only. The result is an approximation — `world`
-        // was built with the real scale — but a placed gizmo on a flattened
-        // layer beats no gizmo, since scaling back up is what you came for.
-        let safe = (
-            if info.scale.0.abs() < 1e-9 { 1.0 } else { info.scale.0 },
-            if info.scale.1.abs() < 1e-9 { 1.0 } else { info.scale.1 },
-        );
-        let local = Self::local(pos, info.rot, safe, anchor);
         Self {
             node,
-            parent: world * local.inverse(),
+            parent_xf,
+            parent: parent_xf.to_affine_lossy(),
             pos,
             pos_z: info.pos.2,
             rot_deg: info.rot,
@@ -215,20 +201,13 @@ impl GizmoTarget {
         }
     }
 
-    /// The gizmo's origin in parent space. `local` maps the *anchor point* to
-    /// `position` by construction, so `position` already is the anchor as the
-    /// parent sees it — which is why rotation and scale pivot here.
-    fn origin_parent(&self) -> Point {
-        Point::new(self.pos.x, self.pos.y)
-    }
-
     /// The layer's own axes as unit vectors in parent space, depth included.
     ///
     /// Scale is deliberately *not* folded in: the arrows show orientation, and
     /// a squashed layer should not get squashed handles. Rotation **is**, all
     /// three of it — an arrow that ignored the layer's tilt would point
     /// somewhere the layer does not go.
-    fn axis_parent(&self, axis: GizmoAxis) -> MVec3 {
+    pub(crate) fn axis_parent(&self, axis: GizmoAxis) -> MVec3 {
         axis_column(&rot_matrix(self.rot_deg, self.rot_xy), axis)
     }
 
@@ -241,20 +220,81 @@ impl GizmoTarget {
     /// out and the right one reapplied. Without a camera there is nothing to
     /// undo and depth simply does not move the point, which is the honest
     /// picture of an orthographic comp.
-    fn to_screen3(self, fit: Affine, ppp: f64, d: MVec3) -> egui::Pos2 {
-        let o = self.origin_parent();
-        let flat = self.parent * Point::new(o.x + d.x, o.y + d.y);
+    /// The exact way back — the inverse of [`Self::to_screen3`]: a pointer
+    /// position to a point in the layer's parent space, by **intersecting the
+    /// view ray with the layer's own plane**.
+    ///
+    /// A screen point names a ray, not a point — every depth along it projects
+    /// to the same pixel — so the answer is only unique once you say which
+    /// surface to land on. The layer's own plane (`z = pos_z` in parent space)
+    /// is the right one: it is the plane a move slides in, so a grab lands
+    /// exactly where the pointer is and the layer neither jumps toward the eye
+    /// nor away from it.
+    ///
+    /// Doing this as a ray, rather than unprojecting onto a single depth, is
+    /// what makes it exact under a **tipped parent**. There, parent-space points
+    /// sharing a `z` sit at *different* composition depths, so no one depth
+    /// could stand in for the plane — the shortcut round-trips the origin and
+    /// drifts everywhere else, which is the sort of error that reads as a gizmo
+    /// slipping under the cursor the further you drag.
+    pub(crate) fn unproject(self, fit: Affine, ppp: f64, p: egui::Pos2) -> Point {
+        let phys = Point::new(p.x as f64 * ppp, p.y as f64 * ppp);
+        // Where this pixel crosses the composition's zero plane. A point at
+        // `z = 0` projects to itself, so this is a point on the ray.
+        let at_zero = fit.inverse() * phys;
+
+        // The ray, in composition space. With a camera it starts at the eye —
+        // which sits `distance` in *front* of the zero plane, hence the
+        // negative z — and runs through `at_zero`. Without one the projection
+        // is orthographic and the ray is simply the depth axis.
+        let (origin, dir) = match self.view {
+            Some((eye, dist)) => (
+                MVec3::new(eye.x, eye.y, -dist),
+                MVec3::new(at_zero.x - eye.x, at_zero.y - eye.y, dist),
+            ),
+            None => (
+                MVec3::new(at_zero.x, at_zero.y, 0.0),
+                MVec3::new(0.0, 0.0, 1.0),
+            ),
+        };
+
+        let m = self.parent_xf.to_mat4();
+        let Some(inv) = m.inverse_affine() else {
+            // A collapsed scale somewhere above has no inverse. Holding the
+            // grab still beats writing a NaN position into the document.
+            return Point::new(self.pos.x, self.pos.y);
+        };
+        // Into parent space: the origin as a point, the direction as a
+        // direction — translating a direction would aim the ray at nothing.
+        let o = inv.transform_point(origin);
+        let d = inv.transform_dir(dir);
+
+        // Intersect with the plane the layer lives in. A ray parallel to it
+        // never meets it: that is the layer seen exactly edge-on, where the
+        // pointer genuinely does not name a point on it.
+        if d.z.abs() < 1e-9 {
+            return Point::new(self.pos.x, self.pos.y);
+        }
+        let t = (self.pos_z - o.z) / d.z;
+        Point::new(o.x + d.x * t, o.y + d.y * t)
+    }
+
+    pub(crate) fn to_screen3(self, fit: Affine, ppp: f64, d: MVec3) -> egui::Pos2 {
+        let p_parent = MVec3::new(self.pos.x + d.x, self.pos.y + d.y, self.pos_z + d.z);
+        let p_comp = self.parent_xf.to_mat4().transform_point(p_parent);
         let comp = match self.view {
             Some((eye, dist)) => {
-                let s0 = dist / (dist + self.pos_z);
-                let s = dist / (dist + self.pos_z + d.z);
-                if !s0.is_finite() || s0.abs() < 1e-9 || !s.is_finite() {
-                    flat
+                let s = dist / (dist + p_comp.z);
+                if !s.is_finite() || s.abs() < 1e-9 {
+                    Point::new(p_comp.x, p_comp.y)
                 } else {
-                    eye + (eye + (flat - eye) / s0 - eye) * s
+                    Point::new(
+                        eye.x + (p_comp.x - eye.x) * s,
+                        eye.y + (p_comp.y - eye.y) * s,
+                    )
                 }
             }
-            None => flat,
+            None => Point::new(p_comp.x, p_comp.y),
         };
         let c = fit * comp;
         egui::pos2((c.x / ppp) as f32, (c.y / ppp) as f32)
@@ -358,29 +398,11 @@ impl GizmoAxis {
     }
 }
 
-/// Map a parent-space point to logical screen points.
-fn to_screen(t: &GizmoTarget, fit: Affine, ppp: f64, p: Point) -> egui::Pos2 {
-    let c = fit * (t.parent * p);
-    egui::pos2((c.x / ppp) as f32, (c.y / ppp) as f32)
-}
-
-/// Map logical screen points back to parent space — the inverse of
-/// [`to_screen`], used to put the pointer into the space the values live in.
-fn to_parent(t: &GizmoTarget, fit: Affine, ppp: f64, p: egui::Pos2) -> Point {
-    let phys = Point::new(p.x as f64 * ppp, p.y as f64 * ppp);
-    // Parent → comp → physical is `fit · parent`, so the way back is its
-    // inverse. Writing the product the other way round silently yields a
-    // plausible-looking transform that drifts as soon as the layer is nested.
-    (fit * t.parent).inverse() * phys
-}
-
 fn layout(t: &GizmoTarget, fit: Affine, ppp: f64) -> Layout {
-    let o_parent = t.origin_parent();
-    let origin = to_screen(t, fit, ppp, o_parent);
-    // Take each axis direction through the *same* transform as the origin and
-    // renormalise on screen: that way a rotated, flipped or non-uniformly
-    // scaled parent still produces arrows pointing the way the layer actually
-    // moves, at a fixed on-screen length.
+    // The origin goes through the **same** map as every direction below it. It
+    // used to take a flattened shortcut, which put the handles a perspective
+    // factor away from the axes they were supposed to start at.
+    let origin = t.to_screen3(fit, ppp, MVec3::ZERO);
     // Every direction is *measured*: step one unit along it in parent space,
     // ask where that lands on screen, and take the difference. One rule serves
     // the in-plane axes, depth, and the ring bases alike, and it goes through
@@ -872,7 +894,7 @@ pub(crate) fn gizmo_ui(
                     start_rot_xy: target.rot_xy,
                     start_scale: target.scale,
                     start_anchor: target.anchor,
-                    grab_parent: to_parent(target, fit, ppp, p),
+                    grab_parent: target.unproject(fit, ppp, p),
                     grab_screen: p,
                     origin_screen: l.origin,
                 });
@@ -889,7 +911,7 @@ pub(crate) fn gizmo_ui(
         // geared to where the layer is now rather than where it started — the
         // arrow keeps pointing at the vanishing point as the layer recedes.
         let screen = l.screen(p);
-        let r = resolve_drag(&d, to_parent(target, fit, ppp, p), screen);
+        let r = resolve_drag(&d, target.unproject(fit, ppp, p), screen);
         let (mut pos, rot, scale, anchor) = (r.pos, r.rot, r.scale, r.anchor);
         // Snapping applies to moves only. Rotating or scaling *to* a guide is a
         // different question with a different answer (an angle, not a point),

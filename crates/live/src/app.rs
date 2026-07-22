@@ -2614,7 +2614,7 @@ impl App {
         let gizmo_target = match (self.selected, &sel_info) {
             (Some(id), Some(info)) => scene
                 .place(id)
-                .map(|place| GizmoTarget::new(id.0, place.world, info, gizmo_view)),
+                .map(|place| GizmoTarget::new(id.0, place.parent_xf, info, gizmo_view)),
             _ => None,
         };
         // One box per drawable item in the selection's subtree — a group shows

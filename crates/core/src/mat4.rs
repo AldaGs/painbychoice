@@ -140,6 +140,72 @@ impl Mat4 {
         parallel.then(|| kurbo::Affine::new([m[0], m[1], m[4], m[5], m[12], m[13]]))
     }
 
+    /// The inverse of an **affine** matrix — a rotation/scale/shear block plus a
+    /// translation, which is every matrix this engine builds. `None` when the
+    /// linear block is singular (a collapsed scale), where no inverse exists and
+    /// returning one would put NaNs into a drag.
+    ///
+    /// Not a general 4x4 inverse: nothing here has a perspective row, and
+    /// pretending otherwise would be forty lines of arithmetic that no caller
+    /// exercises. The projection is applied *after* this matrix, by the camera,
+    /// and is inverted separately — see `Projector`.
+    pub fn inverse_affine(&self) -> Option<Mat4> {
+        let m = &self.0;
+        // Columns of the 3x3 linear block.
+        let (a, b, c) = (
+            [m[0], m[1], m[2]],
+            [m[4], m[5], m[6]],
+            [m[8], m[9], m[10]],
+        );
+        let det = a[0] * (b[1] * c[2] - b[2] * c[1]) - b[0] * (a[1] * c[2] - a[2] * c[1])
+            + c[0] * (a[1] * b[2] - a[2] * b[1]);
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+        // Inverse of the linear block, by cofactors. Written out rather than
+        // looped so the transpose is visible: the adjugate's rows are the
+        // original's cofactor columns.
+        let r = [
+            (b[1] * c[2] - b[2] * c[1]) * inv_det,
+            (a[2] * c[1] - a[1] * c[2]) * inv_det,
+            (a[1] * b[2] - a[2] * b[1]) * inv_det,
+            (b[2] * c[0] - b[0] * c[2]) * inv_det,
+            (a[0] * c[2] - a[2] * c[0]) * inv_det,
+            (a[2] * b[0] - a[0] * b[2]) * inv_det,
+            (b[0] * c[1] - b[1] * c[0]) * inv_det,
+            (a[1] * c[0] - a[0] * c[1]) * inv_det,
+            (a[0] * b[1] - a[1] * b[0]) * inv_det,
+        ];
+        let t = [m[12], m[13], m[14]];
+        // The inverse translation is -(R^-1 * t): undo the rotation first, then
+        // step back.
+        let it = [
+            -(r[0] * t[0] + r[3] * t[1] + r[6] * t[2]),
+            -(r[1] * t[0] + r[4] * t[1] + r[7] * t[2]),
+            -(r[2] * t[0] + r[5] * t[1] + r[8] * t[2]),
+        ];
+        Some(Mat4([
+            r[0], r[1], r[2], 0.0, //
+            r[3], r[4], r[5], 0.0, //
+            r[6], r[7], r[8], 0.0, //
+            it[0], it[1], it[2], 1.0,
+        ]))
+    }
+
+    /// Transform a **direction**: the linear block only, with the translation
+    /// left out. A direction has no position, so translating it would be a
+    /// category error — and the classic way to get a ray that starts in the
+    /// right place but points the wrong way.
+    pub fn transform_dir(&self, v: Vec3) -> Vec3 {
+        let m = &self.0;
+        Vec3::new(
+            m[0] * v.x + m[4] * v.y + m[8] * v.z,
+            m[1] * v.x + m[5] * v.y + m[9] * v.z,
+            m[2] * v.x + m[6] * v.y + m[10] * v.z,
+        )
+    }
+
     /// Transform a point (w = 1), dividing through by w so a later perspective
     /// matrix works without a second code path.
     pub fn transform_point(&self, p: Vec3) -> Vec3 {
@@ -280,5 +346,43 @@ mod tests {
         for (l, r) in m.as_coeffs().iter().zip(k.as_coeffs().iter()) {
             assert!((l - r).abs() < 1e-12, "{l} vs {r}");
         }
+    }
+
+    /// The inverse undoes the matrix, for a transform with all three rotations
+    /// and a non-uniform scale in it — the case a gizmo actually has to invert
+    /// to map a pointer back into the layer's parent space.
+    #[test]
+    fn the_affine_inverse_round_trips_a_point() {
+        let m = Mat4::translate(Vec3::new(30.0, -12.0, 7.0))
+            * Mat4::rotate_z(0.6)
+            * Mat4::rotate_y(-0.4)
+            * Mat4::rotate_x(0.25)
+            * Mat4::scale(Vec3::new(2.0, 0.5, 3.0));
+        let inv = m.inverse_affine().expect("invertible");
+        let p = Vec3::new(11.0, -5.0, 2.5);
+        let back = inv.transform_point(m.transform_point(p));
+        assert!((back.x - p.x).abs() < 1e-9, "{back:?}");
+        assert!((back.y - p.y).abs() < 1e-9, "{back:?}");
+        assert!((back.z - p.z).abs() < 1e-9, "{back:?}");
+    }
+
+    /// A collapsed scale has no inverse, and must say so rather than hand back
+    /// infinities that would land in the document as a NaN position.
+    #[test]
+    fn a_singular_matrix_has_no_inverse() {
+        assert!(Mat4::scale(Vec3::new(1.0, 0.0, 1.0)).inverse_affine().is_none());
+    }
+
+    /// A direction ignores translation. Asserted against the point transform of
+    /// a difference, which is the same thing said the long way.
+    #[test]
+    fn a_direction_ignores_translation() {
+        let m = Mat4::translate(Vec3::new(100.0, 5.0, -3.0)) * Mat4::rotate_y(0.4);
+        let v = Vec3::new(1.0, 2.0, 3.0);
+        let by_points = m.transform_point(v) - m.transform_point(Vec3::ZERO);
+        let direct = m.transform_dir(v);
+        assert!((direct.x - by_points.x).abs() < 1e-12);
+        assert!((direct.y - by_points.y).abs() < 1e-12);
+        assert!((direct.z - by_points.z).abs() < 1e-12);
     }
 }

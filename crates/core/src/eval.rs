@@ -151,6 +151,8 @@ pub struct Placement {
     /// already applied. An overlay that needs to know which way the layer's
     /// axes point (not merely where it is) needs this, not just [`Self::pivot`].
     pub world: Affine,
+    /// The true unprojected 3D parent matrix, used for 3D gizmos.
+    pub parent_xf: Xf,
     /// The node's anchor point in composition space.
     ///
     /// The *anchor*, not the local origin: the local matrix maps the anchor to
@@ -384,6 +386,7 @@ fn walk(
         node.id,
         Placement {
             world: flat,
+            parent_xf,
             pivot: flat * kurbo::Point::new(anchor.x, anchor.y),
             bounds: None,
         },

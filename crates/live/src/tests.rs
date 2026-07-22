@@ -1493,7 +1493,7 @@ fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
         * Affine::translate(Vec2::new(-info.anchor.0, -info.anchor.1));
     let world = parent * local;
 
-    let t = GizmoTarget::new(1, world, &info, None);
+    let t = GizmoTarget::new(1, motion_core::mat4::Xf::Flat(parent), &info, None);
     // The recovered parent must map `position` to wherever the world matrix
     // puts the anchor point — that is the definition of the pivot.
     let via_parent = t.parent * Point::new(info.pos.0, info.pos.1);
@@ -1750,7 +1750,7 @@ fn a_bare_group_gets_a_gizmo_target_from_its_place() {
     let info = NodeInfo::resolve(n, c, 50.0);
     let place = scene.place(node).expect("a group has a place");
 
-    let target = GizmoTarget::new(node.0, place.world, &info, None);
+    let target = GizmoTarget::new(node.0, place.parent_xf, &info, None);
     let origin = target.parent * Point::new(target.pos.x, target.pos.y);
     let pivot = scene.pivot(node).expect("and a pivot");
     assert!(
@@ -1979,6 +1979,7 @@ fn the_snap_tolerance_shrinks_as_you_zoom_in() {
 fn an_axis_constrained_drag_only_snaps_along_its_axis() {
     let target = GizmoTarget {
         node: 1,
+        parent_xf: motion_core::mat4::Xf::Flat(Affine::IDENTITY),
         parent: Affine::IDENTITY,
         pos: Vec2::new(0.0, 0.0),
         pos_z: 0.0,
@@ -2048,6 +2049,7 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
     let parent = Affine::translate((100.0, 40.0)) * Affine::scale(2.0);
     let target = GizmoTarget {
         node: 1,
+        parent_xf: motion_core::mat4::Xf::Flat(parent),
         parent,
         pos: Vec2::ZERO,
         pos_z: 0.0,
@@ -2097,6 +2099,7 @@ fn a_nested_layer_snaps_to_the_guide_in_composition_space() {
 fn the_bypass_modifier_defeats_every_snap_target() {
     let target = GizmoTarget {
         node: 1,
+        parent_xf: motion_core::mat4::Xf::Flat(Affine::IDENTITY),
         parent: Affine::IDENTITY,
         pos: Vec2::ZERO,
         pos_z: 0.0,
@@ -4823,4 +4826,86 @@ fn the_gimbal_locks_where_euler_angles_do() {
     let (x, z) = (axes[GizmoAxis::X as usize], axes[GizmoAxis::Z as usize]);
     let dot = x.0 * z.0 + x.1 * z.1 + x.2 * z.2;
     assert!(dot.abs() > 0.999, "X and Z rings should be collinear, dot = {dot}");
+}
+
+/// A target sitting in a genuinely three-dimensional parent: pushed back in
+/// depth and tipped, with a camera looking at it.
+fn spatial_target(rot_xy: (f64, f64)) -> GizmoTarget {
+    let parent = motion_core::Mat4::translate(motion_core::Vec3::new(40.0, -25.0, 300.0))
+        * motion_core::Mat4::rotate_y(0.3)
+        * motion_core::Mat4::rotate_z(0.2);
+    GizmoTarget {
+        node: 1,
+        parent_xf: motion_core::Xf::Spatial(parent),
+        parent: parent.as_affine_ignoring_depth().unwrap_or(Affine::IDENTITY),
+        pos: Vec2::new(120.0, 60.0),
+        pos_z: 150.0,
+        rot_deg: 25.0,
+        rot_xy,
+        scale: (1.0, 1.0),
+        anchor: Vec2::ZERO,
+        view: Some((Point::new(960.0, 540.0), 1200.0)),
+    }
+}
+
+/// **The property the whole gizmo rests on.** Screen and parent space must be
+/// exact inverses of each other through the real 3D chain — parent matrix,
+/// camera, canvas fit — or a drag lands somewhere other than the pointer.
+///
+/// This is what a flattened `parent` affine could never give: it was recovered
+/// from an already-projected, already-foreshortening-discarded matrix, so for a
+/// tipped layer it disagreed with the picture on screen by however much the
+/// layer was turned.
+#[test]
+fn screen_and_parent_space_round_trip_through_the_real_chain() {
+    let t = spatial_target((35.0, -20.0));
+    let fit = Affine::scale(0.55) * Affine::translate((12.0, -7.0));
+    for probe in [Point::new(120.0, 60.0), Point::new(400.0, -90.0), Point::ZERO] {
+        let screen = t.to_screen3(
+            fit,
+            1.0,
+            motion_core::Vec3::new(probe.x - t.pos.x, probe.y - t.pos.y, 0.0),
+        );
+        let back = t.unproject(fit, 1.0, screen);
+        // The arithmetic is f64 throughout; the tolerance is for the one f32
+        // hop through `egui::Pos2`, which is where a screen position lives.
+        assert!(
+            (back.x - probe.x).abs() < 1e-3 && (back.y - probe.y).abs() < 1e-3,
+            "{probe:?} came back as {back:?}"
+        );
+    }
+}
+
+/// The gizmo's origin and its axes must come from the *same* map. They used to
+/// disagree — the origin took a flattened shortcut while the axes went through
+/// the projection — which put every handle a perspective factor away from the
+/// point it was supposed to start at.
+#[test]
+fn the_gizmo_origin_sits_where_the_layer_does() {
+    let t = spatial_target((0.0, 0.0));
+    let fit = Affine::scale(0.55);
+    let origin = t.to_screen3(fit, 1.0, motion_core::Vec3::ZERO);
+    let back = t.unproject(fit, 1.0, origin);
+    assert!((back.x - t.pos.x).abs() < 1e-3, "{back:?}");
+    assert!((back.y - t.pos.y).abs() < 1e-3, "{back:?}");
+}
+
+/// A tipped layer's axes are genuinely three-dimensional: rotating about X must
+/// change where the Y and Z arrows point, which a flattened chain could not
+/// express at all.
+#[test]
+fn tipping_the_layer_moves_its_arrows() {
+    let fit = Affine::scale(0.55);
+    let step = |t: &GizmoTarget, axis: GizmoAxis| {
+        let o = t.to_screen3(fit, 1.0, motion_core::Vec3::ZERO);
+        t.to_screen3(fit, 1.0, t.axis_parent(axis)) - o
+    };
+    let flat = spatial_target((0.0, 0.0));
+    let tipped = spatial_target((60.0, 0.0));
+    let a = step(&flat, GizmoAxis::Y);
+    let b = step(&tipped, GizmoAxis::Y);
+    assert!(
+        (a - b).length() > 0.05,
+        "the Y arrow should swing when the layer tips about X: {a:?} vs {b:?}"
+    );
 }
