@@ -252,7 +252,38 @@ pub(crate) fn to_vello(
         }
     }
 
-    for item in &scene.items {
+    // Isolated layers, outermost first. `walk` emits them in post-order (a
+    // child's group is pushed before its parent's, since a range isn't known
+    // until its subtree is walked), so they have to be re-sorted before they
+    // can be opened as nested layers: by where they start, and for a shared
+    // start the longer range is the outer one.
+    let groups = scene.nesting_order();
+    let mut next_group = 0usize;
+    // Ends of the layers currently open, innermost last.
+    let mut open: Vec<usize> = Vec::new();
+
+    for (i, item) in scene.items.iter().enumerate() {
+        // Open every layer that begins here. `push_layer` gives vello an
+        // offscreen target: everything drawn until the matching `pop_layer`
+        // composites as one image, which is what a blend mode needs and what
+        // masks and effects will hang off next.
+        while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
+            vs.push_layer(
+                Fill::NonZero,
+                to_peniko_blend(g.blend),
+                g.alpha.clamp(0.0, 1.0) as f32,
+                fit,
+                // No mask yet, so the clip is just the layer's own extent —
+                // bounded rather than "everything", because vello rasterizes
+                // the clip shape and an unbounded one would cost the whole
+                // frame per group. Outside its own bounds a layer contributes
+                // nothing anyway, so this clips away only what can't show.
+                &group_bounds(scene, g),
+            );
+            open.push(g.end);
+            next_group += 1;
+        }
+
         let xf = fit * item.transform;
         // Footage draws *instead of* the fill: the fill colour is what a
         // rectangle would paint, and a clip covers it entirely. A stroke still
@@ -275,6 +306,17 @@ pub(crate) fn to_vello(
                 &item.path,
             );
         }
+
+        // Close every layer that ended with this item, innermost first.
+        while open.last() == Some(&(i + 1)) {
+            vs.pop_layer();
+            open.pop();
+        }
+    }
+    // Belt and braces: an unbalanced push would corrupt everything drawn after
+    // it, and the ranges come from data that a future edit could get wrong.
+    for _ in 0..open.len() {
+        vs.pop_layer();
     }
     // Passepartout: dim everything outside the comp bounds, so the frame reads
     // as the shot and whatever is parked off-stage recedes without vanishing.
@@ -464,6 +506,55 @@ pub(crate) fn nav_zoom_about(
         dy - (cy - doc.height * scale * 0.5),
     );
     CanvasNav { zoom: Some(scale / ppp), pan }
+}
+
+/// Map a document blend mode onto peniko's.
+///
+/// A plain one-to-one translation, because `BlendMode` was deliberately
+/// defined as the standard sixteen rather than a bespoke set — so this is a
+/// rename, not an approximation. Compositing stays `SrcOver`: these modes
+/// change how colours combine, not how coverage does.
+fn to_peniko_blend(mode: MBlendMode) -> vello::peniko::BlendMode {
+    use vello::peniko::{BlendMode as B, Compose, Mix};
+    let mix = match mode {
+        MBlendMode::Normal => Mix::Normal,
+        MBlendMode::Multiply => Mix::Multiply,
+        MBlendMode::Screen => Mix::Screen,
+        MBlendMode::Overlay => Mix::Overlay,
+        MBlendMode::Darken => Mix::Darken,
+        MBlendMode::Lighten => Mix::Lighten,
+        MBlendMode::ColorDodge => Mix::ColorDodge,
+        MBlendMode::ColorBurn => Mix::ColorBurn,
+        MBlendMode::HardLight => Mix::HardLight,
+        MBlendMode::SoftLight => Mix::SoftLight,
+        MBlendMode::Difference => Mix::Difference,
+        MBlendMode::Exclusion => Mix::Exclusion,
+        MBlendMode::Hue => Mix::Hue,
+        MBlendMode::Saturation => Mix::Saturation,
+        MBlendMode::Color => Mix::Color,
+        MBlendMode::Luminosity => Mix::Luminosity,
+    };
+    B::new(mix, Compose::SrcOver)
+}
+
+/// The extent of an isolated layer's contents, in composition space.
+///
+/// Used as the clip when opening the layer. Strokes straddle the path they
+/// follow, so half a stroke's width is added back — a clip tight to the fill
+/// would shave the outer half off every outlined shape in the group.
+pub(crate) fn group_bounds(scene: &MScene, group: &LayerGroup) -> kurbo::Rect {
+    let mut bounds: Option<kurbo::Rect> = None;
+    for item in &scene.items[group.start..group.end] {
+        let mut b = (item.transform * item.path.clone()).bounding_box();
+        if let Some((_, width)) = item.stroke {
+            b = b.inflate(width / 2.0, width / 2.0);
+        }
+        bounds = Some(match bounds {
+            Some(acc) => acc.union(b),
+            None => b,
+        });
+    }
+    bounds.unwrap_or_default()
 }
 
 /// Draw one footage item, returning whether pixels actually landed.

@@ -1544,6 +1544,12 @@ impl App {
             tr.opacity.set_at(frame, o);
             changed = true;
         }
+        // Plain data, so a direct assignment rather than `set_at`: there is no
+        // interpolating between Multiply and Screen, so no track to key into.
+        if let Some(mode) = e.blend {
+            node.blend = mode;
+            changed = true;
+        }
         if let Some(rgb) = e.fill {
             if let Some(fill) = node.fill.as_mut() {
                 fill.set_at(frame, rgb_color(rgb));

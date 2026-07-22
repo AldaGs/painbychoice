@@ -40,6 +40,9 @@ pub(crate) struct NodeInfo {
     /// animatable property in its own right, with a row and a stopwatch.
     pub(crate) anchor: (f64, f64),
     pub(crate) opacity: f64,
+    /// How this layer combines with the backdrop. Anything but `Normal` makes
+    /// it composite in isolation — see [`motion_core::BlendMode`].
+    pub(crate) blend: MBlendMode,
     pub(crate) fill: Option<[f32; 3]>,
     /// Parametric geometry, `None` for a group or a hand-drawn `Path`.
     pub(crate) size: Option<(f64, f64)>,
@@ -245,6 +248,7 @@ impl NodeInfo {
             scale: (scale.x, scale.y),
             anchor: (anchor.x, anchor.y),
             opacity: tr.opacity.resolve(ctx),
+            blend: node.blend,
             fill: node.fill.as_ref().map(|f| {
                 let c = f.resolve(ctx);
                 [c.r as f32, c.g as f32, c.b as f32]
@@ -347,6 +351,7 @@ pub(crate) struct PropEdits {
     pub(crate) scale_x: Option<f64>,
     pub(crate) scale_y: Option<f64>,
     pub(crate) opacity: Option<f64>,
+    pub(crate) blend: Option<MBlendMode>,
     pub(crate) fill: Option<[f32; 3]>,
     pub(crate) size_x: Option<f64>,
     pub(crate) size_y: Option<f64>,
@@ -719,6 +724,22 @@ pub(crate) fn properties_ui(
         if key_button(ui, n.opacity_anim) {
             edits.key.insert(PropKind::Opacity);
         }
+        ui.end_row();
+
+        // Plain data, not a `Value`: a blend mode is a choice from a fixed set
+        // with no in-between, so it has no stopwatch — the same reason a text
+        // layer's alignment doesn't.
+        ui.label("Blend");
+        egui::ComboBox::from_id_salt("blend_mode")
+            .width(150.0)
+            .selected_text(n.blend.label())
+            .show_ui(ui, |ui| {
+                for mode in MBlendMode::ALL {
+                    if ui.selectable_label(n.blend == mode, mode.label()).clicked() {
+                        edits.blend = Some(mode);
+                    }
+                }
+            });
         ui.end_row();
 
         ui.label("Fill");

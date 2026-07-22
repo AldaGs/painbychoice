@@ -10,6 +10,7 @@
 //! must be testable by rendering a frame in a `cargo test`, not a window.
 
 pub mod asset;
+pub mod composite;
 pub mod demo;
 pub mod eval;
 pub mod expr;
@@ -27,7 +28,8 @@ pub use asset::{
     Asset, AssetId, AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, FrameStream,
     ImagePaint,
 };
-pub use eval::{evaluate, evaluate_comp, evaluate_project, RenderItem, Scene};
+pub use composite::BlendMode;
+pub use eval::{evaluate, evaluate_comp, evaluate_project, LayerGroup, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
     MathOp, UnOp,

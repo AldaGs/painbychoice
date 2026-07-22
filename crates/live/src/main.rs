@@ -25,6 +25,7 @@ use motion_core::{
     mirror_handle, EasePreset, ExprValue, Handle, Interp, Keyframe, Track, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
     MathOp, Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
+    BlendMode as MBlendMode, LayerGroup,
     compile_modules, lower_geometry, lower_output, Binding, Edge, Endpoint, GraphCtx, GraphNode, GraphNodeId, NodeCategory,
     NodeDescriptor, NodeGraph, NodeRegistry, ShapeBinding, SocketType, TextConfig,
 };

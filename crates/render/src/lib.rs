@@ -10,7 +10,7 @@ pub mod decode;
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
 
 use kurbo::Shape as _;
-use motion_core::{Asset, Color, Scene};
+use motion_core::{Asset, BlendMode, Color, Scene};
 
 /// Serialize an evaluated scene to an SVG string sized to the composition.
 ///
@@ -33,7 +33,26 @@ pub fn scene_to_svg(
         css_rgba(background)
     ));
 
-    for item in &scene.items {
+    // Isolated layers become nested `<g>`s carrying `mix-blend-mode`, which is
+    // SVG's own name for the same operation — so the offline render agrees
+    // with the GPU one instead of quietly dropping every blend mode. The
+    // nesting order comes from `Scene` itself, so both backends open groups
+    // the same way by construction.
+    let groups = scene.nesting_order();
+    let mut next_group = 0usize;
+    let mut open: Vec<usize> = Vec::new();
+
+    for (i, item) in scene.items.iter().enumerate() {
+        while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
+            out.push_str(&format!(
+                "  <g style=\"mix-blend-mode:{}\" opacity=\"{:.3}\">\n",
+                css_blend(g.blend),
+                g.alpha.clamp(0.0, 1.0)
+            ));
+            open.push(g.end);
+            next_group += 1;
+        }
+
         // kurbo emits SVG path data directly; we push the node transform as an
         // SVG matrix so the geometry stays in local coordinates.
         let d = item.path.to_svg();
@@ -65,15 +84,18 @@ pub fn scene_to_svg(
         // Only the *first* frame of a clip is addressable this way, so this is
         // honest for stills and approximate for video — an SVG has no notion of
         // a source frame. The GPU backend is where video actually plays.
-        if let Some(paint) = item.image {
-            let href = assets
+        //
+        // A missing `href` is footage the project no longer has. `evaluate`
+        // already warned; fall through and draw the plain rectangle so the
+        // layer's place on screen is still visible.
+        let footage_href = item.image.and_then(|paint| {
+            assets
                 .iter()
                 .find(|a| a.id == paint.asset)
-                .map(|a| a.path.to_string_lossy().replace('&', "&amp;"));
-            // A `None` here is footage the project no longer has. `evaluate`
-            // already warned; fall through and draw the plain rectangle so the
-            // layer's place on screen is still visible.
-            if let Some(href) = href {
+                .map(|a| a.path.to_string_lossy().replace('&', "&amp;"))
+        });
+        match footage_href {
+            Some(href) => {
                 let b = item.path.bounding_box();
                 out.push_str(&format!(
                     "  <image transform=\"{matrix}\" x=\"{}\" y=\"{}\" width=\"{}\" \
@@ -85,17 +107,51 @@ pub fn scene_to_svg(
                     b.height(),
                     item.opacity.clamp(0.0, 1.0),
                 ));
-                continue;
             }
+            None => out.push_str(&format!(
+                "  <path transform=\"{matrix}\" d=\"{d}\" fill=\"{fill}\"{stroke}/>\n"
+            )),
         }
 
-        out.push_str(&format!(
-            "  <path transform=\"{matrix}\" d=\"{d}\" fill=\"{fill}\"{stroke}/>\n"
-        ));
+        // Close every layer that ended with this item, innermost first. This
+        // has to run for *every* item, which is why drawing footage is an arm
+        // above rather than an early `continue`.
+        while open.last() == Some(&(i + 1)) {
+            out.push_str("  </g>\n");
+            open.pop();
+        }
+    }
+    for _ in 0..open.len() {
+        out.push_str("  </g>\n");
     }
 
     out.push_str("</svg>\n");
     out
+}
+
+/// The CSS keyword for a blend mode.
+///
+/// A straight rename: `BlendMode` is deliberately the standard sixteen that CSS
+/// and SVG already define, so nothing is approximated here.
+fn css_blend(mode: BlendMode) -> &'static str {
+    match mode {
+        BlendMode::Normal => "normal",
+        BlendMode::Multiply => "multiply",
+        BlendMode::Screen => "screen",
+        BlendMode::Overlay => "overlay",
+        BlendMode::Darken => "darken",
+        BlendMode::Lighten => "lighten",
+        BlendMode::ColorDodge => "color-dodge",
+        BlendMode::ColorBurn => "color-burn",
+        BlendMode::HardLight => "hard-light",
+        BlendMode::SoftLight => "soft-light",
+        BlendMode::Difference => "difference",
+        BlendMode::Exclusion => "exclusion",
+        BlendMode::Hue => "hue",
+        BlendMode::Saturation => "saturation",
+        BlendMode::Color => "color",
+        BlendMode::Luminosity => "luminosity",
+    }
 }
 
 fn with_alpha(mut c: Color, mul: f64) -> Color {
@@ -112,4 +168,58 @@ fn css_rgba(c: Color) -> String {
         to255(c.b),
         c.a.clamp(0.0, 1.0)
     )
+}
+
+#[cfg(test)]
+mod svg_tests {
+    use super::*;
+    use motion_core::{Comp, Node, Shape, Value};
+
+    fn blended(id: u64, blend: BlendMode) -> Node {
+        let mut n = Node::group(id, format!("n{id}"));
+        n.shape = Some(Shape::Rect {
+            size: Value::constant(kurbo::Vec2::new(10.0, 10.0)),
+            radius: Value::constant(0.0),
+        });
+        n.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        n.blend = blend;
+        n
+    }
+
+    fn render(root: Node) -> String {
+        let comp = Comp::new(100.0, 100.0, root);
+        scene_to_svg(&motion_core::evaluate(&comp, 0.0), 100.0, 100.0, Color::rgb(0.0, 0.0, 0.0), &[])
+    }
+
+    /// A blend mode reaches the offline render too. Dropping it here would make
+    /// the exported frame quietly disagree with the preview — the worst kind of
+    /// rendering bug, because nothing reports it.
+    #[test]
+    fn a_blend_mode_survives_into_the_svg() {
+        let svg = render(Node::group(0, "root").with_child(blended(1, BlendMode::Multiply)));
+        assert!(svg.contains("mix-blend-mode:multiply"), "{svg}");
+    }
+
+    /// Every `<g>` opened is closed. Unbalanced tags are not a rendering
+    /// artefact but a broken file, and nothing in the pipeline would catch it.
+    #[test]
+    fn nested_groups_are_balanced() {
+        let mut outer = blended(1, BlendMode::Multiply);
+        outer.children.push(blended(2, BlendMode::Screen));
+        let svg = render(Node::group(0, "root").with_child(outer));
+
+        assert_eq!(svg.matches("<g ").count(), 2);
+        assert_eq!(svg.matches("</g>").count(), 2);
+        // And the inner one opens after the outer one.
+        let outer_at = svg.find("mix-blend-mode:multiply").unwrap();
+        let inner_at = svg.find("mix-blend-mode:screen").unwrap();
+        assert!(outer_at < inner_at);
+    }
+
+    /// The ordinary document gains no wrapper at all.
+    #[test]
+    fn an_unblended_document_emits_no_groups() {
+        let svg = render(Node::group(0, "root").with_child(blended(1, BlendMode::Normal)));
+        assert!(!svg.contains("<g "), "{svg}");
+    }
 }

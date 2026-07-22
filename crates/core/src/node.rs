@@ -6,6 +6,7 @@ use kurbo::{BezPath, Rect, RoundedRect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::asset::{Asset, AssetId, ImagePaint};
+use crate::composite::BlendMode;
 use crate::expr::EvalCtx;
 use crate::text::TextAlign;
 use crate::value::{Color, Value};
@@ -475,6 +476,20 @@ pub struct Node {
     /// model came first.
     #[serde(default)]
     pub precomp: Option<CompId>,
+    /// How this layer combines with what is behind it.
+    ///
+    /// Anything but [`BlendMode::Normal`] makes the layer **isolated**: its
+    /// subtree is composited into an image of its own and that image is blended
+    /// into the frame. `#[serde(default)]` is the whole migration — every `.pbc`
+    /// written before compositing existed loads as `Normal` and renders exactly
+    /// as it did.
+    ///
+    /// A blend mode applies to the layer **and its children**, because that is
+    /// what "isolated" means and what makes a group with a blend mode useful:
+    /// the group's contents resolve amongst themselves first, then the result
+    /// meets the backdrop once.
+    #[serde(default)]
+    pub blend: BlendMode,
     pub children: Vec<Node>,
 }
 
@@ -490,6 +505,7 @@ impl Node {
             params: Vec::new(),
             timing: None,
             precomp: None,
+            blend: BlendMode::default(),
             children: Vec::new(),
         }
     }
@@ -505,6 +521,7 @@ impl Node {
             params: Vec::new(),
             timing: None,
             precomp: None,
+            blend: BlendMode::default(),
             children: Vec::new(),
         }
     }

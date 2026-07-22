@@ -4088,3 +4088,119 @@ fn loading_another_project_drops_the_cached_frames() {
     assert_eq!(cache.resident_bytes(), 0);
     assert!(cache.image(&asset, at(&asset, 0)).is_none(), "nothing survives the swap");
 }
+
+// ---------------------------------------------------------------------------
+// Compositing: isolated layers and blend modes.
+// ---------------------------------------------------------------------------
+
+fn blended_box(id: u64, x: f64, blend: MBlendMode) -> MNode {
+    let mut n = MNode::shape(
+        id,
+        format!("box{id}"),
+        MShape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::constant(0.0),
+        },
+    )
+    .with_fill(MColor::rgb(1.0, 1.0, 1.0));
+    n.transform.position = Value::constant(Vec2::new(x, 0.0));
+    n.blend = blend;
+    n
+}
+
+/// Replay the draw loop's push/pop discipline over a scene's groups and return
+/// the event sequence, so the nesting can be checked without a GPU.
+///
+/// Mirrors `to_vello` exactly: open every group starting at this item, draw,
+/// then close every group ending after it.
+fn composite_events(scene: &MScene) -> Vec<String> {
+    let groups = scene.nesting_order();
+    let mut next = 0;
+    let mut open: Vec<usize> = Vec::new();
+    let mut events = Vec::new();
+    for i in 0..scene.items.len() {
+        while let Some(g) = groups.get(next).filter(|g| g.start == i) {
+            events.push(format!("push{}", g.source.0));
+            open.push(g.end);
+            next += 1;
+        }
+        events.push(format!("draw{}", scene.items[i].source.0));
+        while open.last() == Some(&(i + 1)) {
+            events.push("pop".into());
+            open.pop();
+        }
+    }
+    assert!(open.is_empty(), "every layer opened must be closed");
+    events
+}
+
+/// Nested blend modes open outermost-first and close innermost-first.
+///
+/// `walk` emits groups in post-order (a child's range is known first), which is
+/// the reverse of the order they must be opened in — so this pins the sort that
+/// undoes that. Getting it wrong would corrupt everything drawn afterwards.
+#[test]
+fn nested_isolated_layers_open_outermost_first_and_balance() {
+    let mut outer = blended_box(1, 0.0, MBlendMode::Multiply);
+    outer.children.push(blended_box(2, 10.0, MBlendMode::Screen));
+    let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(outer));
+    let scene = motion_core::evaluate(&comp, 0.0);
+
+    assert_eq!(
+        composite_events(&scene),
+        vec!["push1", "draw1", "push2", "draw2", "pop", "pop"],
+        "the outer layer wraps the inner one"
+    );
+}
+
+/// Two blended siblings each get their own layer, opened and closed in turn
+/// rather than nested — they are peers, not parent and child.
+#[test]
+fn sibling_isolated_layers_do_not_nest() {
+    let comp = Comp::new(
+        100.0,
+        100.0,
+        MNode::group(0, "root")
+            .with_child(blended_box(1, 0.0, MBlendMode::Multiply))
+            .with_child(blended_box(2, 40.0, MBlendMode::Screen)),
+    );
+    let scene = motion_core::evaluate(&comp, 0.0);
+
+    assert_eq!(
+        composite_events(&scene),
+        vec!["push1", "draw1", "pop", "push2", "draw2", "pop"]
+    );
+}
+
+/// A layer with no blend mode draws straight into the frame — no layer pushed,
+/// so no offscreen target. This is what keeps existing documents free.
+#[test]
+fn an_unblended_layer_costs_no_offscreen_target() {
+    let comp = Comp::new(
+        100.0,
+        100.0,
+        MNode::group(0, "root").with_child(blended_box(1, 0.0, MBlendMode::Normal)),
+    );
+    let scene = motion_core::evaluate(&comp, 0.0);
+    assert_eq!(composite_events(&scene), vec!["draw1"]);
+}
+
+/// The clip an isolated layer opens with covers its stroke, not just its fill.
+///
+/// A stroke straddles the path it follows, so a clip tight to the geometry
+/// would shave off the outer half of every outlined shape in the group.
+#[test]
+fn a_groups_clip_bounds_include_the_stroke_width() {
+    let mut n = blended_box(1, 0.0, MBlendMode::Multiply);
+    n.stroke = Some(motion_core::Stroke {
+        color: Value::constant(MColor::rgb(0.0, 0.0, 0.0)),
+        width: Value::constant(8.0),
+    });
+    let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(n));
+    let scene = motion_core::evaluate(&comp, 0.0);
+
+    let bounds = crate::scene::group_bounds(&scene, &scene.groups[0]);
+    // A 10×10 box with an 8-wide stroke reaches 4 beyond each edge.
+    assert_eq!(bounds.width(), 18.0);
+    assert_eq!(bounds.height(), 18.0);
+}

@@ -5,6 +5,7 @@
 use kurbo::{Affine, BezPath, Shape as _};
 
 use crate::asset::ImagePaint;
+use crate::composite::BlendMode;
 use crate::expr::EvalCtx;
 use crate::node::{CompId, Document, Node, NodeId, Project};
 use crate::value::Color;
@@ -50,6 +51,60 @@ pub struct Scene {
     /// returns before reaching them, which is exactly the "layer isn't here on
     /// this frame" signal a motion path breaks its polyline on.
     pub places: Vec<(NodeId, Placement)>,
+    /// Layers that must be composited **in isolation** — rendered into an image
+    /// of their own, then combined with the backdrop as a unit.
+    ///
+    /// Expressed as index ranges into [`Scene::items`] rather than by nesting
+    /// the draw list, because `walk` is depth-first and so a node's subtree is
+    /// already contiguous. That keeps `items` a flat list in draw order, which
+    /// is what picking, the gizmo, onion skins and the SVG backend all read —
+    /// none of them had to change to gain compositing.
+    ///
+    /// Ranges nest but never partially overlap (they are a tree flattened), so
+    /// a backend can walk them with a stack. Empty for a document that uses no
+    /// blend modes, which is the ordinary case and costs nothing.
+    pub groups: Vec<LayerGroup>,
+}
+
+impl Scene {
+    /// Isolated layers in the order a renderer must **open** them: outermost
+    /// first.
+    ///
+    /// [`walk`] emits groups in post-order — a child's range is known before
+    /// its parent's, so it is pushed first — which is the reverse of the order
+    /// they have to be opened in. Sorting by start ascending, and by length
+    /// descending where two share a start, restores the nesting: an enclosing
+    /// range always sorts before the one it contains.
+    ///
+    /// Lives here rather than in a backend because it is a property of how a
+    /// `Scene` is laid out, and every renderer that supports isolation needs
+    /// the same answer. An unbalanced or interleaved sequence would corrupt
+    /// everything drawn after it, so there is one definition to get right.
+    pub fn nesting_order(&self) -> Vec<&LayerGroup> {
+        let mut groups: Vec<&LayerGroup> = self.groups.iter().collect();
+        groups.sort_by_key(|g| (g.start, std::cmp::Reverse(g.end)));
+        groups
+    }
+}
+
+/// One isolated layer: which items belong to it, and how the result combines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerGroup {
+    pub source: NodeId,
+    /// Half-open range into [`Scene::items`]. May be empty, in which case
+    /// there is nothing to composite — `walk` skips emitting those.
+    pub start: usize,
+    pub end: usize,
+    pub blend: BlendMode,
+    /// The layer's own opacity, applied **once to the composited result**
+    /// rather than to each item.
+    ///
+    /// That distinction is the whole reason isolation is visible to the user:
+    /// two overlapping shapes in a 50% group show through each other when
+    /// their opacities multiply individually, and don't when the group is
+    /// composited first and faded as a unit. The second is what every
+    /// compositing tool does, and what a blend mode requires anyway.
+    pub alpha: f64,
 }
 
 /// Where one node sits in composition space on this frame.
@@ -194,7 +249,15 @@ fn walk(
     let prev_node = ctx.enter_node(node.id);
     let (local_xf, local_opacity) = node.transform.resolve(ctx);
     let xf = parent_xf * local_xf;
-    let opacity = parent_opacity * local_opacity.clamp(0.0, 1.0);
+    // An isolated layer's opacity belongs to the *group*, applied once to the
+    // finished image, so the subtree below it draws at full strength and the
+    // fade happens on the way out. `full` is what accumulated down to here;
+    // since entering an isolated layer resets the running value to 1.0, an
+    // isolated layer nested inside another can't double-count its ancestors.
+    let isolated = node.blend.needs_isolation();
+    let full = parent_opacity * local_opacity.clamp(0.0, 1.0);
+    let opacity = if isolated { 1.0 } else { full };
+    let group_at = scene.items.len();
 
     // Recorded for every node, drawable or not — see `Scene::places`. `bounds`
     // can't be known yet (a group's extent is its children's), so the slot is
@@ -284,6 +347,20 @@ fn walk(
     }
     scene.places[place_at].1.bounds = bounds;
 
+    // Emitted *after* the children, because only now is the subtree's extent in
+    // `items` known — which is exactly what makes the range representation
+    // work. Skipped when the subtree drew nothing: an isolated layer with no
+    // pixels would cost a backend an offscreen target to composite nothing.
+    if isolated && scene.items.len() > group_at {
+        scene.groups.push(LayerGroup {
+            source: node.id,
+            start: group_at,
+            end: scene.items.len(),
+            blend: node.blend,
+            alpha: full,
+        });
+    }
+
     ctx.frame = prev_frame;
     ctx.timing = prev_timing;
     bounds
@@ -296,6 +373,132 @@ mod tests {
     use crate::node::{Node, Shape, Transform};
     use crate::value::{Keyframe, Track, Value};
     use kurbo::Vec2;
+
+    fn box_at(id: u64, x: f64) -> Node {
+        let mut n = Node::group(id, format!("box{id}"));
+        n.shape = Some(Shape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::constant(0.0),
+        });
+        n.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        n.transform.position = Value::constant(Vec2::new(x, 0.0));
+        n
+    }
+
+    /// The ordinary document pays nothing. No blend modes means no groups,
+    /// which means no backend ever allocates an offscreen target — and it is
+    /// why every `.pbc` written before compositing renders exactly as it did.
+    #[test]
+    fn a_document_without_blend_modes_has_no_groups() {
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(box_at(1, 10.0)).with_child(box_at(2, 20.0)),
+        );
+        let scene = evaluate(&doc, 0.0);
+        assert_eq!(scene.items.len(), 2);
+        assert!(scene.groups.is_empty(), "Normal costs nothing");
+    }
+
+    /// A blended layer's group covers **its own item and its whole subtree** —
+    /// the property the range representation rests on, which holds because the
+    /// walk is depth-first and so a subtree is contiguous in `items`.
+    #[test]
+    fn a_blended_layers_group_spans_its_whole_subtree() {
+        let mut parent = box_at(1, 0.0);
+        parent.blend = BlendMode::Multiply;
+        parent.children.push(box_at(2, 10.0));
+        parent.children.push(box_at(3, 20.0));
+        let doc = Document::new(
+            100.0,
+            100.0,
+            Node::group(0, "root").with_child(box_at(9, 90.0)).with_child(parent),
+        );
+
+        let scene = evaluate(&doc, 0.0);
+        assert_eq!(scene.items.len(), 4, "the untouched sibling plus the trio");
+        let g = scene.groups.first().expect("the blended layer is isolated");
+        assert_eq!(g.source, NodeId(1));
+        assert_eq!(g.blend, BlendMode::Multiply);
+        // The sibling drew first and is outside; the parent and both children
+        // are inside, contiguously.
+        assert_eq!((g.start, g.end), (1, 4));
+        for item in &scene.items[g.start..g.end] {
+            assert!(matches!(item.source, NodeId(1) | NodeId(2) | NodeId(3)));
+        }
+    }
+
+    /// An isolated layer's opacity moves to the group and off the items.
+    ///
+    /// This is the visible difference between isolating and not: faded as a
+    /// unit, overlapping children don't show through each other. Getting it
+    /// wrong would double-apply the fade — once per item and again on the
+    /// composite.
+    #[test]
+    fn isolation_moves_opacity_from_the_items_to_the_group() {
+        let mut parent = box_at(1, 0.0);
+        parent.blend = BlendMode::Screen;
+        parent.transform.opacity = Value::constant(0.5);
+        parent.children.push(box_at(2, 10.0));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(parent));
+
+        let scene = evaluate(&doc, 0.0);
+        let g = scene.groups.first().expect("isolated");
+        assert_eq!(g.alpha, 0.5, "the fade rides on the composite");
+        for item in &scene.items {
+            assert_eq!(item.opacity, 1.0, "and not on the items as well");
+        }
+    }
+
+    /// Ancestor opacity still reaches an isolated layer — it folds into the
+    /// group's alpha rather than being dropped.
+    #[test]
+    fn an_isolated_layers_group_carries_its_ancestors_fade_too() {
+        let mut parent = box_at(1, 0.0);
+        parent.blend = BlendMode::Multiply;
+        parent.transform.opacity = Value::constant(0.5);
+        let mut outer = Node::group(7, "outer");
+        outer.transform.opacity = Value::constant(0.5);
+        outer.children.push(parent);
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(outer));
+
+        let scene = evaluate(&doc, 0.0);
+        assert_eq!(scene.groups[0].alpha, 0.25, "0.5 above times 0.5 of its own");
+    }
+
+    /// Nested isolated layers don't double-count: entering one resets the
+    /// running opacity, so the inner group's alpha is its own share only and
+    /// the outer group applies the rest to the finished image.
+    #[test]
+    fn nested_isolated_layers_each_apply_their_own_share_once() {
+        let mut inner = box_at(2, 10.0);
+        inner.blend = BlendMode::Screen;
+        inner.transform.opacity = Value::constant(0.5);
+        let mut outer = box_at(1, 0.0);
+        outer.blend = BlendMode::Multiply;
+        outer.transform.opacity = Value::constant(0.5);
+        outer.children.push(inner);
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(outer));
+
+        let scene = evaluate(&doc, 0.0);
+        let inner_g = scene.groups.iter().find(|g| g.source == NodeId(2)).expect("inner");
+        let outer_g = scene.groups.iter().find(|g| g.source == NodeId(1)).expect("outer");
+        assert_eq!(inner_g.alpha, 0.5, "its own share, not 0.25");
+        assert_eq!(outer_g.alpha, 0.5);
+        // Ranges nest rather than partially overlap — what lets a backend walk
+        // them with a plain stack.
+        assert!(outer_g.start <= inner_g.start && inner_g.end <= outer_g.end);
+    }
+
+    /// A layer that draws nothing gets no group. An offscreen target to
+    /// composite zero pixels is pure cost.
+    #[test]
+    fn an_empty_isolated_layer_emits_no_group() {
+        let mut empty = Node::group(1, "empty");
+        empty.blend = BlendMode::Multiply;
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(empty));
+        assert!(evaluate(&doc, 0.0).groups.is_empty());
+    }
 
     /// Footage is a rectangle that names some pixels: it produces an ordinary
     /// render item with a path, so every overlay and hit-test in the editor
