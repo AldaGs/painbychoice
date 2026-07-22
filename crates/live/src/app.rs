@@ -834,6 +834,13 @@ impl App {
                     n.pos = pos;
                 }
             }
+            NgOp::MoveBy { ids, delta } => {
+                for id in ids {
+                    if let Some(n) = graph.node_mut(id) {
+                        n.pos += delta;
+                    }
+                }
+            }
             NgOp::Remove { id } => {
                 graph.remove_node(id);
             }

@@ -122,7 +122,6 @@ const CFG_TOP_GAP: f32 = 6.0;
 const DOT_R: f32 = 5.0;
 /// How close the pointer must land to a socket to hit it on drop.
 const DOT_HIT: f32 = 9.0;
-const MARGIN: f32 = 16.0;
 
 /// One deferred node-graph edit. At most one per frame, like `GraphOp` and the
 /// dock's `DockCmd`, so `App` mutates the model after the UI pass.
@@ -131,6 +130,10 @@ pub(crate) enum NgOp {
     Add { kind: String, pos: Vec2 },
     /// Move a node to a new position (a drag delta already applied).
     Move { id: GraphNodeId, pos: Vec2 },
+    /// Shift several nodes by one delta — a group drag of the marquee selection.
+    /// One op, so moving a whole selection still fits the one-edit-per-frame
+    /// contract every other structural edit follows.
+    MoveBy { ids: Vec<GraphNodeId>, delta: Vec2 },
     /// Remove a node and its wires.
     Remove { id: GraphNodeId },
     /// Wire an output to an input. Validated by the model against the registry,
@@ -289,7 +292,7 @@ fn node_height(node: &GraphNode, desc: Option<&NodeDescriptor>) -> f32 {
 /// An **upper bound** on the height a node's in-box config editors take, below
 /// its socket rows. Only a bound: the box is painted to the *measured* height of
 /// what the editors actually draw (see [`draw_node`]), so a generous estimate
-/// here just leaves the scroll area a little roomier and never clips a node.
+/// here just leaves the node's box a little roomier and never clips its config.
 fn config_height(node: &GraphNode, desc: Option<&NodeDescriptor>) -> f32 {
     let lines = config_lines(node, desc);
     if lines == 0 { 0.0 } else { CFG_TOP_GAP + lines as f32 * CFG_LINE }
@@ -348,7 +351,7 @@ pub(crate) enum NgScope {
 }
 
 /// The panel. A scope bar, then (in module scope) the module header, then the
-/// graph on a scrollable canvas. There is no side inspector: every node carries
+/// graph on a pan/zoom canvas. There is no side inspector: every node carries
 /// its own properties — socket literals *and* non-socket config alike — on the
 /// box itself (see [`node_editors`]), so selecting a node is only a highlight.
 ///
@@ -376,6 +379,20 @@ pub(crate) fn nodegraph_ui(
         ui.heading("Nodes");
         ui.weak(format!("{} nodes", graph.nodes.len()));
         palette_menu(ui, graph, ctx.reg, out);
+        // Navigation: zoom the canvas in/out, or frame the whole graph. Drag the
+        // empty canvas with the middle mouse (or scroll) to pan; a left-drag
+        // there rubber-bands a selection.
+        ui.separator();
+        if icon::button(ui, icon::ZOOM_OUT, "Zoom out").clicked() {
+            zoom_scene(ui.ctx(), scope, 1.25);
+        }
+        if icon::button(ui, icon::ZOOM_IN, "Zoom in").clicked() {
+            zoom_scene(ui.ctx(), scope, 0.8);
+        }
+        if icon::button(ui, icon::ZOOM_FIT, "Frame all nodes").clicked() {
+            // A zero rect makes `Scene` re-fit to the graph's own bounds.
+            write_scene_rect(ui.ctx(), scope, egui::Rect::ZERO);
+        }
     });
     ui.separator();
     match scope {
@@ -400,9 +417,7 @@ pub(crate) fn nodegraph_ui(
     if graph.nodes.is_empty() {
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
     }
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        canvas(ui, graph, ctx, layers, modules, script_preview, out);
-    });
+    canvas(ui, graph, ctx, scope, layers, modules, script_preview, out);
 }
 
 /// Which graph node is selected for the inspector — ephemeral view state, so it
@@ -1044,41 +1059,216 @@ fn palette_menu(ui: &mut egui::Ui, graph: &NodeGraph, reg: &NodeRegistry, out: &
     });
 }
 
-/// Lay the graph out and interact with it. Node positions come from the model
-/// (they're saved), so a drag emits a `Move` op and — for the frame in hand —
-/// the delta is applied locally so the box tracks the pointer without a lag.
+// ── Canvas navigation: pan, zoom, and multi-selection view state. ────────────
+//
+// The graph rides inside an [`egui::containers::Scene`] — egui's pan/zoom
+// container. It draws its contents in a transformed layer, so the node boxes and
+// the real egui widgets on them (a `value`'s field, a combo) pan and scale as
+// one, with pointer input mapped back for interaction. `Scene` owns a
+// `scene_rect` — the slice of graph space the view shows — which we persist in
+// egui memory, keyed by scope so the project graph and a module's body keep
+// independent views.
+
+/// The memory id holding a scope's `scene_rect` — the view rectangle `Scene`
+/// pans and zooms. Per scope, so entering a module doesn't inherit the project
+/// graph's framing.
+fn scene_rect_id(scope: NgScope) -> egui::Id {
+    match scope {
+        NgScope::Project => egui::Id::new("ng_scene_rect_project"),
+        NgScope::Module(m) => egui::Id::new(("ng_scene_rect_mod", m.0)),
+    }
+}
+
+fn read_scene_rect(ctx: &egui::Context, scope: NgScope) -> egui::Rect {
+    ctx.data(|d| d.get_temp(scene_rect_id(scope))).unwrap_or(egui::Rect::ZERO)
+}
+
+fn write_scene_rect(ctx: &egui::Context, scope: NgScope, rect: egui::Rect) {
+    ctx.data_mut(|d| d.insert_temp(scene_rect_id(scope), rect));
+}
+
+/// Scale the view about its centre — the toolbar's zoom buttons. `factor < 1`
+/// shrinks the shown rectangle (zoom **in**); `> 1` grows it (zoom **out**). A
+/// zero rect is the uninitialised state `Scene` re-fits from, so it's left be.
+fn zoom_scene(ctx: &egui::Context, scope: NgScope, factor: f32) {
+    let r = read_scene_rect(ctx, scope);
+    if r.size() == egui::Vec2::ZERO {
+        return;
+    }
+    write_scene_rect(ctx, scope, egui::Rect::from_center_size(r.center(), r.size() * factor));
+}
+
+/// The marquee/multi-selection set — every node the box-select or a click chose.
+/// Drives the highlight and group drag. Kept beside the single primary selection
+/// ([`read_selection`]), which the script preview and other one-node paths read.
+fn read_selset(ctx: &egui::Context) -> std::collections::HashSet<GraphNodeId> {
+    ctx.data(|d| d.get_temp(egui::Id::new("ng_selset"))).unwrap_or_default()
+}
+
+fn write_selset(ctx: &egui::Context, sel: std::collections::HashSet<GraphNodeId>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ng_selset"), sel));
+}
+
+/// Every node whose box intersects `sel` (graph coordinates) — what a marquee
+/// drag selects. A free function so the geometry is unit-testable without a
+/// window.
+pub(crate) fn nodes_in_rect(graph: &NodeGraph, ctx: &GraphCtx, sel: egui::Rect) -> Vec<GraphNodeId> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            let h = node_height(n, ctx.descriptor_for(n).as_deref());
+            let r = egui::Rect::from_min_size(
+                egui::pos2(n.pos.x as f32, n.pos.y as f32),
+                egui::vec2(NODE_W, h),
+            );
+            sel.intersects(r)
+        })
+        .map(|n| n.id)
+        .collect()
+}
+
+/// The pan/zoom host. Wraps [`draw_graph`] in a [`Scene`], then resolves a
+/// marquee drag against the background the scene reports.
+///
+/// [`Scene`]: egui::containers::Scene
 #[allow(clippy::too_many_arguments)]
 fn canvas(
+    ui: &mut egui::Ui,
+    graph: &NodeGraph,
+    ctx: &GraphCtx,
+    scope: NgScope,
+    layers: &[LayerInfo],
+    modules: &[(ModuleId, String)],
+    script_preview: Option<&(GraphNodeId, Result<String, String>)>,
+    out: &mut NgEdits,
+) {
+    let mut scene_rect = read_scene_rect(ui.ctx(), scope);
+    let mut selset = read_selset(ui.ctx());
+
+    // Middle-drag (and scroll) pans; pinch / ctrl-scroll zooms. Left-drag is left
+    // free — a node header claims it to move, and the empty background reports it
+    // for the marquee below.
+    let scene = egui::containers::Scene::new()
+        .zoom_range(egui::Rangef::new(0.2, 2.0))
+        // Room for a large graph; the boxes are placed by explicit rects, so this
+        // only bounds the inner ui's nominal size, not where nodes may sit.
+        .max_inner_size(egui::Vec2::splat(100_000.0))
+        .drag_pan_buttons(egui::containers::DragPanButtons::MIDDLE);
+
+    let response = scene.show(ui, &mut scene_rect, |ui| {
+        draw_graph(ui, graph, ctx, layers, modules, script_preview, &mut selset, out)
+    });
+    let scene_layer = response.inner;
+
+    marquee(ui, &response.response, scene_layer, graph, ctx, &mut selset);
+
+    write_selset(ui.ctx(), selset);
+    write_scene_rect(ui.ctx(), scope, scene_rect);
+}
+
+/// Resolve a **marquee**: a left-drag that began on the empty canvas (a node
+/// header claims its own press, so the scene background only ever reports the
+/// empty-space drags). Draws the rubber band and, on release, selects every node
+/// it covers. A plain click on the background clears the selection.
+///
+/// `pan` is the scene's background response; its layer carries the view
+/// transform, so we map the global pointer into graph space with it rather than
+/// trusting a single coordinate space.
+fn marquee(
+    ui: &mut egui::Ui,
+    pan: &egui::Response,
+    scene_layer: egui::LayerId,
+    graph: &NodeGraph,
+    ctx: &GraphCtx,
+    selset: &mut std::collections::HashSet<GraphNodeId>,
+) {
+    let to_global =
+        ui.ctx().layer_transform_to_global(scene_layer).unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let from_global = to_global.inverse();
+    let ptr_scene = ui.input(|i| i.pointer.interact_pos()).map(|p| from_global.mul_pos(p));
+    let shift = ui.input(|i| i.modifiers.shift);
+
+    let mid = egui::Id::new("ng_marquee");
+    let mut anchor: Option<egui::Pos2> = ui.data(|d| d.get_temp(mid)).flatten();
+
+    // A background click (not on any node) drops the selection.
+    if pan.clicked() && !shift {
+        selset.clear();
+        write_selection(ui.ctx(), None);
+    }
+    if pan.drag_started_by(egui::PointerButton::Primary) {
+        anchor = ptr_scene;
+    }
+    if pan.dragged_by(egui::PointerButton::Primary) {
+        if let (Some(a), Some(c)) = (anchor, ptr_scene) {
+            // Painted in graph space *inside* the scene layer so it pans/zooms
+            // with the nodes; mapped to global for the parent-layer painter.
+            let r = egui::Rect::from_two_pos(to_global.mul_pos(a), to_global.mul_pos(c));
+            ui.painter().rect(
+                r,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(90, 140, 220, 40),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(130, 175, 240)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    if pan.drag_stopped_by(egui::PointerButton::Primary) {
+        if let (Some(a), Some(c)) = (anchor.take(), ptr_scene) {
+            let sel = egui::Rect::from_two_pos(a, c);
+            if !shift {
+                selset.clear();
+            }
+            for id in nodes_in_rect(graph, ctx, sel) {
+                selset.insert(id);
+            }
+            // Primary selection follows the box — the first node in it, so the
+            // script preview and other one-node reads still have a target.
+            write_selection(ui.ctx(), selset.iter().next().copied());
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(mid, anchor));
+}
+
+/// Lay the graph out and interact with it, in **graph coordinates** (the `Scene`
+/// layer maps them to the screen). Node positions come from the model (they're
+/// saved), so a drag emits a `Move` — or a `MoveBy` for a whole selection — and,
+/// for the frame in hand, the delta is applied locally so the box tracks the
+/// pointer without a lag. Returns the layer it drew into, so the caller can map
+/// the pointer for the marquee.
+#[allow(clippy::too_many_arguments)]
+fn draw_graph(
     ui: &mut egui::Ui,
     graph: &NodeGraph,
     ctx: &GraphCtx,
     layers: &[LayerInfo],
     modules: &[(ModuleId, String)],
     script_preview: Option<&(GraphNodeId, Result<String, String>)>,
+    selset: &mut std::collections::HashSet<GraphNodeId>,
     out: &mut NgEdits,
-) {
-    // Content extent covers every node so the scroll area can reach them.
-    let mut extent = egui::vec2(NODE_W, ROW_H);
-    for n in &graph.nodes {
-        let h = node_height(n, ctx.descriptor_for(n).as_deref());
-        extent.x = extent.x.max(n.pos.x as f32 + NODE_W);
-        extent.y = extent.y.max(n.pos.y as f32 + h);
-    }
-    let (area, _) =
-        ui.allocate_exact_size(extent + egui::vec2(MARGIN, MARGIN), egui::Sense::hover());
-    let origin = area.min;
-    let selected = read_selection(ui.ctx());
+) -> egui::LayerId {
+    // Graph space is the model's own space now — no screen origin to add, since
+    // the scene layer's transform places and scales everything.
+    let origin = egui::Pos2::ZERO;
 
-    // Pending wire (an in-flight connection drag): ephemeral view state, so it
-    // lives in egui memory keyed to this panel, not in the model.
-    let pending_id = ui.id().with("ng_pending");
+    // Pending wire (an in-flight connection drag): ephemeral view state in egui
+    // memory. The pointer arrives in global space, so map it into graph space
+    // with this layer's transform for every hit test.
+    let layer = ui.layer_id();
+    let from_global = ui.ctx().layer_transform_from_global(layer);
+    let map_ptr = |p: egui::Pos2| from_global.map_or(p, |t| t.mul_pos(p));
+    let pending_id = egui::Id::new("ng_pending");
     let mut pending: Option<Endpoint> = ui.data(|d| d.get_temp(pending_id)).flatten();
 
     // Pass 1 — body drags, so every node's live top-left is known before we draw
     // sockets or wires off it. `live_pos` is this frame's position (model + any
-    // drag delta); a drag also emits the `Move` that persists it.
+    // drag delta); a drag also emits the `Move`/`MoveBy` that persists it.
     let mut live_pos: std::collections::HashMap<GraphNodeId, egui::Pos2> =
         std::collections::HashMap::new();
+    // A group drag shifts the whole selection by one delta, applied after the
+    // loop so nodes processed later still move this frame.
+    let mut group_delta: Option<egui::Vec2> = None;
     for n in &graph.nodes {
         let base = origin + egui::vec2(n.pos.x as f32, n.pos.y as f32);
         let h = node_height(n, ctx.descriptor_for(n).as_deref());
@@ -1088,20 +1278,45 @@ fn canvas(
         let header = egui::Rect::from_min_size(rect.min, egui::vec2(NODE_W, HEADER_H));
         let resp =
             ui.interact(header, ui.id().with(("ng_drag", n.id.0)), egui::Sense::click_and_drag());
-        // A click (no drag) selects the node for the inspector.
+        // A click (no drag) selects just this node.
         if resp.clicked() {
+            selset.clear();
+            selset.insert(n.id);
             write_selection(ui.ctx(), Some(n.id));
         }
         let mut pos = base;
-        if resp.dragged() {
-            pos += resp.drag_delta();
-            let model = pos - origin.to_vec2();
-            out.op = Some(NgOp::Move { id: n.id, pos: Vec2::new(model.x as f64, model.y as f64) });
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            let delta = resp.drag_delta();
+            if selset.contains(&n.id) && selset.len() > 1 {
+                // Dragging one of many selected moves them all, as one op.
+                group_delta = Some(delta);
+                out.op = Some(NgOp::MoveBy {
+                    ids: selset.iter().copied().collect(),
+                    delta: Vec2::new(delta.x as f64, delta.y as f64),
+                });
+            } else {
+                // Dragging a lone (or unselected) node selects and moves it.
+                if !selset.contains(&n.id) {
+                    selset.clear();
+                    selset.insert(n.id);
+                    write_selection(ui.ctx(), Some(n.id));
+                }
+                pos += delta;
+                out.op =
+                    Some(NgOp::Move { id: n.id, pos: Vec2::new(pos.x as f64, pos.y as f64) });
+            }
         }
         live_pos.insert(n.id, pos);
     }
+    if let Some(delta) = group_delta {
+        for id in selset.iter() {
+            if let Some(p) = live_pos.get_mut(id) {
+                *p += delta;
+            }
+        }
+    }
 
-    // Socket screen positions, from the live top-lefts.
+    // Socket positions, from the live top-lefts (graph space).
     let mut out_pos: std::collections::HashMap<Endpoint, egui::Pos2> =
         std::collections::HashMap::new();
     let mut in_pos: std::collections::HashMap<Endpoint, egui::Pos2> =
@@ -1138,11 +1353,14 @@ fn canvas(
         let desc = ctx.descriptor_for(n);
         let h = node_height(n, desc.as_deref());
         let rect = egui::Rect::from_min_size(top, egui::vec2(NODE_W, h));
-        let is_sel = selected == Some(n.id);
+        let is_sel = selset.contains(&n.id);
         draw_node(
             ui, &painter, n, desc.as_deref(), rect, is_sel, graph, layers, modules,
             script_preview, out, &mut pending, &in_pos, &out_pos,
         );
+        // The boxes are painted, not allocated, so tell the ui they're there —
+        // otherwise `Scene`'s "frame all" and its initial fit see an empty graph.
+        ui.expand_to_include_rect(rect);
     }
 
     // A pending wire follows the pointer until it's dropped.
@@ -1150,7 +1368,7 @@ fn canvas(
         if let (Some(&from), Some(ptr)) =
             (out_pos.get(src), ui.input(|i| i.pointer.interact_pos()))
         {
-            wire(&painter, from, ptr, egui::Color32::from_gray(200));
+            wire(&painter, from, map_ptr(ptr), egui::Color32::from_gray(200));
         }
     }
 
@@ -1161,10 +1379,8 @@ fn canvas(
     let released = ui.input(|i| i.pointer.any_released());
     if released {
         if let Some(src) = pending.take() {
-            if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()) {
-                if let Some((ep, _)) =
-                    in_pos.iter().find(|(_, &p)| p.distance(ptr) <= DOT_HIT)
-                {
+            if let Some(ptr) = ui.input(|i| i.pointer.interact_pos()).map(map_ptr) {
+                if let Some((ep, _)) = in_pos.iter().find(|(_, &p)| p.distance(ptr) <= DOT_HIT) {
                     out.op = Some(NgOp::Connect { from: src, to: ep.clone() });
                 }
             }
@@ -1172,6 +1388,7 @@ fn canvas(
     }
 
     ui.data_mut(|d| d.insert_temp(pending_id, pending));
+    layer
 }
 
 /// Draw one node box and interact with its header button and sockets.
