@@ -18,6 +18,8 @@ pub(crate) struct CanvasEdits {
     /// Return the viewer to straight on — back to the view that actually
     /// renders.
     pub reset_orbit: bool,
+    /// Switch the active canvas tool (Select ⇄ Pen).
+    pub set_tool: Option<Tool>,
 }
 
 /// The fixed zoom stops offered in the toolbar menu, as percentages.
@@ -39,6 +41,7 @@ pub(crate) fn canvas_toolbar(
     zoom_pct: i32,
     is_fit: bool,
     orbit: (f64, f64),
+    tool: Tool,
     aids: &ViewAids,
     out: &mut CanvasEdits,
     aid_out: &mut AidEdits,
@@ -49,6 +52,23 @@ pub(crate) fn canvas_toolbar(
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(&mut child, |ui| {
             ui.horizontal_centered(|ui| {
+                // Tool toggle first — it decides what a canvas click *does*, so
+                // it belongs at the head of the strip.
+                if ui
+                    .selectable_label(tool == Tool::Select, "Select")
+                    .on_hover_text("Select and transform layers")
+                    .clicked()
+                {
+                    out.set_tool = Some(Tool::Select);
+                }
+                if ui
+                    .selectable_label(tool == Tool::Pen, "Pen")
+                    .on_hover_text("Draw / edit the selected vector path")
+                    .clicked()
+                {
+                    out.set_tool = Some(Tool::Pen);
+                }
+                ui.separator();
                 if ui.small_button("-").on_hover_text("Zoom out").clicked() {
                     out.zoom_by = Some(1.0 / 1.25);
                 }

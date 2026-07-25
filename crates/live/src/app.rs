@@ -141,6 +141,12 @@ pub(crate) struct App {
     /// `fps_drag` this holds the pre-drag values so every delta resolves off
     /// the state the grab started from — see `gizmo::resolve_drag`.
     pub(crate) gizmo_drag: Option<GizmoDrag>,
+    /// Which canvas tool is armed — Select (the gizmo) or the Bézier Pen. View
+    /// state, not saved: a tool is a mode of *this* editing session, not a
+    /// property of the document.
+    pub(crate) tool: Tool,
+    /// The pen tool's live control-point drag, if one is in flight.
+    pub(crate) pen_drag: Option<PenDrag>,
     /// Whether last frame's UI pass found a gizmo handle under the pointer (or
     /// had a drag in flight). Gates canvas click-picking: without it, pressing
     /// a handle *also* runs the picker, which hits empty canvas out at the end
@@ -406,8 +412,9 @@ pub(crate) fn bake_unbound(
                     size.bake_to_const(&mut ctx);
                     baked = true;
                 }
-                // A `Path` has no `Value` params, and a group has no shape.
-                Some(MShape::Path(_)) | None => {}
+                // A legacy `Path` has no `Value` params, a group has no shape, and
+                // a `Vector` isn't graph-authored yet (Phase 5), so none bake here.
+                Some(MShape::Path(_)) | Some(MShape::Vector { .. }) | None => {}
             }
         }
     }
@@ -813,6 +820,8 @@ impl App {
             shown_props: PropSelection::new(),
             fps_drag: None,
             gizmo_drag: None,
+            tool: Tool::default(),
+            pen_drag: None,
             gizmo_hot: false,
             motion_path: MotionPath::default(),
             onion: OnionSkins::default(),
@@ -1556,6 +1565,9 @@ impl ApplicationHandler for App {
                 if !over_ui
                     && !self.gizmo_hot
                     && !self.aids_hot
+                    // The pen owns canvas clicks while armed — a press there
+                    // places an anchor, it must not double as a pick/deselect.
+                    && self.tool == Tool::Select
                     && state == ElementState::Pressed
                     && button == winit::event::MouseButton::Left =>
             {
@@ -1651,6 +1663,29 @@ impl App {
     /// Write the panel's edits into the selected node. Returns whether anything
     /// changed. An edit to a constant overwrites it; an edit to an animated
     /// property sets a keyframe on `frame` (via `Value::set_at`).
+    /// Land a pen-tool edit on the layer's path.
+    ///
+    /// The pen emits an all-`Const` path built from resolved geometry; this is
+    /// where it becomes a document change. A **structural** change — a different
+    /// anchor count, or the path closing — replaces the shape wholesale (any
+    /// animation on points that no longer exist goes with them, the honest result
+    /// of adding/removing/closing). A same-topology change is a **move**, written
+    /// through each control point's `Value` so an animated point auto-keys at
+    /// `frame` and a static one stays constant — exactly like a gizmo drag.
+    pub(crate) fn apply_pen_edits(&mut self, frame: i64, e: &PenEdits) -> bool {
+        let Some((id, new_path)) = &e.set_path else {
+            return false;
+        };
+        let Some(node) = self.project.comp_mut(self.current).unwrap().root.find_mut(*id) else {
+            return false;
+        };
+        let Some(MShape::Vector { path }) = node.shape.as_mut() else {
+            return false;
+        };
+        merge_path(path, new_path, frame);
+        true
+    }
+
     pub(crate) fn apply_edits(&mut self, frame: i64, e: &PropEdits) -> bool {
         let t = frame as f64;
         let mut ctx = EvalCtx::at(t);
@@ -2207,10 +2242,24 @@ impl App {
             .with_fill(fill)
             .with_transform(at_center),
             NewShape::Group => MNode::group(id, format!("Group {id}")).with_transform(at_center),
+            // An empty path at the *origin* (identity transform), so a clicked
+            // anchor's comp position is its local position — no centre offset to
+            // reason about while drawing. The pen tool is armed below.
+            NewShape::Vector => MNode::shape(
+                id,
+                format!("Path {id}"),
+                MShape::Vector { path: motion_core::VectorPath::empty() },
+            )
+            .with_fill(fill),
         };
 
+        let armed_pen = matches!(kind, NewShape::Vector);
         // Parent under the selected node if it still exists, else the root.
         self.push_layer(node, self.selected);
+        if armed_pen {
+            self.tool = Tool::Pen;
+            self.pen_drag = None;
+        }
         true
     }
 
@@ -2645,6 +2694,30 @@ impl App {
                 .map(|place| GizmoTarget::new(id.0, place.parent_xf, info, gizmo_view)),
             _ => None,
         };
+        // The pen tool's snapshot: the selected vector layer's world matrix and
+        // its anchors resolved at this frame. Only gathered while the pen is
+        // armed and a vector layer is selected — otherwise the canvas behaves
+        // exactly as it did before the tool existed.
+        let pen_target = if self.tool == Tool::Pen {
+            match (self.selected, sel_node) {
+                (Some(id), Some(node)) => scene.place(id).and_then(|place| match &node.shape {
+                    Some(MShape::Vector { path }) => {
+                        let comp = self.doc().clone();
+                        let mut ctx = EvalCtx::new(&comp, frame as f64);
+                        Some(PenTarget {
+                            node: id,
+                            world: place.world,
+                            samples: path.sample_anchors(&mut ctx),
+                            closed: path.closed,
+                        })
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         // One box per drawable item in the selection's subtree — a group shows
         // its pieces, not just its extent. Comp space, projected at paint time
         // like the motion path.
@@ -2733,6 +2806,9 @@ impl App {
         // Moved out of `self` for the UI pass and put back after it, like the
         // keyframe selection — the closure must not borrow `App`.
         let mut gizmo_drag = self.gizmo_drag.take();
+        let mut pen_drag = self.pen_drag.take();
+        let mut pen_edits = PenEdits::default();
+        let tool = self.tool;
         let mut guide_drag = self.guide_drag.take();
         let mut aid_edits = AidEdits::default();
         let mut aids_hot = false;
@@ -2978,6 +3054,7 @@ impl App {
                             zoom_pct,
                             is_fit,
                             nav_orbit,
+                            tool,
                             &aids,
                             &mut canvas_edits,
                             &mut aid_edits,
@@ -3017,8 +3094,14 @@ impl App {
                         }
                         // The gizmo paints over the frame and reports into the
                         // ordinary property edits, so a handle drag auto-keys
-                        // exactly like a DragValue drag does.
-                        if let (Some(t), Some(rect)) = (&gizmo_target, canvas_pts) {
+                        // exactly like a DragValue drag does. The pen replaces it
+                        // while armed — the two are different tools for the same
+                        // canvas and must not both grab the pointer.
+                        if tool == Tool::Pen {
+                            if let (Some(t), Some(rect)) = (&pen_target, canvas_pts) {
+                                gizmo_hot = pen_ui(ui, rect, t, fit, ppp, &mut pen_drag, &mut pen_edits);
+                            }
+                        } else if let (Some(t), Some(rect)) = (&gizmo_target, canvas_pts) {
                             gizmo_hot =
                                 gizmo_ui(
                                     ui,
@@ -3157,6 +3240,12 @@ impl App {
         // into an explicit zoom, since a fixed step needs a fixed anchor).
         if canvas_edits.reset_orbit {
             self.nav.orbit = (0.0, 0.0);
+            window.request_redraw();
+        }
+        if let Some(tool) = canvas_edits.set_tool {
+            self.tool = tool;
+            // Leaving a tool abandons any half-finished drag it owned.
+            self.pen_drag = None;
             window.request_redraw();
         }
         if let Some(mode) = canvas_edits.set_zoom {
@@ -3321,6 +3410,7 @@ impl App {
         // Apply property edits + keyframe drags to the selected node, then
         // re-evaluate so the change is visible on this very frame.
         self.gizmo_drag = gizmo_drag;
+        self.pen_drag = pen_drag;
         self.gizmo_hot = gizmo_hot;
         self.guide_drag = guide_drag;
         self.aids_hot = aids_hot;
@@ -3346,6 +3436,9 @@ impl App {
             self.apply_ng_knob_op(kop);
         }
         let mut dirty = self.apply_edits(frame, &edits);
+        if self.apply_pen_edits(frame, &pen_edits) {
+            dirty = true;
+        }
         // Applied here rather than with the other comp settings above so it can
         // mark the scene dirty — the backdrop is baked into `vscene`, which is
         // only rebuilt when something says it changed.

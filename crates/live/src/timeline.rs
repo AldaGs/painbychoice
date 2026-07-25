@@ -102,19 +102,25 @@ pub(crate) fn transport_ui(
 
 /// One dopesheet row: an animated property and the frames of its keyframes.
 pub(crate) struct DopeRow {
-    pub(crate) label: &'static str,
+    pub(crate) label: String,
     pub(crate) kind: PropKind,
     pub(crate) frames: Vec<i64>,
 }
 
 /// Gather the animated properties of a node into dopesheet rows.
+///
+/// Only *animated* properties get a row, which is what keeps a vector path from
+/// crowding the sheet: its many control points are enumerated by
+/// [`prop_kinds_of`], but an un-keyframed point resolves as a constant and is
+/// filtered out here — so "animate this point" (which promotes it to a track) is
+/// exactly what makes its row appear.
 pub(crate) fn dope_rows(node: &motion_core::Node) -> Vec<DopeRow> {
-    PropKind::ALL
-        .iter()
-        .filter_map(|&kind| {
+    prop_kinds_of(node)
+        .into_iter()
+        .filter_map(|kind| {
             let p = prop_of(node, kind)?;
             p.is_animated().then(|| DopeRow {
-                label: kind.label(),
+                label: kind.label().into_owned(),
                 kind,
                 frames: p.key_frames(),
             })
@@ -1061,7 +1067,7 @@ pub(crate) fn dopesheet_ui(
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             let cell = label_cell(ui, label_w, ROW_H);
-            label_text(ui, cell, row.label, false);
+            label_text(ui, cell, &row.label, false);
 
             // The track: full remaining width, fixed height.
             ui.add_space(SPLIT_W);

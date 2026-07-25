@@ -91,6 +91,11 @@ pub(crate) struct NodeInfo {
     /// selection twice. What makes a knob *useful* is still the graph — but so
     /// is what makes `position` useful, and that has always lived here.
     pub(crate) knobs: Vec<KnobInfo>,
+    /// One entry per anchor of a vector path (empty for any other shape): whether
+    /// that anchor's on-curve point is animated. Drives the "animate this point"
+    /// stopwatches in the properties panel — the opt-in that keeps a many-point
+    /// path from filling the dopesheet by default.
+    pub(crate) path_pts: Vec<bool>,
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -360,6 +365,12 @@ impl NodeInfo {
             },
             footage: footage_info(node, ctx),
             knobs: node.params.iter().map(crate::nodegraph::knob_info).collect(),
+            path_pts: match node.shape.as_ref() {
+                Some(MShape::Vector { path }) => {
+                    path.anchors.iter().map(|a| a.point.is_animated()).collect()
+                }
+                _ => Vec::new(),
+            },
         }
     }
 }
@@ -927,6 +938,31 @@ pub(crate) fn properties_ui(
             ui.end_row();
         }
 
+        // --- Vector path points. The dopesheet only shows *animated* channels,
+        // so a fresh path is silent there; this is where you opt a point in.
+        // Deliberately per-point, not one blanket "Path" row, so animating one
+        // anchor doesn't drag every other point onto the timeline. ---
+        if !n.path_pts.is_empty() {
+            ui.label("Path");
+            if ui
+                .button("Animate all points")
+                .on_hover_text("Give every anchor a keyframe at the playhead")
+                .clicked()
+            {
+                for i in 0..n.path_pts.len() {
+                    edits.key.insert(PropKind::PathPoint { index: i, part: PathPart::Point });
+                }
+            }
+            ui.end_row();
+            for (i, &anim) in n.path_pts.iter().enumerate() {
+                ui.label(format!("  Point {}", i + 1));
+                if key_button(ui, anim) {
+                    edits.key.insert(PropKind::PathPoint { index: i, part: PathPart::Point });
+                }
+                ui.end_row();
+            }
+        }
+
         // --- Mask. A shape that limits where this layer draws. Scoped to the
         // layer's own content like the blend mode, which is why the two belong
         // together. ---
@@ -1202,10 +1238,17 @@ pub(crate) enum PropKind {
     TextContent,
     TimeRemap,
     MaskSize,
+    /// One control point of a vector path anchor. **Indexed**, so unlike every
+    /// variant above it is not a fixed member of `ALL` — a path has as many as it
+    /// has anchors, discovered per node by [`prop_kinds_of`]. It sorts last (after
+    /// the fixed kinds) and by `(index, part)`, which keeps a selection's entries
+    /// for one point contiguous the way `group_selection_by_prop` needs.
+    PathPoint { index: usize, part: PathPart },
 }
 
 impl PropKind {
-    /// Every property that can be animated, in row order.
+    /// The **fixed** animatable properties, in row order. Path points are dynamic
+    /// and are appended per node by [`prop_kinds_of`], never listed here.
     pub(crate) const ALL: [PropKind; 14] = [
         PropKind::Anchor,
         PropKind::Position,
@@ -1223,7 +1266,19 @@ impl PropKind {
         PropKind::MaskSize,
     ];
 
-    pub(crate) fn label(self) -> &'static str {
+    /// Row label. A [`std::borrow::Cow`] because a path point's label carries its
+    /// index (`P3 out`) and so can't be a `&'static str` like the fixed kinds.
+    pub(crate) fn label(self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        if let PropKind::PathPoint { index, part } = self {
+            return Cow::Owned(format!("P{}{}", index + 1, part.suffix()));
+        }
+        Cow::Borrowed(self.fixed_label())
+    }
+
+    /// The label for the fixed (non-indexed) kinds. Kept `&'static str` so the
+    /// dynamic [`Self::label`] borrows it without allocating.
+    fn fixed_label(self) -> &'static str {
         match self {
             PropKind::Anchor => "Anchor",
             PropKind::Position => "Position",
@@ -1239,6 +1294,8 @@ impl PropKind {
             PropKind::TextContent => "Content",
             PropKind::TimeRemap => "Time Remap",
             PropKind::MaskSize => "Mask Size",
+            // Intercepted by `label` before this is reached.
+            PropKind::PathPoint { .. } => "Path Point",
         }
     }
 
@@ -1546,7 +1603,9 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             // through the same property (and the same gizmo handles) a
             // rectangle uses.
             | MShape::Image { size, .. } => PropRef::Vec2(size),
-            MShape::Path(_) | MShape::Text { .. } => return None,
+            // A vector path has no single scalar size — its geometry lives in
+            // per-anchor point values, addressed by `PropKind::PathPoint`.
+            MShape::Path(_) | MShape::Vector { .. } | MShape::Text { .. } => return None,
         },
         // Only a *remapped* clip has this: an unremapped one plays at its
         // natural rate and has no curve to key.
@@ -1570,7 +1629,32 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { content, .. } => PropRef::Str(content),
             _ => return None,
         },
+        // One control point of a vector path — a plain `Value<Vec2>`, so it
+        // keyframes, retimes, and plots (as X/Y) exactly like a shape's size.
+        PropKind::PathPoint { index, part } => match node.shape.as_ref()? {
+            MShape::Vector { path } => PropRef::Vec2(path.value(index, part)?),
+            _ => return None,
+        },
     })
+}
+
+/// Every animatable property of a node **including** its dynamic path points.
+///
+/// The fixed kinds are constant; a vector layer additionally exposes one
+/// [`PropKind::PathPoint`] per anchor per control point, in anchor order. This is
+/// what the dopesheet and curve editor enumerate instead of `PropKind::ALL`, so a
+/// hand-drawn path's animated points get rows without every other layer paying
+/// for a dozen empty ones.
+pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
+    let mut kinds: Vec<PropKind> = PropKind::ALL.to_vec();
+    if let Some(MShape::Vector { path }) = &node.shape {
+        for index in 0..path.anchors.len() {
+            for part in PathPart::ALL {
+                kinds.push(PropKind::PathPoint { index, part });
+            }
+        }
+    }
+    kinds
 }
 
 /// Mutable twin of [`prop_of`]. Kept adjacent on purpose: the two must agree on
@@ -1590,7 +1674,7 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             MShape::Rect { size, .. }
             | MShape::Ellipse { size }
             | MShape::Image { size, .. } => PropRefMut::Vec2(size),
-            MShape::Path(_) | MShape::Text { .. } => return None,
+            MShape::Path(_) | MShape::Vector { .. } | MShape::Text { .. } => return None,
         },
         PropKind::TimeRemap => match node.shape.as_mut()? {
             MShape::Image { time_remap, .. } => PropRefMut::Num(time_remap.as_mut()?),
@@ -1606,6 +1690,10 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         },
         PropKind::TextSize => match node.shape.as_mut()? {
             MShape::Text { size, .. } => PropRefMut::Num(size),
+            _ => return None,
+        },
+        PropKind::PathPoint { index, part } => match node.shape.as_mut()? {
+            MShape::Vector { path } => PropRefMut::Vec2(path.value_mut(index, part)?),
             _ => return None,
         },
         PropKind::TextContent => match node.shape.as_mut()? {

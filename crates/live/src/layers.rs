@@ -26,7 +26,7 @@ impl RowKind {
             None => RowKind::Group,
             Some(MShape::Rect { .. }) => RowKind::Rect,
             Some(MShape::Ellipse { .. }) => RowKind::Ellipse,
-            Some(MShape::Path(_)) => RowKind::Path,
+            Some(MShape::Path(_)) | Some(MShape::Vector { .. }) => RowKind::Path,
             Some(MShape::Text { .. }) => RowKind::Text,
             Some(MShape::Image { .. }) => RowKind::Footage,
         }
@@ -112,6 +112,9 @@ pub(crate) enum NewShape {
     Ellipse,
     Text,
     Group,
+    /// An empty editable path; adding one also arms the pen tool so the next
+    /// canvas clicks place its anchors.
+    Vector,
 }
 
 /// What the layers panel reports: selection, reorder, add, and/or delete.
@@ -165,6 +168,11 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
         if icon::button(ui, icon::GROUP, "Add a group").clicked() {
             out.add = Some(NewShape::Group);
+        }
+        // No dedicated pen glyph in the icon subset (adding one needs a font
+        // regen), so a plain text button — distinct enough beside the icons.
+        if ui.button("Pen").on_hover_text("Draw a vector path with the pen tool").clicked() {
+            out.add = Some(NewShape::Vector);
         }
         if icon::button(ui, icon::IMPORT, "Import footage (image or video)").clicked() {
             out.import_footage = true;

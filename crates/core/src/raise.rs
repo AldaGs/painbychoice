@@ -290,7 +290,9 @@ pub fn raise_geometry(
     // Check every param *before* touching the graph: a refusal must leave no
     // orphaned nodes behind, and the checks are cheap.
     let params: Vec<(&str, &'static str, ShapeParam<'_>)> = match shape {
-        Shape::Path(_) => return Err(RaiseShapeError::Unsupported),
+        // An editable path has no node-graph counterpart yet (that is the Phase 5
+        // geometry-node work); raising one is refused rather than flattened.
+        Shape::Path(_) | Shape::Vector { .. } => return Err(RaiseShapeError::Unsupported),
         Shape::Image { .. } => return Err(RaiseShapeError::Footage),
         Shape::Rect { size, radius } => vec![
             ("size", "Size", ShapeParam::Vec2(size)),
@@ -312,7 +314,9 @@ pub fn raise_geometry(
         Shape::Rect { .. } => "rect",
         Shape::Ellipse { .. } => "ellipse",
         Shape::Text { .. } => "text",
-        Shape::Path(_) | Shape::Image { .. } => unreachable!("refused above"),
+        Shape::Path(_) | Shape::Vector { .. } | Shape::Image { .. } => {
+            unreachable!("refused above")
+        }
     };
     // Expression params are raised into the column to the left, sharing one row
     // cursor so two raised subtrees can't land on top of each other — the same

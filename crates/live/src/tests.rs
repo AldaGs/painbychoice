@@ -885,6 +885,94 @@ fn dope_rows_lists_animated_shape_and_stroke_properties() {
     assert_eq!(rows[2].frames, vec![5], "radius keyed at frame 5");
 }
 
+/// A three-anchor open vector path layer, all points constant.
+fn vector_node() -> MNode {
+    let path = motion_core::VectorPath::polyline(
+        [Vec2::new(0.0, 0.0), Vec2::new(50.0, 0.0), Vec2::new(50.0, 40.0)],
+        false,
+    );
+    MNode::shape(1, "path", MShape::Vector { path })
+}
+
+#[test]
+fn a_vector_layer_exposes_a_property_per_anchor_control_point() {
+    let n = vector_node();
+    // Three anchors × three parts (point/in/out) on top of the fixed kinds.
+    let points: Vec<_> = prop_kinds_of(&n)
+        .into_iter()
+        .filter(|k| matches!(k, PropKind::PathPoint { .. }))
+        .collect();
+    assert_eq!(points.len(), 9);
+    // Every one resolves through the same machinery as any other property, and
+    // reads/writes agree on existence.
+    for kind in points {
+        let mut m = n.clone();
+        assert!(prop_of(&n, kind).is_some(), "{kind:?} missing");
+        assert!(prop_of_mut(&mut m, kind).is_some(), "{kind:?} missing (mut)");
+    }
+    // A layer with no path exposes none of them.
+    assert!(!prop_kinds_of(&full_node())
+        .iter()
+        .any(|k| matches!(k, PropKind::PathPoint { .. })));
+}
+
+#[test]
+fn animating_one_point_gives_it_a_dopesheet_row_and_leaves_the_rest_alone() {
+    let mut n = vector_node();
+    // The uncrowded default: a fresh path animates nothing, so no rows.
+    assert!(dope_rows(&n).is_empty(), "an unkeyed path must not crowd the sheet");
+
+    // "Animate this point" is exactly the stopwatch path — insert a key.
+    let kind = PropKind::PathPoint { index: 1, part: PathPart::Point };
+    prop_of_mut(&mut n, kind).unwrap().insert_key(12);
+
+    let rows = dope_rows(&n);
+    assert_eq!(rows.len(), 1, "only the animated point gets a row");
+    assert_eq!(rows[0].kind, kind);
+    assert_eq!(rows[0].label, "P2", "1-based, point part has no suffix");
+    assert_eq!(rows[0].frames, vec![12]);
+}
+
+#[test]
+fn a_path_point_label_names_its_anchor_and_handle() {
+    assert_eq!(PropKind::PathPoint { index: 0, part: PathPart::Point }.label(), "P1");
+    assert_eq!(PropKind::PathPoint { index: 2, part: PathPart::In }.label(), "P3 in");
+    assert_eq!(PropKind::PathPoint { index: 2, part: PathPart::Out }.label(), "P3 out");
+}
+
+#[test]
+fn a_pen_edit_replaces_the_path_when_the_topology_changes() {
+    // Placing anchors changes the anchor count, so the whole path is swapped in.
+    let mut path = motion_core::VectorPath::empty();
+    let drawn = motion_core::VectorPath::polyline([Vec2::ZERO, Vec2::new(20.0, 0.0)], false);
+    pen::merge_path(&mut path, &drawn, 0);
+    assert_eq!(path.anchors.len(), 2);
+    // Closing is also structural.
+    let closed = motion_core::VectorPath { closed: true, ..drawn.clone() };
+    pen::merge_path(&mut path, &closed, 0);
+    assert!(path.closed);
+}
+
+#[test]
+fn a_pen_move_keeps_a_static_point_constant_and_auto_keys_an_animated_one() {
+    let mut path =
+        motion_core::VectorPath::polyline([Vec2::ZERO, Vec2::new(20.0, 0.0)], false);
+    // Animate anchor 1's point (promotes the constant to a one-key track).
+    path.value_mut(1, PathPart::Point).unwrap().insert_key(0);
+
+    // A same-topology drag: move both points.
+    let moved = motion_core::VectorPath::polyline([Vec2::new(5.0, 5.0), Vec2::new(30.0, 9.0)], false);
+    pen::merge_path(&mut path, &moved, 12);
+
+    // The static point (anchor 0) stayed constant, just relocated.
+    assert!(matches!(path.value(0, PathPart::Point), Some(Value::Const(_))));
+    // The animated point (anchor 1) took a new key at frame 12 rather than
+    // being flattened back to a constant.
+    let a1 = path.value(1, PathPart::Point).unwrap();
+    assert!(a1.is_animated(), "an animated point must stay animated");
+    assert_eq!(a1.key_frames(), vec![0, 12]);
+}
+
 #[test]
 fn a_color_clip_will_not_paste_onto_a_scalar_property() {
     // The type tag on ClipTrack is the only thing standing between a fill

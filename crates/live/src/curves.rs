@@ -73,23 +73,24 @@ impl ValueView {
 /// One property's worth of plottable curves: a `Vec2` contributes two, a colour
 /// three, a scalar one. Text contributes none and so never gets a row.
 pub(crate) struct CurveRow {
-    pub(crate) label: &'static str,
+    pub(crate) label: String,
     pub(crate) kind: PropKind,
     pub(crate) channels: Vec<Channel>,
 }
 
 /// Gather the animated properties of a node into curve rows.
 pub(crate) fn curve_rows(node: &MNode) -> Vec<CurveRow> {
-    PropKind::ALL
-        .iter()
-        .filter_map(|&kind| {
+    prop_kinds_of(node)
+        .into_iter()
+        .filter_map(|kind| {
             let p = prop_of(node, kind)?;
             if !p.is_animated() {
                 return None;
             }
             let channels = p.channels();
             // A text track is animated but has nothing numeric to plot.
-            (!channels.is_empty()).then_some(CurveRow { label: kind.label(), kind, channels })
+            (!channels.is_empty())
+                .then_some(CurveRow { label: kind.label().into_owned(), kind, channels })
         })
         .collect()
 }
@@ -453,7 +454,7 @@ pub(crate) fn curves_ui(
                         painter.line_segment([kp, hp], egui::Stroke::new(1.0, accent));
                         painter.circle_filled(hp, 3.5, accent);
 
-                        let id = ui.id().with(("tangent", row.label, i, side == Side::Out));
+                        let id = ui.id().with(("tangent", &row.label, i, side == Side::Out));
                         let hit =
                             egui::Rect::from_center_size(hp, egui::Vec2::splat(GRAB_R * 2.0));
                         let tr = ui.interact(hit, id, egui::Sense::drag());
@@ -493,7 +494,7 @@ pub(crate) fn curves_ui(
                     painter.circle_stroke(kp, r + 3.0, egui::Stroke::new(1.0, accent));
                 }
 
-                let id = ui.id().with(("curve_key", row.label, ci, i));
+                let id = ui.id().with(("curve_key", &row.label, ci, i));
                 let hit = egui::Rect::from_center_size(kp, egui::Vec2::splat(GRAB_R * 2.0));
                 let kr = ui.interact(hit, id, egui::Sense::click_and_drag());
                 if kr.clicked() {
@@ -642,7 +643,7 @@ fn property_column(
         painter.text(
             egui::pos2(cell.left() + 4.0, cell.center().y),
             egui::Align2::LEFT_CENTER,
-            row.label,
+            row.label.clone(),
             egui::TextStyle::Body.resolve(ui.style()),
             if is_shown {
                 ui.style().visuals.text_color()

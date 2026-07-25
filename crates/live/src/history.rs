@@ -74,6 +74,7 @@ pub(crate) fn edit_label(
             NewShape::Ellipse => "Add ellipse",
             NewShape::Text => "Add text",
             NewShape::Group => "Add group",
+            NewShape::Vector => "Add path",
         };
     }
     if tree.delete.is_some() {

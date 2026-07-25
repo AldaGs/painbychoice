@@ -24,7 +24,7 @@ use motion_core::{
     Comp, Document, EvalCtx, Expr, Project as MProject,
     mirror_handle, EasePreset, ExprValue, Handle, Interp, Keyframe, Track, Node as MNode, NodeId, PropPath,
     node::LayerTiming,
-    MathOp, Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
+    MathOp, PathPart, Scene as MScene, Shape as MShape, TextAlign, Transform, Value, Waveform,
     BlendMode as MBlendMode, ComposeMode as MComposeMode, LayerGroup, Mask, MatteMode,
     compile_modules, lower_geometry, lower_output, Binding, Edge, Endpoint, GraphCtx, GraphNode, GraphNodeId, NodeCategory,
     NodeDescriptor, NodeGraph, NodeRegistry, ShapeBinding, SocketType, TextConfig,
@@ -55,6 +55,7 @@ mod layers;
 mod motionpath;
 mod nodegraph;
 mod onion;
+mod pen;
 mod props;
 mod scene;
 mod strips;
@@ -74,6 +75,7 @@ use layers::*;
 use motionpath::*;
 use nodegraph::*;
 use onion::*;
+use pen::*;
 use props::*;
 use scene::*;
 use strips::*;

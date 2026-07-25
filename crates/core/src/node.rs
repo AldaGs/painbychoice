@@ -9,6 +9,7 @@ use crate::asset::{Asset, AssetId, ImagePaint};
 use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::expr::{EvalCtx, Expr};
 use crate::mat4::{Mat4, Xf};
+use crate::path::VectorPath;
 use crate::text::TextAlign;
 use crate::value::{Color, Value};
 use crate::vec3::Vec3;
@@ -191,8 +192,15 @@ where
 /// so a rectangle's size can itself be keyframed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Shape {
-    /// A pre-built path (imported / drawn by hand).
+    /// A **legacy** baked outline. Kept only so a `.pbc` written before editable
+    /// paths existed still deserializes; [`Shape::migrate`] upgrades it to a
+    /// [`Shape::Vector`] on load, so nothing new ever writes this variant and the
+    /// functional arms below treat it as a static, un-animatable outline.
     Path(BezPath),
+    /// An editable, animatable Bézier path — what the pen tool draws. Its control
+    /// points are [`Value`]s (see [`crate::path`]), so it keyframes, retimes, and
+    /// morphs through the same machinery as every other property.
+    Vector { path: VectorPath },
     /// Rounded rectangle centered on the origin, animatable size and corner.
     Rect {
         size: Value<Vec2>,
@@ -262,6 +270,7 @@ impl Shape {
     pub fn to_path(&self, ctx: &mut EvalCtx) -> BezPath {
         match self {
             Shape::Path(p) => p.clone(),
+            Shape::Vector { path } => path.to_bez(ctx),
             Shape::Rect { size, radius } => {
                 let s = size.resolve(ctx);
                 let r = radius.resolve(ctx);
@@ -335,6 +344,7 @@ impl Shape {
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
         match self {
             Shape::Path(_) => {}
+            Shape::Vector { path } => path.migrate_frames(fps),
             Shape::Rect { size, radius } => {
                 size.migrate_frames(fps);
                 radius.migrate_frames(fps);
@@ -353,9 +363,19 @@ impl Shape {
         }
     }
 
+    /// Fold a legacy [`Shape::Path`] into an editable [`Shape::Vector`]. Called
+    /// on load (see [`Node::migrate`]); a no-op for every other variant, so it is
+    /// safe to run over the whole tree unconditionally.
+    pub(crate) fn migrate(&mut self) {
+        if let Shape::Path(bez) = self {
+            *self = Shape::Vector { path: VectorPath::from_bez(bez) };
+        }
+    }
+
     pub(crate) fn retime(&mut self, ratio: f64) {
         match self {
             Shape::Path(_) => {}
+            Shape::Vector { path } => path.retime(ratio),
             Shape::Rect { size, radius } => {
                 size.retime(ratio);
                 radius.retime(ratio);
@@ -790,11 +810,16 @@ impl Node {
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
         self.transform.migrate_frames(fps);
         if let Some(shape) = &mut self.shape {
+            // Upgrade a legacy baked `Shape::Path` to an editable `Shape::Vector`
+            // before touching its keys — a `Vector`'s control points are the
+            // things that carry keyframes now.
+            shape.migrate();
             shape.migrate_frames(fps);
         }
         // A mask's shape is parametric like any other, so its keys live on the
         // same grid and migrate with everything else.
         if let Some(mask) = &mut self.mask {
+            mask.shape.migrate();
             mask.shape.migrate_frames(fps);
         }
         if let Some(fill) = &mut self.fill {
