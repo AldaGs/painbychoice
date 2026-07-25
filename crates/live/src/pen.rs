@@ -94,6 +94,9 @@ enum Grab {
 
 /// Hit radius for an anchor or a handle, in logical points.
 const GRAB_R: f32 = 7.0;
+/// A more forgiving radius for landing a click on the first anchor to close —
+/// closing is a deliberate gesture and worth an easier target.
+const CLOSE_R: f32 = GRAB_R * 2.0;
 
 /// Land an emitted all-`Const` path onto an existing (possibly animated) one.
 ///
@@ -190,7 +193,19 @@ pub(crate) fn pen_ui(
     if pressed && resp.hovered() {
         let press = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer);
         if let Some(p) = press {
-            if let Some((index, grab)) = hit(&samples, p, &to_screen) {
+            // Draw mode: clicking back on the first anchor closes the contour,
+            // connecting last→first. Checked *before* `hit`, or the click would
+            // be caught as a grab of the first point and the path never closes —
+            // the "it won't close" bug.
+            let closes = mode == PenMode::Draw
+                && !closed
+                && samples.len() >= 2
+                && to_screen(samples[0].point).distance(p) <= CLOSE_R;
+            if closes {
+                closed = true;
+                *drag = None;
+                changed = true;
+            } else if let Some((index, grab)) = hit(&samples, p, &to_screen) {
                 // Alt-dragging an anchor point pulls symmetric tangents out of a
                 // corner (or re-smooths one), the standard convert gesture.
                 // Removal is the Delete key, so Alt here is unambiguous.
@@ -200,27 +215,35 @@ pub(crate) fn pen_ui(
                     grab
                 };
                 *drag = Some(PenDrag { node: target.node, index, grab });
-            } else if mode == PenMode::Draw
-                && !closed
-                && samples.len() >= 2
-                && to_screen(samples[0].point).distance(p) <= GRAB_R * 1.5
-            {
-                // Draw mode: clicking the first anchor closes the contour.
-                closed = true;
-                changed = true;
-            } else if mode == PenMode::Draw {
+            } else if mode == PenMode::Draw && !closed {
                 // Draw mode: append a fresh corner anchor; a drag pulls tangents.
+                // A closed path is finished — no more appending (edit with Points).
                 samples.push(PathSample { point: to_local(p), in_tan: Vec2::ZERO, out_tan: Vec2::ZERO });
                 *drag = Some(PenDrag { node: target.node, index: samples.len() - 1, grab: Grab::NewAnchor });
                 changed = true;
-            } else if let Some((seg, t)) = nearest_segment(&samples, closed, p, &to_screen) {
-                // Edit mode: click on a segment inserts a point there, splitting
-                // the curve so its shape is preserved, then drags the new point.
-                let index = insert_on_segment(&mut samples, seg, t);
-                *drag = Some(PenDrag { node: target.node, index, grab: Grab::Point });
-                changed = true;
+            } else if mode == PenMode::Edit {
+                if let Some((seg, t)) = nearest_segment(&samples, closed, p, &to_screen) {
+                    // Edit mode: click on a segment inserts a point there,
+                    // splitting the curve so its shape is preserved.
+                    let index = insert_on_segment(&mut samples, seg, t);
+                    *drag = Some(PenDrag { node: target.node, index, grab: Grab::Point });
+                    changed = true;
+                }
             }
         }
+    }
+
+    // --- Double-click finishes the path by closing it, the way every vector
+    //     editor does. The second click's press appended a point a frame ago, so
+    //     drop that trailing duplicate before closing. ---
+    if resp.double_clicked() && mode == PenMode::Draw && !closed && samples.len() >= 2 {
+        let n = samples.len();
+        if to_screen(samples[n - 1].point).distance(to_screen(samples[n - 2].point)) <= CLOSE_R {
+            samples.pop();
+        }
+        closed = true;
+        *drag = None;
+        changed = true;
     }
 
     // --- Delete key: remove the anchor being dragged, else the hovered one. ---
