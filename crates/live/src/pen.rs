@@ -87,6 +87,9 @@ enum Grab {
     In,
     Out,
     NewAnchor,
+    /// Alt-dragging a corner anchor pulls symmetric tangents out of it,
+    /// converting it to a smooth point — the drag math is [`Grab::NewAnchor`]'s.
+    Pull,
 }
 
 /// Hit radius for an anchor or a handle, in logical points.
@@ -188,15 +191,15 @@ pub(crate) fn pen_ui(
         let press = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer);
         if let Some(p) = press {
             if let Some((index, grab)) = hit(&samples, p, &to_screen) {
-                // Alt-clicking an existing anchor point deletes it (a corner-cut
-                // convenience alongside the Delete key).
-                if alt && grab == Grab::Point && mode == PenMode::Edit {
-                    samples.remove(index);
-                    *drag = None;
-                    changed = true;
+                // Alt-dragging an anchor point pulls symmetric tangents out of a
+                // corner (or re-smooths one), the standard convert gesture.
+                // Removal is the Delete key, so Alt here is unambiguous.
+                let grab = if alt && grab == Grab::Point && mode == PenMode::Edit {
+                    Grab::Pull
                 } else {
-                    *drag = Some(PenDrag { node: target.node, index, grab });
-                }
+                    grab
+                };
+                *drag = Some(PenDrag { node: target.node, index, grab });
             } else if mode == PenMode::Draw
                 && !closed
                 && samples.len() >= 2
@@ -239,8 +242,9 @@ pub(crate) fn pen_ui(
                 let lp = to_local(p);
                 match d.grab {
                     Grab::Point => s.point = lp,
-                    // A new anchor's drag pulls a smooth (mirrored) tangent.
-                    Grab::NewAnchor => {
+                    // A new anchor's drag — or pulling handles out of a corner —
+                    // sets a smooth (mirrored) tangent.
+                    Grab::NewAnchor | Grab::Pull => {
                         let t = lp - s.point;
                         s.out_tan = t;
                         s.in_tan = -t;
@@ -347,7 +351,9 @@ fn paint(
             let hot = active == Some((i, grab));
             painter.circle_filled(h, if hot { 4.5 } else { 3.5 }, HANDLE_COL);
         }
-        let hot = active == Some((i, Grab::Point)) || active == Some((i, Grab::NewAnchor));
+        let hot = active == Some((i, Grab::Point))
+            || active == Some((i, Grab::NewAnchor))
+            || active == Some((i, Grab::Pull));
         let r = if hot { 5.0 } else { 4.0 };
         painter.rect_filled(egui::Rect::from_center_size(a, egui::Vec2::splat(r)), 1.0, ANCHOR_COL);
     }

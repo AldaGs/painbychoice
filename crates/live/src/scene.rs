@@ -71,8 +71,9 @@ pub(crate) fn canvas_toolbar(
                 if ui
                     .selectable_label(tool == Tool::EditPath, "Points")
                     .on_hover_text(
-                        "Edit points: drag anchors/handles, Alt-drag to break a tangent, \
-                         click a segment to insert, Delete to remove",
+                        "Edit points: drag anchors/handles; Alt-drag a corner to pull out \
+                         handles; Alt-drag a handle to break it; click a segment to insert; \
+                         Delete to remove",
                     )
                     .clicked()
                 {
