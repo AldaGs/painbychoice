@@ -1830,6 +1830,12 @@ impl App {
             node.compound = op;
             changed = true;
         }
+        if let Some(closed) = e.set_path_closed {
+            if let Some(MShape::Vector { path }) = node.shape.as_mut() {
+                path.closed = closed;
+                changed = true;
+            }
+        }
         if let Some(mode) = e.matte {
             node.matte = mode;
             changed = true;
@@ -2815,7 +2821,7 @@ impl App {
         // its anchors resolved at this frame. Only gathered while the pen is
         // armed and a vector layer is selected — otherwise the canvas behaves
         // exactly as it did before the tool existed.
-        let pen_target = if self.tool == Tool::Pen {
+        let pen_target = if self.tool.pen_mode().is_some() {
             match (self.selected, sel_node) {
                 (Some(id), Some(node)) => scene.place(id).and_then(|place| match &node.shape {
                     Some(MShape::Vector { path }) => {
@@ -3214,9 +3220,10 @@ impl App {
                         // exactly like a DragValue drag does. The pen replaces it
                         // while armed — the two are different tools for the same
                         // canvas and must not both grab the pointer.
-                        if tool == Tool::Pen {
+                        if let Some(mode) = tool.pen_mode() {
                             if let (Some(t), Some(rect)) = (&pen_target, canvas_pts) {
-                                gizmo_hot = pen_ui(ui, rect, t, fit, ppp, &mut pen_drag, &mut pen_edits);
+                                gizmo_hot =
+                                    pen_ui(ui, rect, t, fit, ppp, mode, &mut pen_drag, &mut pen_edits);
                             }
                         } else if let (Some(t), Some(rect)) = (&gizmo_target, canvas_pts) {
                             gizmo_hot =

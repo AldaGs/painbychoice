@@ -96,6 +96,9 @@ pub(crate) struct NodeInfo {
     /// stopwatches in the properties panel — the opt-in that keeps a many-point
     /// path from filling the dopesheet by default.
     pub(crate) path_pts: Vec<bool>,
+    /// Whether the selected vector path is closed (meaningless unless it's a
+    /// vector — `path_pts` non-empty).
+    pub(crate) path_closed: bool,
     /// This node is a group (no shape of its own) — it can be made a compound.
     pub(crate) is_group: bool,
     /// The boolean op if this group is a compound path, else `None` (an ordinary
@@ -376,6 +379,7 @@ impl NodeInfo {
                 }
                 _ => Vec::new(),
             },
+            path_closed: matches!(&node.shape, Some(MShape::Vector { path }) if path.closed),
             is_group: node.shape.is_none(),
             compound: node.compound,
         }
@@ -442,6 +446,8 @@ pub(crate) struct PropEdits {
     /// make it an ordinary group again.
     #[allow(clippy::option_option)]
     pub(crate) set_compound: Option<Option<motion_core::BoolOp>>,
+    /// Open ⇄ close the selected vector path.
+    pub(crate) set_path_closed: Option<bool>,
     /// `Some(None)` removes the mask; `Some(Some(kind))` adds or replaces one.
     /// The nested option is the same shape `text_max_width` uses.
     #[allow(clippy::option_option)]
@@ -955,6 +961,12 @@ pub(crate) fn properties_ui(
         // anchor doesn't drag every other point onto the timeline. ---
         if !n.path_pts.is_empty() {
             ui.label("Path");
+            let mut closed = n.path_closed;
+            if ui.checkbox(&mut closed, "Closed").changed() {
+                edits.set_path_closed = Some(closed);
+            }
+            ui.end_row();
+            ui.label("");
             if ui
                 .button("Animate all points")
                 .on_hover_text("Give every anchor a keyframe at the playhead")

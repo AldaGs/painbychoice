@@ -63,10 +63,20 @@ pub(crate) fn canvas_toolbar(
                 }
                 if ui
                     .selectable_label(tool == Tool::Pen, "Pen")
-                    .on_hover_text("Draw / edit the selected vector path")
+                    .on_hover_text("Draw a vector path — click to add points, click the first to close")
                     .clicked()
                 {
                     out.set_tool = Some(Tool::Pen);
+                }
+                if ui
+                    .selectable_label(tool == Tool::EditPath, "Points")
+                    .on_hover_text(
+                        "Edit points: drag anchors/handles, Alt-drag to break a tangent, \
+                         click a segment to insert, Delete to remove",
+                    )
+                    .clicked()
+                {
+                    out.set_tool = Some(Tool::EditPath);
                 }
                 ui.separator();
                 if ui.small_button("-").on_hover_text("Zoom out").clicked() {
