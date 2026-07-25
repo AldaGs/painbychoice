@@ -427,6 +427,37 @@ fn walk(
     ));
     let mut bounds: Option<kurbo::Rect> = None;
 
+    // A compound group replaces the normal shape/children handling entirely: its
+    // direct shape children are boolean-combined into one contour drawn with this
+    // node's own fill/stroke, and the children are consumed rather than drawn.
+    // Emitted here as a single item and returned early, so it bypasses isolation,
+    // mattes and per-child recursion — a compound is one piece of geometry.
+    if let Some(op) = node.compound {
+        let merged = compound_geometry(node, ctx, op);
+        if !merged.is_empty() {
+            let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
+            let stroke = node
+                .stroke
+                .as_ref()
+                .map(|s| (s.color.resolve(ctx), s.width.resolve(ctx)));
+            bounds = Some((flat * merged.clone()).bounding_box());
+            scene.items.push(RenderItem {
+                source: node.id,
+                transform: flat,
+                path: merged,
+                fill,
+                stroke,
+                image: None,
+                opacity,
+            });
+        }
+        scene.places[place_at].1.bounds = bounds;
+        ctx.exit_node(prev_node);
+        ctx.frame = prev_frame;
+        ctx.timing = prev_timing;
+        return bounds;
+    }
+
     if let Some(shape) = &node.shape {
         let path = shape.to_path(ctx);
         let image = shape.image_paint(ctx);
@@ -630,6 +661,36 @@ fn walk(
     ctx.frame = prev_frame;
     ctx.timing = prev_timing;
     bounds
+}
+
+/// The combined contour of a compound group's direct shape children, in the
+/// group's own local space.
+///
+/// Each child's shape is resolved and pushed through its own local transform
+/// (so a child moved within the group combines where it visibly sits), then the
+/// whole set is folded by the boolean op. Only direct children with a shape take
+/// part — a nested group contributes nothing here — and a child trimmed out of
+/// its time window is skipped, exactly as the walk skips it. Runs every frame,
+/// which is what makes a compound animatable for free.
+fn compound_geometry(node: &Node, ctx: &mut EvalCtx, op: crate::pathfinder::BoolOp) -> BezPath {
+    let mut paths: Vec<BezPath> = Vec::new();
+    for child in &node.children {
+        if let Some(t) = &child.timing {
+            if !t.is_live(ctx.comp_frame) {
+                continue;
+            }
+        }
+        let Some(shape) = &child.shape else { continue };
+        let prev = ctx.frame;
+        if let Some(t) = &child.timing {
+            ctx.frame = t.local_frame(ctx.comp_frame);
+        }
+        let (local_xf, _) = child.transform.resolve(ctx);
+        let p = shape.to_path(ctx);
+        paths.push(local_xf.to_affine_lossy() * p);
+        ctx.frame = prev;
+    }
+    crate::pathfinder::combine(&paths, op)
 }
 
 
@@ -1275,6 +1336,39 @@ mod tests {
 
         let scene = evaluate(&doc, 0.0);
         assert!((scene.items[0].opacity - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_compound_group_merges_its_children_into_one_item() {
+        let sq = |id, x| {
+            Node::shape(
+                id,
+                "r",
+                Shape::Rect {
+                    size: Value::constant(Vec2::new(20.0, 20.0)),
+                    radius: Value::constant(0.0),
+                },
+            )
+            .with_transform(Transform {
+                position: Value::constant(Vec3::flat(x, 0.0)),
+                ..Transform::default()
+            })
+        };
+        let mut group = Node::group(1, "compound")
+            .with_fill(Color::rgb(1.0, 0.0, 0.0))
+            .with_child(sq(2, 0.0))
+            .with_child(sq(3, 10.0)); // overlaps the first
+        group.compound = Some(crate::pathfinder::BoolOp::Union);
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(group));
+
+        let scene = evaluate(&doc, 0.0);
+        // One drawable: the merged contour, sourced from the group. The two
+        // children are consumed, not drawn on their own.
+        assert_eq!(scene.items.len(), 1, "compound emits one item");
+        assert_eq!(scene.items[0].source.0, 1, "sourced from the group");
+        assert!(scene.items[0].fill.is_some(), "drawn with the group's fill");
+        // The union spans both squares: wider than either alone.
+        assert!(scene.items[0].path.bounding_box().width() > 20.0);
     }
 
     #[test]

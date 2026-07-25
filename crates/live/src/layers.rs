@@ -139,6 +139,10 @@ pub(crate) struct TreeEdits {
     /// Move the selection into a new composition and leave an instance behind —
     /// the core AE workflow.
     pub(crate) precompose: Option<NodeId>,
+    /// Wrap this layer in a new group node, in place.
+    pub(crate) group: Option<NodeId>,
+    /// Dissolve this group, splicing its children into the parent.
+    pub(crate) ungroup: Option<NodeId>,
     /// Open the composition this precomp layer instances.
     pub(crate) open_comp: Option<CompId>,
 }
@@ -223,6 +227,27 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
                     }
                 } else {
                     ui.weak("No shape of its own to split.");
+                }
+                // Group / ungroup. A non-root layer can be wrapped; a group can
+                // be dissolved back into its parent.
+                if row.depth > 0 {
+                    if ui
+                        .button("Group")
+                        .on_hover_text("Wrap this layer in a new group node")
+                        .clicked()
+                    {
+                        out.group = Some(row.id);
+                        ui.close();
+                    }
+                    if row.kind == RowKind::Group
+                        && ui
+                            .button("Ungroup")
+                            .on_hover_text("Dissolve this group, keeping its children in place")
+                            .clicked()
+                    {
+                        out.ungroup = Some(row.id);
+                        ui.close();
+                    }
                 }
             });
             if let Some(comp) = row.precomp {

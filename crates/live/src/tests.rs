@@ -940,6 +940,51 @@ fn a_path_point_label_names_its_anchor_and_handle() {
     assert_eq!(PropKind::PathPoint { index: 2, part: PathPart::Out }.label(), "P3 out");
 }
 
+/// A project with one comp whose root has a single rect child, for the
+/// group/ungroup tests.
+fn one_layer_project() -> (MProject, CompId, NodeId) {
+    let child = MNode::shape(
+        1,
+        "rect",
+        MShape::Rect {
+            size: Value::constant(Vec2::new(10.0, 10.0)),
+            radius: Value::constant(0.0),
+        },
+    );
+    let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(child));
+    let mut project = MProject::single(comp);
+    let comp_id = project.comps.keys().next().copied().unwrap();
+    (project, comp_id, NodeId(1))
+}
+
+#[test]
+fn grouping_wraps_a_layer_in_place_and_ungrouping_undoes_it() {
+    let (mut project, comp, layer) = one_layer_project();
+    let group = group_layer(&mut project, comp, layer, 99).unwrap();
+
+    let root = &project.comp(comp).unwrap().root;
+    assert_eq!(root.children.len(), 1, "the group took the layer's slot");
+    assert_eq!(root.children[0].id, group);
+    assert_eq!(root.children[0].children[0].id, layer, "layer is now the group's child");
+    // Grouping is visually a no-op: the group carries an identity transform.
+    assert_eq!(root.children[0].transform, Transform::default());
+
+    ungroup_layer(&mut project, comp, group).unwrap();
+    let root = &project.comp(comp).unwrap().root;
+    assert_eq!(root.children.len(), 1);
+    assert_eq!(root.children[0].id, layer, "ungroup put the layer back where it was");
+}
+
+#[test]
+fn ungroup_refuses_a_group_that_carries_its_own_transform() {
+    let (mut project, comp, layer) = one_layer_project();
+    let group = group_layer(&mut project, comp, layer, 99).unwrap();
+    // Move the group — now flattening it would shift its child.
+    project.comp_mut(comp).unwrap().root.find_mut(group).unwrap().transform.position =
+        Value::constant(motion_core::Vec3::flat(20.0, 0.0));
+    assert!(ungroup_layer(&mut project, comp, group).is_err());
+}
+
 #[test]
 fn a_pen_edit_replaces_the_path_when_the_topology_changes() {
     // Placing anchors changes the anchor count, so the whole path is swapped in.

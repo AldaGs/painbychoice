@@ -631,6 +631,80 @@ pub(crate) fn split_shape(
     Ok(child_id)
 }
 
+/// Wrap `id` in a new group node, in place. The group takes `id`'s slot among
+/// its siblings and an **identity transform**, so the layer renders exactly as
+/// before — grouping is visually a no-op, a container you can then add siblings
+/// to, mask, blend, or (Phase 4) turn into a compound path. Returns the new
+/// group's id. Refuses the composition root, which is the comp, not a layer.
+///
+/// Window-free like [`split_shape`], so it is unit-testable without an editor.
+pub(crate) fn group_layer(
+    project: &mut MProject,
+    comp: CompId,
+    id: NodeId,
+    new_id: u64,
+) -> Result<NodeId, String> {
+    let Some(c) = project.comps.get_mut(&comp) else {
+        return Err("that composition is gone.".into());
+    };
+    if c.root.id == id {
+        return Err("the composition root can't be grouped.".into());
+    }
+    let Some(parent) = c.root.parent_of_mut(id) else {
+        return Err("that layer is gone.".into());
+    };
+    let i = parent.children.iter().position(|n| n.id == id).unwrap();
+    let node = parent.children.remove(i);
+    let mut group = MNode::group(new_id, format!("Group {new_id}"));
+    group.children.push(node);
+    parent.children.insert(i, group);
+    Ok(NodeId(new_id))
+}
+
+/// Dissolve a group, splicing its children up into its parent at its own slot so
+/// draw order is preserved, then dropping it. Refuses anything that isn't a
+/// **pure container**: a group carrying its own transform, artwork, mask, blend,
+/// matte, precomp or params can't be flattened without changing the picture, so
+/// it is refused by name rather than silently altering the frame. (Baking a
+/// group's transform into its children is a later refinement.)
+pub(crate) fn ungroup_layer(project: &mut MProject, comp: CompId, id: NodeId) -> Result<(), String> {
+    let Some(c) = project.comps.get_mut(&comp) else {
+        return Err("that composition is gone.".into());
+    };
+    if c.root.id == id {
+        return Err("the composition root isn't a group.".into());
+    }
+    // Read-only checks first, so a refusal leaves the tree untouched.
+    let Some(node) = c.root.find(id) else {
+        return Err("that group is gone.".into());
+    };
+    if node.children.is_empty() {
+        return Err("that group is empty — delete it instead.".into());
+    }
+    let pristine = node.transform == Transform::default()
+        && node.shape.is_none()
+        && node.fill.is_none()
+        && node.stroke.is_none()
+        && node.mask.is_none()
+        && node.blend == MBlendMode::default()
+        && node.matte.is_none()
+        && node.precomp.is_none()
+        && node.params.is_empty();
+    if !pristine {
+        return Err("this group carries a transform or artwork of its own — flatten those first.".into());
+    }
+    let Some(parent) = c.root.parent_of_mut(id) else {
+        return Err("that group is gone.".into());
+    };
+    let i = parent.children.iter().position(|n| n.id == id).unwrap();
+    let group = parent.children.remove(i);
+    // Splice the children in at the group's slot, preserving their order.
+    for (k, child) in group.children.into_iter().enumerate() {
+        parent.children.insert(i + k, child);
+    }
+    Ok(())
+}
+
 /// Raise the shape of whatever `sink` targets onto the canvas and wire it into
 /// that sink — the geometry half of the **fold**, run from the node that already
 /// names the layer. `Err` carries the message for the Nodes panel's status line.
@@ -1752,6 +1826,10 @@ impl App {
             node.blend = mode;
             changed = true;
         }
+        if let Some(op) = e.set_compound {
+            node.compound = op;
+            changed = true;
+        }
         if let Some(mode) = e.matte {
             node.matte = mode;
             changed = true;
@@ -2158,6 +2236,45 @@ impl App {
                 self.selected_keys.clear();
                 self.shown_props.clear();
                 self.recompile_graph();
+                true
+            }
+            Err(msg) => {
+                self.ng_status = Some(msg);
+                false
+            }
+        }
+    }
+
+    /// Wrap `id` in a new group and select it (see [`group_layer`]).
+    fn group_selected(&mut self, id: NodeId) -> bool {
+        let new_id = self.next_id;
+        match group_layer(&mut self.project, self.current, id, new_id) {
+            Ok(group) => {
+                self.next_id += 1;
+                self.ng_status = None;
+                self.selected = Some(group);
+                self.selected_keys.clear();
+                self.shown_props.clear();
+                true
+            }
+            Err(msg) => {
+                self.ng_status = Some(msg);
+                false
+            }
+        }
+    }
+
+    /// Dissolve the group `id` (see [`ungroup_layer`]). Selection falls back to
+    /// the root, since the group it named is gone.
+    fn ungroup_selected(&mut self, id: NodeId) -> bool {
+        match ungroup_layer(&mut self.project, self.current, id) {
+            Ok(()) => {
+                self.ng_status = None;
+                if self.selected == Some(id) {
+                    self.selected = None;
+                    self.selected_keys.clear();
+                    self.shown_props.clear();
+                }
                 true
             }
             Err(msg) => {
@@ -3303,6 +3420,12 @@ impl App {
         // instance takes its place.
         if let Some(id) = tree_edits.precompose {
             self.precompose(id);
+        }
+        if let Some(id) = tree_edits.group {
+            self.group_selected(id);
+        }
+        if let Some(id) = tree_edits.ungroup {
+            self.ungroup_selected(id);
         }
 
         // Layers panel: selection + reorder.

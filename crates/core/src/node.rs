@@ -629,6 +629,13 @@ pub struct Node {
     /// layer of a group has nothing to take its shape from, so it simply draws.
     #[serde(default)]
     pub matte: Option<MatteMode>,
+    /// Turns this group into a **compound path**: its direct shape children are
+    /// combined by the boolean op into one filled contour drawn with *this*
+    /// node's fill/stroke, and the children are consumed rather than drawn on
+    /// their own. `None` is an ordinary group. `#[serde(default)]` so every older
+    /// `.pbc` loads as a plain group. See [`crate::pathfinder`].
+    #[serde(default)]
+    pub compound: Option<crate::pathfinder::BoolOp>,
     pub children: Vec<Node>,
 }
 
@@ -657,6 +664,7 @@ impl Node {
             blend: BlendMode::default(),
             mask: None,
             matte: None,
+            compound: None,
             children: Vec::new(),
         }
     }
@@ -675,6 +683,7 @@ impl Node {
             blend: BlendMode::default(),
             mask: None,
             matte: None,
+            compound: None,
             children: Vec::new(),
         }
     }
@@ -769,6 +778,16 @@ impl Node {
             return Some(self);
         }
         self.children.iter_mut().find_map(|c| c.find_mut(id))
+    }
+
+    /// The node whose `children` directly contains `id`, if `id` is anywhere in
+    /// this subtree. `None` for the root's own id (it has no parent here) or a
+    /// missing id. The seam group/ungroup reach through to splice the tree.
+    pub fn parent_of_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        if self.children.iter().any(|c| c.id == id) {
+            return Some(self);
+        }
+        self.children.iter_mut().find_map(|c| c.parent_of_mut(id))
     }
 
     /// Move the child with `id` among its siblings by `delta` (e.g. -1 up, +1

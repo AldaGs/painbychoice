@@ -89,6 +89,12 @@ pub(crate) fn edit_label(
     if tree.split_shape.is_some() {
         return "Split shape";
     }
+    if tree.group.is_some() {
+        return "Group";
+    }
+    if tree.ungroup.is_some() {
+        return "Ungroup";
+    }
     if tree.import_footage {
         return "Import footage";
     }

@@ -96,6 +96,11 @@ pub(crate) struct NodeInfo {
     /// stopwatches in the properties panel — the opt-in that keeps a many-point
     /// path from filling the dopesheet by default.
     pub(crate) path_pts: Vec<bool>,
+    /// This node is a group (no shape of its own) — it can be made a compound.
+    pub(crate) is_group: bool,
+    /// The boolean op if this group is a compound path, else `None` (an ordinary
+    /// group). See [`motion_core::BoolOp`].
+    pub(crate) compound: Option<motion_core::BoolOp>,
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -371,6 +376,8 @@ impl NodeInfo {
                 }
                 _ => Vec::new(),
             },
+            is_group: node.shape.is_none(),
+            compound: node.compound,
         }
     }
 }
@@ -431,6 +438,10 @@ pub(crate) struct PropEdits {
     pub(crate) scale_z: Option<f64>,
     pub(crate) opacity: Option<f64>,
     pub(crate) blend: Option<MBlendMode>,
+    /// Turn a group into a compound path, pick its boolean op, or (`Some(None)`)
+    /// make it an ordinary group again.
+    #[allow(clippy::option_option)]
+    pub(crate) set_compound: Option<Option<motion_core::BoolOp>>,
     /// `Some(None)` removes the mask; `Some(Some(kind))` adds or replaces one.
     /// The nested option is the same shape `text_max_width` uses.
     #[allow(clippy::option_option)]
@@ -961,6 +972,28 @@ pub(crate) fn properties_ui(
                 }
                 ui.end_row();
             }
+        }
+
+        // --- Compound path. A group can fold its shape children into one filled
+        // contour by a boolean op — the pathfinder. "Group" (no op) is the
+        // ordinary container. ---
+        if n.is_group {
+            ui.label("Compound");
+            let cur = n.compound;
+            let label = cur.map_or("Group", |op| op.label());
+            egui::ComboBox::from_id_salt("compound_op")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(cur.is_none(), "Group").clicked() {
+                        edits.set_compound = Some(None);
+                    }
+                    for op in motion_core::BoolOp::ALL {
+                        if ui.selectable_label(cur == Some(op), op.label()).clicked() {
+                            edits.set_compound = Some(Some(op));
+                        }
+                    }
+                });
+            ui.end_row();
         }
 
         // --- Mask. A shape that limits where this layer draws. Scoped to the

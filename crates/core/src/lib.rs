@@ -20,6 +20,7 @@ pub mod lower;
 pub mod mat4;
 pub mod node;
 pub mod path;
+pub mod pathfinder;
 pub mod raise;
 pub mod registry;
 pub mod socket;
@@ -41,6 +42,7 @@ pub use expr::{
     PropPath, ToExpr, Waveform,
 };
 pub use path::{Anchor, PathPart, PathSample, VectorPath};
+pub use pathfinder::{combine as combine_paths, BoolOp};
 pub use node::{
     Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project, Shape,
     Stroke, Transform, ViewAids,
