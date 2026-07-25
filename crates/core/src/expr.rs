@@ -256,6 +256,10 @@ pub enum PropPath {
     /// A mask's size. Animatable like the shape it is — which is the point of a
     /// mask being a [`crate::node::Shape`] rather than a fixed outline.
     MaskSize,
+    /// One control point of a vector path — so the node graph can drive a single
+    /// anchor or handle. **Indexed**, so unlike the others it is not a member of
+    /// [`Self::ALL`]; the graph picker appends a vector layer's points per target.
+    PathPoint { index: usize, part: crate::path::PathPart },
 }
 
 impl PropPath {
@@ -278,6 +282,9 @@ impl PropPath {
             PropPath::TextContent => "content",
             PropPath::TimeRemap => "time_remap",
             PropPath::MaskSize => "mask_size",
+            // Not uniquely script-addressable (a placeholder, since it carries an
+            // index and `name` is `&'static`); the graph picker labels it fully.
+            PropPath::PathPoint { .. } => "path_point",
         }
     }
 
@@ -310,9 +317,13 @@ impl PropPath {
     /// node, no document, or a cycle) where there's no real value to return.
     fn zero(self) -> ExprValue {
         match self {
-            PropPath::Position | PropPath::Scale | PropPath::Anchor | PropPath::ShapeSize | PropPath::MaskSize => {
-                ExprValue::Vec3(Vec3::ZERO)
-            }
+            PropPath::Position
+            | PropPath::Scale
+            | PropPath::Anchor
+            | PropPath::ShapeSize
+            | PropPath::MaskSize
+            // A path point is planar (Vec2) but rides the one vector kind, z=0.
+            | PropPath::PathPoint { .. } => ExprValue::Vec3(Vec3::ZERO),
             // Rotation's *value* is a 3-vector since 2.5D, even though the
             // graph still wires it as a scalar — see `socket_type`.
             PropPath::Rotation => ExprValue::Vec3(Vec3::ZERO),
@@ -1910,6 +1921,13 @@ impl<'a> EvalCtx<'a> {
                 Some(Shape::Rect { size, .. }) | Some(Shape::Ellipse { size }) => {
                     size.resolve(self).to_expr()
                 }
+                _ => prop.zero(),
+            },
+            PropPath::PathPoint { index, part } => match &node.shape {
+                Some(Shape::Vector { path }) => match path.value(index, part) {
+                    Some(v) => v.resolve(self).to_expr(),
+                    None => prop.zero(),
+                },
                 _ => prop.zero(),
             },
         }

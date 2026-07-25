@@ -21,8 +21,8 @@ use crate::*;
 /// (`PropPath::ALL`) so a new property shows up in the picker automatically.
 pub(crate) const PROP_PATHS: [PropPath; PropPath::ALL.len()] = PropPath::ALL;
 
-pub(crate) fn prop_path_label(p: PropPath) -> &'static str {
-    match p {
+pub(crate) fn prop_path_label(p: PropPath) -> String {
+    let fixed = match p {
         PropPath::Position => "Position",
         PropPath::Rotation => "Rotation",
         PropPath::Scale => "Scale",
@@ -37,7 +37,25 @@ pub(crate) fn prop_path_label(p: PropPath) -> &'static str {
         PropPath::TextContent => "Content",
         PropPath::TimeRemap => "Time Remap",
         PropPath::MaskSize => "Mask Size",
+        // A path point carries an index, so its label is built, not borrowed.
+        PropPath::PathPoint { index, part } => {
+            return format!("P{}{}", index + 1, part.suffix());
+        }
+    };
+    fixed.to_string()
+}
+
+/// The `PropPath`s a graph output can target — the fixed list, plus one entry
+/// per anchor control point when the target has `anchors > 0` (a vector layer),
+/// so the picker can drive an individual path point.
+pub(crate) fn prop_paths_for(anchors: usize) -> Vec<PropPath> {
+    let mut out: Vec<PropPath> = PROP_PATHS.to_vec();
+    for index in 0..anchors {
+        for part in motion_core::PathPart::ALL {
+            out.push(PropPath::PathPoint { index, part });
+        }
     }
+    out
 }
 
 
@@ -217,6 +235,9 @@ pub(crate) struct LayerInfo {
     pub(crate) id: u64,
     pub(crate) name: String,
     pub(crate) knobs: Vec<KnobInfo>,
+    /// Anchor count if this layer is a vector path, else 0 — lets a graph output
+    /// picker offer its individual points as drive targets.
+    pub(crate) path_anchors: usize,
 }
 
 /// Flatten the layer tree into what the panel needs, knobs included. The tree
@@ -230,6 +251,10 @@ pub(crate) fn collect_layer_info(node: &MNode, out: &mut Vec<LayerInfo>) {
         id: node.id.0,
         name: node.name.clone(),
         knobs: node.params.iter().map(knob_info).collect(),
+        path_anchors: match &node.shape {
+            Some(MShape::Vector { path }) => path.anchors.len(),
+            _ => 0,
+        },
     });
     for c in &node.children {
         collect_layer_info(c, out);
@@ -1863,11 +1888,15 @@ fn out_editor(
             let prop = cur_prop.unwrap_or(PropPath::Rotation);
             out.op = Some(NgOp::SetOutTarget { id: node.id, target: Some((l, prop)) });
         }
+        // A vector target also offers its individual path points.
+        let anchors = cur_layer
+            .and_then(|l| layers.iter().find(|li| li.id == l.0))
+            .map_or(0, |li| li.path_anchors);
         egui::ComboBox::from_id_salt(("out_prop", node.id.0))
             .width(90.0)
-            .selected_text(cur_prop.map_or("(property)", prop_path_label))
+            .selected_text(cur_prop.map_or_else(|| "(property)".to_string(), prop_path_label))
             .show_ui(ui, |ui| {
-                for p in PROP_PATHS {
+                for p in prop_paths_for(anchors) {
                     if ui.selectable_label(cur_prop == Some(p), prop_path_label(p)).clicked()
                         && cur_prop != Some(p)
                     {
@@ -2021,10 +2050,11 @@ fn ref_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: &m
             }
         }
     });
+    let ref_anchors = layers.iter().find(|l| l.id == cur_node.0).map_or(0, |l| l.path_anchors);
     egui::ComboBox::from_id_salt(("ref_prop", node.id.0))
         .selected_text(prop_path_label(cur_prop))
         .show_ui(ui, |ui| {
-            for p in PROP_PATHS {
+            for p in prop_paths_for(ref_anchors) {
                 if ui.selectable_label(p == cur_prop, prop_path_label(p)).clicked() && p != cur_prop {
                     prop = p;
                     changed = true;

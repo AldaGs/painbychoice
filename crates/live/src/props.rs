@@ -1363,6 +1363,7 @@ impl PropKind {
             PropPath::ShapeRadius => PropKind::ShapeRadius,
             PropPath::TextSize => PropKind::TextSize,
             PropPath::TextContent => PropKind::TextContent,
+            PropPath::PathPoint { index, part } => PropKind::PathPoint { index, part },
             PropPath::TimeRemap => PropKind::TimeRemap,
             PropPath::MaskSize => PropKind::MaskSize,
         }

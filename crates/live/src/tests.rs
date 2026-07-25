@@ -986,6 +986,23 @@ fn ungroup_refuses_a_group_that_carries_its_own_transform() {
 }
 
 #[test]
+fn the_graph_can_target_a_vector_layers_points() {
+    use crate::nodegraph::{prop_paths_for, PROP_PATHS};
+    // No path → only the fixed properties.
+    assert_eq!(prop_paths_for(0).len(), PROP_PATHS.len());
+    // A 3-anchor path adds 9 point targets (3 anchors × point/in/out).
+    let with_points = prop_paths_for(3);
+    assert_eq!(with_points.len(), PROP_PATHS.len() + 9);
+    assert!(with_points.contains(&PropPath::PathPoint { index: 2, part: PathPart::Out }));
+    // A path-point PropPath maps to the matching editor PropKind, so a driver
+    // built on it reaches prop_of_mut.
+    assert_eq!(
+        PropKind::from_path(PropPath::PathPoint { index: 1, part: PathPart::In }),
+        PropKind::PathPoint { index: 1, part: PathPart::In }
+    );
+}
+
+#[test]
 fn a_pen_edit_replaces_the_path_when_the_topology_changes() {
     // Placing anchors changes the anchor count, so the whole path is swapped in.
     let mut path = motion_core::VectorPath::empty();
@@ -3517,6 +3534,7 @@ fn the_panel_lays_out_every_node_kind_without_an_id_clash() {
         id: 1,
         name: "Star".into(),
         knobs: vec![],
+        path_anchors: 0,
     }];
 
     let egui_ctx = egui::Context::default();
