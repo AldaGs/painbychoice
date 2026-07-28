@@ -107,6 +107,10 @@ pub(crate) struct NodeInfo {
     /// The layer's effect stack, top to bottom in application order — resolved
     /// for display and paired with which parameters to edit.
     pub(crate) effects: Vec<EffectInfo>,
+    /// The stack contains an effect the in-scene fast path can't show yet (a
+    /// blur), so the preview under-represents it. Surfaced as a note rather than
+    /// silently drawing the wrong thing.
+    pub(crate) effects_preview_gap: bool,
 }
 
 /// One row of the properties panel's effect stack: what the effect is, whether
@@ -463,6 +467,11 @@ impl NodeInfo {
                     },
                 })
                 .collect(),
+            effects_preview_gap: {
+                let resolved: Vec<_> =
+                    node.effects.iter().filter_map(|e| e.resolve(ctx)).collect();
+                crate::fx::needs_readback(&resolved)
+            },
         }
     }
 }
@@ -1254,6 +1263,12 @@ pub(crate) fn properties_ui(
                 ui.label("");
                 ui.end_row();
             }
+        }
+        if n.effects_preview_gap {
+            ui.label("");
+            ui.colored_label(WARN_COLOR, "blur not shown in preview yet")
+                .on_hover_text("Colour effects preview live; blur needs the full-image compositor, still being built.");
+            ui.end_row();
         }
 
         // --- Footage. The source is a read-only fact about a file; the only

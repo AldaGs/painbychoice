@@ -313,8 +313,10 @@ pub(crate) fn to_vello(
     // start the longer range is the outer one.
     let groups = scene.nesting_order();
     let mut next_group = 0usize;
-    // Ends of the layers currently open, innermost last.
-    let mut open: Vec<usize> = Vec::new();
+    // The layers currently open, innermost last. Holds the groups themselves
+    // (not just their end index) so the item loop can reach each open layer's
+    // effect stack while it draws inside it.
+    let mut open: Vec<&LayerGroup> = Vec::new();
 
     for (i, item) in scene.items.iter().enumerate() {
         // Open every layer that begins here. `push_layer` gives vello an
@@ -344,7 +346,7 @@ pub(crate) fn to_vello(
                     &group_bounds(scene, g),
                 ),
             }
-            open.push(g.end);
+            open.push(g);
             next_group += 1;
         }
 
@@ -358,21 +360,22 @@ pub(crate) fn to_vello(
         };
         if let Some(fill) = item.fill {
             if !drew_footage {
-                vs.fill(Fill::NonZero, xf, to_peniko(fill, item.opacity), None, &item.path);
+                let c = with_effects(fill, &open);
+                vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity), None, &item.path);
             }
         }
         if let Some((color, width)) = item.stroke {
             vs.stroke(
                 &KurboStroke::new(width),
                 xf,
-                to_peniko(color, item.opacity),
+                to_peniko(with_effects(color, &open), item.opacity),
                 None,
                 &item.path,
             );
         }
 
         // Close every layer that ended with this item, innermost first.
-        while open.last() == Some(&(i + 1)) {
+        while open.last().map(|g| g.end) == Some(i + 1) {
             vs.pop_layer();
             open.pop();
         }
@@ -639,6 +642,21 @@ fn to_peniko_blend(mode: MBlendMode, compose: MComposeMode) -> vello::peniko::Bl
         MComposeMode::DestOut => Compose::DestOut,
     };
     B::new(mix, compose)
+}
+
+/// Apply the colour-adjustment effects of every open layer to one item colour,
+/// innermost outward — the in-scene fast path for the effect stack (see
+/// [`crate::fx`]). A blur in the stack is skipped here; it needs the whole
+/// rasterized layer, which the readback compositor will supply. Most items sit
+/// inside no effect layer, so the common case is a single `is_empty` check.
+fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {
+    let mut c = color;
+    for g in open.iter().rev() {
+        if !g.effects.is_empty() {
+            c = crate::fx::apply_color_effects(c, &g.effects);
+        }
+    }
+    c
 }
 
 /// The extent of an isolated layer's contents, in composition space.
