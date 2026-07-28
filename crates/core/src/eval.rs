@@ -10,6 +10,7 @@ use crate::warp::warp_path;
 
 use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
+use crate::effect::ResolvedEffect;
 use crate::expr::EvalCtx;
 use crate::node::{CompId, Document, Node, NodeId, Project};
 use crate::value::Color;
@@ -127,6 +128,15 @@ pub struct LayerGroup {
     /// bounds minus the shape, to be filled even-odd. Doing that here keeps
     /// every backend from re-deriving the same trick and disagreeing about it.
     pub clip: Option<MaskPath>,
+    /// The layer's effect stack, resolved to plain parameters for this frame and
+    /// in application order.
+    ///
+    /// Applied to the isolated image *after* it is drawn and *before* the blend
+    /// and `alpha` combine it with the backdrop — the pixel-rework stage of the
+    /// composite. Empty for a layer with no effects (and for the structural
+    /// groups a track matte emits), so a backend that ignores this field draws
+    /// exactly as before, the same arrangement mattes already have.
+    pub effects: Vec<ResolvedEffect>,
 }
 
 /// A resolved mask: the outline to clip to, and how to fill it.
@@ -583,6 +593,9 @@ fn walk(
                 MaskPath { path, transform: flat, even_odd: false }
             }
         });
+        // The effect stack, resolved for this frame. Runs on the isolated image
+        // before the blend and alpha combine it with the backdrop.
+        let effects = node.effects.iter().filter_map(|e| e.resolve(ctx)).collect();
         scene.groups.push(LayerGroup {
             source: node.id,
             start: group_at,
@@ -591,6 +604,7 @@ fn walk(
             compose: ComposeMode::SrcOver,
             alpha: full,
             clip,
+            effects,
         });
     }
 
@@ -630,6 +644,7 @@ fn walk(
                 compose: ComposeMode::SrcOver,
                 alpha: 1.0,
                 clip: None,
+                effects: Vec::new(),
             });
             // The inner one is the matte layer itself, composited onto the
             // content with a coverage rule instead of being painted.
@@ -641,6 +656,7 @@ fn walk(
                 compose: mode.compose(),
                 alpha: 1.0,
                 clip: None,
+                effects: Vec::new(),
             });
             // The matte contributes shape, not extent: a layer cut to a smaller
             // shape did not get bigger, so only the content's bounds count.

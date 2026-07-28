@@ -104,6 +104,71 @@ pub(crate) struct NodeInfo {
     /// The boolean op if this group is a compound path, else `None` (an ordinary
     /// group). See [`motion_core::BoolOp`].
     pub(crate) compound: Option<motion_core::BoolOp>,
+    /// The layer's effect stack, top to bottom in application order — resolved
+    /// for display and paired with which parameters to edit.
+    pub(crate) effects: Vec<EffectInfo>,
+}
+
+/// One row of the properties panel's effect stack: what the effect is, whether
+/// it's on, and its parameters resolved for this frame.
+pub(crate) struct EffectInfo {
+    pub(crate) ty: motion_core::EffectType,
+    pub(crate) enabled: bool,
+    /// Numeric parameters in editing order, each tagged with which parameter it
+    /// is so an edit routes back to the right `Value`.
+    pub(crate) nums: Vec<(EffectParam, f64)>,
+    /// The tint colour, `Some` only for a `Tint` effect.
+    pub(crate) color: Option<[f32; 3]>,
+}
+
+/// Names one editable numeric parameter of an effect, so a `DragValue` edit can
+/// say which `Value` it changed without the panel knowing the effect's layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffectParam {
+    BlurRadius,
+    Brightness,
+    Contrast,
+    Hue,
+    Saturation,
+    Lightness,
+    TintAmount,
+}
+
+impl EffectParam {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            EffectParam::BlurRadius => "Radius",
+            EffectParam::Brightness => "Brightness",
+            EffectParam::Contrast => "Contrast",
+            EffectParam::Hue => "Hue",
+            EffectParam::Saturation => "Saturation",
+            EffectParam::Lightness => "Lightness",
+            EffectParam::TintAmount => "Amount",
+        }
+    }
+}
+
+/// The numeric parameters of one effect, in editing order, paired with which
+/// parameter each is. One place enumerates each kind's layout so the readout and
+/// the apply path can't disagree about it.
+pub(crate) fn effect_nums(
+    kind: &motion_core::EffectKind,
+    ctx: &mut EvalCtx,
+) -> Vec<(EffectParam, f64)> {
+    use motion_core::EffectKind as K;
+    match kind {
+        K::GaussianBlur { radius } => vec![(EffectParam::BlurRadius, radius.resolve(ctx))],
+        K::BrightnessContrast { brightness, contrast } => vec![
+            (EffectParam::Brightness, brightness.resolve(ctx)),
+            (EffectParam::Contrast, contrast.resolve(ctx)),
+        ],
+        K::HueSaturation { hue, saturation, lightness } => vec![
+            (EffectParam::Hue, hue.resolve(ctx)),
+            (EffectParam::Saturation, saturation.resolve(ctx)),
+            (EffectParam::Lightness, lightness.resolve(ctx)),
+        ],
+        K::Tint { amount, .. } => vec![(EffectParam::TintAmount, amount.resolve(ctx))],
+    }
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -382,6 +447,22 @@ impl NodeInfo {
             path_closed: matches!(&node.shape, Some(MShape::Vector { path }) if path.closed),
             is_group: node.shape.is_none(),
             compound: node.compound,
+            effects: node
+                .effects
+                .iter()
+                .map(|ef| EffectInfo {
+                    ty: ef.effect_type(),
+                    enabled: ef.enabled,
+                    nums: effect_nums(&ef.kind, ctx),
+                    color: match &ef.kind {
+                        motion_core::EffectKind::Tint { color, .. } => {
+                            let c = color.resolve(ctx);
+                            Some([c.r as f32, c.g as f32, c.b as f32])
+                        }
+                        _ => None,
+                    },
+                })
+                .collect(),
         }
     }
 }
@@ -493,6 +574,28 @@ pub(crate) struct PropEdits {
     /// reach it from, so it gets one op and one apply path, not two that have to
     /// agree.
     pub(crate) knob: Option<NgKnobOp>,
+    /// One edit to the layer's effect stack this frame. At most one — the stack
+    /// controls are discrete (a click adds/removes/reorders, a drag edits one
+    /// parameter), so a single slot is enough and mirrors `set_compound`.
+    pub(crate) effect: Option<EffectOp>,
+}
+
+/// A single change to a layer's effect stack, reported by the panel and applied
+/// in `apply_edits`. Indices address the stack top-to-bottom, as the panel shows
+/// it.
+#[derive(Clone)]
+pub(crate) enum EffectOp {
+    /// Append a new effect of this kind, seeded with neutral parameters.
+    Add(motion_core::EffectType),
+    Remove(usize),
+    /// Move the effect at `index` by `delta` (`-1` up / earlier, `+1` down).
+    Move { index: usize, delta: isize },
+    /// Flip the enabled flag of the effect at `index`.
+    ToggleEnabled(usize),
+    /// Set a numeric parameter (auto-keying it if it's animated).
+    SetNum { index: usize, param: EffectParam, value: f64 },
+    /// Set a `Tint` effect's colour.
+    SetColor { index: usize, rgb: [f32; 3] },
 }
 
 /// The set of properties whose stopwatch was clicked this frame.
@@ -1085,6 +1188,72 @@ pub(crate) fn properties_ui(
                 }
             }
             ui.end_row();
+        }
+
+        // --- Effects. An ordered stack of pixel operations on the layer's
+        // finished, isolated image. Sits with the compositing controls because
+        // it is one: a non-empty stack isolates the layer exactly as a blend
+        // mode does. Effects apply top-to-bottom, the order the panel lists. ---
+        ui.label("Effects");
+        egui::ComboBox::from_id_salt("add_effect")
+            .selected_text("Add…")
+            .show_ui(ui, |ui| {
+                for ty in motion_core::EffectType::ALL {
+                    if ui.selectable_label(false, ty.label()).clicked() {
+                        edits.effect = Some(EffectOp::Add(ty));
+                    }
+                }
+            });
+        ui.end_row();
+
+        let last = n.effects.len().saturating_sub(1);
+        for (i, ef) in n.effects.iter().enumerate() {
+            // Header row: enable toggle + name in the label cell, reorder /
+            // remove in the control cell.
+            ui.horizontal(|ui| {
+                let mut on = ef.enabled;
+                if ui.checkbox(&mut on, "").on_hover_text("Enable this effect").changed() {
+                    edits.effect = Some(EffectOp::ToggleEnabled(i));
+                }
+                // A disabled effect reads dimmed, so a muted stack is legible at
+                // a glance rather than only via the checkbox.
+                let name = egui::RichText::new(ef.ty.label());
+                let name = if ef.enabled { name.strong() } else { name.weak() };
+                ui.label(name);
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(i > 0, egui::Button::new("Up").small()).clicked() {
+                    edits.effect = Some(EffectOp::Move { index: i, delta: -1 });
+                }
+                if ui.add_enabled(i < last, egui::Button::new("Dn").small()).clicked() {
+                    edits.effect = Some(EffectOp::Move { index: i, delta: 1 });
+                }
+                if ui.button("Remove").clicked() {
+                    edits.effect = Some(EffectOp::Remove(i));
+                }
+            });
+            ui.end_row();
+
+            // Parameter rows, indented under the effect they belong to.
+            for &(param, value) in &ef.nums {
+                ui.label(format!("  {}", param.label()));
+                let mut v = value;
+                let speed = if param == EffectParam::BlurRadius { 0.5 } else { 0.01 };
+                if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {
+                    edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
+                }
+                ui.label("");
+                ui.end_row();
+            }
+            if let Some(rgb) = ef.color {
+                ui.label("  Color");
+                let mut c = rgb;
+                if ui.color_edit_button_rgb(&mut c).changed() {
+                    edits.effect = Some(EffectOp::SetColor { index: i, rgb: c });
+                }
+                ui.label("");
+                ui.end_row();
+            }
         }
 
         // --- Footage. The source is a read-only fact about a file; the only

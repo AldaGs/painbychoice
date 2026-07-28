@@ -636,6 +636,20 @@ pub struct Node {
     /// `.pbc` loads as a plain group. See [`crate::pathfinder`].
     #[serde(default)]
     pub compound: Option<crate::pathfinder::BoolOp>,
+    /// The layer's effect stack: ordered pixel operations applied to its
+    /// finished, isolated image before it composites with the backdrop.
+    ///
+    /// Scoped like [`Node::blend`] and [`Node::mask`] — the layer's own content
+    /// and the comp it instances, never its children — because an effect reworks
+    /// the pixels this layer produced, and its children are separate layers.
+    /// Empty for every layer that has no effects, which is the ordinary case and
+    /// `#[serde(default)]` so every older `.pbc` loads with an empty stack.
+    ///
+    /// A non-empty stack forces isolation (see [`Node::needs_isolation`]) for the
+    /// same reason a blend mode does: an effect acts on the layer as one finished
+    /// image, not on each item as it is painted.
+    #[serde(default)]
+    pub effects: Vec<crate::effect::Effect>,
     pub children: Vec<Node>,
 }
 
@@ -645,7 +659,7 @@ impl Node {
     /// The single place that answers it, so the walk and any future backend
     /// can't disagree about which layers cost an offscreen target.
     pub fn needs_isolation(&self) -> bool {
-        self.blend.needs_isolation() || self.mask.is_some()
+        self.blend.needs_isolation() || self.mask.is_some() || !self.effects.is_empty()
     }
 }
 
@@ -665,6 +679,7 @@ impl Node {
             mask: None,
             matte: None,
             compound: None,
+            effects: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -684,6 +699,7 @@ impl Node {
             mask: None,
             matte: None,
             compound: None,
+            effects: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -848,6 +864,9 @@ impl Node {
             stroke.color.migrate_frames(fps);
             stroke.width.migrate_frames(fps);
         }
+        for effect in &mut self.effects {
+            effect.migrate_frames(fps);
+        }
         for child in &mut self.children {
             child.migrate_frames(fps);
         }
@@ -869,6 +888,9 @@ impl Node {
         if let Some(stroke) = &mut self.stroke {
             stroke.color.retime(ratio);
             stroke.width.retime(ratio);
+        }
+        for effect in &mut self.effects {
+            effect.retime(ratio);
         }
         if let Some(timing) = &mut self.timing {
             timing.retime(ratio);

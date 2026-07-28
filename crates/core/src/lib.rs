@@ -13,6 +13,7 @@ pub mod asset;
 pub mod camera;
 pub mod composite;
 pub mod demo;
+pub mod effect;
 pub mod eval;
 pub mod expr;
 pub mod graph;
@@ -35,6 +36,7 @@ pub use asset::{
     ImagePaint,
 };
 pub use composite::{BlendMode, ComposeMode, Mask, MatteMode};
+pub use effect::{Effect, EffectKind, EffectType, ResolvedEffect};
 pub use eval::{evaluate, evaluate_comp, evaluate_comp_orbited, evaluate_project, LayerGroup, MaskPath, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,

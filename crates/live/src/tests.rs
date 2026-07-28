@@ -5176,3 +5176,97 @@ fn orbiting_never_changes_what_renders() {
         "an orbited view is a different picture — but only in the preview"
     );
 }
+
+// --- Effect stack: the properties-panel edit ops. `apply_effect_op` is the
+// window-free apply path, so the whole authoring flow is unit-testable. ---
+
+fn effect_layer() -> MNode {
+    MNode::shape(1, "layer", MShape::Rect {
+        size: Value::constant(Vec2::new(100.0, 100.0)),
+        radius: Value::constant(0.0),
+    })
+}
+
+#[test]
+fn adding_an_effect_appends_a_seeded_one() {
+    let mut node = effect_layer();
+    assert!(apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur)));
+    assert_eq!(node.effects.len(), 1);
+    assert_eq!(node.effects[0].effect_type(), motion_core::EffectType::GaussianBlur);
+    assert!(node.effects[0].enabled);
+    // A seeded effect forces the layer to isolate — that's the whole point.
+    assert!(node.needs_isolation());
+}
+
+#[test]
+fn a_stale_index_no_ops_instead_of_panicking() {
+    // Indices come from a panel snapshot a frame old; a shrunk stack must not
+    // panic. Every index-bearing op is exercised against an empty stack.
+    let mut node = effect_layer();
+    for op in [
+        EffectOp::Remove(3),
+        EffectOp::Move { index: 2, delta: -1 },
+        EffectOp::ToggleEnabled(5),
+        EffectOp::SetNum { index: 1, param: EffectParam::BlurRadius, value: 4.0 },
+        EffectOp::SetColor { index: 0, rgb: [1.0, 0.0, 0.0] },
+    ] {
+        assert!(!apply_effect_op(&mut node, 0, &op), "stale op should no-op");
+    }
+    assert!(node.effects.is_empty());
+}
+
+#[test]
+fn reorder_swaps_and_clamps_at_the_ends() {
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::Tint));
+    // Moving the top one up (off the top) is refused.
+    assert!(!apply_effect_op(&mut node, 0, &EffectOp::Move { index: 0, delta: -1 }));
+    // Moving it down swaps the two.
+    assert!(apply_effect_op(&mut node, 0, &EffectOp::Move { index: 0, delta: 1 }));
+    assert_eq!(node.effects[0].effect_type(), motion_core::EffectType::Tint);
+    assert_eq!(node.effects[1].effect_type(), motion_core::EffectType::GaussianBlur);
+    // Moving the bottom one down (off the bottom) is refused.
+    assert!(!apply_effect_op(&mut node, 0, &EffectOp::Move { index: 1, delta: 1 }));
+}
+
+#[test]
+fn toggle_and_set_num_reach_the_right_field() {
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    assert!(apply_effect_op(&mut node, 0, &EffectOp::ToggleEnabled(0)));
+    assert!(!node.effects[0].enabled);
+    // A disabled effect still isolates the layer — it's in the stack.
+    assert!(node.needs_isolation());
+
+    assert!(apply_effect_op(
+        &mut node,
+        0,
+        &EffectOp::SetNum { index: 0, param: EffectParam::BlurRadius, value: 20.0 },
+    ));
+    let mut ctx = EvalCtx::at(0.0);
+    match node.effects[0].resolve(&mut ctx) {
+        // Disabled → resolves away regardless of the new radius.
+        None => {}
+        other => panic!("a disabled effect should resolve to None, got {other:?}"),
+    }
+    // Re-enable and confirm the radius stuck.
+    apply_effect_op(&mut node, 0, &EffectOp::ToggleEnabled(0));
+    assert_eq!(
+        node.effects[0].resolve(&mut ctx),
+        Some(motion_core::ResolvedEffect::GaussianBlur { radius: 20.0 }),
+    );
+}
+
+#[test]
+fn set_num_ignores_a_param_from_another_kind() {
+    // The panel only ever offers a kind's own params, but the apply path guards
+    // against a mismatch rather than writing the wrong field.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    assert!(!apply_effect_op(
+        &mut node,
+        0,
+        &EffectOp::SetNum { index: 0, param: EffectParam::Hue, value: 90.0 },
+    ));
+}

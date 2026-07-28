@@ -550,6 +550,77 @@ pub(crate) fn mask_seed_size(node: &MNode) -> Vec2 {
     }
 }
 
+/// Apply one effect-stack edit to a layer, returning whether it changed
+/// anything. Every index is bounds-checked: the panel captured it a frame
+/// earlier, so a stale op (from a stack that shrank in between) must no-op
+/// rather than panic — the same discipline the dock's deferred ops follow.
+pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bool {
+    use motion_core::{Effect, EffectKind as K};
+    match *op {
+        EffectOp::Add(ty) => {
+            node.effects.push(Effect::seed(ty));
+            true
+        }
+        EffectOp::Remove(i) => node.effects.get(i).is_some() && {
+            node.effects.remove(i);
+            true
+        },
+        EffectOp::Move { index, delta } => {
+            let dest = index.checked_add_signed(delta);
+            match dest {
+                Some(j) if index < node.effects.len() && j < node.effects.len() => {
+                    node.effects.swap(index, j);
+                    true
+                }
+                _ => false,
+            }
+        }
+        EffectOp::ToggleEnabled(i) => match node.effects.get_mut(i) {
+            Some(ef) => {
+                ef.enabled = !ef.enabled;
+                true
+            }
+            None => false,
+        },
+        EffectOp::SetNum { index, param, value } => match node.effects.get_mut(index) {
+            Some(ef) => set_effect_num(&mut ef.kind, param, frame, value),
+            None => false,
+        },
+        EffectOp::SetColor { index, rgb } => match node.effects.get_mut(index) {
+            Some(ef) => {
+                if let K::Tint { color, .. } = &mut ef.kind {
+                    color.set_at(frame, rgb_color(rgb));
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        },
+    }
+}
+
+/// Write one numeric effect parameter, auto-keying it if it's animated
+/// (`Value::set_at`). Returns false if the parameter doesn't belong to this
+/// effect kind — a mismatch the panel shouldn't produce, but which no-ops rather
+/// than writing the wrong field. The one place the `EffectParam`→`Value` mapping
+/// is written, mirroring `effect_nums` on the read side.
+fn set_effect_num(kind: &mut motion_core::EffectKind, param: EffectParam, frame: i64, v: f64) -> bool {
+    use motion_core::EffectKind as K;
+    use EffectParam as P;
+    match (kind, param) {
+        (K::GaussianBlur { radius }, P::BlurRadius) => radius.set_at(frame, v),
+        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness.set_at(frame, v),
+        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast.set_at(frame, v),
+        (K::HueSaturation { hue, .. }, P::Hue) => hue.set_at(frame, v),
+        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation.set_at(frame, v),
+        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness.set_at(frame, v),
+        (K::Tint { amount, .. }, P::TintAmount) => amount.set_at(frame, v),
+        _ => return false,
+    }
+    true
+}
+
 /// The properties that live on a node's **artwork** rather than its placement,
 /// and so move with the shape when a layer is split.
 ///
@@ -1839,6 +1910,11 @@ impl App {
         if let Some(mode) = e.matte {
             node.matte = mode;
             changed = true;
+        }
+        if let Some(op) = &e.effect {
+            if apply_effect_op(node, frame, op) {
+                changed = true;
+            }
         }
         // A fresh mask is seeded to the layer's own size, so it starts covering
         // what it masks rather than as a speck at the origin the user has to
