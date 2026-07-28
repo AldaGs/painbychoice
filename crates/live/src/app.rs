@@ -2729,6 +2729,47 @@ impl App {
     }
 
     /// Evaluate + rasterize the current frame, then composite the egui overlay.
+    /// Rasterize and process the frame's blurred layers into device-space
+    /// images for [`to_vello`], or an empty map when there are none.
+    ///
+    /// Kept out of `render` so the field borrows stay legible: it reads the
+    /// active surface for the device and size, borrows the renderer and footage
+    /// cache, and hands them to [`rasterize_effect_layers`]. Early-outs before
+    /// touching the GPU when no layer needs the full-image path, so the common
+    /// document pays nothing.
+    fn effect_images(
+        &mut self,
+        scene: &MScene,
+        fit: Affine,
+    ) -> std::collections::HashMap<NodeId, vello::peniko::ImageData> {
+        use std::collections::HashMap;
+        if !scene.groups.iter().any(|g| crate::fx::needs_readback(&g.effects)) {
+            return HashMap::new();
+        }
+        let (dev, w, h) = match &self.state {
+            RenderState::Active { surface, .. } => {
+                (surface.dev_id, surface.config.width, surface.config.height)
+            }
+            RenderState::Suspended(_) => return HashMap::new(),
+        };
+        let device = &self.context.devices[dev].device;
+        let queue = &self.context.devices[dev].queue;
+        let Some(renderer) = self.renderers[dev].as_mut() else {
+            return HashMap::new();
+        };
+        rasterize_effect_layers(
+            scene,
+            fit,
+            w,
+            h,
+            device,
+            queue,
+            renderer,
+            &mut self.footage,
+            &self.project.assets,
+        )
+    }
+
     pub(crate) fn render(&mut self, window: &Window) {
         // The whole render path is in the frame domain; seconds only ever
         // appear in the timecode string.
@@ -2819,6 +2860,9 @@ impl App {
 
         let bg = self.doc().bg;
         let pp = self.doc().passepartout;
+        // Blurred layers rasterized + filtered before the scene is assembled, so
+        // `to_vello` can drop each one's processed image in place of its items.
+        let effect_images = self.effect_images(&scene, fit);
         self.vscene =
             {
                 // Comp dimensions read *before* the call: `to_vello` borrows
@@ -2836,6 +2880,7 @@ impl App {
                     self.selected,
                     &mut self.footage,
                     &self.project.assets,
+                    &effect_images,
                 )
             };
 
@@ -3836,6 +3881,7 @@ impl App {
                 );
             let bg = self.doc().bg;
             let pp = self.doc().passepartout;
+            let effect_images = self.effect_images(&scene, fit);
         self.vscene =
             {
                 // Comp dimensions read *before* the call: `to_vello` borrows
@@ -3853,6 +3899,7 @@ impl App {
                     self.selected,
                     &mut self.footage,
                     &self.project.assets,
+                    &effect_images,
                 )
             };
         }

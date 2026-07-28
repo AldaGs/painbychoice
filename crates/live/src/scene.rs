@@ -275,6 +275,12 @@ pub(crate) fn to_vello(
     selected: Option<NodeId>,
     footage: &mut FootageCache,
     assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+    // Layers whose effect stack needed the full-image path (a blur), already
+    // rasterized and processed into a device-space image keyed by the layer's
+    // node. When a group is here, its raw items are replaced by this image; when
+    // it isn't — because it has no blur, or because the readback failed — the
+    // items draw normally and the in-scene colour path still applies.
+    effect_images: &std::collections::HashMap<NodeId, vello::peniko::ImageData>,
 ) -> VScene {
     let mut vs = VScene::new();
 
@@ -317,66 +323,101 @@ pub(crate) fn to_vello(
     // (not just their end index) so the item loop can reach each open layer's
     // effect stack while it draws inside it.
     let mut open: Vec<&LayerGroup> = Vec::new();
+    // While `Some(end)`, the current layer's raw content has been replaced by a
+    // processed image (a blurred layer); its own items and any nested groups are
+    // skipped until `end`, since they are already baked into that image.
+    let mut replaced_until: Option<usize> = None;
 
     for (i, item) in scene.items.iter().enumerate() {
+        let inside_replaced = replaced_until.is_some_and(|e| i < e);
         // Open every layer that begins here. `push_layer` gives vello an
         // offscreen target: everything drawn until the matching `pop_layer`
-        // composites as one image, which is what a blend mode needs and what
-        // masks and effects will hang off next.
-        while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
-            // A masked layer clips to its mask; an unmasked one clips to its
-            // own extent — bounded rather than "everything", because vello
-            // rasterizes the clip shape and an unbounded one would cost the
-            // whole frame per group. Outside its own bounds a layer
-            // contributes nothing anyway, so that clips away only what could
-            // not have shown.
-            match &g.clip {
-                Some(mask) => vs.push_layer(
-                    if mask.even_odd { Fill::EvenOdd } else { Fill::NonZero },
-                    to_peniko_blend(g.blend, g.compose),
-                    g.alpha.clamp(0.0, 1.0) as f32,
-                    fit * mask.transform,
-                    &mask.path,
-                ),
-                None => vs.push_layer(
-                    Fill::NonZero,
-                    to_peniko_blend(g.blend, g.compose),
-                    g.alpha.clamp(0.0, 1.0) as f32,
-                    fit,
-                    &group_bounds(scene, g),
-                ),
+        // composites as one image, which is what a blend mode needs and what a
+        // mask and the colour effects hang off. An item inside a replaced region
+        // opens nothing — its groups were consumed when the replacement drew.
+        if !inside_replaced {
+            while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
+                let replacement = effect_images.get(&g.source);
+                // A masked layer clips to its mask; an unmasked one clips to its
+                // own extent — bounded rather than "everything", because vello
+                // rasterizes the clip shape and an unbounded one would cost the
+                // whole frame per group. A *replaced* (blurred) layer is the
+                // exception: the blur spreads past the raw bounds, so an
+                // unmasked one clips to the whole comp instead of shaving off the
+                // halo.
+                match &g.clip {
+                    Some(mask) => vs.push_layer(
+                        if mask.even_odd { Fill::EvenOdd } else { Fill::NonZero },
+                        to_peniko_blend(g.blend, g.compose),
+                        g.alpha.clamp(0.0, 1.0) as f32,
+                        fit * mask.transform,
+                        &mask.path,
+                    ),
+                    None => {
+                        let bounds =
+                            if replacement.is_some() { comp_rect } else { group_bounds(scene, g) };
+                        vs.push_layer(
+                            Fill::NonZero,
+                            to_peniko_blend(g.blend, g.compose),
+                            g.alpha.clamp(0.0, 1.0) as f32,
+                            fit,
+                            &bounds,
+                        );
+                    }
+                }
+                open.push(g);
+                next_group += 1;
+
+                if let Some(img) = replacement {
+                    // The processed image is already in device space (rasterized
+                    // through the same `fit`), so it draws at identity, inside
+                    // this layer's push_layer so the blend and alpha still apply.
+                    vs.draw_image(&vello::peniko::ImageBrush::new(img.clone()), Affine::IDENTITY);
+                    replaced_until = Some(g.end);
+                    // Skip every group nested inside this one: its effects are
+                    // baked into the image, and leaving them for the loop would
+                    // strand `next_group` on a range that can't match a later
+                    // start.
+                    while groups.get(next_group).is_some_and(|g2| g2.start < g.end) {
+                        next_group += 1;
+                    }
+                    break;
+                }
             }
-            open.push(g);
-            next_group += 1;
         }
 
-        let xf = fit * item.transform;
-        // Footage draws *instead of* the fill: the fill colour is what a
-        // rectangle would paint, and a clip covers it entirely. A stroke still
-        // applies, so a bordered video layer works like a bordered rect.
-        let drew_footage = match item.image {
-            Some(paint) => draw_footage(&mut vs, item, xf, paint, footage, assets),
-            None => false,
-        };
-        if let Some(fill) = item.fill {
-            if !drew_footage {
-                let c = with_effects(fill, &open);
-                vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity), None, &item.path);
+        if !inside_replaced {
+            let xf = fit * item.transform;
+            // Footage draws *instead of* the fill: the fill colour is what a
+            // rectangle would paint, and a clip covers it entirely. A stroke
+            // still applies, so a bordered video layer works like a bordered rect.
+            let drew_footage = match item.image {
+                Some(paint) => draw_footage(&mut vs, item, xf, paint, footage, assets),
+                None => false,
+            };
+            if let Some(fill) = item.fill {
+                if !drew_footage {
+                    let c = with_effects(fill, &open);
+                    vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity), None, &item.path);
+                }
             }
-        }
-        if let Some((color, width)) = item.stroke {
-            vs.stroke(
-                &KurboStroke::new(width),
-                xf,
-                to_peniko(with_effects(color, &open), item.opacity),
-                None,
-                &item.path,
-            );
+            if let Some((color, width)) = item.stroke {
+                vs.stroke(
+                    &KurboStroke::new(width),
+                    xf,
+                    to_peniko(with_effects(color, &open), item.opacity),
+                    None,
+                    &item.path,
+                );
+            }
         }
 
         // Close every layer that ended with this item, innermost first.
         while open.last().map(|g| g.end) == Some(i + 1) {
             vs.pop_layer();
+            if replaced_until == Some(i + 1) {
+                replaced_until = None;
+            }
             open.pop();
         }
     }
@@ -657,6 +698,188 @@ fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {
         }
     }
     c
+}
+
+/// Draw one item's raw fill/stroke/footage into a scene at `fit`, with **no**
+/// effects applied. Used to build the sub-scene a full-image effect layer is
+/// rasterized from — [`crate::fx::apply_stack`] applies the whole stack (colour
+/// *and* blur) to the readback, so the sub-scene must be the untouched pixels.
+fn draw_item_raw(
+    vs: &mut VScene,
+    item: &motion_core::RenderItem,
+    fit: Affine,
+    footage: &mut FootageCache,
+    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+) {
+    let xf = fit * item.transform;
+    let drew_footage = match item.image {
+        Some(paint) => draw_footage(vs, item, xf, paint, footage, assets),
+        None => false,
+    };
+    if let Some(fill) = item.fill {
+        if !drew_footage {
+            vs.fill(Fill::NonZero, xf, to_peniko(fill, item.opacity), None, &item.path);
+        }
+    }
+    if let Some((color, width)) = item.stroke {
+        vs.stroke(&KurboStroke::new(width), xf, to_peniko(color, item.opacity), None, &item.path);
+    }
+}
+
+/// Rasterize and process every layer whose effect stack needs the full image (a
+/// blur), returning a device-space image per such layer for [`to_vello`] to draw
+/// in place of the raw items.
+///
+/// This is the readback half of the compositor. vello renders one scene
+/// atomically and has no layer-filter primitive, so a blur — which reworks a
+/// pixel from its neighbours — can only be done by rendering the layer on its
+/// own, reading the pixels back, filtering them, and drawing the result back in.
+/// The colour adjustments don't need this (see [`with_effects`]); they ride the
+/// in-scene path and are applied here only because [`crate::fx::apply_stack`]
+/// runs the whole stack in order on the readback.
+///
+/// Robust by construction: any layer whose render or readback fails is simply
+/// left out of the map, and [`to_vello`] then draws its raw items — so the worst
+/// case is that a blur doesn't show, never a crash or a blank frame.
+///
+/// **Runtime assumptions to verify on a GPU** (untestable in a headless build):
+/// vello writes straight-alpha `Rgba8Unorm`, and the target texture wants
+/// `STORAGE_BINDING | COPY_SRC`. If edges come out dark, vello's output is
+/// premultiplied and the readback needs to divide alpha out before filtering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rasterize_effect_layers(
+    scene: &MScene,
+    fit: Affine,
+    width: u32,
+    height: u32,
+    device: &vello::wgpu::Device,
+    queue: &vello::wgpu::Queue,
+    renderer: &mut vello::Renderer,
+    footage: &mut FootageCache,
+    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+) -> std::collections::HashMap<NodeId, vello::peniko::ImageData> {
+    use vello::wgpu;
+    let mut out = std::collections::HashMap::new();
+    if width == 0 || height == 0 {
+        return out;
+    }
+    for g in &scene.groups {
+        if !crate::fx::needs_readback(&g.effects) {
+            continue;
+        }
+        // The layer's raw pixels, rasterized through the same `fit` as the main
+        // frame so the result lands on the identical device pixels.
+        let mut sub = VScene::new();
+        for item in &scene.items[g.start..g.end] {
+            draw_item_raw(&mut sub, item, fit, footage, assets);
+        }
+
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("effect-layer"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let rendered = renderer.render_to_texture(
+            device,
+            queue,
+            &sub,
+            &view,
+            &vello::RenderParams {
+                // Transparent, so only the layer's own pixels are present — a
+                // backdrop colour here would tint the whole processed image.
+                base_color: vello::peniko::Color::TRANSPARENT,
+                width,
+                height,
+                antialiasing_method: vello::AaConfig::Area,
+            },
+        );
+        if rendered.is_err() {
+            continue;
+        }
+        let Some(mut rgba) = read_texture_rgba(device, queue, &tex, width, height) else {
+            continue;
+        };
+        crate::fx::apply_stack(&mut rgba, width as usize, height as usize, &g.effects);
+        out.insert(
+            g.source,
+            vello::peniko::ImageData {
+                data: vello::peniko::Blob::new(std::sync::Arc::new(rgba)),
+                format: vello::peniko::ImageFormat::Rgba8,
+                alpha_type: vello::peniko::ImageAlphaType::Alpha,
+                width,
+                height,
+            },
+        );
+    }
+    out
+}
+
+/// Copy an `Rgba8Unorm` texture back to a tight (unpadded) CPU RGBA8 buffer.
+///
+/// `copy_texture_to_buffer` requires each row padded to
+/// `COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes), so the buffer is over-sized and
+/// the padding stripped row by row on the way out. The map is waited on
+/// synchronously — a stall, but a readback has to finish before the pixels can
+/// be filtered this frame.
+fn read_texture_rgba(
+    device: &vello::wgpu::Device,
+    queue: &vello::wgpu::Queue,
+    tex: &vello::wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    use vello::wgpu;
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("effect-readback"),
+        size: padded as u64 * height as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effect-copy") });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return None;
+    }
+    let data = slice.get_mapped_range();
+    let mut rgba = vec![0u8; unpadded as usize * height as usize];
+    for y in 0..height as usize {
+        let src = y * padded as usize;
+        let dst = y * unpadded as usize;
+        rgba[dst..dst + unpadded as usize].copy_from_slice(&data[src..src + unpadded as usize]);
+    }
+    drop(data);
+    buffer.unmap();
+    Some(rgba)
 }
 
 /// The extent of an isolated layer's contents, in composition space.

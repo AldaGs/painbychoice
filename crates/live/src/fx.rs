@@ -73,14 +73,12 @@ pub(crate) fn needs_readback(effects: &[ResolvedEffect]) -> bool {
 /// The full-image path, for the readback compositor (blur, footage layers,
 /// overlapping content). Not yet wired into the renderer — kept tested so the
 /// arithmetic is trustworthy before the GPU plumbing that will feed it lands.
-#[allow(dead_code)]
 pub(crate) fn apply_stack(px: &mut [u8], width: usize, height: usize, effects: &[ResolvedEffect]) {
     for effect in effects {
         apply_one(px, width, height, effect);
     }
 }
 
-#[allow(dead_code)]
 fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect) {
     match *effect {
         ResolvedEffect::GaussianBlur { radius } => gaussian_blur(px, width, height, radius),
@@ -105,7 +103,6 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
 /// The colour is passed and returned as straight (non-premultiplied) linear-in
 /// `[0, 1]` — "linear" here only meaning the 0..255 encoding scaled down, not a
 /// gamma decode, matching the rest of the engine's naive colour handling.
-#[allow(dead_code)]
 fn map_rgb(px: &mut [u8], mut f: impl FnMut([f32; 3]) -> [f32; 3]) {
     for chunk in px.chunks_exact_mut(4) {
         let out = f([
@@ -119,7 +116,6 @@ fn map_rgb(px: &mut [u8], mut f: impl FnMut([f32; 3]) -> [f32; 3]) {
     }
 }
 
-#[allow(dead_code)]
 fn to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -200,7 +196,6 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
 /// blurred edge picks up whatever stale RGB sat under the transparency. Two 1D
 /// passes (horizontal then vertical) give the 2D Gaussian at O(n·r) instead of
 /// O(n·r²).
-#[allow(dead_code)]
 fn gaussian_blur(px: &mut [u8], width: usize, height: usize, radius: f64) {
     if radius < 0.5 || width == 0 || height == 0 {
         return;
@@ -240,7 +235,6 @@ fn gaussian_blur(px: &mut [u8], width: usize, height: usize, radius: f64) {
 
 /// One separable pass. `horizontal` picks the axis; samples clamp at the edges
 /// (extend the border) so the frame doesn't darken toward its edges.
-#[allow(dead_code)]
 fn blur_axis(
     src: &[[f32; 4]],
     dst: &mut [[f32; 4]],
@@ -273,7 +267,6 @@ fn blur_axis(
 
 /// A normalized 1D Gaussian kernel for standard deviation `sigma`, truncated at
 /// 3σ (where the tail is negligible) and re-normalized so the weights sum to 1.
-#[allow(dead_code)]
 fn gaussian_kernel(sigma: f32) -> Vec<f32> {
     let sigma = sigma.max(1e-3);
     let r = (sigma * 3.0).ceil() as usize;
