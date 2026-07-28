@@ -22,12 +22,26 @@ use motion_core::asset::{
 pub fn default_registry() -> DecoderRegistry {
     let mut reg = DecoderRegistry::new();
     reg.register(Box::new(ImageDecoder));
+    reg.register(Box::new(RawDecoder));
+    reg.register(Box::new(HeicDecoder::new()));
     reg.register(Box::new(FfmpegDecoder::new()));
     reg
 }
 
 fn extension(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// The `ffmpeg` binary to invoke, overridable so a bundled build can point at
+/// its own instead of whatever is on PATH. Shared by every decoder that shells
+/// out to it — video *and* HEIC stills.
+fn ffmpeg_bin() -> String {
+    std::env::var("PBC_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+}
+
+/// The `ffprobe` binary to invoke. See [`ffmpeg_bin`].
+fn ffprobe_bin() -> String {
+    std::env::var("PBC_FFPROBE").unwrap_or_else(|_| "ffprobe".into())
 }
 
 /// Still images, via the `image` crate.
@@ -77,6 +91,187 @@ impl Decoder for ImageDecoder {
     }
 }
 
+/// Camera RAW, decoded and developed to sRGB in-process via `imagepipe`.
+///
+/// A separate decoder from [`ImageDecoder`] because the `image` crate can't read
+/// a mosaiced sensor file at all: a `.CR2` or `.NEF` isn't a bitmap, it's raw
+/// photosite values that have to be demosaiced and colour-managed before there
+/// are pixels. `imagepipe` owns that pipeline (and pulls `rawloader` for the
+/// per-camera sensor read), and it is pure Rust — so this stays consistent with
+/// the deliberate no-heavy-C-deps stance the video sidecar exists to hold.
+pub struct RawDecoder;
+
+/// Canon and Nikon, as asked for. CR3 is intentionally absent: `rawloader`'s
+/// support for Canon's newer container is partial, and claiming a file we can't
+/// actually develop would turn "unsupported format" into a decode error deep in
+/// the render. Extending this list is how the set grows once a format is proven.
+const RAW_EXTS: &[&str] = &["cr2", "crw", "nef", "nrw"];
+
+impl RawDecoder {
+    /// Decode and develop `path` to a full-size 8-bit sRGB image.
+    ///
+    /// The one expensive operation for a RAW: there is no cheap header read that
+    /// yields the *developed* dimensions (crop and orientation only settle once
+    /// the pipeline runs), so both [`Decoder::open`] and [`Decoder::frame`] go
+    /// through here. `open` throws the pixels away — the architecture forbids it
+    /// from caching them — which means a RAW is developed twice across import
+    /// and first render. Acceptable: import is once, and the frame cache above
+    /// keeps every later request off this path.
+    fn develop(path: &Path) -> Result<(u32, u32, Vec<u8>), DecodeError> {
+        // `0, 0` = no size cap: develop at native resolution.
+        let img = imagepipe::simple_decode_8bit(path, 0, 0)
+            .map_err(|e| DecodeError::Malformed(format!("{}: {e}", path.display())))?;
+        // `imagepipe` hands back tightly-packed RGB; footage is RGBA everywhere
+        // above the decoder, so widen it with an opaque alpha. A RAW has no alpha
+        // channel of its own, so fully opaque is the correct, not a placeholder,
+        // value.
+        let mut rgba = Vec::with_capacity(img.width * img.height * 4);
+        for px in img.data.chunks_exact(3) {
+            rgba.extend_from_slice(px);
+            rgba.push(255);
+        }
+        Ok((img.width as u32, img.height as u32, rgba))
+    }
+}
+
+impl Decoder for RawDecoder {
+    fn name(&self) -> &str {
+        "raw"
+    }
+
+    fn probe(&self, path: &Path) -> bool {
+        RAW_EXTS.contains(&extension(path).as_str())
+    }
+
+    fn open(&self, path: &Path) -> Result<AssetMeta, DecodeError> {
+        let (w, h, _) = Self::develop(path)?;
+        Ok(AssetMeta { kind: AssetKind::Image, width: w as f64, height: h as f64, frames: 1, fps: 0.0 })
+    }
+
+    fn frame(
+        &self,
+        path: &Path,
+        _source_frame: i64,
+        _meta: &AssetMeta,
+    ) -> Result<Frame, DecodeError> {
+        // A RAW is a still: one frame, and `Asset::source_frame` already clamps
+        // every request to 0. See [`ImageDecoder::frame`].
+        let (w, h, rgba) = Self::develop(path)?;
+        Frame::new(w, h, rgba)
+    }
+}
+
+/// HEIC/HEIF stills, decoded through the `ffmpeg` sidecar.
+///
+/// Reuses the video path's binary rather than linking `libheif`: the same
+/// reasoning that made video a sidecar (a heavy C dependency to build on
+/// Windows, and no reason to link it when a process boundary does) applies
+/// here, and there is no mature pure-Rust HEIC decoder to reach for instead. A
+/// HEIC is treated as a one-frame still — HEIC image *sequences* read as their
+/// first frame, the same way an animated GIF does.
+pub struct HeicDecoder {
+    ffmpeg: String,
+    ffprobe: String,
+}
+
+const HEIC_EXTS: &[&str] = &["heic", "heif", "hif"];
+
+impl Default for HeicDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HeicDecoder {
+    pub fn new() -> Self {
+        Self { ffmpeg: ffmpeg_bin(), ffprobe: ffprobe_bin() }
+    }
+
+    fn missing_tool(&self, tool: &str) -> DecodeError {
+        DecodeError::Unsupported(format!(
+            "HEIC needs '{tool}' on PATH (or set PBC_FFMPEG / PBC_FFPROBE)"
+        ))
+    }
+}
+
+impl Decoder for HeicDecoder {
+    fn name(&self) -> &str {
+        "heic"
+    }
+
+    fn probe(&self, path: &Path) -> bool {
+        HEIC_EXTS.contains(&extension(path).as_str())
+    }
+
+    fn open(&self, path: &Path) -> Result<AssetMeta, DecodeError> {
+        // Dimensions only, like [`ImageDecoder::open`]: cheap, and no bitmap is
+        // decoded just to size the layer.
+        let out = Command::new(&self.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(path)
+            .output()
+            .map_err(|_| self.missing_tool(&self.ffprobe))?;
+        if !out.status.success() {
+            return Err(DecodeError::Malformed(format!(
+                "ffprobe couldn't read {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut width = None;
+        let mut height = None;
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match k.trim() {
+                "width" => width = v.trim().parse::<f64>().ok(),
+                "height" => height = v.trim().parse::<f64>().ok(),
+                _ => {}
+            }
+        }
+        let (Some(width), Some(height)) = (width, height) else {
+            return Err(DecodeError::Malformed(format!(
+                "ffprobe reported no image stream in {}",
+                path.display()
+            )));
+        };
+        Ok(AssetMeta { kind: AssetKind::Image, width, height, frames: 1, fps: 0.0 })
+    }
+
+    fn frame(
+        &self,
+        path: &Path,
+        _source_frame: i64,
+        meta: &AssetMeta,
+    ) -> Result<Frame, DecodeError> {
+        let (w, h) = (meta.width as u32, meta.height as u32);
+        let out = Command::new(&self.ffmpeg)
+            .args(["-v", "error"])
+            .arg("-i")
+            .arg(path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .output()
+            .map_err(|_| self.missing_tool(&self.ffmpeg))?;
+        if !out.status.success() {
+            return Err(DecodeError::Malformed(format!(
+                "ffmpeg couldn't decode {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Frame::new(w, h, out.stdout)
+    }
+}
+
 /// Video, by shelling out to `ffmpeg`/`ffprobe`.
 ///
 /// **A sidecar, deliberately.** Linking libav into the process is faster and
@@ -90,8 +285,14 @@ pub struct FfmpegDecoder {
     ffprobe: String,
 }
 
-const VIDEO_EXTS: &[&str] =
-    &["mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "ogv"];
+// Containers, not codecs: probing is by extension and the codec inside is
+// ffmpeg's problem, so ProRes and DNxHD ride in on `mov`/`mxf` and need no entry
+// of their own. `mxf` is the broadcast delivery wrapper for exactly those two;
+// `mts`/`m2ts`/`ts` are the transport-stream containers camera AVCHD ships in.
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "ogv", "mxf", "mts",
+    "m2ts", "ts", "m2v", "3gp",
+];
 
 impl Default for FfmpegDecoder {
     fn default() -> Self {
@@ -101,12 +302,7 @@ impl Default for FfmpegDecoder {
 
 impl FfmpegDecoder {
     pub fn new() -> Self {
-        // Overridable so a bundled build can point at its own binaries without
-        // depending on what happens to be on PATH.
-        Self {
-            ffmpeg: std::env::var("PBC_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
-            ffprobe: std::env::var("PBC_FFPROBE").unwrap_or_else(|_| "ffprobe".into()),
-        }
+        Self { ffmpeg: ffmpeg_bin(), ffprobe: ffprobe_bin() }
     }
 
     /// Whether the tools are actually callable. Used by the UI to explain a
@@ -422,6 +618,11 @@ mod tests {
         let reg = default_registry();
         assert_eq!(reg.decoder_for(Path::new("a/b/logo.PNG")).map(|d| d.name()), Some("image"));
         assert_eq!(reg.decoder_for(Path::new("a/b/clip.MOV")).map(|d| d.name()), Some("ffmpeg"));
+        // The still-image formats each land on their own decoder, and ahead of
+        // the video one so a HEIC never falls through to it.
+        assert_eq!(reg.decoder_for(Path::new("a/b/shot.CR2")).map(|d| d.name()), Some("raw"));
+        assert_eq!(reg.decoder_for(Path::new("a/b/shot.NEF")).map(|d| d.name()), Some("raw"));
+        assert_eq!(reg.decoder_for(Path::new("a/b/pic.HEIC")).map(|d| d.name()), Some("heic"));
         assert!(reg.decoder_for(Path::new("notes.txt")).is_none());
     }
 }

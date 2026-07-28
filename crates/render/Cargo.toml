@@ -12,3 +12,8 @@ kurbo.workspace = true
 # rarely-wanted formats would be a later tightening; footage import wants the
 # common set to just work.
 image = "0.25"
+# Camera RAW (Canon CR2/CRW, Nikon NEF/NRW, …), decoded and developed to sRGB
+# entirely in Rust — no C library to build on Windows, matching the reason the
+# video path is an ffmpeg *sidecar* rather than linked libav. `imagepipe` owns
+# the demosaic-to-sRGB pipeline and pulls `rawloader` for the sensor read.
+imagepipe = "0.5"

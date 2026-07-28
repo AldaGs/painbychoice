@@ -2398,8 +2398,10 @@ impl App {
     pub(crate) fn import_footage(&mut self) -> bool {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Footage", &[
-                "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "tga", "qoi", "mp4",
-                "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "ogv",
+                "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "tga", "qoi", "heic",
+                "heif", "hif", "cr2", "crw", "nef", "nrw", "mp4", "mov", "m4v", "avi", "mkv",
+                "webm", "mpg", "mpeg", "wmv", "flv", "ogv", "mxf", "mts", "m2ts", "ts", "m2v",
+                "3gp",
             ])
             .pick_file()
         else {
