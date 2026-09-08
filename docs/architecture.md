@@ -14,10 +14,25 @@ test, not a window. This separation is the whole design; keep it.
 ```
 crates/
   core/    document model + evaluation engine. No GPU, no windowing. (unit-tested)
-  render/  evaluated Scene -> pixels. SVG backend (offline). vello lives in live/.
-  app/     offline binary `motion`: evaluate the demo doc -> out/frame_*.svg
+  render/  evaluated Scene -> pixels, and pixels -> a file:
+             raster.rs   CPU rasterizer (the offline backend)
+             encode.rs   the Encoder trait: PNG sequence + ffmpeg sidecar
+             decode.rs   footage in, through the same ffmpeg discipline
+             parallel.rs frames across cores, delivered in order
+           The SVG backend lives in lib.rs. vello lives in live/.
+  app/     the headless renderer `motion`: a .pbc (or --demo) -> mp4 / PNG seq
   live/    the real editor `pbc`: winit + vello (wgpu) + egui over the engine
+             offscreen.rs   export target: the preview's own renderer, to a texture
+             renderqueue.rs the two render buttons and the stepped export job
 ```
+
+Both halves of export go through `render`, and that is the point: the editor
+and the command line share one `Encoder`, one container table and one quality
+model, so a preset and a `--out` cannot come to mean different things. What they
+do *not* share is the rasterizer — the CLI draws on the CPU, the editor exports
+through the same vello renderer that drew its preview. See
+[0017](decisions/0017-offline-cpu-rasterizer.md) for why that asymmetry is
+deliberate.
 
 ## The core idea
 
