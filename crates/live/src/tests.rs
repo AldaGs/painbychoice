@@ -735,6 +735,61 @@ fn prop_of_and_prop_of_mut_agree_on_what_exists() {
 }
 
 #[test]
+fn level_and_pan_exist_only_on_a_layer_that_carries_sound() {
+    // A shape layer offering a volume fader would advertise a mix it can
+    // never have — and its dopesheet would grow two rows that cannot animate.
+    let silent = MNode::group(1, "shape");
+    assert!(prop_of(&silent, PropKind::AudioLevel).is_none());
+    assert!(prop_of(&silent, PropKind::AudioPan).is_none());
+
+    let mut sounding = MNode::group(2, "music");
+    sounding.audio = Some(motion_core::AudioClip::new(motion_core::AssetId(1)));
+    assert!(prop_of(&sounding, PropKind::AudioLevel).is_some());
+    assert!(prop_of(&sounding, PropKind::AudioPan).is_some());
+}
+
+#[test]
+fn keying_a_level_makes_it_a_dopesheet_row() {
+    // The point of routing the mix through `PropKind`: no audio-specific
+    // keyframe machinery, so a level animates like a position does.
+    let mut node = MNode::group(1, "music");
+    node.audio = Some(motion_core::AudioClip::new(motion_core::AssetId(1)));
+    assert!(dope_rows(&node).is_empty(), "a constant level is not a row");
+    prop_of_mut(&mut node, PropKind::AudioLevel).unwrap().insert_key(12);
+    let row = dope_rows(&node).into_iter().find(|r| r.kind == PropKind::AudioLevel);
+    assert_eq!(row.expect("the level now has a row").frames, vec![12]);
+}
+
+#[test]
+fn a_level_reads_as_decibels_and_a_pan_as_a_side() {
+    // Unity is 0dB and silence is off, not merely very quiet.
+    assert_eq!(db_label(1.0), "+0.0 dB");
+    assert_eq!(db_label(0.0), "-inf dB");
+    assert!(db_label(0.5).starts_with("-6.0"));
+    assert!(db_label(2.0).starts_with("+6.0"));
+    assert_eq!(pan_label(0.0), "centre");
+    assert_eq!(pan_label(-0.4), "L40");
+    assert_eq!(pan_label(1.0), "R100");
+}
+
+#[test]
+fn only_mix_edits_ask_for_a_republish() {
+    // Republishing is cheap but not free, and doing it on every property drag
+    // would walk the comp for sound nobody changed.
+    let mut e = PropEdits::default();
+    assert!(!e.touches_audio());
+    e.opacity = Some(0.5);
+    assert!(!e.touches_audio());
+    e.audio_pan = Some(-1.0);
+    assert!(e.touches_audio());
+    // A stopwatch click changes the mix too: it writes the current value into
+    // a track.
+    let mut k = PropEdits::default();
+    k.key.insert(PropKind::AudioLevel);
+    assert!(k.touches_audio());
+}
+
+#[test]
 fn optional_properties_are_absent_when_the_node_lacks_them() {
     // A group has no paint and no geometry...
     let g = MNode::group(1, "g");

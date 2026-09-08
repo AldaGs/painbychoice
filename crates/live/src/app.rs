@@ -1957,6 +1957,24 @@ impl App {
             tr.opacity.set_at(frame, o);
             changed = true;
         }
+        // The mix. `set_at` like any other numeric property, so dragging the
+        // fader on a keyframed level writes a key and on a static one just
+        // moves it. Muting is plain data — there is no half-muted — so it
+        // assigns.
+        if let Some(clip) = node.audio.as_mut() {
+            if let Some(l) = e.audio_level {
+                clip.level.set_at(frame, l.max(0.0));
+                changed = true;
+            }
+            if let Some(pan) = e.audio_pan {
+                clip.pan.set_at(frame, pan.clamp(-1.0, 1.0));
+                changed = true;
+            }
+            if let Some(on) = e.audio_enabled {
+                clip.enabled = on;
+                changed = true;
+            }
+        }
         // Plain data, so a direct assignment rather than `set_at`: there is no
         // interpolating between Multiply and Screen, so no track to key into.
         if let Some(mode) = e.blend {
@@ -4160,7 +4178,14 @@ impl App {
         if let Some(kop) = edits.knob.take() {
             self.apply_ng_knob_op(kop);
         }
+        // What the callback is playing was resolved before these edits; a new
+        // level that only reaches the picture would be a fader that moves and
+        // changes nothing you can hear.
+        let touched_audio = edits.touches_audio();
         let mut dirty = self.apply_edits(frame, &edits);
+        if touched_audio && dirty {
+            self.publish_mix();
+        }
         if self.apply_pen_edits(frame, &pen_edits) {
             dirty = true;
         }
