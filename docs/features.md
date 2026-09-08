@@ -129,4 +129,6 @@ produce a finished video.
     border, passepartout, selection, onion skins). Effects included: a blurred
     layer exports blurred, through the same readback the preview uses.
   - The same renders are available headlessly:
-    `motion render project.pbc --out film.mp4 --quality master`.
+    `motion render project.pbc --out film.mp4 --quality master`. The offline
+    renderer uses **every core** (`--threads n` to pin it, `--threads 1` for the
+    sequential path), which is roughly 4.6x at 1080p.

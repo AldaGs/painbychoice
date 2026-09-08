@@ -75,6 +75,29 @@ same release profile, CPU rasterizer), which is roughly 3× the container:
 | 1920×1080 | ffmpeg, H.264 master | 68.2 | 4.4s |
 | 1920×1080 | ffmpeg, ProRes HQ | 57.2 | 5.3s |
 
+**Frame-parallel rendering, measured 2026-09-08 on the same machine** (16
+logical cores, demo at 1920x1080, PNG sequence, `--threads n`):
+
+| Threads | Frames/sec | Speedup |
+| --- | --- | --- |
+| 1 | 68.5 | 1.0x |
+| 2 | 169.9 | 2.5x |
+| 4 | 267.5 | 3.9x |
+| 8 | 312.8 | 4.6x |
+| 16 (default) | 307.3 | 4.5x |
+
+**It stops scaling at about 8, and the reason is the writer.** Frames are
+rendered in parallel but written by one thread, and at 1080p PNG encoding is a
+large enough share of a frame's cost to become the serial bottleneck — Amdahl's
+law, arriving early. Adding threads past that point buys nothing and the default
+(one per core) is slightly *worse* than 8 through oversubscription.
+
+So the next parallelism win is not more workers, it is taking PNG compression
+off the writer thread. Note the 2-thread row is superlinear, which is a
+measurement artefact rather than magic: single-run timings on a loaded desktop
+carry a few percent of noise, and 68.5 here against 76.4 in the table above is
+that spread.
+
 The encoder spread is the useful part: **master costs ~4% over draft**, and
 ProRes ~25% over H.264, at this resolution. Both are small next to the
 rasterizer, which is the other way round from what the two-button model assumes
@@ -89,10 +112,9 @@ Three things fall out of that, and all three are actionable:
 - **It is cleanly pixel-bound.** Four times faster per halving of each
   dimension, almost exactly. Evaluation is not the bottleneck at this
   complexity; filling pixels is.
-- **It is single-threaded.** Four cores were available and one was used. Frames
-  are independent and `evaluate` is pure — the render loop is embarrassingly
-  parallel, and this is the largest easy win available. It has not been taken
-  yet because correctness came first and the seam is trivial to add later.
+- ~~**It is single-threaded.**~~ Taken, 2026-09-08: the offline renderer runs
+  frames on all cores and writes them in order (`render/src/parallel.rs`). See
+  the scaling table above, and note where it stops.
 - **PNG encoding is inside that number.** A meaningful share of it, at 1080p.
   Splitting raster time from encode time is worth doing before optimising
   either.

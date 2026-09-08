@@ -23,9 +23,12 @@
 //! cancellation is just dropping the job. The cost is that the editor's frame
 //! rate drops while a render runs, which is honest — the GPU is busy.
 //!
-//! Frame-parallel rendering (still ahead in the plan) parallelises `evaluate`,
-//! which is pure and the CPU half of this loop. It composes with this design
-//! rather than replacing it.
+//! The offline renderer's frame-parallelism (`render/src/parallel.rs`) does not
+//! apply here and that is not an oversight: it parallelises whole frames across
+//! cores because its rasterizer is on the CPU, whereas this path's rasterizer is
+//! the one GPU the preview is also using. What would compose with this design is
+//! parallelising the *evaluate* half of a step, which is pure; the GPU half stays
+//! serial because there is one device.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

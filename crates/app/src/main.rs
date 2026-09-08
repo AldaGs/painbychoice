@@ -58,6 +58,10 @@ RENDER OPTIONS:
   --demo             Render the built-in demo document instead of a file.
                      The way to check that rendering works on a machine with
                      no project to hand.
+  --threads <n>      Render this many frames at once. Default: one per core.
+                     Frames are independent and evaluation is pure, so this
+                     scales close to linearly; `--threads 1` is the sequential
+                     path, for comparing against or debugging.
   -q, --quiet        Only report errors.
 
   motion demo        Writes the built-in demo document as SVG frames to ./out,
@@ -102,6 +106,8 @@ struct Opts {
     fps: Option<f64>,
     ffmpeg_args: Vec<String>,
     quality: Quality,
+    /// Worker threads for the render loop. `None` means one per core.
+    threads: Option<usize>,
     quiet: bool,
     demo: bool,
 }
@@ -119,6 +125,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         fps: None,
         ffmpeg_args: Vec::new(),
         quality: Quality::default(),
+        threads: None,
         quiet: false,
         demo: false,
     };
@@ -150,6 +157,15 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                     .ok_or_else(|| format!("--quality wants draft or master, not '{v}'"))?;
             }
             "--demo" => o.demo = true,
+            "--threads" => {
+                let n: usize = value("--threads")?
+                    .parse()
+                    .map_err(|_| "--threads wants a count")?;
+                if n == 0 {
+                    return Err("--threads wants at least 1".to_string());
+                }
+                o.threads = Some(n);
+            }
             "-q" | "--quiet" => o.quiet = true,
             other if other.starts_with('-') => return Err(format!("unknown option '{other}'")),
             other => positional = Some(PathBuf::from(other)),
@@ -232,27 +248,54 @@ fn render(args: &[String]) -> Result<(), String> {
     let mut notes: std::collections::BTreeMap<String, usize> = Default::default();
     let started = std::time::Instant::now();
 
-    for frame in start..=end {
+    let threads = o.threads.unwrap_or_else(motion_render::default_threads);
+
+    // Frames are rendered in parallel and written in order. The two halves are
+    // split precisely along what is pure: `evaluate` + `rasterize` take only
+    // the project and a frame number and are called from many threads, while
+    // the encoder — a pipe with no notion of frame numbers — stays on this one.
+    let render_frame = |frame: i64| {
         let scene = evaluate_comp(&project, comp_id, frame as f64);
-        for (id, msg) in &scene.warnings {
-            *notes.entry(format!("node {}: {msg}", id.0)).or_default() += 1;
-        }
+        // Warnings are collected per frame and merged by the writer rather than
+        // shared through a lock: the map would be contended on every frame to
+        // record something that is nearly always identical across all of them.
+        let warnings: Vec<String> =
+            scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)).collect();
         let (pixels, report) =
             rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)
                 .map_err(|e| e.to_string())?;
-        for note in report {
-            *notes.entry(note).or_default() += 1;
-        }
-        encoder.push(&pixels).map_err(|e| e.to_string())?;
-        if !o.quiet && (frame - start) % 25 == 0 {
-            eprint!("\r  frame {frame}/{end}");
-        }
+        Ok((pixels, warnings, report))
+    };
+
+    let mut written = 0i64;
+    let result = motion_render::render_in_order(
+        start..=end,
+        threads,
+        render_frame,
+        |frame, (pixels, warnings, report)| {
+            for note in warnings.into_iter().chain(report) {
+                *notes.entry(note).or_default() += 1;
+            }
+            encoder.push(&pixels).map_err(|e| e.to_string())?;
+            written += 1;
+            if !o.quiet && (frame - start) % 25 == 0 {
+                eprint!("\r  frame {frame}/{end}");
+            }
+            Ok(())
+        },
+    );
+    // A failed render still has to close its encoder, and `abort` rather than
+    // `finish`: half a video finalized into a playable container is the failure
+    // mode `Encoder::abort` exists for.
+    if let Err(e) = result {
+        encoder.abort();
+        return Err(e);
     }
     encoder.finish().map_err(|e| e.to_string())?;
 
     if !o.quiet {
         let secs = started.elapsed().as_secs_f64();
-        let frames = (end - start + 1) as f64;
+        let frames = written as f64;
         eprintln!(
             "\r  {} frames in {secs:.2}s ({:.1} fps) → {}",
             frames as i64,

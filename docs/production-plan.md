@@ -21,7 +21,7 @@ cleanly where those are absent, so a headless CI box sees fewer.
 | Editor (`live`) | Broad. Dockable panels, timeline + dopesheet + curves, gizmo, pen tool, snapping, guides, onion skins, motion path, layer strips, font picker, undo/redo. |
 | Compositing | Model only. Blend modes, masks, track mattes exist in `Scene` and both backends. No effect stack, no GPU effect passes. |
 | Footage | Import works: stills (incl. HEIC/RAW), video via an `ffmpeg` sidecar, threaded decode cache with a warm frame stream. |
-| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gaps: no frame range and no frame-parallelism. |
+| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gaps: no frame range; the GUI export is GPU-serial (the CLI is frame-parallel). |
 | **Audio** | **Does not exist.** No decode, no playback, no waveform, no master clock. |
 | Effects | Does not exist. `NodeCategory::Effect` is a registry slot with nothing in it. |
 | Motion blur | Does not exist. |
@@ -150,15 +150,22 @@ piece cannot leave the app.
   produced a complete, playable, wrong-length video with nothing to mark it as
   partial.
 
+- ✅ **Frame-parallel rendering** in the offline renderer
+  (`render/src/parallel.rs`, `--threads`). Frames render on every core and are
+  reassembled into order before anything is written — an ffmpeg pipe has no
+  notion of frame numbers, so an early frame is not late data, it is wrong data,
+  silently. **4.6x** at 1080p; it stops scaling around eight threads because the
+  writer is serial and PNG compression is a large share of a frame. Verified by
+  rendering the demo at 1 and 12 threads and diffing all 300 frames: byte
+  identical.
+
 **Still ahead in this phase:**
 
-- **Frame-parallel rendering.** The loop is single-threaded and cleanly
-  pixel-bound; frames are independent and `evaluate` is pure, so this is the
-  largest easy win available. It composes with the stepped job rather than
-  replacing it: the parallel half is `evaluate`, the GPU half stays serial
-  because there is one device. See [`performance.md`](performance.md).
 - **A range control.** A job renders the whole comp; the work area exists in the
   timeline and does not reach the render yet.
+- **Parallel encoding.** The next win after the above, and the thing that would
+  let the frame parallelism keep scaling: compression currently happens on the
+  one thread that writes.
 **Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI *and*
 from the command line, and the exported frame equals the preview frame.
 **True today**, for both halves.
