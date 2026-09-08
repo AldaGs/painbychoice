@@ -4130,13 +4130,13 @@ struct FakeDecoder {
 
 impl FakeDecoder {
     fn meta(&self) -> motion_core::AssetMeta {
-        motion_core::AssetMeta {
-            kind: motion_core::AssetKind::Video,
-            width: self.side as f64,
-            height: self.side as f64,
-            frames: 1000,
-            fps: 24.0,
-        }
+        motion_core::AssetMeta::visual(
+            motion_core::AssetKind::Video,
+            self.side as f64,
+            self.side as f64,
+            1000,
+            24.0,
+        )
     }
 }
 
@@ -4230,13 +4230,7 @@ fn seed() -> LayerSeed {
 }
 
 fn clip_meta() -> motion_core::AssetMeta {
-    motion_core::AssetMeta {
-        kind: motion_core::AssetKind::Video,
-        width: 1920.0,
-        height: 1080.0,
-        frames: 48,
-        fps: 24.0,
-    }
+    motion_core::AssetMeta::visual(motion_core::AssetKind::Video, 1920.0, 1080.0, 48, 24.0)
 }
 
 /// Footage lands at 100%: the layer is sized to the source's native pixels, so
@@ -4276,13 +4270,8 @@ fn an_imported_clip_gets_a_layer_window_its_own_length() {
 fn an_imported_still_gets_no_layer_window() {
     let mut project = MProject::single(Comp::new(640.0, 360.0, MNode::group(0, "root")));
     let comp = project.root;
-    let meta = motion_core::AssetMeta {
-        kind: motion_core::AssetKind::Image,
-        width: 512.0,
-        height: 512.0,
-        frames: 1,
-        fps: 0.0,
-    };
+    let meta =
+        motion_core::AssetMeta::visual(motion_core::AssetKind::Image, 512.0, 512.0, 1, 0.0);
     let node = import_footage(&mut project, meta, "logo.png".into(), seed(), comp);
     assert!(node.timing.is_none());
 }

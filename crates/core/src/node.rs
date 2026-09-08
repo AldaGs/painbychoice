@@ -650,6 +650,20 @@ pub struct Node {
     /// image, not on each item as it is painted.
     #[serde(default)]
     pub effects: Vec<crate::effect::Effect>,
+    /// The sound this layer contributes, if any.
+    ///
+    /// **A field beside the picture, not a [`Shape`] variant.** The deciding
+    /// case is a video with a soundtrack: one layer has both, so audio cannot be
+    /// the thing a layer draws. It is also orthogonal to everything drawing
+    /// cares about — a sound has no geometry, no fill, no bounds — and a
+    /// `Shape::Audio` would have meant a meaningless arm in every match that
+    /// asks a shape for its path.
+    ///
+    /// Timing rides the layer's own [`LayerTiming`], so trimming a sound is
+    /// trimming a layer, and nothing new had to learn about in and out points.
+    /// `#[serde(default)]`, so a pre-audio `.pbc` loads silent.
+    #[serde(default)]
+    pub audio: Option<crate::audio::AudioClip>,
     pub children: Vec<Node>,
 }
 
@@ -680,6 +694,7 @@ impl Node {
             matte: None,
             compound: None,
             effects: Vec::new(),
+            audio: None,
             children: Vec::new(),
         }
     }
@@ -700,6 +715,7 @@ impl Node {
             matte: None,
             compound: None,
             effects: Vec::new(),
+            audio: None,
             children: Vec::new(),
         }
     }
