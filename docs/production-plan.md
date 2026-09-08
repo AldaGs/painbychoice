@@ -113,8 +113,13 @@ piece cannot leave the app.
 - **An offscreen vello render target**, so the *editor's* export uses the same
   rasterizer as its preview and per-pixel parity becomes provable. Belongs where
   a GPU device already exists.
-- **A render queue in the GUI**: comp, range, scale, format, path; on a worker,
-  with progress and cancel, the editor stays live throughout.
+- **A render queue in the GUI**, hosting **two buttons** rather than one dialog:
+  **Draft** (no questions, one keystroke) and **Master** (full settings, saved
+  with the project so a team renders identically). The `Quality` model behind
+  them is built and tested; the buttons are a thin call.
+  See [`decisions/0018-two-render-buttons.md`](decisions/0018-two-render-buttons.md).
+- **Named render presets saved in the `.pbc`**, so an export spec travels with
+  the piece instead of living in whoever last opened the dialog.
 - **Frame-parallel rendering.** The loop is single-threaded and cleanly
   pixel-bound; frames are independent and `evaluate` is pure, so this is the
   largest easy win available. See [`performance.md`](performance.md).
@@ -306,6 +311,14 @@ us shipping a promise the evaluator can't honour — that instinct is the right
 one and should be kept.
 
 ### Kind 3 — Panels and automation (the question with the least obvious answer)
+
+> **The first step here is a console panel**, not a plugin format. It is the
+> same commitment — commands in, no `&mut Document` — minus packaging, and it
+> proves the vocabulary before anyone can depend on it. Critically, its log
+> should record what the *UI* did, so dragging a layer prints the command that
+> would have done it: that is how Blender users learn the Python API, and it
+> turns the UI into its own documentation. See
+> [`decisions/0019-the-console.md`](decisions/0019-the-console.md).
 
 "How do we give access to the UI and the internals?" splits into two questions
 that need opposite answers.

@@ -157,6 +157,84 @@ impl Encoder for PngSequence {
     }
 }
 
+/// How hard the encoder should work — the **two-button model**.
+///
+/// Borrowed from build tooling, where `run` and `release` are different verbs
+/// rather than one verb with a settings dialog. The two answer different
+/// questions, and conflating them is what makes an export dialog something
+/// people dread:
+///
+/// - [`Quality::Draft`] — "let me see it move." Fast to encode, big on disk,
+///   never asked a question. The equivalent of `cargo run`.
+/// - [`Quality::Master`] — "this is the deliverable." Slow, small, visually
+///   lossless, and *reproducible*: the settings belong to the project, not to
+///   whatever was last typed into a dialog.
+///
+/// Both render **every pixel** at full resolution. Draft is cheaper to *encode*,
+/// not cheaper to render — a preview that silently halved resolution would be
+/// the fastest way to ship the wrong file, and a draft you cannot trust is a
+/// draft nobody uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quality {
+    /// Fast, disposable, no questions asked.
+    #[default]
+    Draft,
+    /// The deliverable.
+    Master,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 2] = [Quality::Draft, Quality::Master];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Draft => "Draft",
+            Quality::Master => "Master",
+        }
+    }
+
+    /// Parse the name a CLI flag or a saved preset uses.
+    pub fn parse(s: &str) -> Option<Quality> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "draft" | "quick" | "preview" => Some(Quality::Draft),
+            "master" | "release" | "final" => Some(Quality::Master),
+            _ => None,
+        }
+    }
+
+    /// The ffmpeg arguments this quality implies for `path`'s container.
+    ///
+    /// Container-aware because the right answer differs: `.mov` at master
+    /// quality means **ProRes**, which is what an editorial hand-off expects and
+    /// what H.264 is wrong for; everything else means H.264 at a CRF chosen for
+    /// the job. A user's own `--arg` is appended after these, so anything here
+    /// can be overridden without editing this table.
+    ///
+    /// Deliberately a *small* table. The moment it grows a codec matrix we are
+    /// maintaining the thing [0007](../../docs/decisions/0007-never-implement-codecs.md)
+    /// says not to maintain — one sensible default per quality, and ffmpeg's own
+    /// flags for everything else.
+    pub fn ffmpeg_args(self, path: &Path) -> Vec<String> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match (self, ext.as_str()) {
+            // ProRes 422 HQ: the editorial interchange format, and the reason
+            // anyone asks for a .mov master in the first place.
+            (Quality::Master, "mov") => a(&["-c:v", "prores_ks", "-profile:v", "3"]),
+            (Quality::Master, _) => {
+                a(&["-c:v", "libx264", "-preset", "slow", "-crf", "16"])
+            }
+            // `veryfast` rather than `ultrafast`: the latter's files are large
+            // enough that writing them costs back the encode time it saved.
+            (Quality::Draft, _) => a(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]),
+        }
+    }
+}
+
 /// The `ffmpeg` binary to invoke. Shared with [`crate::decode`], so a bundled
 /// build points both halves at one binary.
 fn ffmpeg_bin() -> String {
@@ -339,6 +417,42 @@ mod tests {
         assert!(matches!(err, EncodeError::Failed(_)), "{err:?}");
         assert!(enc.frames().is_empty(), "nothing written");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The master `.mov` is ProRes, not H.264 — a `.mov` master exists for
+    /// editorial hand-off, and handing over H.264 in a `.mov` wrapper is the
+    /// wrong answer wearing the right extension.
+    #[test]
+    fn a_mov_master_is_prores_and_an_mp4_master_is_x264() {
+        let mov = Quality::Master.ffmpeg_args(Path::new("cut.mov"));
+        assert!(mov.contains(&"prores_ks".to_string()), "{mov:?}");
+        let mp4 = Quality::Master.ffmpeg_args(Path::new("cut.mp4"));
+        assert!(mp4.contains(&"libx264".to_string()), "{mp4:?}");
+        assert!(mp4.contains(&"16".to_string()), "a master CRF, {mp4:?}");
+    }
+
+    /// Draft is cheaper to *encode*, and identical in what it renders. If this
+    /// ever starts changing resolution, a draft becomes something you can ship
+    /// by accident.
+    #[test]
+    fn draft_differs_only_in_encoder_effort() {
+        let draft = Quality::Draft.ffmpeg_args(Path::new("cut.mp4"));
+        assert!(draft.contains(&"veryfast".to_string()), "{draft:?}");
+        assert!(
+            !draft.iter().any(|a| a == "-s" || a == "-vf"),
+            "draft must not resize or filter: {draft:?}"
+        );
+    }
+
+    /// The names a user might type, including the ones borrowed from build
+    /// tools, all land somewhere sensible.
+    #[test]
+    fn quality_parses_the_words_people_use() {
+        assert_eq!(Quality::parse("draft"), Some(Quality::Draft));
+        assert_eq!(Quality::parse("Quick"), Some(Quality::Draft));
+        assert_eq!(Quality::parse("release"), Some(Quality::Master));
+        assert_eq!(Quality::parse(" MASTER "), Some(Quality::Master));
+        assert_eq!(Quality::parse("best"), None);
     }
 
     /// Broadcast rates are ratios. Handing ffmpeg `23.976` writes timestamps

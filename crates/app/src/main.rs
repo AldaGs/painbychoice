@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use motion_core::{demo::demo_document, evaluate_comp, Color, CompId, Project};
 use motion_render::{
     output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder, OutputSpec,
-    PngSequence,
+    PngSequence, Quality,
 };
 
 const USAGE: &str = "\
@@ -48,7 +48,13 @@ RENDER OPTIONS:
   --scale <factor>   Output scale, e.g. 0.5 for a half-size preview. Default: 1.
   --fps <rate>       Override the output rate. The comp is still evaluated on
                      its own frames; this only changes playback speed.
-  --arg <ffmpeg arg> Passed through to ffmpeg, before the output path. Repeatable.
+  --quality <name>   draft (fast, disposable) or master (the deliverable).
+                     Default: draft — the same default as the editor's two
+                     render buttons, and for the same reason: the cheap one is
+                     what you reach for twenty times an hour.
+  --arg <ffmpeg arg> Passed through to ffmpeg, after the quality preset's own
+                     arguments, so anything a preset chooses can be overridden.
+                     Repeatable.
   --demo             Render the built-in demo document instead of a file.
                      The way to check that rendering works on a machine with
                      no project to hand.
@@ -95,6 +101,7 @@ struct Opts {
     scale: f64,
     fps: Option<f64>,
     ffmpeg_args: Vec<String>,
+    quality: Quality,
     quiet: bool,
     demo: bool,
 }
@@ -111,6 +118,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         scale: 1.0,
         fps: None,
         ffmpeg_args: Vec::new(),
+        quality: Quality::default(),
         quiet: false,
         demo: false,
     };
@@ -136,6 +144,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             }
             "--fps" => o.fps = Some(value("--fps")?.parse().map_err(|_| "--fps wants a rate")?),
             "--arg" => o.ffmpeg_args.push(value("--arg")?),
+            "--quality" => {
+                let v = value("--quality")?;
+                o.quality = Quality::parse(&v)
+                    .ok_or_else(|| format!("--quality wants draft or master, not '{v}'"))?;
+            }
             "--demo" => o.demo = true,
             "-q" | "--quiet" => o.quiet = true,
             other if other.starts_with('-') => return Err(format!("unknown option '{other}'")),
@@ -195,7 +208,11 @@ fn render(args: &[String]) -> Result<(), String> {
     let spec = OutputSpec { width: w, height: h, fps: o.fps.unwrap_or(comp.fps) };
 
     let mut encoder: Box<dyn Encoder> = if is_video(&o.out) {
-        Box::new(FfmpegEncoder::new(&o.out, spec, &o.ffmpeg_args).map_err(|e| e.to_string())?)
+        // The preset first, the user's own arguments after it, so `--arg` can
+        // override anything the preset chose rather than fighting it.
+        let mut args = o.quality.ffmpeg_args(&o.out);
+        args.extend(o.ffmpeg_args.iter().cloned());
+        Box::new(FfmpegEncoder::new(&o.out, spec, &args).map_err(|e| e.to_string())?)
     } else {
         let stem = o
             .project
@@ -208,12 +225,13 @@ fn render(args: &[String]) -> Result<(), String> {
 
     if !o.quiet {
         eprintln!(
-            "rendering {} frames of \"{}\" at {}x{} @ {} → {}",
+            "rendering {} frames of \"{}\" at {}x{} @ {} — {} → {}",
             end - start + 1,
             comp.label(comp_id),
             w,
             h,
             spec.fps,
+            o.quality.label(),
             encoder.name()
         );
     }
@@ -349,6 +367,20 @@ mod tests {
         assert_eq!(o.fps, Some(24.0));
         assert_eq!(o.ffmpeg_args, vec!["-crf", "18"]);
         assert!(o.quiet);
+    }
+
+    /// The two-button model reaches the command line as one flag, and it
+    /// defaults to the cheap one — the same default the editor's buttons have,
+    /// because that is the button pressed twenty times an hour.
+    #[test]
+    fn quality_defaults_to_draft_and_accepts_both_names() {
+        assert_eq!(parse(&args("f.pbc --out o.mp4")).unwrap().quality, Quality::Draft);
+        assert_eq!(
+            parse(&args("f.pbc --out o.mp4 --quality master")).unwrap().quality,
+            Quality::Master
+        );
+        let err = parse(&args("f.pbc --out o.mp4 --quality best")).unwrap_err();
+        assert!(err.contains("draft or master"), "{err}");
     }
 
     /// End to end, on the built-in demo: frames are evaluated, rasterized and
