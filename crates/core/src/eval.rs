@@ -1702,8 +1702,8 @@ mod tests {
         });
         let mut doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(square));
         doc.fps = 10.0;
-        doc.duration = 10.0; // 100 frames
-        assert_eq!(doc.duration_frames(), 100);
+        doc.set_duration_seconds(10.0); // 100 frames
+        assert_eq!(doc.duration_frames, 100);
 
         assert!((evaluate(&doc, 50.0).items[0].opacity - 0.5).abs() < 1e-9);
         assert!((evaluate(&doc, 100.0).items[0].opacity - 1.0).abs() < 1e-9);

@@ -12,6 +12,11 @@ kurbo.workspace = true
 # rarely-wanted formats would be a later tightening; footage import wants the
 # common set to just work.
 image = "0.25"
+# The offline rasterizer. Pure Rust and CPU-only by design: it is what lets a
+# frame be rendered — and therefore asserted on — with no GPU present, in a
+# test or on a build machine. `docs/decisions/0004-vector-first-raster-compositor.md`
+# named it for exactly this role.
+tiny-skia = "0.11"
 # Camera RAW (Canon CR2/CRW, Nikon NEF/NRW, …), decoded and developed to sRGB
 # entirely in Rust — no C library to build on Windows, matching the reason the
 # video path is an ffmpeg *sidecar* rather than linked libav. `imagepipe` owns

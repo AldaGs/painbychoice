@@ -225,3 +225,11 @@ Effector); do not adopt its lack of an underlying IR.
 - enve: <https://maurycyliebner.github.io/> · <https://github.com/MaurycyLiebner/enve>
 - Lottie/ThorVG: <https://github.com/thorvg/thorvg>
 - Motion Canvas: <https://motioncanvas.io/> · Remotion: <https://www.remotion.dev/>
+
+## Reference: the EBN project
+
+`../_extendBlueNode` (Extend Blue Node) is a prior project — a node-graph →
+ExtendScript compiler for After Effects. Ideas worth borrowing here: the IR +
+dumb-printer split (for the future expression/parametric IR), line→nodeId
+provenance (already applied as `RenderItem.source`), and the recursive
+splittable `layoutTree` (for the dockable-panel work (see `decisions/0015-dock-tree.md`)). Skip its ExtendScript/CEP machinery.
