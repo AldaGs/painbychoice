@@ -894,7 +894,28 @@ pub struct Comp {
     pub width: f64,
     pub height: f64,
     pub fps: f64,
-    pub duration: f64,
+    /// Total length of the composition, in **whole frames**.
+    ///
+    /// Stored as frames rather than seconds so the comp end always lands on a
+    /// frame boundary. It used to be seconds with the count derived, which made
+    /// "how many frames is this comp?" a rounding decision: 5.0s at 23.976fps
+    /// is 119.88 frames, and a renderer asking how many frames to write got an
+    /// answer from `.round()`. Harmless for a playhead, a ±1-frame difference
+    /// in an exported file.
+    ///
+    /// `#[serde(default)]` (0) marks "not read from this file"; [`Comp::migrate`]
+    /// then fills it from [`Comp::legacy_duration`] or the default length. Every
+    /// loader must call `migrate()` — see the crate docs.
+    #[serde(default)]
+    pub duration_frames: i64,
+    /// The pre-frames `duration`, in seconds, as read from an older `.pbc`.
+    ///
+    /// Deferred rather than resolved in place (unlike `de_text_content`) only
+    /// because the conversion needs `fps`, which serde has no ordering
+    /// guarantee about during field-by-field deserialization. Folded by
+    /// [`Comp::migrate`] and never written back out.
+    #[serde(default, rename = "duration", skip_serializing)]
+    legacy_duration: Option<f64>,
     /// The colour painted inside the comp bounds, behind every layer. A user
     /// setting, not a constant — `#[serde(default)]` so pre-bg `.pbc` files
     /// load with [`Comp::DEFAULT_BG`] rather than transparent.
@@ -1131,6 +1152,11 @@ impl Comp {
         Self::DEFAULT_MOTION_PATH_RANGE
     }
 
+    /// Five seconds at the default 60fps — the length a new comp used to get
+    /// when the field was `duration: 5.0` seconds, preserved exactly so a fresh
+    /// document is unchanged by the move to frames.
+    pub const DEFAULT_DURATION_FRAMES: i64 = 300;
+
     pub fn new(width: f64, height: f64, root: Node) -> Self {
         Self {
             name: String::new(),
@@ -1141,7 +1167,8 @@ impl Comp {
             width,
             height,
             fps: 60.0,
-            duration: 5.0,
+            duration_frames: Comp::DEFAULT_DURATION_FRAMES,
+            legacy_duration: None,
             bg: Self::DEFAULT_BG,
             passepartout: Self::DEFAULT_PASSEPARTOUT,
             motion_path_range: Self::DEFAULT_MOTION_PATH_RANGE,
@@ -1173,6 +1200,16 @@ impl Comp {
     /// a no-op on an already-migrated doc, so calling it twice is safe.
     pub fn migrate(&mut self) {
         let fps = self.timebase().fps();
+        // `duration_frames` at 0 means the file predates it. Fold the old
+        // seconds field if it carried one, else fall back to the default
+        // length — a comp with no duration at all would render nothing.
+        if self.duration_frames == 0 {
+            self.duration_frames = match self.legacy_duration.take() {
+                Some(secs) => self.timebase().seconds_to_frames(secs).max(1),
+                None => Comp::DEFAULT_DURATION_FRAMES,
+            };
+        }
+        self.legacy_duration = None;
         self.root.migrate_frames(fps);
         if let Some(camera) = &mut self.camera {
             camera.migrate_frames(fps);
@@ -1198,6 +1235,10 @@ impl Comp {
         if new == old {
             return false;
         }
+        // The length is in frames now, so it re-grids with everything else:
+        // a 5-second comp stays 5 seconds long across a rate change.
+        self.duration_frames = ((self.duration_frames as f64) * (new / old)).round() as i64;
+        self.duration_frames = self.duration_frames.max(1);
         self.root.retime(new / old);
         // The camera's dolly and orientation are keyframed on the same grid, so
         // they re-time with everything else — miss it and an animated camera
@@ -1208,9 +1249,17 @@ impl Comp {
         true
     }
 
-    /// Total length of the composition in whole frames: 5s @ 24fps = 120.
-    pub fn duration_frames(&self) -> i64 {
-        self.timebase().seconds_to_frames(self.duration)
+    /// Total length of the composition in seconds — a *presentation* unit,
+    /// derived from the stored frame count. Playback and the timecode readout
+    /// want it; nothing should store it.
+    pub fn duration_seconds(&self) -> f64 {
+        self.timebase().frames_to_seconds(self.duration_frames as f64)
+    }
+
+    /// Set the length from a duration in seconds, snapping to whole frames.
+    /// The edge where a user types "5s" and the comp has to pick a frame.
+    pub fn set_duration_seconds(&mut self, seconds: f64) {
+        self.duration_frames = self.timebase().seconds_to_frames(seconds).max(1);
     }
 }
 
@@ -1492,6 +1541,85 @@ mod tests {
 
     fn key_frames(comp: &Comp) -> Vec<i64> {
         comp.root.children[0].transform.rotation.key_frames()
+    }
+
+    /// A comp serialized the way a pre-frames `.pbc` was: `duration` in
+    /// seconds (or absent), and no `duration_frames` at all.
+    fn legacy_json(fps: f64, seconds: Option<f64>) -> serde_json::Value {
+        let mut comp = Comp::new(640.0, 480.0, Node::group(0, "root"));
+        comp.fps = fps;
+        let mut v = serde_json::to_value(&comp).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("duration_frames");
+        match seconds {
+            Some(s) => {
+                obj.insert("duration".into(), serde_json::json!(s));
+            }
+            None => {
+                obj.remove("duration");
+            }
+        }
+        v
+    }
+
+    /// The length is stored in frames now. A `.pbc` written when it was
+    /// `duration` in seconds must still open at the same length, and the
+    /// conversion is `migrate`'s job — the field alone can't do it, because
+    /// serde gives no ordering guarantee that `fps` is read first.
+    #[test]
+    fn a_legacy_seconds_duration_migrates_to_frames() {
+        let mut comp: Comp = serde_json::from_value(legacy_json(24.0, Some(5.0))).unwrap();
+        // Before migration the field is the "not in this file" sentinel.
+        assert_eq!(comp.duration_frames, 0);
+        comp.migrate();
+        assert_eq!(comp.duration_frames, 120, "5s @ 24fps");
+        assert!((comp.duration_seconds() - 5.0).abs() < 1e-12);
+    }
+
+    /// A file with neither field — or one somehow carrying a zero — must not
+    /// open as a comp of no length, which would render nothing at all.
+    #[test]
+    fn a_comp_with_no_duration_at_all_migrates_to_the_default_length() {
+        let mut comp: Comp = serde_json::from_value(legacy_json(60.0, None)).unwrap();
+        comp.migrate();
+        assert_eq!(comp.duration_frames, Comp::DEFAULT_DURATION_FRAMES);
+    }
+
+    /// The point of the whole change: the frame count is stored, so it is never
+    /// a rounding decision. At 23.976 a 5-second comp used to be 119.88 frames,
+    /// and whether a renderer wrote 119 or 120 came down to `.round()`.
+    #[test]
+    fn the_frame_count_is_exact_at_a_fractional_rate() {
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root"));
+        comp.fps = 24000.0 / 1001.0; // 23.976
+        comp.duration_frames = 120;
+        // Whatever the rate, the comp is exactly the frames it says it is.
+        assert_eq!(comp.duration_frames, 120);
+        // And the seconds it reports are derived, not stored.
+        assert!((comp.duration_seconds() - 120.0 * 1001.0 / 24000.0).abs() < 1e-12);
+    }
+
+    /// A rate change re-grids the animation; the length has to travel with it,
+    /// or a comp silently gets longer or shorter in wall-clock terms.
+    #[test]
+    fn changing_the_rate_keeps_the_comp_the_same_length_in_seconds() {
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root"));
+        comp.fps = 60.0;
+        comp.duration_frames = 300; // five seconds
+        comp.set_fps(24.0);
+        assert_eq!(comp.duration_frames, 120, "still five seconds, on a new grid");
+        assert!((comp.duration_seconds() - 5.0).abs() < 1e-9);
+    }
+
+    /// The legacy field is read, never written: once migrated, a save must not
+    /// carry a stale `duration` for some future loader to disagree with.
+    #[test]
+    fn a_migrated_comp_no_longer_serializes_the_legacy_field() {
+        let mut comp: Comp = serde_json::from_value(legacy_json(24.0, Some(2.0))).unwrap();
+        comp.migrate();
+        let out = serde_json::to_string(&comp).unwrap();
+        assert!(!out.contains("\"duration\""), "no legacy seconds field: {out}");
+        assert!(out.contains("\"duration_frames\":48"));
     }
 
     /// The comp background is a setting, so it round-trips — and a `.pbc`

@@ -106,7 +106,7 @@ impl OnionSkins {
             Some(v)
         });
 
-        let last = project.comps.get(&comp).map(|c| c.duration_frames()).unwrap_or(0);
+        let last = project.comps.get(&comp).map(|c| c.duration_frames).unwrap_or(0);
         for (offset, t) in offsets {
             let f = frame + offset;
             // Ghosts outside the comp are skipped rather than clamped: a clamped

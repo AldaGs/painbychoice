@@ -53,30 +53,34 @@ Sequenced so each phase ends with something a user can *do*, and so the
 expensive shared subsystem (the compositor) is built once, late, with its
 clients known.
 
-### Phase 0 — Two fixes that must land before the first exported file
+### Phase 0 — Two fixes that must land before the first exported file ✅
 
-Both are cheap now and expensive later, and both are latent precisely until
-something is rendered to disk.
+**Done, 2026-09-08.** Both were latent until something was rendered to disk, and
+both were cheaper to fix before saved projects and export code multiplied.
 
-- **`Comp::duration` is stored in seconds** (`core/src/node.rs:897`), with
-  `duration_frames()` deriving the count through a rounding `seconds_to_frames`.
-  The README already lists this as left open from roadmap item #1. It is
-  harmless while the only consumer is a playhead; it becomes a **±1 frame
-  ambiguity** the moment a render queue asks "how many frames am I writing?" —
-  5.0s at 23.976 fps is 119.88 frames, and whether the output file is 119 or 120
-  frames long comes down to a `.round()`. Store frames outright and derive
-  seconds. It is a `.pbc` format change, so it rides a migration, which is
-  exactly why it wants to happen before saved projects multiply.
-- **The SVG backend silently drops matte layers** (`render/src/lib.rs:45-50`,
-  documented in place: SVG expresses a matte with `<mask>`, a different
-  construction from the `<g>` nesting the blend path uses, so matte items are
-  skipped rather than drawn wrong). The GPU backend handles them properly. That
-  is a live disagreement between two backends, and Phase 1's entire premise is
-  that the exported frame equals the previewed frame. Either implement `<mask>`,
-  or formally demote the SVG backend to a debug/vector-export path that is not a
-  render target and cannot be selected in the queue. Pick one deliberately.
+- ~~**`Comp::duration` is stored in seconds**~~ ✅ The comp now stores
+  `duration_frames: i64`, with `duration_seconds()` derived and
+  `set_duration_seconds()` for the one edge (the comp bar) where a user types a
+  time. The frame count is no longer the output of a `.round()`: at 23.976fps a
+  five-second comp used to be 119.88 frames, and whether an exported file got
+  119 or 120 was a rounding decision. A pre-frames `.pbc` still opens — the old
+  seconds field is read into a private `legacy_duration` and folded by
+  `migrate()`, which is where it has to happen because serde gives no ordering
+  guarantee that `fps` is read first, and it is never written back out.
+  `set_fps` now re-grids the length along with the animation, so a rate change
+  keeps a comp the same number of seconds long. Five tests pin it.
+- ~~**The SVG backend silently drops matte layers**~~ ✅ Implemented as a
+  **luminance** mask rather than demoting the backend — exact for both matte
+  modes, and without depending on `mask-type="alpha"` (which has no inverse for
+  `DestOut`). The backend also grew a way to say "I could not draw this
+  exactly": `scene_to_svg_reporting` returns notes for the one case that is
+  still inexact — footage used as a matte, whose luminance is not its alpha —
+  and the offline binary prints them. See
+  [`decisions/0016-svg-mattes-are-luminance-masks.md`](decisions/0016-svg-mattes-are-luminance-masks.md).
 
-Neither is a bug in today's app. Both are bugs in tomorrow's renderer.
+The second fix matters more than it looks: the SVG backend is the headless way
+to verify compositing semantics without a GPU, which is what Phase 1's
+preview-equals-export tests will assert against.
 
 ### Phase 1 — Export (the unblocker)
 
@@ -377,8 +381,8 @@ we intend to hand over.
 
 ## 6. The one-line version
 
-The engine is ready. Fix the **frame-count and matte-parity** gaps, then build
-**export**, **audio**, the **compositor and effects**, and **autosave and
-relink** — and stop adding engine depth until a finished video can leave the
+The engine is ready. The **frame-count and matte-parity** gaps are closed; next
+is **export**, then **audio**, the **compositor and effects**, and **autosave and relink**
+— and stop adding engine depth until a finished video can leave the
 application. Extensibility (§4) costs nothing today but discipline: keep every
 built-in going through the registry, and every edit through an op.

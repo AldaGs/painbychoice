@@ -1713,7 +1713,7 @@ impl<'a> EvalCtx<'a> {
     pub fn local_window(&self) -> (f64, f64) {
         match self.timing {
             Some(t) => ((t.in_ - t.start) as f64, (t.out - t.start) as f64),
-            None => (0.0, self.doc.map_or(0.0, |d| d.duration_frames() as f64)),
+            None => (0.0, self.doc.map_or(0.0, |d| d.duration_frames as f64)),
         }
     }
 

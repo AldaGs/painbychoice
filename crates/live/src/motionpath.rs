@@ -85,7 +85,7 @@ impl MotionPath {
             return false;
         };
         let range = range.clamp(0, MAX_RANGE);
-        let last = c.duration_frames();
+        let last = c.duration_frames;
         let lo = (frame - range).max(0);
         let hi = (frame + range).min(last);
         let key = PathKey { node, comp, lo, hi, revision };

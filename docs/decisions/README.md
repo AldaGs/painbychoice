@@ -22,6 +22,7 @@ itself teaches nothing.
 | [0012](0012-reusable-modules.md) | Reusable animation modules — shared, auto-retimed, overridable |
 | [0014](0014-undo-is-snapshots.md) | Undo/redo is whole-document snapshots, not inverse operations |
 | [0015](0015-dock-tree.md) | The workspace is a layout tree edited by deferred ops |
+| [0016](0016-svg-mattes-are-luminance-masks.md) | Track mattes in SVG are luminance masks, and divergences are reported |
 
 ## Decided, not yet built
 

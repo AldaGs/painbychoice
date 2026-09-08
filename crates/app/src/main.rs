@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 
 use motion_core::{demo::demo_document, evaluate, Color};
-use motion_render::scene_to_svg;
+use motion_render::scene_to_svg_reporting;
 
 fn main() {
     let doc = demo_document();
@@ -32,7 +32,13 @@ fn main() {
         }
         // The demo document is a bare comp with no project behind it, so it has
         // no footage library to hand over.
-        let svg = scene_to_svg(&scene, doc.width, doc.height, bg, &[]);
+        let (svg, report) = scene_to_svg_reporting(&scene, doc.width, doc.height, bg, &[]);
+        // Anything this backend could not express exactly. Printed rather than
+        // swallowed: an offline frame that quietly disagrees with the editor is
+        // the bug that costs a whole render to find.
+        for note in &report {
+            eprintln!("note [frame {frame}]: {note}");
+        }
         let path = out_dir.join(format!("frame_{i:02}.svg"));
         fs::write(&path, svg).expect("write svg");
         println!(

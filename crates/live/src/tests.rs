@@ -4,7 +4,7 @@
 //! Moved verbatim out of `main.rs` when it was split by concern.
 
 use crate::*;
-use motion_core::{BinOp, UnOp};
+use motion_core::BinOp;
 
 fn test_axis(view: TimelineView) -> Axis {
     // 8px pad each side → a 400px usable span.
@@ -1105,13 +1105,13 @@ fn a_precomp_inherits_the_open_comps_format() {
     {
         let open = project.comp_mut(current).unwrap();
         open.fps = 24.0;
-        open.duration = 7.5;
+        open.set_duration_seconds(7.5);
     }
     let (comp_id, _) = precompose_into(&mut project, current, NodeId(2), 99).unwrap();
     let inner = project.comp(comp_id).unwrap();
     assert_eq!((inner.width, inner.height), (640.0, 480.0));
     assert_eq!(inner.fps, 24.0);
-    assert_eq!(inner.duration, 7.5);
+    assert_eq!(inner.duration_frames, 180); // 7.5s @ 24fps
 }
 
 /// Pre-composing must be visually a no-op: the layer's transform travels *into*

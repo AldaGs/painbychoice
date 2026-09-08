@@ -843,7 +843,7 @@ impl App {
 
     pub(crate) fn new(doc: Document) -> Self {
         let next_id = max_id(&doc.root) + 1;
-        let view = TimelineView::full(doc.duration_frames());
+        let view = TimelineView::full(doc.duration_frames);
         let project = MProject::single(doc);
         let current = project.root;
         Self {
@@ -946,7 +946,7 @@ impl App {
             self.current = self.project.root;
         }
         let comp = self.doc();
-        let (next_id, frames) = (max_id(&comp.root) + 1, comp.duration_frames());
+        let (next_id, frames) = (max_id(&comp.root) + 1, comp.duration_frames);
         // Never *lower* the counter: a redo can bring back nodes that were
         // deleted, and reusing an id they still hold would alias two layers.
         self.next_id = self.next_id.max(next_id);
@@ -1377,7 +1377,7 @@ impl App {
     /// The playback loop's frame bounds `[lo, hi)` — the work area clamped into
     /// the comp, or the whole comp.
     pub(crate) fn loop_bounds_frames(&self) -> (i64, i64) {
-        loop_bounds(self.work_area, self.doc().duration_frames())
+        loop_bounds(self.work_area, self.doc().duration_frames)
     }
 
     /// The same bounds in seconds, for the wall-clock playback loop. The
@@ -1386,7 +1386,7 @@ impl App {
     /// areas existed.
     fn loop_bounds_secs(&self) -> (f64, f64) {
         match self.work_area {
-            None => (0.0, self.doc().duration),
+            None => (0.0, self.doc().duration_seconds()),
             Some(_) => {
                 let tb = self.doc().timebase();
                 let (lo, hi) = self.loop_bounds_frames();
@@ -1407,8 +1407,8 @@ impl App {
         if self.playing {
             let (lo, hi) = self.loop_bounds_secs();
             wrap_into(self.anchor.elapsed().as_secs_f64(), lo, hi)
-        } else if self.doc().duration > 0.0 {
-            self.paused_t.rem_euclid(self.doc().duration)
+        } else if self.doc().duration_frames > 0 {
+            self.paused_t.rem_euclid(self.doc().duration_seconds())
         } else {
             self.paused_t
         }
@@ -1419,12 +1419,12 @@ impl App {
     /// unit-tested); a degenerate range is re-clamped by `loop_bounds` at read
     /// time, so the loop span can never invert.
     pub(crate) fn set_work_start(&mut self, frame: i64) {
-        let total = self.doc().duration_frames();
+        let total = self.doc().duration_frames;
         self.work_area = Some(with_work_start(self.work_area, frame, total));
     }
 
     pub(crate) fn set_work_end(&mut self, frame: i64) {
-        let total = self.doc().duration_frames();
+        let total = self.doc().duration_frames;
         self.work_area = Some(with_work_end(self.work_area, frame, total));
     }
 
@@ -1448,13 +1448,13 @@ impl App {
     /// Seek to a frame, wrapping around the composition length. All seeking
     /// goes through here, so the playhead can only ever land on the grid.
     pub(crate) fn seek_frame(&mut self, frame: i64) {
-        let total = self.doc().duration_frames().max(1);
+        let total = self.doc().duration_frames.max(1);
         let frame = frame.rem_euclid(total);
         self.seek(self.doc().timebase().frames_to_seconds(frame as f64));
     }
 
     pub(crate) fn seek(&mut self, t: f64) {
-        let t = t.rem_euclid(self.doc().duration.max(f64::MIN_POSITIVE));
+        let t = t.rem_euclid(self.doc().duration_seconds().max(f64::MIN_POSITIVE));
         self.paused_t = t;
         self.anchor = Instant::now() - std::time::Duration::from_secs_f64(t);
     }
@@ -2186,7 +2186,7 @@ impl App {
             return false; // the block is boxed in somewhere
         }
         // Also keep the whole selection inside the composition.
-        let last = self.doc().duration_frames().max(1);
+        let last = self.doc().duration_frames.max(1);
         let node = self.doc_mut().root.find_mut(id).expect("checked above");
         let mut min_frame = i64::MAX;
         let mut max_frame = i64::MIN;
@@ -2475,7 +2475,7 @@ impl App {
         // all of `self`, so the reads can't straddle an assignment.
         let comp = self.doc();
         let (next_id, frames, name) =
-            (max_id(&comp.root) + 1, comp.duration_frames(), comp.name.clone());
+            (max_id(&comp.root) + 1, comp.duration_frames, comp.name.clone());
         self.next_id = next_id;
         self.view = TimelineView::full(frames);
         // The work area is per-comp view state; a fresh open starts with none.
@@ -2584,7 +2584,7 @@ impl App {
         project.migrate();
         let open = project.root_comp();
         self.next_id = max_id(&open.root) + 1;
-        self.view = TimelineView::full(open.duration_frames());
+        self.view = TimelineView::full(open.duration_frames);
         // The work area is view state, not saved with the document.
         self.work_area = None;
         self.project = project;
@@ -2658,7 +2658,7 @@ impl App {
         // appear in the timecode string.
         let frame = self.current_frame();
         let t = frame as f64;
-        let last_frame = self.doc().duration_frames().max(1);
+        let last_frame = self.doc().duration_frames.max(1);
         // Take delivery of whatever the decode worker finished since the last
         // redraw, before anything reads the cache. Frames it hands over include
         // ones nobody asked for — that is the prefetch running ahead of the
@@ -2904,7 +2904,7 @@ impl App {
 
         // --- Run egui for this frame (no `self` borrow leaks into the UI). ---
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(window);
-        let duration = self.doc().duration;
+        let duration = self.doc().duration_seconds();
         let comp_bg = self.doc().bg;
         let comp_pp = self.doc().passepartout;
         let comp_path_range = self.doc().motion_path_range;
@@ -3410,12 +3410,13 @@ impl App {
             &mut selected_keys,
         );
         if let Some(d) = comp.duration {
-            self.doc_mut().duration = d.max(0.1);
+            // The bar edits seconds; the comp stores frames. One snap, here.
+            self.doc_mut().set_duration_seconds(d.max(0.1));
         }
         // fps/duration changes resize the frame axis under the view, so the
         // window may now hang past the end of the comp.
         if comp.fps.is_some() || comp.duration.is_some() {
-            self.view = self.view.clamped(self.doc().duration_frames());
+            self.view = self.view.clamped(self.doc().duration_frames);
         }
 
         if let Some(name) = comp.rename {
@@ -3513,7 +3514,7 @@ impl App {
             self.seek_frame(nf);
         }
         // Start/End fields write the same work area the B/N keys do.
-        let total = self.doc().duration_frames();
+        let total = self.doc().duration_frames;
         if let Some(f) = transport.set_work_start {
             self.work_area = Some(with_work_start(self.work_area, f, total));
         }
@@ -3907,12 +3908,12 @@ pub(crate) fn precompose_into(
         return None;
     }
     let layer = open.root.find(id)?.clone();
-    let (w, h, fps, duration) = (open.width, open.height, open.fps, open.duration);
+    let (w, h, fps, frames) = (open.width, open.height, open.fps, open.duration_frames);
     let name = if layer.name.trim().is_empty() { "Precomp".to_string() } else { layer.name.clone() };
 
     let mut inner = Comp::new(w, h, MNode::group(0, "root").with_child(layer));
     inner.fps = fps;
-    inner.duration = duration;
+    inner.duration_frames = frames;
     inner.name = name.clone();
     let comp_id = project.insert(inner);
 

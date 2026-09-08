@@ -23,6 +23,25 @@ pub fn scene_to_svg(
     background: Color,
     assets: &[Asset],
 ) -> String {
+    scene_to_svg_reporting(scene, width, height, background, assets).0
+}
+
+/// [`scene_to_svg`], plus the list of things this backend could not express
+/// exactly.
+///
+/// The reason this exists: a backend that silently drops what it cannot draw
+/// produces a frame that looks plausible and is wrong, which is the failure
+/// mode hardest to notice and hardest to trace. Every divergence from what the
+/// GPU backend would draw is named here instead, and the offline binary prints
+/// them.
+pub fn scene_to_svg_reporting(
+    scene: &Scene,
+    width: f64,
+    height: f64,
+    background: Color,
+    assets: &[Asset],
+) -> (String, Vec<String>) {
+    let mut report: Vec<String> = Vec::new();
     let mut out = String::new();
     out.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
@@ -42,12 +61,28 @@ pub fn scene_to_svg(
     let mut next_group = 0usize;
     let mut open: Vec<usize> = Vec::new();
 
-    // Track mattes are **not** implemented here yet: SVG expresses them with
-    // `<mask>` rather than a coverage rule, which is a different construction
-    // from the `<g>` nesting above. Until that lands, the matte layer's items
-    // are skipped rather than drawn — an unmatted layer is wrong, but a matte
-    // painted as a solid shape over the content is wrong *and* unrecognisable.
-    // The GPU backend does mattes properly; see `to_vello`.
+    // Track mattes become an SVG `<mask>` on the group they apply to.
+    //
+    // The engine models a matte as a coverage rule — an inner group composed
+    // `DestIn`/`DestOut` over its enclosing pair — and SVG has no such rule, so
+    // it is expressed as a **luminance** mask instead, which is exactly
+    // equivalent for the case that matters:
+    //
+    // - `DestIn` (keep the backdrop where the matte is opaque): an empty (black,
+    //   luminance 0) mask with the matte's shapes painted white at their own
+    //   coverage. White at alpha a over black has luminance a, so the mask's
+    //   luminance *is* the matte's alpha.
+    // - `DestOut` (keep the backdrop where the matte is transparent): the same
+    //   thing inverted — a white ground with the matte painted black, giving
+    //   luminance 1-a.
+    //
+    // Deliberately not `mask-type="alpha"`: it would express `DestIn` directly
+    // but has no inverse for `DestOut`, so one of the two would still be an
+    // approximation. Luminance gets both exactly, with one construction.
+    //
+    // Where it is *not* exact — footage inside a matte, whose luminance is not
+    // its alpha — the mask is still emitted and the divergence is reported
+    // rather than silently drawn.
     let matte_ranges: Vec<(usize, usize)> = scene
         .groups
         .iter()
@@ -55,6 +90,28 @@ pub fn scene_to_svg(
         .map(|g| (g.start, g.end))
         .collect();
     let is_matte = |i: usize| matte_ranges.iter().any(|(s, e)| i >= *s && i < *e);
+
+    // Which group does each matte apply to? The innermost one that strictly
+    // contains it — the pair the engine built when it made the matte a child.
+    // Keyed by the *enclosing* group's start, which is what the emit loop has
+    // in hand when it opens a group.
+    let mattes: Vec<(usize, &motion_core::LayerGroup)> = scene
+        .groups
+        .iter()
+        .filter(|m| m.compose != ComposeMode::SrcOver)
+        .filter_map(|m| {
+            scene
+                .groups
+                .iter()
+                .filter(|e| {
+                    e.compose == ComposeMode::SrcOver
+                        && e.start <= m.start
+                        && e.end >= m.end
+                })
+                .min_by_key(|e| e.end - e.start)
+                .map(|e| (e.start, m))
+        })
+        .collect();
 
     for (i, item) in scene.items.iter().enumerate() {
         while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
@@ -90,8 +147,27 @@ pub fn scene_to_svg(
                 }
                 None => String::new(),
             };
+            // A matte on this group is defined here, immediately before the
+            // group that references it, so the document stays readable and no
+            // id can outlive its use.
+            let mask_ref = match mattes.iter().find(|(start, _)| *start == g.start) {
+                Some((_, m)) => {
+                    let id = format!("matte{}_{}", m.source.0, m.start);
+                    out.push_str(&write_matte_mask(
+                        &id,
+                        scene,
+                        m,
+                        width,
+                        height,
+                        assets,
+                        &mut report,
+                    ));
+                    format!(" mask=\"url(#{id})\"")
+                }
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "  <g style=\"mix-blend-mode:{}\" opacity=\"{:.3}\"{clip_ref}>\n",
+                "  <g style=\"mix-blend-mode:{}\" opacity=\"{:.3}\"{clip_ref}{mask_ref}>\n",
                 css_blend(g.blend),
                 g.alpha.clamp(0.0, 1.0)
             ));
@@ -99,7 +175,7 @@ pub fn scene_to_svg(
         }
 
         if is_matte(i) {
-            // Consumed by a matte this backend can't yet express; see above.
+            // Drawn into the `<mask>` above, not into the frame.
             while open.last() == Some(&(i + 1)) {
                 out.push_str("  </g>\n");
                 open.pop();
@@ -180,7 +256,66 @@ pub fn scene_to_svg(
     }
 
     out.push_str("</svg>\n");
-    out
+    (out, report)
+}
+
+/// Emit the `<mask>` element for one matte group.
+///
+/// `DestIn` paints the matte white on an implicit black ground; `DestOut`
+/// paints it black on an explicit white one. See the reasoning at the call
+/// site for why this is luminance rather than alpha masking.
+#[allow(clippy::too_many_arguments)]
+fn write_matte_mask(
+    id: &str,
+    scene: &Scene,
+    matte: &motion_core::LayerGroup,
+    width: f64,
+    height: f64,
+    assets: &[Asset],
+    report: &mut Vec<String>,
+) -> String {
+    let out_mode = matte.compose == ComposeMode::DestOut;
+    let paint = if out_mode { "black" } else { "white" };
+    let mut m = format!("  <mask id=\"{id}\" maskUnits=\"userSpaceOnUse\">\n");
+    if out_mode {
+        // The ground the matte subtracts from. Sized to the comp, because a
+        // mask only affects what it covers and an unpainted region reads as
+        // "hide", which would blank the layer everywhere the matte isn't.
+        m.push_str(&format!(
+            "    <rect x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\" fill=\"white\"/>\n"
+        ));
+    }
+    for item in &scene.items[matte.start..matte.end] {
+        let c = item.transform.as_coeffs();
+        let matrix = format!("matrix({} {} {} {} {} {})", c[0], c[1], c[2], c[3], c[4], c[5]);
+        // Coverage is the fill's own alpha times the item's opacity — the same
+        // product the GPU backend would write into the alpha channel.
+        let cov = item.fill.map_or(0.0, |f| f.a) * item.opacity;
+        if item.image.is_some() {
+            // Luminance is not alpha: a dark opaque pixel masks as if it were
+            // transparent. Named rather than silently wrong.
+            let known = item
+                .image
+                .and_then(|p| assets.iter().find(|a| a.id == p.asset))
+                .map(|a| a.path.to_string_lossy().to_string())
+                .unwrap_or_else(|| "<missing>".to_string());
+            report.push(format!(
+                "footage used as a track matte ({known}) is approximated by its \
+                 luminance in the SVG backend; the GPU backend uses its alpha"
+            ));
+        }
+        let stroke = match item.stroke {
+            Some((_, w)) => format!(" stroke=\"{paint}\" stroke-width=\"{w}\""),
+            None => String::new(),
+        };
+        m.push_str(&format!(
+            "    <path transform=\"{matrix}\" d=\"{}\" fill=\"{paint}\"{stroke} \
+             fill-opacity=\"{cov:.3}\" stroke-opacity=\"{cov:.3}\"/>\n",
+            item.path.to_svg(),
+        ));
+    }
+    m.push_str("  </mask>\n");
+    m
 }
 
 /// The CSS keyword for a blend mode.
@@ -321,5 +456,96 @@ mod mask_tests {
     #[test]
     fn an_inverted_mask_clips_even_odd() {
         assert!(masked(true).contains("clip-rule=\"evenodd\""));
+    }
+}
+
+#[cfg(test)]
+mod matte_tests {
+    use super::*;
+    use motion_core::{Comp, MatteMode, Node, Shape, Value};
+
+    /// A content layer matted by the layer above it, as the engine builds it:
+    /// the matte is a *sibling*, and `matte` on the content names the mode.
+    fn matted(mode: MatteMode, opacity: f64) -> (String, Vec<String>) {
+        let mut content = Node::group(1, "content");
+        content.shape = Some(Shape::Rect {
+            size: Value::constant(kurbo::Vec2::new(20.0, 20.0)),
+            radius: Value::constant(0.0),
+        });
+        content.fill = Some(Value::constant(Color::rgb(1.0, 0.0, 0.0)));
+        content.matte = Some(mode);
+
+        let mut matte = Node::group(2, "matte");
+        matte.shape = Some(Shape::Ellipse { size: Value::constant(kurbo::Vec2::new(8.0, 8.0)) });
+        matte.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
+        matte.transform.opacity = Value::constant(opacity);
+
+        let comp = Comp::new(
+            100.0,
+            100.0,
+            // The matte is the sibling *above* the content, which the engine
+            // reads as the next child in document order.
+            Node::group(0, "root").with_child(content).with_child(matte),
+        );
+        scene_to_svg_reporting(
+            &motion_core::evaluate(&comp, 0.0),
+            100.0,
+            100.0,
+            Color::rgb(0.0, 0.0, 0.0),
+            &[],
+        )
+    }
+
+    /// The gap this closes: a track matte used to be *dropped* by this backend,
+    /// so the offline render drew an unmatted layer and disagreed with the GPU
+    /// one. It must now emit a mask, and the group must reference it.
+    #[test]
+    fn a_track_matte_becomes_a_mask() {
+        let (svg, report) = matted(MatteMode::Alpha, 1.0);
+        assert!(svg.contains("<mask id=\"matte"), "{svg}");
+        assert!(svg.contains("mask=\"url(#matte"), "{svg}");
+        assert!(report.is_empty(), "a vector matte is exact: {report:?}");
+    }
+
+    /// `Alpha` keeps the content where the matte is opaque, so the mask paints
+    /// the matte white on the implicit black ground — luminance *is* alpha.
+    #[test]
+    fn an_alpha_matte_paints_white_on_black() {
+        let (svg, _) = matted(MatteMode::Alpha, 1.0);
+        let mask = &svg[svg.find("<mask").unwrap()..svg.find("</mask>").unwrap()];
+        assert!(mask.contains("fill=\"white\""), "{mask}");
+        assert!(!mask.contains("fill=\"black\""), "no inverted ground: {mask}");
+    }
+
+    /// `AlphaInverted` is the same construction turned over: a white ground the
+    /// matte subtracts from. Without the ground the layer would be hidden
+    /// everywhere the matte does not reach, which is the opposite of the mode.
+    #[test]
+    fn an_inverted_matte_subtracts_from_a_white_ground() {
+        let (svg, _) = matted(MatteMode::AlphaInverted, 1.0);
+        let mask = &svg[svg.find("<mask").unwrap()..svg.find("</mask>").unwrap()];
+        assert!(mask.contains("<rect"), "needs a ground to subtract from: {mask}");
+        assert!(mask.contains("fill=\"white\""), "{mask}");
+        assert!(mask.contains("fill=\"black\""), "the matte subtracts: {mask}");
+    }
+
+    /// A semi-transparent matte is a *partial* coverage, not a binary one — the
+    /// mask carries the same product the GPU backend writes into alpha.
+    #[test]
+    fn a_partly_transparent_matte_carries_its_coverage() {
+        let (svg, _) = matted(MatteMode::Alpha, 0.5);
+        assert!(svg.contains("fill-opacity=\"0.500\""), "{svg}");
+    }
+
+    /// The matte layer contributes shape, never pixels: its own colour must not
+    /// reach the frame. It is drawn into the mask and nowhere else.
+    #[test]
+    fn the_matte_layer_is_consumed_not_drawn() {
+        let (svg, _) = matted(MatteMode::Alpha, 1.0);
+        let body = &svg[svg.find("</mask>").unwrap()..];
+        assert!(
+            !body.contains("fill=\"white\""),
+            "the matte must not be painted into the frame: {body}"
+        );
     }
 }

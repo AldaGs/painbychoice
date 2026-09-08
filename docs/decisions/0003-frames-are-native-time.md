@@ -23,8 +23,13 @@ Keyframes snap to frames at any zoom by construction, and changing a comp's fps
 *re-grids* the animation (`Comp::set_fps`) instead of leaving keys on stale
 frame numbers.
 
-One piece is still outstanding and is now blocking: `Comp::duration` is stored
-in **seconds** with the frame count derived through a rounding conversion, so
-"how many frames does this comp contain?" is answered by a `.round()`. Harmless
-for a playhead, a ±1-frame ambiguity for a renderer. Phase 0 of
-[`../production-plan.md`](../production-plan.md).
+The last piece of this landed on 2026-09-08: `Comp::duration_frames` is now
+**stored**, with `duration_seconds()` derived. It used to be the other way
+round, which made "how many frames does this comp contain?" the output of a
+`.round()` — 5.0s at 23.976fps is 119.88 frames, so a renderer could write 119
+or 120. Harmless for a playhead, a ±1-frame difference in an exported file.
+
+A pre-frames `.pbc` still opens: the old seconds field is read into a private
+`legacy_duration` and folded by `migrate()`, which is where the conversion has
+to happen because serde gives no guarantee that `fps` is deserialized first. The
+legacy field is never written back out.
