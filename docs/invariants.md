@@ -74,24 +74,41 @@ constraints were load-bearing and which were taste.
     `Encoder::abort` kills the process and removes the fragment. Both are pinned
     by tests. ([0020](decisions/0020-the-render-job-is-stepped-not-threaded.md))
 
-## The boundaries we are deliberately keeping open
-
 18. **An encoder's `Preparer` shares nothing with its encoder.** It is called
     from many threads at once, so it holds pixels-in, bytes-out and no state.
     An encoder that overrides `preparer` must override `write_prepared` to
     match — they are two halves of one operation running on different threads,
     and `push` routes through both so the sequential and parallel paths cannot
     write different files. Pinned by a test.
-19. **`render/` abstracts `Scene → pixels` with more than one backend.** That
+19. **Audio positions are in sample frames, never samples.** One per instant of
+    time, regardless of channels — a stereo second at 48kHz is 48000 sample
+    frames and 96000 samples. Conflating them is the classic way to get audio at
+    half speed or half length, so the names say which is meant.
+20. **The audio callback must not allocate, block, or decode.** It runs on the
+    driver's realtime thread, where missing the deadline is an audible click
+    rather than a slow frame. The mix reaches it as an immutable snapshot read
+    through a `try_lock` held only long enough to clone an `Arc`, and
+    `mix_into` fills a caller's scratch slice rather than returning a `Vec` for
+    exactly this reason. A block that cannot get the lock is silent — one block,
+    never a stall.
+    ([0021](decisions/0021-audio-is-the-master-clock.md))
+21. **A sound that will not decode is silence plus a note, never a failed
+    render.** The same rule as missing footage, for the same reason: an export
+    that dies because one asset moved is worse than one that says so and
+    continues.
+
+## The boundaries we are deliberately keeping open
+
+22. **`render/` abstracts `Scene → pixels` with more than one backend.** That
     boundary is the escape hatch if vello's maturity bites; compositor code must
     not reach around it. ([0004](decisions/0004-vector-first-raster-compositor.md))
-20. **We never implement a codec.** Frames out, encoder in.
+23. **We never implement a codec.** Frames out, encoder in.
     ([0007](decisions/0007-never-implement-codecs.md))
-21. **Built-ins register through the same seam a plugin would.** A seam we do
+24. **Built-ins register through the same seam a plugin would.** A seam we do
     not dogfood is a seam that will rot.
     ([0009](decisions/0009-plugin-shaped-now.md))
-22. **Plugins read a projection and write only ops.** No plugin ever gets
+25. **Plugins read a projection and write only ops.** No plugin ever gets
     `&mut Document` — that would bypass undo, migration, and every test.
-23. **We do not ship a promise the evaluator cannot honour.**
+26. **We do not ship a promise the evaluator cannot honour.**
     `NodeCategory::is_buildable_now()` exists for exactly this, and a test pins
     it.

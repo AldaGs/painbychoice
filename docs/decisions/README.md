@@ -26,6 +26,7 @@ itself teaches nothing.
 | [0017](0017-offline-cpu-rasterizer.md) | The offline renderer rasterizes on the CPU; parity with the preview is structural |
 | [0018](0018-two-render-buttons.md) | Two render buttons: Draft and Master |
 | [0020](0020-the-render-job-is-stepped-not-threaded.md) | The GUI render job is stepped from the redraw loop, not threaded |
+| [0021](0021-audio-is-the-master-clock.md) | Audio is the master clock; the wall clock is the fallback |
 
 ## Decided, not yet built
 

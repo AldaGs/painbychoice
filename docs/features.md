@@ -95,6 +95,22 @@ produce a finished video.
   with its live result or error shown). Drag boxes to arrange them. A cycle or a
   bad script falls back to a neutral value instead of breaking the frame.
 
+- **Sound** — import a sound file as a layer with **Audio** in the layers panel.
+  It arrives trimmed to its own length, and its timing is the layer's, so
+  trimming a sound is trimming a layer. Level and pan are ordinary animatable
+  properties, so they keyframe and take expressions like anything else (no
+  controls for them yet — see the production plan).
+  - **Playback follows the sound, not the wall clock.** When a comp has audio
+    the device becomes the time source and the frame is derived from the samples
+    it has actually consumed, so the picture cannot drift off the music over a
+    long piece. With no sound, or no working audio device, playback runs on the
+    wall clock exactly as it always did.
+  - A rendered **video carries the mix** — `motion render` muxes it. The
+    editor's own render buttons do not yet.
+  - Formats are whatever symphonia handles: wav, mp3, flac, ogg, m4a, aac, aiff.
+    A sound that will not decode leaves that layer silent and says so, rather
+    than failing the render.
+
 - **Export** — two buttons on the composition bar, and they are **different
   verbs** rather than one button with a mode
   ([0018](decisions/0018-two-render-buttons.md)).

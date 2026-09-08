@@ -8,8 +8,8 @@ close it.
 
 ## 1. Where the project actually is
 
-Measured, not remembered: ~38k lines of Rust across four crates, `cargo test
---workspace` green (628 tests: 317 core, 272 live, 31 render, 8 CLI). The render
+Measured, not remembered: ~40k lines of Rust across four crates, `cargo test
+--workspace` green (714 tests: 340 core, 305 live, 61 render, 8 CLI). The render
 and live counts include tests that need a real GPU or a real `ffmpeg`; both skip
 cleanly where those are absent, so a headless CI box sees fewer.
 
@@ -22,7 +22,7 @@ cleanly where those are absent, so a headless CI box sees fewer.
 | Compositing | Model only. Blend modes, masks, track mattes exist in `Scene` and both backends. No effect stack, no GPU effect passes. |
 | Footage | Import works: stills (incl. HEIC/RAW), video via an `ffmpeg` sidecar, threaded decode cache with a warm frame stream. |
 | Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gap: the GUI export is GPU-serial (the CLI is frame-parallel). |
-| **Audio** | **Does not exist.** No decode, no playback, no waveform, no master clock. |
+| Audio | Works. Sound layers with animatable level/pan, symphonia decode, a realtime output stream, and the master clock inverted so the picture follows the sound. The CLI muxes a mix into rendered video. Gaps: no waveform, no level/pan controls, no audio from the GUI render buttons. |
 | Effects | Does not exist. `NodeCategory::Effect` is a registry slot with nothing in it. |
 | Motion blur | Does not exist. |
 | Project robustness | No autosave, no crash recovery, no asset relink UI, no "collect files". |
@@ -215,14 +215,28 @@ than a gap in it.
   finished WAV handed to ffmpeg as a second input — two pipes into one process
   is a deadlock waiting to happen.
 
-**Still ahead in this phase:**
+Playback was confirmed working on a real device on 2026-09-08 — the one part of
+this phase that could not be verified from a test.
 
-- **A waveform in the timeline** — the actual reason sync is editable.
-- **Audio in the GUI export path.** The CLI muxes sound; the editor's render
-  queue does not yet.
-- **A level/pan UI.** The properties are animatable but have no controls.
-- **Resampling quality.** Mismatched rates use linear interpolation, which is a
-  documented floor rather than a considered choice.
+**Still ahead in this phase — start here:**
+
+1. **A waveform in the timeline.** The largest remaining gap and the plan's own
+   stated reason sync is editable: today a sound is an unmarked bar, so you can
+   hear the music but not see where the beat is. The data is already there —
+   `App::sounds` holds decoded `Sound`s — so this is a peaks-per-pixel reduction
+   plus a strip renderer, and the reduction should be cached per asset because
+   recomputing it per redraw at 48kHz would dominate the frame.
+2. **A level/pan UI.** The properties animate already; they need controls in the
+   properties panel and rows in the dopesheet. Small, and it makes the mix
+   editable rather than only programmable.
+3. **Audio in the GUI export path.** `motion render` muxes sound;
+   `renderqueue.rs` does not. The pieces exist (`mix_comp`, `write_wav`,
+   `FfmpegEncoder::with_audio`) — the work is threading a temp WAV through the
+   stepped job's lifetime, which is fiddlier than the CLI's because the job
+   outlives the call that starts it.
+4. **Resampling quality.** Mismatched rates use linear interpolation, which
+   `Sound::read` documents as a floor rather than a choice. A windowed-sinc
+   resampler is the upgrade and that function is the only seam it needs.
 
 **Done when:** a cut can be edited to music and the exported file carries it.
 *The export half is true today; the editing half needs the waveform.*
@@ -508,8 +522,9 @@ we intend to hand over.
 
 ## 6. The one-line version
 
-The engine is ready and **export now works from both the CLI and the GUI**. Next
-is **audio and the master clock**, then the **compositor and effects**, then
-**autosave and relink** — and still no new engine depth until those land.
+The engine is ready, **export works from both the CLI and the GUI**, and
+**sound plays and exports**. What is left in Phase 2 is making a mix *editable*
+— a waveform and level controls — then the **compositor and effects**, then
+**autosave and relink**. Still no new engine depth until those land.
 Extensibility (§4) costs nothing today but discipline: keep every built-in going
 through the registry, and every edit through an op.
