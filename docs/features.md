@@ -95,7 +95,7 @@ produce a finished video.
   with its live result or error shown). Drag boxes to arrange them. A cycle or a
   bad script falls back to a neutral value instead of breaking the frame.
 
-- **Export** — two buttons under the composition bar, and they are **different
+- **Export** — two buttons on the composition bar, and they are **different
   verbs** rather than one button with a mode
   ([0018](decisions/0018-two-render-buttons.md)).
   - **Draft** asks nothing: the whole comp, **full resolution**, fast encoder
@@ -119,7 +119,7 @@ produce a finished video.
     file of the wrong length.
   - The export renders through **the same vello renderer as the preview**, so
     what you see is what is written, minus the editor's own furniture (frame
-    border, passepartout, selection, onion skins). One current exception: a
-    layer with a **blur** exports without it.
+    border, passepartout, selection, onion skins). Effects included: a blurred
+    layer exports blurred, through the same readback the preview uses.
   - The same renders are available headlessly:
     `motion render project.pbc --out film.mp4 --quality master`.

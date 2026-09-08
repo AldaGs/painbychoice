@@ -28,6 +28,9 @@
 //!   `Renderer`. Standing up a second device to render a frame would double the
 //!   GPU memory for the atlas and the shaders, and would render with a
 //!   different adapter on a laptop that has two.
+//!
+//! What it *does* do, and must: run the preview's own effect-stack readback, so
+//! a layer with a blur exports blurred. See [`FrameRenderer::frame`].
 
 use crate::scene::{read_texture_rgba, Chrome};
 use kurbo::Affine;
@@ -151,10 +154,18 @@ impl FrameRenderer<'_> {
     /// the timebase is frames-native ([`decisions/0003`]) and sub-frame values
     /// are meaningful to motion blur later.
     ///
-    /// Note what is *absent*: no orbit matrix (the preview's 3D navigation is a
-    /// view of the comp, not part of it — a render is always through the comp's
-    /// own camera), and no effect-image readback. The latter is a real
-    /// limitation rather than an oversight; see the module docs on the blur gap.
+    /// Note what is *absent*: no orbit matrix. The preview's 3D navigation is a
+    /// view *of* the comp, not part of it — a render is always through the
+    /// comp's own camera, so an orbited preview and its export differ, and
+    /// correctly so.
+    ///
+    /// The effect-stack readback **is** here, and has to be: a layer with a blur
+    /// needs its pixels rendered, read back, filtered and drawn in place of its
+    /// items, because vello has no layer-filter primitive. Running the same
+    /// `rasterize_effect_layers` the preview runs is the whole of what makes the
+    /// export match — skipping it would silently drop every blur from a
+    /// delivered file, which is the class of bug nobody notices until a client
+    /// does. It costs one extra render + readback per blurred layer per frame.
     pub(crate) fn frame(
         &mut self,
         project: &MProject,
@@ -166,13 +177,29 @@ impl FrameRenderer<'_> {
             .ok_or_else(|| format!("no composition {} in this project", comp.0))?;
         let dims = (doc.width, doc.height);
         let bg = doc.bg;
-        let (w, _) = self.target.size();
+        let (w, h) = self.target.size();
         // The same scale the target was sized with, recovered from it, so the
         // picture cannot land at a different scale than the texture it is
         // rendered into.
         let fit = Affine::scale(w as f64 / dims.0.max(1e-6));
 
         let scene = evaluate_comp(project, comp, frame);
+        // Blurred layers rasterized and filtered first, so `to_vello` can drop
+        // each one's processed image in place of its raw items — the same order
+        // the preview uses. A layer whose readback fails is simply absent from
+        // the map and draws unfiltered, so the worst case is a missing blur
+        // rather than a failed render.
+        let effect_images = crate::scene::rasterize_effect_layers(
+            &scene,
+            fit,
+            w,
+            h,
+            self.device,
+            self.queue,
+            self.renderer,
+            self.footage,
+            &project.assets,
+        );
         let vs = to_vello(
             &scene,
             fit,
@@ -181,7 +208,7 @@ impl FrameRenderer<'_> {
             &Chrome::none(),
             self.footage,
             &project.assets,
-            &std::collections::HashMap::new(),
+            &effect_images,
         );
         self.target.render(self.device, self.queue, self.renderer, &vs)
     }
@@ -350,6 +377,100 @@ mod tests {
             mirrored.0 > 200 && mirrored.1 > 200 && mirrored.2 > 200,
             "the mirrored point must be the white background, not {mirrored:?} \
              (a red reading here means the readback is upside down)"
+        );
+    }
+
+    /// A 30x30 red square centred in a 100x100 white comp — spans 35..65 on
+    /// both axes, so a window of 30..70 straddles every edge.
+    ///
+    /// Separate from [`one_square_project`], whose square is deliberately
+    /// off-centre for the orientation test and therefore sits outside any
+    /// window a blur test would sample.
+    fn centred_square_project() -> MProject {
+        let mut square = MNode::group(1, "square");
+        square.shape = Some(Shape::Rect {
+            size: Value::constant(kurbo::Vec2::new(30.0, 30.0)),
+            radius: Value::constant(0.0),
+        });
+        square.fill = Some(Value::constant(MColor::rgb(1.0, 0.0, 0.0)));
+        square.transform.position =
+            Value::constant(motion_core::Vec3::new(50.0, 50.0, 0.0));
+        let mut comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(square));
+        comp.bg = MColor::rgb(1.0, 1.0, 1.0);
+        comp.duration_frames = 1;
+        MProject::single(comp)
+    }
+
+    /// **A blur reaches an exported frame.**
+    ///
+    /// The regression this exists for is silent: without the effect-stack
+    /// readback the frame still renders, still has the right size, and still
+    /// looks broadly correct — the blur is simply gone. Nothing errors, so only
+    /// a pixel assertion catches it.
+    ///
+    /// The test is a hard edge with and without a blur. Unblurred, the boundary
+    /// column is either fully inside or fully outside the square; blurred, it
+    /// carries intermediate values. So it counts pixels in a vertical strip
+    /// across the edge that are neither the square nor the background, and that
+    /// count must go from ~zero to clearly positive.
+    #[test]
+    fn a_blurred_layer_exports_blurred() {
+        let Some(mut gpu) = Headless::new() else {
+            eprintln!("no usable GPU adapter; skipping the blur export test");
+            return;
+        };
+
+        // Count pixels along the square's right edge that are partway between
+        // the red fill and the white ground — the signature of a filtered edge.
+        let intermediate = |rgba: &[u8]| -> usize {
+            let mut n = 0;
+            for y in 30..70 {
+                for x in 30..70 {
+                    let (r, g, b, _) = px(rgba, 100, x, y);
+                    let solid_red = r > 200 && g < 60 && b < 60;
+                    let solid_white = r > 200 && g > 200 && b > 200;
+                    if !solid_red && !solid_white {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        let render = |gpu: &mut Headless, project: &MProject| {
+            let target = OffscreenTarget::new(&gpu.device, 100, 100).expect("allocate");
+            let mut cache =
+                crate::footage::FootageCache::new(motion_render::default_registry());
+            FrameRenderer {
+                device: &gpu.device,
+                queue: &gpu.queue,
+                renderer: &mut gpu.renderer,
+                target: &target,
+                footage: &mut cache,
+            }
+            .frame(project, project.root, 0.0)
+            .expect("render one frame")
+        };
+
+        let sharp = render(&mut gpu, &centred_square_project());
+
+        let mut blurred_project = centred_square_project();
+        {
+            let comp = blurred_project.comps.get_mut(&blurred_project.root).unwrap();
+            let square = comp.root.find_mut(motion_core::NodeId(1)).expect("the square");
+            square.effects.push(motion_core::effect::Effect {
+                enabled: true,
+                kind: motion_core::effect::EffectKind::GaussianBlur {
+                    radius: motion_core::Value::constant(6.0),
+                },
+            });
+        }
+        let blurred = render(&mut gpu, &blurred_project);
+
+        let (a, b) = (intermediate(&sharp), intermediate(&blurred));
+        assert!(
+            b > a + 40,
+            "a blurred layer must export blurred: {a} soft pixels sharp vs {b} blurred —              an unchanged count means the effect readback never ran"
         );
     }
 

@@ -3328,40 +3328,32 @@ impl App {
                 &mut next_id,
                 &mut path,
                 &mut |editor, ui| match editor {
-                    Editor::Comp => {
-                        comp_ui(
-                            ui,
-                            doc_w,
-                            doc_h,
-                            doc_fps,
-                            duration,
-                            comp_bg,
-                            comp_pp,
-                            comp_path_range,
-                            comp_camera,
-                            &mut comp,
-                            &preset_names,
-                            &mut preset_name_buf,
-                            &mut layout,
-                            &warnings,
-                            &comp_entries,
-                            current_comp,
-                            &mut comp_name_buf,
-                            undo_label,
-                            redo_label,
-                        );
-                        // The render bar sits under the composition bar: an
-                        // export is a property of the comp you are looking at,
-                        // and Draft has to be one click from it. A sibling call
-                        // rather than four more arguments to a function that
-                        // already takes nineteen.
-                        crate::renderqueue::render_ui(
-                            ui,
-                            render_progress.as_ref(),
-                            render_summary.as_ref(),
-                            &mut render_edits,
-                        );
-                    }
+                    Editor::Comp => comp_ui(
+                        ui,
+                        RenderBar {
+                            active: render_progress.as_ref(),
+                            last: render_summary.as_ref(),
+                            out: &mut render_edits,
+                        },
+                        doc_w,
+                        doc_h,
+                        doc_fps,
+                        duration,
+                        comp_bg,
+                        comp_pp,
+                        comp_path_range,
+                        comp_camera,
+                        &mut comp,
+                        &preset_names,
+                        &mut preset_name_buf,
+                        &mut layout,
+                        &warnings,
+                        &comp_entries,
+                        current_comp,
+                        &mut comp_name_buf,
+                        undo_label,
+                        redo_label,
+                    ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Transport => transport_ui(
                         ui,

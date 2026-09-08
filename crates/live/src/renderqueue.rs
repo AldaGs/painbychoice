@@ -368,20 +368,40 @@ pub(crate) struct RenderProgress {
     pub(crate) quality: Quality,
 }
 
-/// The last finished job, one line of it.
+/// The last finished job: a chip for the bar and the detail for its tooltip.
+///
+/// Two strings rather than one because the comp bar cannot grow — `short` is
+/// bounded (a filename), `text` is not (a full path, or an ffmpeg error), and
+/// only the bounded one is allowed on the row. See [`render_ui`].
 pub(crate) struct RenderSummary {
+    /// The bar chip. A filename, or nothing much.
+    pub(crate) short: String,
+    /// The hover detail: the full path and timing, or the error.
     pub(crate) text: String,
     pub(crate) failed: bool,
 }
 
 impl RenderSummary {
-    /// Build the line from a record: the file, how long it took, or why it
-    /// stopped. The path is shown in full — a user who just exported needs to
-    /// find the file, and a basename does not tell them where it went.
+    /// Build both strings from a record.
+    ///
+    /// The full path goes in the tooltip because a user who just exported needs
+    /// to find the file and a basename does not tell them where it went — but
+    /// the bar shows the basename, because the path is unbounded and the row is
+    /// not.
     pub(crate) fn of(record: &RenderRecord) -> Self {
+        let name = record
+            .out
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| record.out.display().to_string());
         match &record.error {
-            Some(e) => RenderSummary { text: format!("Render failed — {e}"), failed: true },
+            Some(e) => RenderSummary {
+                short: "Render failed".to_string(),
+                text: format!("{} → {}: {e}", record.quality.label(), record.out.display()),
+                failed: true,
+            },
             None => RenderSummary {
+                short: format!("✓ {name}"),
                 text: format!(
                     "{} · {} frames in {:.1}s → {}",
                     record.quality.label(),
@@ -397,58 +417,66 @@ impl RenderSummary {
 
 /// The two buttons, and whatever the queue is doing.
 ///
-/// Draft and Master are **different verbs**, not one button with a mode, and the
-/// UI says so by never putting a settings affordance on Draft. While a job runs
-/// both are disabled and a progress bar with a Cancel takes their place — one
-/// GPU, one job.
+/// Draws **inline on the composition bar's existing row**, and that is a
+/// constraint rather than a style choice: the `Comp` leaf is a fixed
+/// [`COMP_H`]-tall strip and is not scroll-wrapped, so anything that allocates
+/// past it pushes the whole layout down and shoves the bottom panel off-screen
+/// (invariant 16). Hence no `ui.horizontal` of its own, no second row, and
+/// nothing here that can grow without bound — the last render's path lives in a
+/// tooltip, not in the bar, because a long path would overflow the row
+/// sideways for the same reason.
+///
+/// Draft and Master are **different verbs**, not one button with a mode, and
+/// the bar says so by never putting a settings affordance on Draft. While a job
+/// runs both are replaced by a progress bar and a Cancel — one GPU, one job.
 pub(crate) fn render_ui(
     ui: &mut egui::Ui,
     active: Option<&RenderProgress>,
     last: Option<&RenderSummary>,
     out: &mut RenderEdits,
 ) {
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.strong("Render");
-        match active {
-            Some(p) => {
-                ui.add(egui::ProgressBar::new(p.frac).desired_width(160.0).text(&p.line));
-                ui.label(p.quality.label());
-                if ui.button("Cancel").clicked() {
-                    out.cancel = true;
-                }
+    match active {
+        Some(p) => {
+            ui.add(
+                egui::ProgressBar::new(p.frac)
+                    .desired_width(120.0)
+                    .text(format!("{} {}", p.quality.label(), p.line)),
+            );
+            if ui.button("Cancel").clicked() {
+                out.cancel = true;
             }
-            None => {
-                if ui
-                    .button("Draft")
-                    .on_hover_text(
-                        "Render the whole comp at full resolution with fast encoder \
-                         settings, beside the project. No questions asked.",
-                    )
-                    .clicked()
-                {
-                    out.draft = true;
-                }
-                if ui
-                    .button("Master")
-                    .on_hover_text(
-                        "Render the deliverable using the project's saved render \
-                         preset, so everyone on this project produces the same file.",
-                    )
-                    .clicked()
-                {
-                    out.master = true;
-                }
-                if let Some(s) = last {
-                    if s.failed {
-                        ui.colored_label(egui::Color32::from_rgb(220, 90, 80), &s.text);
-                    } else {
-                        ui.weak(&s.text);
-                    }
+        }
+        None => {
+            if ui
+                .button("Draft")
+                .on_hover_text(
+                    "Render the whole comp at full resolution with fast encoder                      settings, beside the project. No questions asked.",
+                )
+                .clicked()
+            {
+                out.draft = true;
+            }
+            if ui
+                .button("Master")
+                .on_hover_text(
+                    "Render the deliverable using the project's saved render                      preset, so everyone on this project produces the same file.",
+                )
+                .clicked()
+            {
+                out.master = true;
+            }
+            // The outcome as a short chip with the detail on hover. A rendered
+            // path is easily eighty characters and this row has no room for it.
+            if let Some(s) = last {
+                if s.failed {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 80), "Render failed")
+                        .on_hover_text(&s.text);
+                } else {
+                    ui.weak(&s.short).on_hover_text(&s.text);
                 }
             }
         }
-    });
+    }
 }
 
 #[cfg(test)]

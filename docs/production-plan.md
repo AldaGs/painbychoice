@@ -21,7 +21,7 @@ cleanly where those are absent, so a headless CI box sees fewer.
 | Editor (`live`) | Broad. Dockable panels, timeline + dopesheet + curves, gizmo, pen tool, snapping, guides, onion skins, motion path, layer strips, font picker, undo/redo. |
 | Compositing | Model only. Blend modes, masks, track mattes exist in `Scene` and both backends. No effect stack, no GPU effect passes. |
 | Footage | Import works: stills (incl. HEIC/RAW), video via an `ffmpeg` sidecar, threaded decode cache with a warm frame stream. |
-| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gaps: no frame range, no frame-parallelism, and blurred layers don't reach a GUI export. |
+| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gaps: no frame range and no frame-parallelism. |
 | **Audio** | **Does not exist.** No decode, no playback, no waveform, no master clock. |
 | Effects | Does not exist. `NodeCategory::Effect` is a registry slot with nothing in it. |
 | Motion blur | Does not exist. |
@@ -133,6 +133,12 @@ piece cannot leave the app.
 - ✅ **Named render presets saved in the `.pbc`** (`Project::render_presets`,
   `#[serde(default)]`, so no migration). Master renders from the project's
   preset, which is what makes two people on one project produce the same file.
+- ✅ **Blurred layers export blurred.** The GUI export runs the preview's own
+  `rasterize_effect_layers` readback, because vello has no layer-filter
+  primitive and a blur can only be done by rendering the layer alone, reading it
+  back, filtering and drawing the result in. Skipping it would have dropped
+  every blur from a delivered file *silently* — the frame still renders, still
+  sizes right, and looks broadly correct. Pinned by a pixel test.
 - ✅ **`Encoder::abort`**, which the Cancel button forced into existence:
   dropping a process-backed encoder closes ffmpeg's stdin, and that is precisely
   the signal meaning *finalize the container* — so a cancelled render would have
@@ -148,14 +154,9 @@ piece cannot leave the app.
   because there is one device. See [`performance.md`](performance.md).
 - **A range control.** A job renders the whole comp; the work area exists in the
   timeline and does not reach the render yet.
-- **Blurred layers in a GUI export.** The preview's effect-stack readback
-  (`rasterize_effect_layers`) is not wired into the offscreen path, so a layer
-  with a blur exports without it. The colour effects ride the in-scene path and
-  are unaffected. This is the one place the GUI export is *not* yet the preview.
-
 **Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI *and*
 from the command line, and the exported frame equals the preview frame.
-*True today except for blurred layers, noted above.*
+**True today**, for both halves.
 
 ### Phase 2 — Audio and the master clock
 

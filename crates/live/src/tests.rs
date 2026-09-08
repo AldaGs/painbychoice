@@ -5270,3 +5270,134 @@ fn set_num_ignores_a_param_from_another_kind() {
         &EffectOp::SetNum { index: 0, param: EffectParam::Hue, value: 90.0 },
     ));
 }
+
+/// A raw input describing a comfortably wide window. The comp bar is one row,
+/// so a narrow screen would wrap it and the height assertion would be measuring
+/// the window width rather than the bar's content.
+fn wide_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1600.0, 900.0),
+        )),
+        ..Default::default()
+    }
+}
+
+/// **The composition bar must fit in `COMP_H`.**
+///
+/// Invariant 16's mechanism, pinned by actually laying the bar out rather than
+/// by asserting a flag. `Editor::Comp` is not scroll-wrapped, so egui hands it a
+/// content-driven rect: a bar whose content is taller than its area does not
+/// clip, it *resizes its panel*, pushing every other leaf down until the bottom
+/// one is off the screen. That is exactly what a second row in this bar did —
+/// the render controls went under the taskbar — and
+/// `every_content_leaf_is_kept_from_resizing_its_own_panel` could not catch it,
+/// because the flag it checks was already correct.
+///
+/// So this renders the real `comp_ui` in a headless egui context and measures
+/// what it consumed. Height only: widths depend on the font, and the test
+/// context has no font subset loaded.
+#[test]
+fn the_composition_bar_fits_its_fixed_height() {
+    let ctx = egui::Context::default();
+    let mut used = 0.0_f32;
+    // Two passes: egui sizes some widgets from the previous frame's galley, so
+    // a first-frame measurement can read low.
+    for _ in 0..2 {
+        let mut comp_edits = CompEdits::default();
+        let mut layout = LayoutEdits::default();
+        let mut preset_name_buf = String::new();
+        let mut comp_name_buf = String::new();
+        let mut render_edits = crate::renderqueue::RenderEdits::default();
+        let _ = ctx.run_ui(wide_input(), |ui| {
+            {
+                comp_ui(
+                    ui,
+                    RenderBar {
+                        active: None,
+                        last: None,
+                        out: &mut render_edits,
+                    },
+                    1920.0,
+                    1080.0,
+                    24.0,
+                    5.0,
+                    MColor::rgb(0.0, 0.0, 0.0),
+                    0.0,
+                    12,
+                    None,
+                    &mut comp_edits,
+                    &["Default".to_string()],
+                    &mut preset_name_buf,
+                    &mut layout,
+                    &[],
+                    &[CompEntry { id: CompId(0), label: "Comp 1".to_string() }],
+                    CompId(0),
+                    &mut comp_name_buf,
+                    None,
+                    None,
+                );
+                used = ui.min_rect().height();
+            }
+        });
+    }
+    assert!(
+        used <= COMP_H,
+        "the composition bar used {used}pt of its {COMP_H}pt area — content \
+         taller than the area resizes the panel and pushes the bottom leaf \
+         off-screen (invariant 16)"
+    );
+}
+
+/// The same, with a render in flight: the progress bar and Cancel replace the
+/// two buttons, and that swap must not be taller than what it replaced.
+#[test]
+fn the_composition_bar_still_fits_while_a_render_runs() {
+    let ctx = egui::Context::default();
+    let progress = crate::renderqueue::RenderProgress {
+        frac: 0.5,
+        line: "150/300 · 12.0s · ~12s left".to_string(),
+        quality: motion_render::Quality::Master,
+    };
+    let mut used = 0.0_f32;
+    for _ in 0..2 {
+        let mut comp_edits = CompEdits::default();
+        let mut layout = LayoutEdits::default();
+        let mut preset_name_buf = String::new();
+        let mut comp_name_buf = String::new();
+        let mut render_edits = crate::renderqueue::RenderEdits::default();
+        let _ = ctx.run_ui(wide_input(), |ui| {
+            {
+                comp_ui(
+                    ui,
+                    RenderBar {
+                        active: Some(&progress),
+                        last: None,
+                        out: &mut render_edits,
+                    },
+                    1920.0,
+                    1080.0,
+                    24.0,
+                    5.0,
+                    MColor::rgb(0.0, 0.0, 0.0),
+                    0.0,
+                    12,
+                    None,
+                    &mut comp_edits,
+                    &["Default".to_string()],
+                    &mut preset_name_buf,
+                    &mut layout,
+                    &[],
+                    &[CompEntry { id: CompId(0), label: "Comp 1".to_string() }],
+                    CompId(0),
+                    &mut comp_name_buf,
+                    None,
+                    None,
+                );
+                used = ui.min_rect().height();
+            }
+        });
+    }
+    assert!(used <= COMP_H, "the bar used {used}pt of {COMP_H}pt while rendering");
+}

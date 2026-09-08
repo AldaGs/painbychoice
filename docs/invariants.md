@@ -60,6 +60,13 @@ constraints were load-bearing and which were taste.
     preview and sits exactly on the crop, so a render that forwarded the
     editor's chrome would put a grey rectangle around every delivered frame.
     Pinned by a test.
+
+    The same invariant has a **layout** half, and it is the one that actually
+    bit: the comp bar is a fixed `COMP_H` strip and is not scroll-wrapped, so
+    render controls added as a *second row* did not clip — they resized the
+    panel and pushed the bottom leaf under the taskbar. Anything added to that
+    bar shares its single row, and stays bounded (a filename, not a path).
+    Pinned by a test that lays the bar out and measures it.
 17. **An encoder is finished or aborted, never merely dropped.** Closing a
     process-backed encoder's stdin is the signal that means *finalize the
     container*, so dropping a cancelled ffmpeg encoder yields a complete,
