@@ -6,8 +6,12 @@
 //! input later without touching `motion-core`.
 
 pub mod decode;
+pub mod encode;
+pub mod raster;
 
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
+pub use encode::{Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence};
+pub use raster::{output_size, rasterize, RasterError};
 
 use kurbo::Shape as _;
 use motion_core::{Asset, BlendMode, Color, ComposeMode, Scene};

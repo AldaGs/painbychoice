@@ -20,6 +20,7 @@ whatever file is open.
 | [`editor.md`](editor.md) | The `live/` shell: module layout, the panel tree, timeline, undo, stacking, theming. |
 | [`canvas-tools.md`](canvas-tools.md) | Viewport tools: preview camera, gizmo, grid/guides, snapping, onion skins, motion path. |
 | [`features.md`](features.md) | What a user can actually do today — the capability inventory. |
+| [`performance.md`](performance.md) | What to measure, current numbers, and what a comparison with AE is worth. |
 
 ## Direction
 
@@ -41,6 +42,8 @@ whatever file is open.
   is fresh.
 - **A rule someone could plausibly break** → [`invariants.md`](invariants.md).
 - **A new user-visible capability** → [`features.md`](features.md).
+- **A timing, or a claim about speed** → [`performance.md`](performance.md),
+  with the machine and the build profile.
 - **A change of plan** → [`production-plan.md`](production-plan.md) or
   [`roadmap.md`](roadmap.md).
 

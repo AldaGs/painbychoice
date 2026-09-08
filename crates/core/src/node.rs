@@ -1503,6 +1503,47 @@ impl Project {
     /// whose output no longer exists still becomes an `out` node — it lands at
     /// the origin with a dangling wire, which `validate` reports and the canvas
     /// shows, rather than vanishing without a word.
+    /// Read a `.pbc`, in any of the three formats one has ever been written in,
+    /// and migrate it.
+    ///
+    /// This lives in `core` rather than in the editor because it is knowledge
+    /// about the *document*, not about the UI: a headless renderer needs it as
+    /// much as the app does, and two readers of one format is how a format
+    /// quietly grows two dialects. The editor still parses its own `layout`
+    /// alongside — that half genuinely is UI — but the project comes from here.
+    ///
+    /// Formats, newest first: a project wrapper, a pre-comps wrapper holding a
+    /// single document, and a bare document from before any wrapper existed.
+    /// Each older one becomes a one-comp project, so nothing is stranded.
+    ///
+    /// [`Project::migrate`] is already called on the result — the one thing a
+    /// caller must never forget, so it is not left to them.
+    pub fn from_pbc(text: &str) -> Result<Project, String> {
+        /// Only the project half. Unknown fields (the editor's `layout`) are
+        /// ignored rather than rejected, which is what lets the two readers
+        /// share a file without sharing a struct.
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            project: Option<Project>,
+            #[serde(default)]
+            document: Option<Comp>,
+        }
+
+        let mut project = match serde_json::from_str::<Wrapper>(text) {
+            Ok(Wrapper { project: Some(p), .. }) => p,
+            Ok(Wrapper { document: Some(d), .. }) => Project::single(d),
+            // Neither field: it parsed only because both default. Try the
+            // oldest format — a bare `Comp` — before giving up.
+            Ok(_) => Project::single(
+                serde_json::from_str::<Comp>(text).map_err(|e| format!("not a .pbc: {e}"))?,
+            ),
+            Err(e) => return Err(format!("not a .pbc: {e}")),
+        };
+        project.migrate();
+        Ok(project)
+    }
+
     pub fn migrate(&mut self) {
         for comp in self.comps.values_mut() {
             comp.migrate();

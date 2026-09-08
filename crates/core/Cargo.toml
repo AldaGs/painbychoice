@@ -9,6 +9,9 @@ description = "Headless document model + evaluation engine. No GPU, no windowing
 kurbo.workspace = true
 glam.workspace = true
 serde.workspace = true
+# The `.pbc` *is* JSON, and `core` now owns reading it (`Project::from_pbc`) so
+# that a headless renderer and the editor cannot drift into two dialects.
+serde_json.workspace = true
 rhai.workspace = true
 parley = "0.11"
 skrifa = "0.43"

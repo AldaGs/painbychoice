@@ -1817,6 +1817,7 @@ dependencies = [
  "imagepipe",
  "kurbo",
  "motion-core",
+ "tiny-skia",
 ]
 
 [[package]]
@@ -3457,6 +3458,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
+ "png 0.17.16",
  "tiny-skia-path",
 ]
 

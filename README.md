@@ -4,20 +4,25 @@ A hybrid vector motion / animation tool — non-destructive, non-linear,
 parametric. A blend of After Effects, Figma, Animate and Cavalry, on a Rust
 engine.
 
-**Status: working editor, no export yet.** You can build a composition from
+**Status: working editor; export from the command line, not yet from the GUI.** You can build a composition from
 scratch, animate it with frame-accurate keyframes and editable easing, drive any
 property with expressions or a node graph (including Rhai script nodes), nest
-pre-comps, import footage, scrub, play, and save. You cannot yet render it to a
-video file — that is the top priority, and the plan is
-[`docs/production-plan.md`](docs/production-plan.md).
+pre-comps, import footage, scrub, play, and save — and render the result to a
+video or a PNG sequence with the `motion` CLI. A render queue *inside* the
+editor is next; the plan is [`docs/production-plan.md`](docs/production-plan.md).
 
 ## Run it
 
 ```bash
 cargo test --workspace     # engine + editor unit tests
 cargo run -p motion-live   # THE EDITOR (opens a window) — this is the app
-cargo run --bin motion     # offline: writes out/frame_00.svg .. frame_08.svg
+
+# The headless renderer. Needs no GPU and no display.
+cargo run --release --bin motion -- render project.pbc --out film.mp4
+cargo run --release --bin motion -- render --demo --out frames   # no file needed
 ```
+
+Use `--release` for anything you intend to time: a debug build is ~100× slower.
 
 Rust stable, no system dependencies to build. Footage import shells out to
 `ffmpeg` at runtime if you use it (`PBC_FFMPEG` overrides the binary).
@@ -52,6 +57,7 @@ where new writing belongs.
 - [Gotchas](docs/gotchas.md) — traps, mostly egui's
 - [Decisions](docs/decisions/) — ADRs: what was decided, and what it cost
 - [Production plan](docs/production-plan.md) — the road to a shippable v1
+- [Performance](docs/performance.md) — what to measure, and current numbers
 
 ## License
 

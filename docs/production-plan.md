@@ -82,31 +82,46 @@ The second fix matters more than it looks: the SVG backend is the headless way
 to verify compositing semantics without a GPU, which is what Phase 1's
 preview-equals-export tests will assert against.
 
-### Phase 1 — Export (the unblocker)
+### Phase 1 — Export (the unblocker) — *in progress*
 
 The single highest-value change in the project. Nothing else here matters if a
 piece cannot leave the app.
 
-- `render/src/encode.rs`: an `Encoder` trait — `begin(w, h, fps)`,
-  `push(&[u8] /* RGBA */)`, `finish()`. Two impls: **ffmpeg sidecar** (raw
-  `rgba` over stdin, mirroring `decode.rs`'s process discipline, including its
-  "is the tool installed?" error) and **PNG sequence** (`image`, near-free).
-- An **offscreen vello render target** in `render`, so a frame is rasterized at
-  full comp resolution independent of the window and the preview camera. This is
-  the piece that makes preview-vs-export parity a testable property rather than
-  a hope.
-- A **render queue** in `live`: comp, frame range (comp / work area / custom),
-  scale, format, output path; runs on a worker with progress and cancel; the
-  editor stays live throughout.
-- Retire the demo in `crates/app` — make `motion` the **headless renderer**
-  (`motion render project.pbc --comp X --out film.mp4`). That is also the CI
-  and batch story, and it keeps the engine honest as a library.
-- Tests: a fixed document renders byte-identical frames twice; the SVG and the
-  GPU backend agree on blend/matte structure; a missing `ffmpeg` fails with the
-  named-tool error, not a panic.
+**Landed 2026-09-08 — a project can now become files:**
 
-**Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI and
+- ✅ `render/src/encode.rs`: the `Encoder` trait — `push(rgba)` / `finish()` —
+  with two implementations. **PNG sequence** (pure Rust, always available) and
+  an **ffmpeg sidecar** fed raw RGBA over stdin, mirroring `decode.rs`'s process
+  discipline including its named-tool error. Broadcast rates stay exact ratios
+  (`24000/1001`, not `23.976`) because the decimal writes timestamps that drift.
+- ✅ `render/src/raster.rs`: a **CPU rasterizer** — `Scene` → RGBA — so a frame
+  can be rendered, and asserted on, with no GPU. Draws fills, strokes, opacity,
+  isolation groups, blend modes, masks and track mattes; reports footage rather
+  than silently dropping it. See
+  [`decisions/0017-offline-cpu-rasterizer.md`](decisions/0017-offline-cpu-rasterizer.md)
+  for why parity with the preview is *structural* rather than per-pixel.
+- ✅ `Project::from_pbc` moved into `core`. The `.pbc` reader lived in the
+  editor, where a headless renderer could not reach it; one format with two
+  readers is how a format grows two dialects.
+- ✅ **`motion` is the headless renderer**, not a demo:
+  `motion render project.pbc --out film.mp4`, with `--comp`, `--start/--end`,
+  `--scale`, `--fps`, ffmpeg pass-through, and `--demo` for rendering the
+  built-in document on a machine with no project to hand.
+
+**Still ahead in this phase:**
+
+- **An offscreen vello render target**, so the *editor's* export uses the same
+  rasterizer as its preview and per-pixel parity becomes provable. Belongs where
+  a GPU device already exists.
+- **A render queue in the GUI**: comp, range, scale, format, path; on a worker,
+  with progress and cancel, the editor stays live throughout.
+- **Frame-parallel rendering.** The loop is single-threaded and cleanly
+  pixel-bound; frames are independent and `evaluate` is pure, so this is the
+  largest easy win available. See [`performance.md`](performance.md).
+
+**Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI *and*
 from the command line, and the exported frame equals the preview frame.
+*Half of that is true today: the command line half.*
 
 ### Phase 2 — Audio and the master clock
 

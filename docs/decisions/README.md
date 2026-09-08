@@ -23,6 +23,7 @@ itself teaches nothing.
 | [0014](0014-undo-is-snapshots.md) | Undo/redo is whole-document snapshots, not inverse operations |
 | [0015](0015-dock-tree.md) | The workspace is a layout tree edited by deferred ops |
 | [0016](0016-svg-mattes-are-luminance-masks.md) | Track mattes in SVG are luminance masks, and divergences are reported |
+| [0017](0017-offline-cpu-rasterizer.md) | The offline renderer rasterizes on the CPU; parity with the preview is structural |
 
 ## Decided, not yet built
 
