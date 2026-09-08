@@ -218,28 +218,31 @@ than a gap in it.
 Playback was confirmed working on a real device on 2026-09-08 — the one part of
 this phase that could not be verified from a test.
 
+- ✅ **The waveform in the timeline** (`render::Peaks`, drawn by
+  `strips.rs::waveform`). A min/max reduction at a fixed 256-sample-frame
+  resolution, cached per asset in `App::peaks`: fixed rather than per-zoom
+  because a per-zoom reduction is thrown away on every scroll, which is the
+  cost caching exists to avoid. Drawn from the layer's *local* time, using the
+  same `start` conversion `collect_audio` makes, so what you see and what you
+  hear cannot disagree.
+
 **Still ahead in this phase — start here:**
 
-1. **A waveform in the timeline.** The largest remaining gap and the plan's own
-   stated reason sync is editable: today a sound is an unmarked bar, so you can
-   hear the music but not see where the beat is. The data is already there —
-   `App::sounds` holds decoded `Sound`s — so this is a peaks-per-pixel reduction
-   plus a strip renderer, and the reduction should be cached per asset because
-   recomputing it per redraw at 48kHz would dominate the frame.
-2. **A level/pan UI.** The properties animate already; they need controls in the
+1. **A level/pan UI.** The properties animate already; they need controls in the
    properties panel and rows in the dopesheet. Small, and it makes the mix
    editable rather than only programmable.
-3. **Audio in the GUI export path.** `motion render` muxes sound;
+2. **Audio in the GUI export path.** `motion render` muxes sound;
    `renderqueue.rs` does not. The pieces exist (`mix_comp`, `write_wav`,
    `FfmpegEncoder::with_audio`) — the work is threading a temp WAV through the
    stepped job's lifetime, which is fiddlier than the CLI's because the job
    outlives the call that starts it.
-4. **Resampling quality.** Mismatched rates use linear interpolation, which
+3. **Resampling quality.** Mismatched rates use linear interpolation, which
    `Sound::read` documents as a floor rather than a choice. A windowed-sinc
    resampler is the upgrade and that function is the only seam it needs.
 
 **Done when:** a cut can be edited to music and the exported file carries it.
-*The export half is true today; the editing half needs the waveform.*
+*Both halves are true today; what remains is comfort — a mix you can set with
+controls rather than keyframes, and the GUI's own render buttons carrying it.*
 
 #### The original plan for this phase
 

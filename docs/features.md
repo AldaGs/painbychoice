@@ -105,6 +105,12 @@ produce a finished video.
     it has actually consumed, so the picture cannot drift off the music over a
     long piece. With no sound, or no working audio device, playback runs on the
     wall clock exactly as it always did.
+  - **The waveform draws on the layer strip.** In the timeline's *Strips* view
+    a sound layer's bar carries its own shape, so a beat is somewhere you can
+    aim at rather than a number to count towards. It is drawn from the layer's
+    local time, so trimming the head scrolls the sound inside the bar exactly
+    as it scrolls a trimmed video layer's picture, and a muted layer keeps a
+    dimmed waveform rather than losing it.
   - A rendered **video carries the mix** — `motion render` muxes it. The
     editor's own render buttons do not yet.
   - Formats are whatever symphonia handles: wav, mp3, flac, ogg, m4a, aac, aiff.

@@ -3915,6 +3915,25 @@ fn a_strip_carries_its_layers_window_and_keys() {
 }
 
 #[test]
+fn a_strip_carries_its_sound_so_the_row_can_draw_a_waveform() {
+    let mut sounding = MNode::group(1, "music");
+    sounding.audio = Some(motion_core::AudioClip::new(motion_core::AssetId(7)));
+    let mut muted = MNode::group(2, "muted");
+    let mut clip = motion_core::AudioClip::new(motion_core::AssetId(8));
+    clip.enabled = false;
+    muted.audio = Some(clip);
+    let silent = MNode::group(3, "shape");
+    let rows =
+        strip_rows(&MNode::group(0, "root").with_child(sounding).with_child(muted).with_child(silent));
+    let by_name = |n: &str| rows.iter().find(|r| r.name == n).expect("row").audio;
+    assert_eq!(by_name("music"), Some((motion_core::AssetId(7), true)));
+    // Muted keeps its waveform, dimmed: muting is temporary, and hiding the
+    // shape would blank the row you are about to unmute.
+    assert_eq!(by_name("muted"), Some((motion_core::AssetId(8), false)));
+    assert_eq!(by_name("shape"), None);
+}
+
+#[test]
 fn a_strips_keys_are_deduped_across_properties() {
     // Position and rotation keyed on the same frames must not draw one tick per
     // property stacked on itself.

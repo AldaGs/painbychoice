@@ -130,6 +130,118 @@ impl Sound {
     }
 }
 
+/// One bucket's worth of sample frames in a [`Peaks`] reduction.
+///
+/// 256 frames is about 5ms at 48kHz — fine enough that a drawn column is
+/// honest at any zoom the timeline reaches (a whole comp across a screen is
+/// hundreds of frames per pixel, far coarser than this), and coarse enough
+/// that the reduction is 1/64th the size of the samples it summarises.
+pub const PEAK_SPAN: usize = 256;
+
+/// A waveform reduction: the min and max sample over fixed spans of a
+/// [`Sound`].
+///
+/// Drawing a waveform means answering "how loud is this stretch" once per
+/// pixel column, and at 48kHz a redraw would otherwise walk millions of
+/// samples per sound per frame — enough to dominate the UI's budget. So the
+/// reduction is computed **once per asset** and cached, at a fixed resolution
+/// rather than the zoom's: a per-zoom reduction would have to be thrown away
+/// on every scroll, which is the cost this exists to avoid.
+///
+/// Min *and* max, not one amplitude: a waveform drawn from absolute values
+/// loses the asymmetry that makes speech look like speech, and an envelope
+/// that never crosses the centre line reads as a solid block. Both channels
+/// fold into the same pair, because a strip is one row tall and a stereo
+/// split would halve it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peaks {
+    /// The sound's own rate — the reduction is in the file's time, not the
+    /// project's, exactly as [`Sound::samples`] is.
+    pub sample_rate: u32,
+    /// Sample frames per bucket.
+    pub span: usize,
+    /// `(min, max)` per bucket, in order.
+    pub buckets: Vec<(f32, f32)>,
+}
+
+impl Peaks {
+    /// Reduce a sound at the default resolution.
+    pub fn of(sound: &Sound) -> Self {
+        Self::with_span(sound, PEAK_SPAN)
+    }
+
+    /// Reduce a sound with an explicit bucket size, in sample frames.
+    pub fn with_span(sound: &Sound, span: usize) -> Self {
+        let span = span.max(1);
+        let frames = sound.frames();
+        let mut buckets = Vec::with_capacity(frames.div_ceil(span));
+        let mut lo = 0;
+        while lo < frames {
+            let hi = (lo + span).min(frames);
+            let mut min = f32::INFINITY;
+            let mut max = f32::NEG_INFINITY;
+            for s in &sound.samples[lo * 2..hi * 2] {
+                if *s < min {
+                    min = *s;
+                }
+                if *s > max {
+                    max = *s;
+                }
+            }
+            buckets.push((min, max));
+            lo = hi;
+        }
+        Peaks { sample_rate: sound.sample_rate, span, buckets }
+    }
+
+    /// How long the reduced sound is.
+    pub fn seconds(&self) -> f64 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        (self.buckets.len() * self.span) as f64 / self.sample_rate as f64
+    }
+
+    /// The min and max across `[from, to)` seconds of the sound.
+    ///
+    /// `None` when the span falls entirely outside the sound — which is
+    /// ordinary, not exceptional: a layer trimmed past its source's end has
+    /// columns with nothing to draw, and they should draw nothing rather than
+    /// a flat line at zero.
+    ///
+    /// A span narrower than one bucket still answers, from the bucket it lands
+    /// in: zoomed in far enough, neighbouring columns share a bucket and the
+    /// waveform stops gaining detail, which is the honest failure — the
+    /// alternative is a column that claims silence because it fell between
+    /// two summaries.
+    pub fn range(&self, from: f64, to: f64) -> Option<(f32, f32)> {
+        if self.sample_rate == 0 || self.buckets.is_empty() || !(from.is_finite() && to.is_finite())
+        {
+            return None;
+        }
+        let per_sec = self.sample_rate as f64 / self.span as f64;
+        let a = (from * per_sec).floor();
+        let b = (to * per_sec).ceil();
+        let last = self.buckets.len() as f64;
+        if b <= 0.0 || a >= last {
+            return None;
+        }
+        let a = a.max(0.0) as usize;
+        let b = (b.min(last) as usize).max(a + 1).min(self.buckets.len());
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for &(lo, hi) in &self.buckets[a..b] {
+            if lo < min {
+                min = lo;
+            }
+            if hi > max {
+                max = hi;
+            }
+        }
+        (min <= max).then_some((min, max))
+    }
+}
+
 /// Decode a whole sound file.
 ///
 /// Handles any container and codec symphonia was built with; a file it cannot
@@ -266,6 +378,48 @@ pub fn is_audio_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reduction summarises every sample: the extremes it reports are the
+    /// sound's own, not an approximation of them.
+    #[test]
+    fn peaks_bound_the_samples_they_summarise() {
+        let sound = tone(48_000, 4_000);
+        let pk = Peaks::with_span(&sound, 256);
+        assert_eq!(pk.buckets.len(), 4_000usize.div_ceil(256));
+        let (lo, hi) = pk.range(0.0, sound.seconds()).expect("the whole sound is in range");
+        let real_lo = sound.samples.iter().copied().fold(f32::INFINITY, f32::min);
+        let real_hi = sound.samples.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!((lo, hi), (real_lo, real_hi));
+    }
+
+    /// A column past the end of the source has nothing to draw, and says so
+    /// rather than claiming silence.
+    #[test]
+    fn peaks_outside_the_sound_are_absent_not_silent() {
+        let pk = Peaks::of(&tone(48_000, 4_000));
+        let end = pk.seconds();
+        assert!(pk.range(end + 1.0, end + 2.0).is_none());
+        assert!(pk.range(-2.0, -1.0).is_none());
+        assert!(pk.range(end - 0.001, end + 1.0).is_some());
+    }
+
+    /// Zoomed past one bucket per column, neighbouring columns share a bucket
+    /// — they must still answer, or the waveform would draw gaps.
+    #[test]
+    fn peaks_answer_spans_narrower_than_a_bucket() {
+        let pk = Peaks::with_span(&tone(48_000, 4_000), 256);
+        assert!(pk.range(0.001, 0.001_01).is_some());
+    }
+
+    /// An empty sound reduces to nothing and answers nothing, rather than
+    /// dividing by a rate or a length it does not have.
+    #[test]
+    fn peaks_of_an_empty_sound_are_empty() {
+        let pk = Peaks::of(&Sound { sample_rate: 48_000, samples: Vec::new() });
+        assert!(pk.buckets.is_empty());
+        assert_eq!(pk.seconds(), 0.0);
+        assert!(pk.range(0.0, 1.0).is_none());
+    }
 
     fn tone(rate: u32, frames: usize) -> Sound {
         let mut samples = Vec::with_capacity(frames * 2);

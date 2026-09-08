@@ -214,6 +214,15 @@ pub(crate) struct App {
     /// Decoded sounds, by asset. The audio counterpart of `footage` — and, like
     /// it, outside the document entirely.
     pub(crate) sounds: std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Sound>>,
+    /// Waveform reductions of `sounds`, by asset.
+    ///
+    /// Cached rather than recomputed because a strip redraws every frame and
+    /// the reduction walks the whole sound: at 48kHz that is millions of
+    /// samples per redraw, which would cost more than everything else the
+    /// timeline draws put together. Filled from `sounds` by
+    /// [`App::refresh_peaks`], never independently — a peak set with no sound
+    /// behind it would be a waveform for something that cannot be heard.
+    pub(crate) peaks: std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Peaks>>,
     /// Undo / redo. Whole-document snapshots taken around the edit phase —
     /// see [`crate::history`] for why that rather than inverse operations.
     pub(crate) history: History,
@@ -1002,6 +1011,7 @@ impl App {
             audio_out: None,
             shared_mix: crate::playback::SharedMix::default(),
             sounds: std::collections::HashMap::new(),
+            peaks: std::collections::HashMap::new(),
             history: History::default(),
         }
     }
@@ -2595,10 +2605,24 @@ impl App {
         node.audio = Some(motion_core::AudioClip::new(asset));
 
         self.sounds.insert(asset, sound);
+        self.refresh_peaks();
         self.push_layer(node, self.selected);
         self.publish_mix();
         self.ng_status = None;
         true
+    }
+
+    /// Reduce any newly arrived sound to peaks.
+    ///
+    /// Additive by design: an asset already reduced is left alone, because the
+    /// samples behind it never change once decoded. Call it after anything
+    /// that puts a sound in `sounds`.
+    pub(crate) fn refresh_peaks(&mut self) {
+        for (asset, sound) in &self.sounds {
+            self.peaks
+                .entry(*asset)
+                .or_insert_with(|| std::sync::Arc::new(motion_render::Peaks::of(sound)));
+        }
     }
 
     /// Whether the open comp has anything to hear. Decides which clock runs.
@@ -3389,6 +3413,9 @@ impl App {
         // Strips are per *comp*, not per selection: the whole point is seeing
         // every layer's window at once.
         let strip_rows = strip_rows(&self.doc().root);
+        // Cloned handles rather than a borrow: the timeline draws inside a
+        // closure that also needs `&mut self` for the edits it collects.
+        let peaks = self.peaks.clone();
 
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -3651,6 +3678,7 @@ impl App {
                             selected_node,
                             work_area,
                             dope_label_w,
+                            &peaks,
                             &mut dope,
                         ),
                         TimelineMode::Curves => curves_ui(
