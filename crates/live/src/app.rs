@@ -203,6 +203,17 @@ pub(crate) struct App {
     pub(crate) project_path: Option<std::path::PathBuf>,
     /// Exports in progress and finished. See [`crate::renderqueue`].
     pub(crate) queue: crate::renderqueue::RenderQueue,
+    /// Playback time, from the audio device when there is one. See
+    /// [`crate::clock`] for why the clock inverts.
+    pub(crate) clock: crate::clock::MasterClock,
+    /// The output stream, held so it stays alive. `None` on a machine with no
+    /// usable device, which is an ordinary state, not an error.
+    pub(crate) audio_out: Option<crate::playback::AudioOut>,
+    /// What the audio callback reads. Republished whenever the mix changes.
+    pub(crate) shared_mix: crate::playback::SharedMix,
+    /// Decoded sounds, by asset. The audio counterpart of `footage` — and, like
+    /// it, outside the document entirely.
+    pub(crate) sounds: std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Sound>>,
     /// Undo / redo. Whole-document snapshots taken around the edit phase —
     /// see [`crate::history`] for why that rather than inverse operations.
     pub(crate) history: History,
@@ -987,6 +998,10 @@ impl App {
             footage: FootageCache::new(motion_render::default_registry()),
             project_path: None,
             queue: crate::renderqueue::RenderQueue::default(),
+            clock: crate::clock::MasterClock::new(),
+            audio_out: None,
+            shared_mix: crate::playback::SharedMix::default(),
+            sounds: std::collections::HashMap::new(),
             history: History::default(),
         }
     }
@@ -1487,7 +1502,14 @@ impl App {
     pub(crate) fn raw_time(&self) -> f64 {
         if self.playing {
             let (lo, hi) = self.loop_bounds_secs();
-            wrap_into(self.anchor.elapsed().as_secs_f64(), lo, hi)
+            // **The inversion.** With sound playing, the position comes from the
+            // sample frames the device actually consumed; without it, from the
+            // wall clock exactly as before. Both are folded into the loop span
+            // the same way, so nothing below here knows which clock it is on.
+            // See [`crate::clock`].
+            let wall = self.anchor.elapsed().as_secs_f64();
+            let t = self.clock.seconds(self.comp_has_audio(), wall);
+            crate::clock::fold_into_loop(t, lo, hi).0
         } else if self.doc().duration_frames > 0 {
             self.paused_t.rem_euclid(self.doc().duration_seconds())
         } else {
@@ -1538,15 +1560,27 @@ impl App {
         let t = t.rem_euclid(self.doc().duration_seconds().max(f64::MIN_POSITIVE));
         self.paused_t = t;
         self.anchor = Instant::now() - std::time::Duration::from_secs_f64(t);
+        // Both clocks are moved, not just the one currently running: a device
+        // that starts (or stops) after a seek must resume from where the
+        // playhead is, not from where it had itself got to.
+        let fps = self.doc().fps;
+        self.sync_audio_to_frame(t * fps);
+        self.publish_mix();
     }
 
     pub(crate) fn toggle_play(&mut self) {
         if self.playing {
             self.paused_t = self.current_time();
             self.playing = false;
+            self.publish_mix();
         } else {
+            // Start the sample counter where the playhead is, or the first block
+            // would be mixed from wherever the device last stopped.
+            let fps = self.doc().fps;
+            self.sync_audio_to_frame(self.paused_t * fps);
             self.anchor = Instant::now() - std::time::Duration::from_secs_f64(self.paused_t);
             self.playing = true;
+            self.publish_mix();
         }
     }
 }
@@ -1607,6 +1641,18 @@ impl ApplicationHandler for App {
             surface.format,
             egui_wgpu::RendererOptions::default(),
         ));
+
+        // The audio device, opened once. A machine with none is an ordinary
+        // state, not an error: the clock falls back to the wall and the editor
+        // works exactly as it did before sound existed.
+        if self.audio_out.is_none() {
+            self.audio_out =
+                crate::playback::start(self.shared_mix.clone(), self.clock.audio.clone());
+            self.clock.sample_rate = self.audio_out.as_ref().map(|a| a.sample_rate).unwrap_or(0);
+            if self.clock.sample_rate > 0 {
+                self.publish_mix();
+            }
+        }
 
         self.state = RenderState::Active { surface, window };
     }
@@ -2506,6 +2552,98 @@ impl App {
         self.push_layer(node, self.selected);
         self.ng_status = None;
         true
+    }
+
+    /// Import a sound file as a layer.
+    ///
+    /// Mirrors [`Self::import_footage`]: the document gets a reference and the
+    /// samples live outside it, in `sounds`. The layer is placed at frame 0 and
+    /// trimmed to the sound's own length, because an import is a source
+    /// arriving — where it sits is an editing decision.
+    pub(crate) fn import_audio(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif"])
+            .pick_file()
+        else {
+            return false;
+        };
+        // Decoded here rather than lazily, because the length is what decides
+        // the layer's duration and a layer that resized itself once the file
+        // finished loading would be worse than a moment's wait.
+        let sound = match motion_render::decode_sound(&path) {
+            Ok(s) => std::sync::Arc::new(s),
+            Err(e) => {
+                self.ng_status = Some(format!("Couldn't import {}: {e}", path.display()));
+                return false;
+            }
+        };
+        let meta = motion_core::AssetMeta::sound(
+            sound.sample_rate,
+            2,
+            sound.frames() as u64,
+        );
+        let fps = self.doc().fps;
+        let asset = self
+            .project
+            .add_asset(meta.into_asset(motion_core::AssetId(0), path));
+        let name = self.project.asset(asset).map(|a| a.name.clone()).unwrap_or_default();
+        // The sound's own length, in this comp's frames.
+        let frames = ((sound.seconds() * fps).round() as i64).max(1);
+
+        let mut node = MNode::group(self.next_id, name);
+        node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
+        node.audio = Some(motion_core::AudioClip::new(asset));
+
+        self.sounds.insert(asset, sound);
+        self.push_layer(node, self.selected);
+        self.publish_mix();
+        self.ng_status = None;
+        true
+    }
+
+    /// Whether the open comp has anything to hear. Decides which clock runs.
+    pub(crate) fn comp_has_audio(&self) -> bool {
+        let rate = self.clock.sample_rate;
+        rate > 0
+            && !motion_core::evaluate_audio(&self.project, self.current, 0.0, rate).is_empty()
+    }
+
+    /// Hand the audio callback a fresh mix.
+    ///
+    /// Called after anything that changes what should be heard: an import, an
+    /// edit, a transport change, a new loop range. Cheap enough to call freely —
+    /// it walks the comp and clones a handful of `Arc`s — and getting it wrong
+    /// in the safe direction (publishing too often) costs nothing, while missing
+    /// a publish means the sound and the picture disagree.
+    pub(crate) fn publish_mix(&mut self) {
+        let rate = self.clock.sample_rate;
+        if rate == 0 {
+            return;
+        }
+        let frame = self.current_frame() as f64;
+        let sources = motion_core::evaluate_audio(&self.project, self.current, frame, rate);
+        let fps = self.doc().fps;
+        let (lo, hi) = self.loop_bounds_frames();
+        let to_sf = |f: i64| motion_core::audio::frames_to_sample_frames(f as f64, fps, rate);
+        self.shared_mix.publish(crate::playback::MixState {
+            sources,
+            sounds: self.sounds.clone(),
+            loop_span: (to_sf(lo), to_sf(hi)),
+            playing: self.playing,
+        });
+    }
+
+    /// Pull the device's sample counter to `frame`, so the clock restarts from
+    /// where the playhead was put rather than from wherever playback had got to.
+    pub(crate) fn sync_audio_to_frame(&mut self, frame: f64) {
+        let rate = self.clock.sample_rate;
+        if rate == 0 {
+            return;
+        }
+        let fps = self.doc().fps;
+        self.clock
+            .audio
+            .set(motion_core::audio::frames_to_sample_frames(frame, fps, rate));
     }
 
     /// Create a layer whose shape **is** a graph geometry output — the other
@@ -4129,6 +4267,9 @@ impl App {
         }
         if tree_edits.import_footage {
             dirty |= self.import_footage();
+        }
+        if tree_edits.import_audio {
+            dirty |= self.import_audio();
         }
         // --- Undo: close the phase opened by `before`. ---------------------
         // One comparison covers every edit above. `PartialEq` on the document
