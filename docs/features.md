@@ -118,6 +118,11 @@ produce a finished video.
   - The extension picks the container, exactly as on the command line: `.mp4`
     is H.264, a `.mov` master is **ProRes**, and a path with no video extension
     becomes a numbered **PNG sequence**.
+  - **The work area is the render range.** Set one in the timeline and both
+    buttons render exactly it; the bar shows the frame range whenever it is
+    restricted, so a partial render is never a surprise. Clear the work area to
+    go back to the whole comp. Headlessly this is `--start` / `--end`, the same
+    inclusive convention.
   - A progress bar with **Cancel** replaces the buttons while a job runs. The
     editor stays live — the job renders a few frames per redraw rather than
     blocking ([0020](decisions/0020-the-render-job-is-stepped-not-threaded.md))

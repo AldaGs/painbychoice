@@ -617,6 +617,9 @@ pub(crate) struct RenderBar<'a> {
     pub(crate) draft_out: &'a str,
     /// Where Master currently writes, for its output button's tooltip.
     pub(crate) master_out: Option<&'a str>,
+    /// The work area as an inclusive frame range, when one is set — what both
+    /// buttons will render.
+    pub(crate) range: Option<(i64, i64)>,
     pub(crate) out: &'a mut crate::renderqueue::RenderEdits,
 }
 
@@ -904,6 +907,7 @@ pub(crate) fn comp_ui(
             render.last,
             render.draft_out,
             render.master_out,
+            render.range,
             render.out,
         );
     });

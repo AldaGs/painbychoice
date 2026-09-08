@@ -2623,6 +2623,7 @@ impl App {
             quality: Quality::Draft,
             scale: 1.0,
             ffmpeg_args: Vec::new(),
+            range: self.render_range(),
         });
     }
 
@@ -2671,6 +2672,22 @@ impl App {
         }
         self.project.render_presets[0].out = stored;
         true
+    }
+
+    /// The inclusive frame range a render will cover, or `None` for the whole
+    /// comp.
+    ///
+    /// This is the work area, converted from the half-open `[lo, hi)` playback
+    /// bounds to the inclusive form the renderer and the CLI both use. One
+    /// conversion, here, rather than a `- 1` at each use site.
+    ///
+    /// Both buttons honour it. A work area is how you say "this bit" — it is
+    /// what the preview loops over — and having Draft respect it while Master
+    /// ignored it would mean the two buttons rendered different films.
+    pub(crate) fn render_range(&self) -> Option<(i64, i64)> {
+        self.work_area?;
+        let (lo, hi) = self.loop_bounds_frames();
+        Some((lo, hi - 1))
     }
 
     /// Choose where Draft writes, through the system Save dialog.
@@ -2739,6 +2756,7 @@ impl App {
             quality,
             scale: preset.scale,
             ffmpeg_args: preset.ffmpeg_args.clone(),
+            range: self.render_range(),
         });
     }
 
@@ -3337,6 +3355,7 @@ impl App {
         )
         .display()
         .to_string();
+        let render_range = self.render_range();
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
@@ -3437,6 +3456,7 @@ impl App {
                             last: render_summary.as_ref(),
                             draft_out: &draft_out,
                             master_out: master_out.as_deref(),
+                            range: render_range,
                             out: &mut render_edits,
                         },
                         doc_w,

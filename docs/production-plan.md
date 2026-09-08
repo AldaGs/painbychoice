@@ -21,7 +21,7 @@ cleanly where those are absent, so a headless CI box sees fewer.
 | Editor (`live`) | Broad. Dockable panels, timeline + dopesheet + curves, gizmo, pen tool, snapping, guides, onion skins, motion path, layer strips, font picker, undo/redo. |
 | Compositing | Model only. Blend modes, masks, track mattes exist in `Scene` and both backends. No effect stack, no GPU effect passes. |
 | Footage | Import works: stills (incl. HEIC/RAW), video via an `ffmpeg` sidecar, threaded decode cache with a warm frame stream. |
-| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gaps: no frame range; the GUI export is GPU-serial (the CLI is frame-parallel). |
+| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gap: the GUI export is GPU-serial (the CLI is frame-parallel). |
 | **Audio** | **Does not exist.** No decode, no playback, no waveform, no master clock. |
 | Effects | Does not exist. `NodeCategory::Effect` is a registry slot with nothing in it. |
 | Motion blur | Does not exist. |
@@ -159,10 +159,17 @@ piece cannot leave the app.
   rendering the demo at 1 and 12 threads and diffing all 300 frames: byte
   identical.
 
+- ✅ **The work area reaches the render.** Both buttons render it when one is
+  set — a work area is how you say "this bit", and having Draft respect it while
+  Master ignored it would mean the two buttons rendered different films. The
+  range is shown on the render bar whenever it is restricted, never merely
+  implied by the timeline: a master that is four seconds instead of forty is a
+  mistake nobody catches until they play it. The half-open playback bounds are
+  converted to the inclusive form the renderer and `--start/--end` share, once,
+  at the caller.
+
 **Still ahead in this phase:**
 
-- **A range control.** A job renders the whole comp; the work area exists in the
-  timeline and does not reach the render yet.
 - **Parallel encoding.** The next win after the above, and the thing that would
   let the frame parallelism keep scaling: compression currently happens on the
   one thread that writes.

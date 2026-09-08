@@ -366,6 +366,36 @@ pub(crate) struct JobSpec<'a> {
     pub(crate) quality: Quality,
     pub(crate) scale: f64,
     pub(crate) ffmpeg_args: Vec<String>,
+    /// The frames to render, **inclusive**, or `None` for the whole comp.
+    ///
+    /// Inclusive because that is how the timeline and the CLI's `--start/--end`
+    /// read a range, and one convention is worth more than the half-open form
+    /// being marginally tidier: the work area is stored half-open, and the
+    /// conversion happens once, at the caller, rather than being re-derived at
+    /// every use.
+    pub(crate) range: Option<(i64, i64)>,
+}
+
+/// Clamp a requested inclusive frame range into a comp of `total` frames.
+///
+/// A pure function because the arithmetic is where this goes wrong: an
+/// off-by-one renders one frame too few and nobody notices until they count,
+/// and a reversed or out-of-bounds range must produce *something* renderable
+/// rather than an empty job or a panic. The work area is already clamped for
+/// playback, but a range can also arrive from a stale comp switch.
+pub(crate) fn clamp_range(range: Option<(i64, i64)>, total: i64) -> (i64, i64) {
+    let last = (total - 1).max(0);
+    match range {
+        None => (0, last),
+        Some((from, to)) => {
+            let start = from.clamp(0, last);
+            // At least one frame: a range that collapses is a range someone
+            // dragged to nothing, and rendering an empty file is never what
+            // they meant.
+            let end = to.clamp(start, last);
+            (start, end)
+        }
+    }
 }
 
 /// Start a render, allocating its target and opening its encoder.
@@ -388,12 +418,14 @@ pub(crate) fn start(
     let out_spec = OutputSpec { width: w, height: h, fps: comp.fps };
     let encoder = encoder_for(&spec.out, out_spec, spec.quality, &spec.ffmpeg_args)?;
 
+    let (start, end) = clamp_range(spec.range, comp.duration_frames);
+
     Ok(RenderJob {
         project: spec.project.clone(),
         comp: spec.comp,
-        start: 0,
-        end: comp.duration_frames - 1,
-        next: 0,
+        start,
+        end,
+        next: start,
         out: spec.out,
         quality: spec.quality,
         encoder: Some(encoder),
@@ -506,6 +538,8 @@ pub(crate) fn render_ui(
     last: Option<&RenderSummary>,
     draft_out: &str,
     master_out: Option<&str>,
+    // The work area as an inclusive frame range, when one is set.
+    range: Option<(i64, i64)>,
     out: &mut RenderEdits,
 ) {
     match active {
@@ -548,6 +582,18 @@ pub(crate) fn render_ui(
             }
             if crate::icon::button(ui, crate::icon::SAVE, &output_hint(master_out)).clicked() {
                 out.pick_output = true;
+            }
+            // A restricted range is shown, always, and never merely implied by
+            // the timeline. Both buttons honour the work area, so a leftover one
+            // would otherwise silently truncate a deliverable — and a master
+            // that is four seconds instead of forty is a mistake nobody catches
+            // until they play it.
+            if let Some((from, to)) = range {
+                ui.separator();
+                ui.weak(format!("{from}–{to}")).on_hover_text(format!(
+                    "Both buttons render the work area: frames {from} to {to}. \
+                     Clear it in the timeline to render the whole comp."
+                ));
             }
             // The outcome as a short chip with the detail on hover. A rendered
             // path is easily eighty characters and this row has no room for it.
@@ -777,6 +823,7 @@ mod tests {
                 quality: Quality::Draft,
                 scale: 1.0,
                 ffmpeg_args: Vec::new(),
+                range: None,
             },
             &gpu.device,
         )
@@ -803,6 +850,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// No range means the whole comp, **inclusive of the last frame**. The
+    /// off-by-one here would render one frame short of the comp every time and
+    /// go unnoticed until someone counted.
+    #[test]
+    fn no_range_is_the_whole_comp() {
+        assert_eq!(clamp_range(None, 300), (0, 299));
+    }
+
+    /// A work area renders exactly what it covers.
+    #[test]
+    fn a_range_is_honoured_as_given() {
+        assert_eq!(clamp_range(Some((60, 180)), 300), (60, 180));
+    }
+
+    /// A range reaching past the comp is clamped rather than asking the
+    /// evaluator for frames that do not exist — a stale work area survives a
+    /// comp being shortened.
+    #[test]
+    fn a_range_past_the_end_is_clamped() {
+        assert_eq!(clamp_range(Some((250, 9999)), 300), (250, 299));
+        assert_eq!(clamp_range(Some((9999, 99999)), 300), (299, 299));
+    }
+
+    /// A collapsed or reversed range still renders one frame. Rendering an
+    /// empty file is never what someone who dragged a handle meant, and an
+    /// empty job would report success having written nothing.
+    #[test]
+    fn a_collapsed_range_still_renders_one_frame() {
+        assert_eq!(clamp_range(Some((100, 100)), 300), (100, 100));
+        assert_eq!(clamp_range(Some((180, 60)), 300), (180, 180));
+    }
+
+    /// A one-frame comp is the degenerate case the clamp must not turn
+    /// negative.
+    #[test]
+    fn a_single_frame_comp_clamps_to_frame_zero() {
+        assert_eq!(clamp_range(None, 1), (0, 0));
+        assert_eq!(clamp_range(Some((5, 9)), 1), (0, 0));
+    }
+
+    /// **The range reaches the render.** A job restricted to frames 3..=7 must
+    /// write exactly five files, and the count is the assertion because that is
+    /// what a wrong range looks like from the outside: the right picture, the
+    /// wrong length.
+    #[test]
+    fn a_job_renders_only_its_range() {
+        let Some(mut gpu) = crate::offscreen::Headless::new() else {
+            eprintln!("no usable GPU adapter; skipping the ranged job test");
+            return;
+        };
+        let mut comp =
+            motion_core::Comp::new(16.0, 16.0, motion_core::Node::group(0, "root"));
+        comp.duration_frames = 40;
+        let project = MProject::single(comp);
+
+        let dir = std::env::temp_dir().join(format!("pbc_range_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut job = start(
+            JobSpec {
+                project: &project,
+                comp: project.root,
+                out: dir.clone(),
+                quality: Quality::Draft,
+                scale: 1.0,
+                ffmpeg_args: Vec::new(),
+                range: Some((3, 7)),
+            },
+            &gpu.device,
+        )
+        .expect("the job must open");
+        assert_eq!(job.total(), 5, "frames 3..=7 inclusive");
+
+        let mut cache = crate::footage::FootageCache::new(motion_render::default_registry());
+        let mut guard = 0;
+        loop {
+            match job.step(&gpu.device, &gpu.queue, &mut gpu.renderer, &mut cache) {
+                Step::Working => {}
+                Step::Done => break,
+                Step::Failed(e) => panic!("the job failed: {e}"),
+            }
+            guard += 1;
+            assert!(guard < 100, "the job never finished");
+        }
+        assert_eq!(job.done(), 5, "progress counts from the range's own start");
+        assert_eq!(std::fs::read_dir(&dir).expect("output").count(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A job aimed at a comp that isn't there fails at the button rather than
     /// at frame 200 — and writes nothing on the way.
     #[test]
@@ -822,6 +958,7 @@ mod tests {
                 quality: Quality::Draft,
                 scale: 1.0,
                 ffmpeg_args: Vec::new(),
+                range: None,
             },
             &gpu.device,
         );
