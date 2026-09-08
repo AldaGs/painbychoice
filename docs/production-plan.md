@@ -53,6 +53,31 @@ Sequenced so each phase ends with something a user can *do*, and so the
 expensive shared subsystem (the compositor) is built once, late, with its
 clients known.
 
+### Phase 0 — Two fixes that must land before the first exported file
+
+Both are cheap now and expensive later, and both are latent precisely until
+something is rendered to disk.
+
+- **`Comp::duration` is stored in seconds** (`core/src/node.rs:897`), with
+  `duration_frames()` deriving the count through a rounding `seconds_to_frames`.
+  The README already lists this as left open from roadmap item #1. It is
+  harmless while the only consumer is a playhead; it becomes a **±1 frame
+  ambiguity** the moment a render queue asks "how many frames am I writing?" —
+  5.0s at 23.976 fps is 119.88 frames, and whether the output file is 119 or 120
+  frames long comes down to a `.round()`. Store frames outright and derive
+  seconds. It is a `.pbc` format change, so it rides a migration, which is
+  exactly why it wants to happen before saved projects multiply.
+- **The SVG backend silently drops matte layers** (`render/src/lib.rs:45-50`,
+  documented in place: SVG expresses a matte with `<mask>`, a different
+  construction from the `<g>` nesting the blend path uses, so matte items are
+  skipped rather than drawn wrong). The GPU backend handles them properly. That
+  is a live disagreement between two backends, and Phase 1's entire premise is
+  that the exported frame equals the previewed frame. Either implement `<mask>`,
+  or formally demote the SVG backend to a debug/vector-export path that is not a
+  render target and cannot be selected in the queue. Pick one deliberately.
+
+Neither is a bug in today's app. Both are bugs in tomorrow's renderer.
+
 ### Phase 1 — Export (the unblocker)
 
 The single highest-value change in the project. Nothing else here matters if a
@@ -136,12 +161,207 @@ Small, unglamorous, and the difference between a demo and a tool.
 ### Deferred, deliberately
 
 The **Nuke-style image graph** (README: *the composition node graph*), the
-**WASM plugin ABI**, and **Level B 3D**. All three are architecturally spec'd
-and none of them is on the path to a finished video. The image graph in
+**published plugin SDK** (see §4 — the architecture is settled below, the
+*promise* is what waits), and **Level B 3D**. All three are architecturally
+spec'd and none of them is on the path to a finished video. The image graph in
 particular should wait for Phase 3 — it needs the compositor stage that phase
 builds, exactly as the README argues.
 
-## 4. Risks worth naming now
+## 4. Extensibility: how other people build on PBC
+
+This is not on the critical path to a first exported video, and it is on the
+critical path to PBC being worth using. It is written now because **the choices
+are cheap today and unpayable later** — an extension surface is a promise you
+cannot withdraw, and every one of them is decided by code that already exists.
+
+### Why After Effects has an SDK, and why we need only one system
+
+AE's extensibility is three unrelated machines, and the reason is history rather
+than design:
+
+| AE surface | What it does | Why it exists |
+| --- | --- | --- |
+| **Effect SDK** (C++, `PF_*`) | Pixel filters — `PF_EffectWorld` in, out | 1993-era C ABI; the only way to reach native speed then |
+| **ExtendScript / `.jsx`** | Automation, batch, document edits | A scripting layer bolted on a decade later |
+| **CEP / UXP panels** (HTML+JS) | Custom UI panels | A *third* layer, because ExtendScript had no UI |
+
+The result is famous: a panel is written in JavaScript, talks to ExtendScript
+over a message bridge, which drives a document model the C++ effect API cannot
+see. Three languages, three lifetimes, three sets of documentation, and a plugin
+author who wants a filter *with* a panel writes both halves twice.
+
+We do not have to inherit that, because we have something AE never had: a
+**closed IR with a single pure evaluator**, a **descriptor registry**
+(`core/src/registry.rs`), and an editor that already routes every mutation
+through deferred, unit-tested ops. The design goal is therefore: **one plugin
+model, four contribution kinds.**
+
+### The four things a user will actually want to build
+
+1. **A filter** — operate on pixels. (Your AE question.)
+2. **A node / generator** — produce or transform *values*, not pixels: a custom
+   easing, a rig, a physics driver.
+3. **A panel** — custom UI that automates something for *their* studio: batch
+   rename, an asset check, a shot-tracker, a one-click deliverable.
+4. **An importer / exporter** — a format we don't ship.
+
+Each maps onto a seam that either exists or is already specified.
+
+### The unit of distribution: a folder with a manifest
+
+A plugin is a directory containing `plugin.toml` plus its payloads:
+
+```toml
+name = "studio-tools"
+version = "1.0.0"
+api = "1"                       # the contract version, not the app version
+
+[[contributes.effect]]          # a filter
+id    = "studio.halation"
+shader = "halation.wgsl"
+params = [
+  { id = "amount", type = "number", default = 0.5, range = [0.0, 1.0] },
+  { id = "tint",   type = "color",  default = "#ff8844" },
+]
+
+[[contributes.panel]]           # a UI panel
+id     = "studio.shotcheck"
+title  = "Shot Check"
+script = "shotcheck.rhai"
+
+[capabilities]                  # declared, and consented to on install
+filesystem = ["read:project-dir"]
+network    = false
+process     = false
+```
+
+One manifest, one install, one uninstall, regardless of how many kinds a plugin
+contributes. A filter with a companion panel is *one* plugin — the thing AE
+makes hardest.
+
+### Kind 1 — Filters (pixels)
+
+Covered in the compositor discussion above; restated here as the contract.
+**The primary path is a shader plugin**: the plugin ships WGSL plus its param
+descriptor, and PBC runs it as a pass in the compositor stage. No FFI, no ABI to
+freeze, no crash surface (an invalid shader fails validation instead of taking
+the process down), hot-reloadable while animating, and it is the *fast* path
+rather than a compatibility path.
+
+The contract a filter author is handed:
+
+```
+fn filter(input: texture, params: resolved at this frame, roi: rect) -> texture
+```
+
+Three properties fall out of the architecture for free, and are worth stating in
+the docs as guarantees:
+
+- **Params animate without the author doing anything.** A declared param becomes
+  a `Value<T>` like any other, so it gets a stopwatch, a dopesheet row, easing,
+  and the expression graph. In AE this is `PF_ADD_PARAM` plumbing per parameter.
+- **Determinism is enforced, not requested.** No wall clock, no IO from a filter.
+  This is what makes preview-equals-export provable and frame caching sound.
+- **One working format, fixed before the first filter ships:** linear,
+  premultiplied, **f16 RGBA**. AE's 8/16/32-bpc split and its straight-vs-
+  premultiplied confusion are scar tissue we can decline to inherit — but only
+  by choosing before a plugin signature exists, never after.
+
+Native C-ABI stays the escape hatch for someone who must run existing native
+code, and is not the recommended path. **AE plugins cannot be loaded** — the AE
+SDK is a C++ ABI over its own suites, and a `.aex` has no meaning here. What
+ports is the author's mental model, not their binary.
+
+### Kind 2 — Nodes and generators (values)
+
+Already solved, and this is the part that is genuinely ahead of AE. The registry
+(`core/src/registry.rs`) is explicit that a descriptor is *pure metadata* —
+category, label, typed sockets — and that "a built-in registers a descriptor at
+startup, a plugin registers one at load, and the descriptor-driven canvas draws
+either without knowing which it is."
+
+So the work here is not architecture, it is **discipline**: keep dogfooding
+built-ins through the same registration path, and never let a built-in reach a
+seam a plugin cannot. The registry already carries `is_buildable_now()` to stop
+us shipping a promise the evaluator can't honour — that instinct is the right
+one and should be kept.
+
+### Kind 3 — Panels and automation (the question with the least obvious answer)
+
+"How do we give access to the UI and the internals?" splits into two questions
+that need opposite answers.
+
+**Internals: expose the command layer, not the data model.** The editor already
+routes edits through deferred ops applied after the UI pass — `GraphOp` /
+`apply_graph_op`, the `Dock` tree rewrites — deliberately, so the flow is
+unit-testable as free functions. That layer *is* the plugin API. A panel submits
+the same ops a mouse click submits, which means it inherits undo (snapshot
+history), validation, and the existing test coverage on day one. What a plugin
+must **never** get is `&mut Document`: a plugin mutating the tree directly would
+bypass undo, break the migration contract, and make every future refactor a
+breaking change. The rule to write down now: **plugins read a projection, and
+write only ops.**
+
+**UI: a declarative panel spec, not our widget library.** Handing plugins `egui`
+directly would be the AE mistake in a new costume — egui is pinned at 0.35 and
+churns, so every upgrade would break every plugin. Instead the plugin describes
+its panel (a widget tree: rows, buttons, fields, lists, a table) and receives
+events back; the host renders it in our theme. Plugins get version independence
+and sandboxing; users get panels that look like the app instead of an embedded
+browser. `Editor` in `live/src/dock.rs:21` is a closed `pub(crate)` enum today —
+it gains one `Plugin(PluginPanelId)` variant, and plugin panels then dock,
+split, save into layout presets, and appear in every picker for free, because
+the dock system already treats every editor uniformly.
+
+**Language: Rhai now, WASM later.** Rhai is already in-tree driving expressions,
+already sandboxed, already deterministic. It is the zero-new-dependency
+automation language, and a studio scripting their own pipeline can start the day
+the op layer is exposed. WASM (the README's stated choice) is for *distributable*
+compiled plugins and can follow once the op surface has settled. Note that this
+is also why WASM should be scoped to logic and not per-pixel work: a 4K RGBA
+frame is ~33 MB per copy across the module boundary, per effect, per frame.
+
+### Kind 4 — Importers and exporters
+
+The `Encoder` trait from Phase 1 and the existing `Decoder` split in
+`render/src/decode.rs` are already the right shape. Register them like
+descriptors and a third-party format is another registered impl. Nothing new is
+needed beyond honouring the seam.
+
+### What the documentation actually has to be
+
+An extension surface is documentation-shaped, and this is where AE's is weakest.
+The minimum, per contribution kind:
+
+- **The manifest schema** and the capability list, exhaustively.
+- **A stability contract**: what `api = "1"` guarantees, what may change in a
+  minor version, and how deprecation is signalled. Written *before* the first
+  external plugin exists, or it will be written by accident afterwards.
+- **A template repo per kind** — `cargo generate`-able, building and loading on
+  first try. This matters more than reference docs; most plugin authors start by
+  copying something that works.
+- **One worked example per kind, shipped in-tree**, and ideally *used* by the
+  app: our own halation filter, our own batch-rename panel. A seam we don't
+  depend on is a seam that will quietly rot.
+- **A determinism and colour-space page** — the two contracts a filter author can
+  violate invisibly, producing a render that doesn't match the preview.
+
+### Staging
+
+- **Now (free, and only discipline):** keep every built-in going through the
+  registry; keep every editor mutation going through an op; do not grow a second
+  path.
+- **With Phase 3 (the compositor):** shader filters, since that is the first
+  moment a pixel contract can exist at all.
+- **After Phase 4 (once the app is trusted):** the panel spec and the Rhai
+  automation API, then WASM packaging and a published SDK.
+
+The README's call stands and this refines it: **plugin-shaped now, stable SDK
+later** — and specifically, do not publish `api = "1"` until an exported video,
+an effect stack, and one first-party panel have all been built through the seams
+we intend to hand over.
+
+## 5. Risks worth naming now
 
 - **ffmpeg as a dependency of delivery.** It is already the import path, so the
   precedent is set, but export makes it non-optional. Ship a bundled binary or
@@ -155,8 +375,10 @@ builds, exactly as the README argues.
 - **`live/src/app.rs` is 3,900 lines.** Not urgent, but the render queue and the
   effect stack both want to live somewhere, and neither should land in there.
 
-## 5. The one-line version
+## 6. The one-line version
 
-The engine is ready. Build **export**, then **audio**, then the **compositor and
-effects**, then **autosave and relink** — and stop adding engine depth until a
-finished video can leave the application.
+The engine is ready. Fix the **frame-count and matte-parity** gaps, then build
+**export**, **audio**, the **compositor and effects**, and **autosave and
+relink** — and stop adding engine depth until a finished video can leave the
+application. Extensibility (§4) costs nothing today but discipline: keep every
+built-in going through the registry, and every edit through an op.
