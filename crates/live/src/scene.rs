@@ -251,6 +251,46 @@ pub(crate) fn to_peniko(c: MColor, opacity: f64) -> Color {
     Color::new([c.r as f32, c.g as f32, c.b as f32, (c.a * opacity) as f32])
 }
 
+/// The editor-only decoration drawn around and over a composition: onion-skin
+/// ghosts, the passepartout, the frame border, the selection outline.
+///
+/// Grouped into one parameter because it is exactly the set of things an
+/// **export** must not draw. A render that baked in the frame border would put a
+/// grey 1.5px rectangle around every delivered frame, and the border is drawn
+/// unconditionally, so "pass the editor's values" and "pass nothing" needed to
+/// be one decision rather than four defaults a caller could get individually
+/// wrong. [`Chrome::none`] is the whole of what export passes.
+pub(crate) struct Chrome<'a> {
+    /// Onion-skin ghosts, drawn under the live frame.
+    pub(crate) ghosts: &'a [Ghost],
+    /// The selected layer, outlined on top of everything.
+    pub(crate) selected: Option<NodeId>,
+    /// How strongly to dim outside the comp bounds. `0.0` is off.
+    pub(crate) passepartout: f64,
+    /// The preview area in **physical pixels** — the passepartout needs to know
+    /// how far to reach, and it is the only thing here that does.
+    pub(crate) canvas: kurbo::Rect,
+    /// Whether to stroke the comp bounds. Marks where the render will crop, so
+    /// it is meaningless *in* a render.
+    pub(crate) border: bool,
+}
+
+impl Chrome<'static> {
+    /// No decoration at all: what an exported frame gets. Every field is the
+    /// "draw nothing" value, so a frame rendered with this contains only the
+    /// composition — which is what makes preview-equals-export a claim about
+    /// the picture rather than about the picture plus the editor's furniture.
+    pub(crate) fn none() -> Self {
+        Chrome {
+            ghosts: &[],
+            selected: None,
+            passepartout: 0.0,
+            canvas: kurbo::Rect::ZERO,
+            border: false,
+        }
+    }
+}
+
 /// Convert an evaluated engine `Scene` into a `vello::Scene`, prepending a
 /// global transform that fits the composition into the window.
 ///
@@ -261,18 +301,14 @@ pub(crate) fn to_peniko(c: MColor, opacity: f64) -> Color {
 /// shapes (it dims the parts of them that hang outside the frame, which is the
 /// whole point) but before the border and the selection, which stay crisp.
 ///
-/// `canvas` is the preview area in **physical pixels** — the passepartout needs
-/// to know how far to reach, and it is the only thing here that does.
-#[allow(clippy::too_many_arguments)]
+/// Everything in that list past the shapes is [`Chrome`], and an export passes
+/// [`Chrome::none`] to get the composition and nothing else.
 pub(crate) fn to_vello(
     scene: &MScene,
     fit: Affine,
     comp: (f64, f64),
     bg: MColor,
-    passepartout: f64,
-    canvas: kurbo::Rect,
-    ghosts: &[Ghost],
-    selected: Option<NodeId>,
+    chrome: &Chrome<'_>,
     footage: &mut FootageCache,
     assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
     // Layers whose effect stack needed the full-image path (a blur), already
@@ -292,7 +328,7 @@ pub(crate) fn to_vello(
 
     // Onion skins go under the live frame: they are context, and the frame you
     // are actually editing must never be the faint one.
-    for ghost in ghosts {
+    for ghost in chrome.ghosts {
         for item in &ghost.items {
             let xf = fit * item.transform;
             if let Some(fill) = item.fill {
@@ -428,28 +464,31 @@ pub(crate) fn to_vello(
     }
     // Passepartout: dim everything outside the comp bounds, so the frame reads
     // as the shot and whatever is parked off-stage recedes without vanishing.
-    if passepartout > 0.0 {
+    if chrome.passepartout > 0.0 {
         vs.fill(
             Fill::EvenOdd,
             Affine::IDENTITY,
-            Color::new([0.0, 0.0, 0.0, passepartout.clamp(0.0, 1.0) as f32]),
+            Color::new([0.0, 0.0, 0.0, chrome.passepartout.clamp(0.0, 1.0) as f32]),
             None,
-            &passepartout_path(fit, comp_rect, canvas),
+            &passepartout_path(fit, comp_rect, chrome.canvas),
         );
     }
 
     // Frame border, over both the shapes and the passepartout — it marks where
-    // the render will crop, so nothing should paint over it.
-    vs.stroke(
-        &KurboStroke::new(1.5 / scale),
-        fit,
-        Color::new([0.35, 0.37, 0.42, 1.0]),
-        None,
-        &comp_rect,
-    );
+    // the render will crop, so nothing should paint over it. An export is
+    // *inside* that crop, so it never draws one.
+    if chrome.border {
+        vs.stroke(
+            &KurboStroke::new(1.5 / scale),
+            fit,
+            Color::new([0.35, 0.37, 0.42, 1.0]),
+            None,
+            &comp_rect,
+        );
+    }
 
     // Selection outline on top of everything.
-    if let Some(sel) = selected {
+    if let Some(sel) = chrome.selected {
         if let Some(item) = scene.items.iter().find(|i| i.source == sel) {
             let xf = fit * item.transform;
             // Width is in the item's local space; keep it visible but modest.
@@ -827,7 +866,7 @@ pub(crate) fn rasterize_effect_layers(
 /// the padding stripped row by row on the way out. The map is waited on
 /// synchronously — a stall, but a readback has to finish before the pixels can
 /// be filtered this frame.
-fn read_texture_rgba(
+pub(crate) fn read_texture_rgba(
     device: &vello::wgpu::Device,
     queue: &vello::wgpu::Queue,
     tex: &vello::wgpu::Texture,

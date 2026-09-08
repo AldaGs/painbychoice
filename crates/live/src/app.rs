@@ -5,6 +5,7 @@
 //! only edit was widening visibility to `pub(crate)`.
 
 use crate::*;
+use motion_render::Quality;
 
 pub(crate) enum RenderState {
     Active {
@@ -195,6 +196,13 @@ pub(crate) struct App {
     /// Decoded footage frames. Editor state, never saved: the document holds
     /// references and these are the pixels behind them.
     pub(crate) footage: FootageCache,
+    /// Where this project was last saved or opened from, or `None` if it has
+    /// never been on disk. The render queue needs it for two things a dialog
+    /// cannot supply: a Draft destination the user can guess, and the anchor a
+    /// preset's relative path resolves against.
+    pub(crate) project_path: Option<std::path::PathBuf>,
+    /// Exports in progress and finished. See [`crate::renderqueue`].
+    pub(crate) queue: crate::renderqueue::RenderQueue,
     /// Undo / redo. Whole-document snapshots taken around the edit phase —
     /// see [`crate::history`] for why that rather than inverse operations.
     pub(crate) history: History,
@@ -977,6 +985,8 @@ impl App {
             ng_scope: NgScope::Project,
             ng_status: None,
             footage: FootageCache::new(motion_render::default_registry()),
+            project_path: None,
+            queue: crate::renderqueue::RenderQueue::default(),
             history: History::default(),
         }
     }
@@ -2582,7 +2592,131 @@ impl App {
     /// file chosen via a native save dialog. The layout (active dock + user
     /// presets) rides in a [`Project`] wrapper alongside the document; built-in
     /// presets are code, so only user ones are written.
-    pub(crate) fn save(&self) {
+    /// Start a Draft render: the whole comp, full resolution, fast encoder,
+    /// beside the project. No dialog — that is the entire point of the verb.
+    ///
+    /// The one thing it will refuse is writing a path a saved preset claims
+    /// (rule 2 of decision 0018). Refusing loudly beats quietly choosing another
+    /// name, which would leave the user hunting for a file.
+    pub(crate) fn start_draft(&mut self) {
+        let out = crate::renderqueue::draft_path(self.project_path.as_deref());
+        if crate::renderqueue::collides_with_a_preset(
+            &out,
+            &self.project.render_presets,
+            self.project_path.as_deref(),
+        ) {
+            self.report_render_failure(
+                out,
+                Quality::Draft,
+                "a saved render preset already writes this path; a draft will not                  overwrite a deliverable"
+                    .to_string(),
+            );
+            return;
+        }
+        self.begin_render(crate::renderqueue::JobSpec {
+            project: &self.project.clone(),
+            comp: self.current,
+            out,
+            quality: Quality::Draft,
+            scale: 1.0,
+            ffmpeg_args: Vec::new(),
+        });
+    }
+
+    /// Start a Master render from the project's first saved preset, or from a
+    /// default one if the project has none yet.
+    ///
+    /// Defaulting rather than opening a dialog keeps the button usable on a
+    /// project nobody has configured, and the default is written into the
+    /// project so the *next* press is reproducible — which is what makes the
+    /// preset project data rather than app state.
+    pub(crate) fn start_master(&mut self) {
+        if self.project.render_presets.is_empty() {
+            self.project.render_presets.push(motion_core::RenderPreset::default_master());
+        }
+        let preset = self.project.render_presets[0].clone();
+        let out = crate::renderqueue::resolve_out(self.project_path.as_deref(), &preset.out);
+        let quality = Quality::parse(&preset.quality).unwrap_or(Quality::Master);
+        self.begin_render(crate::renderqueue::JobSpec {
+            project: &self.project.clone(),
+            comp: self.current,
+            out,
+            quality,
+            scale: preset.scale,
+            ffmpeg_args: preset.ffmpeg_args.clone(),
+        });
+    }
+
+    /// Open a job, or log why it could not open.
+    ///
+    /// A render that cannot start must fail *at the button*, not at frame 200 —
+    /// so the encoder is opened here, where the user is still looking at the
+    /// thing they pressed.
+    fn begin_render(&mut self, spec: crate::renderqueue::JobSpec<'_>) {
+        let (out, quality) = (spec.out.clone(), spec.quality);
+        let RenderState::Active { surface, .. } = &self.state else {
+            self.report_render_failure(out, quality, "no GPU device yet".to_string());
+            return;
+        };
+        let device = &self.context.devices[surface.dev_id].device;
+        match crate::renderqueue::start(spec, device) {
+            Ok(job) => self.queue.active = Some(job),
+            Err(e) => self.report_render_failure(out, quality, e),
+        }
+    }
+
+    /// Record a render that never got off the ground, so the bar can say so.
+    fn report_render_failure(
+        &mut self,
+        out: std::path::PathBuf,
+        quality: Quality,
+        error: String,
+    ) {
+        self.queue.log.push(crate::renderqueue::RenderRecord {
+            out,
+            quality,
+            frames: 0,
+            seconds: 0.0,
+            error: Some(error),
+        });
+    }
+
+    /// Advance the active render by one slice. Returns whether a job is still
+    /// running, which is the caller's cue to ask for another redraw.
+    ///
+    /// Every field borrowed here is disjoint — the job, the footage cache, the
+    /// device and the vello renderer are four different fields of `App`, which
+    /// is what lets the render borrow them all at once.
+    pub(crate) fn step_render(&mut self) -> bool {
+        if self.queue.active.is_none() {
+            return false;
+        }
+        let RenderState::Active { surface, .. } = &self.state else {
+            self.queue.finish(Some("the GPU device went away".to_string()));
+            return false;
+        };
+        let dev_id = surface.dev_id;
+        let Some(renderer) = self.renderers[dev_id].as_mut() else {
+            self.queue.finish(Some("the renderer went away".to_string()));
+            return false;
+        };
+        let handle = &self.context.devices[dev_id];
+        let job = self.queue.active.as_mut().expect("checked above");
+        let step = job.step(&handle.device, &handle.queue, renderer, &mut self.footage);
+        match step {
+            crate::renderqueue::Step::Working => true,
+            crate::renderqueue::Step::Done => {
+                self.queue.finish(None);
+                false
+            }
+            crate::renderqueue::Step::Failed(e) => {
+                self.queue.finish(Some(e));
+                false
+            }
+        }
+    }
+
+    pub(crate) fn save(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Pain By Choice", &["pbc", "json"])
             .set_file_name("project.pbc")
@@ -2602,6 +2736,11 @@ impl App {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
                     eprintln!("save failed: {e}");
+                } else {
+                    // Only on success: a failed save leaves the project where
+                    // it was, and a Draft must not aim at a file that isn't
+                    // there.
+                    self.project_path = Some(path);
                 }
             }
             Err(e) => eprintln!("serialize failed: {e}"),
@@ -2668,6 +2807,12 @@ impl App {
         // footage that no longer exists. Keeping them would draw the previous
         // project's pixels under this one's layers.
         self.footage.clear();
+        self.project_path = Some(path);
+        // A render in flight belongs to the project that started it, and that
+        // project is gone. The job holds its own snapshot so finishing would
+        // not be *wrong*, but it would write the previous piece to a path
+        // derived from this one — so it is dropped, and the log with it.
+        self.queue = crate::renderqueue::RenderQueue::default();
         self.current = self.project.root;
         self.selected = None;
         self.selected_keys.clear();
@@ -2869,15 +3014,19 @@ impl App {
                 // the footage cache mutably, and `self.doc()` inside the
                 // argument list would be an overlapping shared borrow of self.
                 let dims = (self.doc().width, self.doc().height);
+                let chrome = crate::scene::Chrome {
+                    ghosts: &self.onion.ghosts,
+                    selected: self.selected,
+                    passepartout: pp,
+                    canvas,
+                    border: true,
+                };
                 to_vello(
                     &scene,
                     fit,
                     dims,
                     bg,
-                    pp,
-                    canvas,
-                    &self.onion.ghosts,
-                    self.selected,
+                    &chrome,
                     &mut self.footage,
                     &self.project.assets,
                     &effect_images,
@@ -3077,6 +3226,15 @@ impl App {
         let eases: &[motion_core::EasePreset] = &self.project.eases;
         let mut ease_lib: Option<EaseLibEdit> = None;
         let mut comp = CompEdits::default();
+        // The render bar's state as owned snapshots, like every other panel
+        // input: the UI closure cannot borrow `App`.
+        let mut render_edits = crate::renderqueue::RenderEdits::default();
+        let render_progress = self.queue.active.as_ref().map(|j| {
+            let (frac, line) =
+                crate::renderqueue::progress(j.done(), j.total(), j.elapsed());
+            crate::renderqueue::RenderProgress { frac, line, quality: j.quality() }
+        });
+        let render_summary = self.queue.last().map(crate::renderqueue::RenderSummary::of);
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
@@ -3170,27 +3328,40 @@ impl App {
                 &mut next_id,
                 &mut path,
                 &mut |editor, ui| match editor {
-                    Editor::Comp => comp_ui(
-                        ui,
-                        doc_w,
-                        doc_h,
-                        doc_fps,
-                        duration,
-                        comp_bg,
-                        comp_pp,
-                        comp_path_range,
-                        comp_camera,
-                        &mut comp,
-                        &preset_names,
-                        &mut preset_name_buf,
-                        &mut layout,
-                        &warnings,
-                        &comp_entries,
-                        current_comp,
-                        &mut comp_name_buf,
-                        undo_label,
-                        redo_label,
-                    ),
+                    Editor::Comp => {
+                        comp_ui(
+                            ui,
+                            doc_w,
+                            doc_h,
+                            doc_fps,
+                            duration,
+                            comp_bg,
+                            comp_pp,
+                            comp_path_range,
+                            comp_camera,
+                            &mut comp,
+                            &preset_names,
+                            &mut preset_name_buf,
+                            &mut layout,
+                            &warnings,
+                            &comp_entries,
+                            current_comp,
+                            &mut comp_name_buf,
+                            undo_label,
+                            redo_label,
+                        );
+                        // The render bar sits under the composition bar: an
+                        // export is a property of the comp you are looking at,
+                        // and Draft has to be one click from it. A sibling call
+                        // rather than four more arguments to a function that
+                        // already takes nineteen.
+                        crate::renderqueue::render_ui(
+                            ui,
+                            render_progress.as_ref(),
+                            render_summary.as_ref(),
+                            &mut render_edits,
+                        );
+                    }
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Transport => transport_ui(
                         ui,
@@ -3538,6 +3709,20 @@ impl App {
         // window may now hang past the end of the comp.
         if comp.fps.is_some() || comp.duration.is_some() {
             self.view = self.view.clamped(self.doc().duration_frames);
+        }
+
+        // The render bar's intent, applied like every other panel edit: after
+        // the pass, never during it. Cancel is checked first — a user who hits
+        // Cancel and Draft in one frame meant to stop.
+        if render_edits.cancel {
+            // Dropping the job drops its encoder unfinished, which is correct:
+            // a cancelled render has no output to close, and finishing the
+            // encoder would mux a partial file that looks complete.
+            self.queue.finish(Some("cancelled".to_string()));
+        } else if render_edits.draft {
+            self.start_draft();
+        } else if render_edits.master {
+            self.start_master();
         }
 
         if let Some(name) = comp.rename {
@@ -3889,15 +4074,19 @@ impl App {
                 // the footage cache mutably, and `self.doc()` inside the
                 // argument list would be an overlapping shared borrow of self.
                 let dims = (self.doc().width, self.doc().height);
+                let chrome = crate::scene::Chrome {
+                    ghosts: &self.onion.ghosts,
+                    selected: self.selected,
+                    passepartout: pp,
+                    canvas,
+                    border: true,
+                };
                 to_vello(
                     &scene,
                     fit,
                     dims,
                     bg,
-                    pp,
-                    canvas,
-                    &self.onion.ghosts,
-                    self.selected,
+                    &chrome,
                     &mut self.footage,
                     &self.project.assets,
                     &effect_images,
@@ -4005,6 +4194,16 @@ impl App {
             .queue
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
+
+        // A slice of the active export, after the frame the user is watching
+        // has been presented. Rendering export frames *before* the present
+        // would delay the preview by the whole budget and make the editor feel
+        // frozen, which is the one thing the incremental design exists to
+        // avoid. Still running means ask for another redraw — otherwise a
+        // `ControlFlow::Wait` loop with no input would stall the job forever.
+        if self.step_render() {
+            window.request_redraw();
+        }
     }
 }
 

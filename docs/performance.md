@@ -65,6 +65,25 @@ demo composition at 1920×1080, rendering to a PNG sequence:
 | 0.5 | 960×540 | 108.3 |
 | 0.25 | 480×270 | 439.0 |
 
+Re-measured 2026-09-08 on a **Windows 11 developer machine** (the same demo,
+same release profile, CPU rasterizer), which is roughly 3× the container:
+
+| Output | Encoder | Frames/sec | 300 frames in |
+| --- | --- | --- | --- |
+| 1920×1080 | PNG sequence | **76.4** | 3.9s |
+| 1920×1080 | ffmpeg, H.264 draft | 70.9 | 4.2s |
+| 1920×1080 | ffmpeg, H.264 master | 68.2 | 4.4s |
+| 1920×1080 | ffmpeg, ProRes HQ | 57.2 | 5.3s |
+
+The encoder spread is the useful part: **master costs ~4% over draft**, and
+ProRes ~25% over H.264, at this resolution. Both are small next to the
+rasterizer, which is the other way round from what the two-button model assumes
+— it assumes encoding is what you save by choosing Draft. At 1080p on this
+content the honest saving is a few percent. Draft's value is that it asks no
+questions, not that it is dramatically faster, and the table above is why
+[0018](decisions/0018-two-render-buttons.md)'s rule that *draft renders every
+pixel* costs so little.
+
 Three things fall out of that, and all three are actionable:
 
 - **It is cleanly pixel-bound.** Four times faster per halving of each
@@ -79,7 +98,7 @@ Three things fall out of that, and all three are actionable:
   either.
 
 **A debug build is ~100× slower** (the same 300-frame render: 244s debug versus
-~12s release). Never quote, compare, or investigate a timing from `cargo run`
+~12s release on the container, 3.9s on the developer machine above). Never quote, compare, or investigate a timing from `cargo run`
 without `--release`. This is the single most common way to arrive at a wrong
 conclusion about this codebase's speed.
 

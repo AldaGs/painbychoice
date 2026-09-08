@@ -1431,6 +1431,68 @@ pub struct Project {
     legacy_bindings: Vec<crate::graph::Binding>,
     #[serde(default, rename = "shape_bindings", skip_serializing)]
     legacy_shape_bindings: Vec<crate::graph::ShapeBinding>,
+    /// How this piece is delivered: named export specs, saved with the project.
+    ///
+    /// Project data rather than app settings, and that is the whole point —
+    /// an export spec is part of how a piece is handed over, so two people
+    /// opening the same `.pbc` render identical files. Settings that live in
+    /// whoever last opened the dialog are the failure mode this replaces.
+    /// `#[serde(default)]` so a file written before presets existed still loads.
+    #[serde(default)]
+    pub render_presets: Vec<RenderPreset>,
+}
+
+/// A named export spec, saved in the `.pbc`.
+///
+/// Deliberately small. [`decisions/0018`] is explicit that the preset table
+/// stays small and that ffmpeg's own flags cover everything else — the moment
+/// this grows a codec matrix it has become the output-module editor that
+/// decision declines to build.
+///
+/// `quality` is a **word**, not the `render` crate's `Quality` enum, because
+/// `core` is headless and does not depend on `render` ([`decisions/0001`]).
+/// The renderer parses it; an unreadable word falls back to draft rather than
+/// refusing to open the project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderPreset {
+    /// What the menu shows.
+    pub name: String,
+    /// Where it writes, relative to the project file unless absolute. The
+    /// extension picks the container, exactly as it does on the command line —
+    /// one rule, not a format dropdown that can disagree with the filename.
+    pub out: String,
+    /// `"draft"` or `"master"`.
+    #[serde(default = "RenderPreset::default_quality")]
+    pub quality: String,
+    /// Resolution multiplier. `1.0` is the comp's own size.
+    #[serde(default = "RenderPreset::default_scale")]
+    pub scale: f64,
+    /// Extra ffmpeg arguments, appended *after* the preset's own so they
+    /// override rather than fight it.
+    #[serde(default)]
+    pub ffmpeg_args: Vec<String>,
+}
+
+impl RenderPreset {
+    fn default_quality() -> String {
+        "master".to_string()
+    }
+
+    fn default_scale() -> f64 {
+        1.0
+    }
+
+    /// The preset a project gets when someone first presses Master with nothing
+    /// configured: an H.264 deliverable next to the project, at full size.
+    pub fn default_master() -> Self {
+        RenderPreset {
+            name: "Master".to_string(),
+            out: "master.mp4".to_string(),
+            quality: "master".to_string(),
+            scale: 1.0,
+            ffmpeg_args: Vec::new(),
+        }
+    }
 }
 
 impl Project {
@@ -1447,6 +1509,7 @@ impl Project {
             assets: std::collections::BTreeMap::new(),
             legacy_bindings: Vec::new(),
             legacy_shape_bindings: Vec::new(),
+            render_presets: Vec::new(),
         }
     }
 
@@ -1683,6 +1746,48 @@ mod tests {
         let out = serde_json::to_string(&comp).unwrap();
         assert!(!out.contains("\"duration\""), "no legacy seconds field: {out}");
         assert!(out.contains("\"duration_frames\":48"));
+    }
+
+    /// Render presets travel with the project, which is the entire reason they
+    /// are project data: two people opening one `.pbc` must render the same
+    /// file. A round-trip is therefore the property under test.
+    #[test]
+    fn render_presets_round_trip_with_the_project() {
+        let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        project.render_presets.push(RenderPreset {
+            name: "YouTube 1080p".to_string(),
+            out: "deliver/yt.mp4".to_string(),
+            quality: "master".to_string(),
+            scale: 0.5,
+            ffmpeg_args: vec!["-crf".to_string(), "18".to_string()],
+        });
+        let back: Project = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(back.render_presets, project.render_presets);
+    }
+
+    /// A `.pbc` written before presets existed must open with none rather than
+    /// failing to parse — the `#[serde(default)]` *is* the migration, and this
+    /// is the test that keeps it that way.
+    #[test]
+    fn a_project_without_presets_loads_with_none() {
+        let project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("render_presets");
+        let back: Project = serde_json::from_value(json).expect("a pre-presets file must open");
+        assert!(back.render_presets.is_empty());
+    }
+
+    /// The optional fields inside a preset default too, so a hand-written entry
+    /// with only a name and a path is valid — presets are the kind of thing a
+    /// person edits in the file by hand.
+    #[test]
+    fn a_minimal_preset_fills_in_its_defaults() {
+        let preset: RenderPreset =
+            serde_json::from_str(r#"{"name":"quick","out":"out.mp4"}"#).expect("must parse");
+        assert_eq!(preset.quality, "master");
+        assert_eq!(preset.scale, 1.0);
+        assert!(preset.ffmpeg_args.is_empty());
     }
 
     /// The comp background is a setting, so it round-trips — and a `.pbc`

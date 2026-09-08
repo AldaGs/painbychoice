@@ -94,3 +94,32 @@ produce a finished video.
   `add` / `mul` / `neg` / **`script`** (a Rhai one-liner over `frame`/`time`,
   with its live result or error shown). Drag boxes to arrange them. A cycle or a
   bad script falls back to a neutral value instead of breaking the frame.
+
+- **Export** — two buttons under the composition bar, and they are **different
+  verbs** rather than one button with a mode
+  ([0018](decisions/0018-two-render-buttons.md)).
+  - **Draft** asks nothing: the whole comp, **full resolution**, fast encoder
+    settings, written beside the project as `<name>_draft.mp4`. It is cheaper to
+    *encode*, never cheaper to render — a preview that silently halved
+    resolution would be the quickest way to ship the wrong file. It also refuses
+    to write a path a saved preset claims, so a draft can never overwrite a
+    deliverable.
+  - **Master** renders the project's saved **render preset** — name, path,
+    quality, scale and extra ffmpeg flags, stored in the `.pbc` — so two people
+    on one project produce identical files. A project with no preset yet gets a
+    default one written into it, which makes the *next* press reproducible.
+  - The extension picks the container, exactly as on the command line: `.mp4`
+    is H.264, a `.mov` master is **ProRes**, and a path with no video extension
+    becomes a numbered **PNG sequence**.
+  - A progress bar with **Cancel** replaces the buttons while a job runs. The
+    editor stays live — the job renders a few frames per redraw rather than
+    blocking ([0020](decisions/0020-the-render-job-is-stepped-not-threaded.md))
+    — though its frame rate drops, because the export is sharing the GPU.
+    Cancelling removes the partial video rather than leaving a complete-looking
+    file of the wrong length.
+  - The export renders through **the same vello renderer as the preview**, so
+    what you see is what is written, minus the editor's own furniture (frame
+    border, passepartout, selection, onion skins). One current exception: a
+    layer with a **blur** exports without it.
+  - The same renders are available headlessly:
+    `motion render project.pbc --out film.mp4 --quality master`.

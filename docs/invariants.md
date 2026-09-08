@@ -53,19 +53,32 @@ constraints were load-bearing and which were taste.
     ([0014](decisions/0014-undo-is-snapshots.md))
 15. **One keyframe per frame per track.** `sample` depends on it; paste replaces
     rather than stacks.
+16. **A render draws the composition and nothing else.** Everything the editor
+    adds around a comp — onion skins, passepartout, frame border, selection
+    outline — is `scene::Chrome`, and an export passes `Chrome::none()`. The
+    frame border is the one that bites: it is drawn unconditionally in the
+    preview and sits exactly on the crop, so a render that forwarded the
+    editor's chrome would put a grey rectangle around every delivered frame.
+    Pinned by a test.
+17. **An encoder is finished or aborted, never merely dropped.** Closing a
+    process-backed encoder's stdin is the signal that means *finalize the
+    container*, so dropping a cancelled ffmpeg encoder yields a complete,
+    playable, wrong-length video. `Encoder::finish` reports muxer failure;
+    `Encoder::abort` kills the process and removes the fragment. Both are pinned
+    by tests. ([0020](decisions/0020-the-render-job-is-stepped-not-threaded.md))
 
 ## The boundaries we are deliberately keeping open
 
-16. **`render/` abstracts `Scene → pixels` with more than one backend.** That
+18. **`render/` abstracts `Scene → pixels` with more than one backend.** That
     boundary is the escape hatch if vello's maturity bites; compositor code must
     not reach around it. ([0004](decisions/0004-vector-first-raster-compositor.md))
-17. **We never implement a codec.** Frames out, encoder in.
+19. **We never implement a codec.** Frames out, encoder in.
     ([0007](decisions/0007-never-implement-codecs.md))
-18. **Built-ins register through the same seam a plugin would.** A seam we do
+20. **Built-ins register through the same seam a plugin would.** A seam we do
     not dogfood is a seam that will rot.
     ([0009](decisions/0009-plugin-shaped-now.md))
-19. **Plugins read a projection and write only ops.** No plugin ever gets
+21. **Plugins read a projection and write only ops.** No plugin ever gets
     `&mut Document` — that would bypass undo, migration, and every test.
-20. **We do not ship a promise the evaluator cannot honour.**
+22. **We do not ship a promise the evaluator cannot honour.**
     `NodeCategory::is_buildable_now()` exists for exactly this, and a test pins
     it.

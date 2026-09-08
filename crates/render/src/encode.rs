@@ -87,6 +87,22 @@ pub trait Encoder {
     /// report that the muxer failed, and a truncated video that reported
     /// success is worse than an error.
     fn finish(self: Box<Self>) -> Result<(), EncodeError>;
+
+    /// Abandon the output: the render was **cancelled**, and whatever has been
+    /// written is not a deliverable.
+    ///
+    /// Distinct from `finish` because dropping an encoder is not neutral. A
+    /// process-backed encoder holds a pipe, and closing that pipe is exactly the
+    /// signal that means *"the stream ended, finalize the file"* — so simply
+    /// dropping a cancelled ffmpeg encoder produces a **complete, playable, and
+    /// wrong** video: the piece, truncated at the frame the user cancelled on,
+    /// with nothing about it to say so. That is the same failure `finish`'s
+    /// signature exists to prevent, reached from the other direction.
+    ///
+    /// The default is to drop, which is right for an encoder whose partial
+    /// output is self-evidently partial (numbered stills). Anything that muxes a
+    /// container should override it.
+    fn abort(self: Box<Self>) {}
 }
 
 /// Frames as numbered PNGs in a directory.
@@ -155,6 +171,12 @@ impl Encoder for PngSequence {
     fn finish(self: Box<Self>) -> Result<(), EncodeError> {
         Ok(())
     }
+
+    /// The written frames are kept. A half-finished PNG sequence is *visibly*
+    /// half-finished — the numbers stop — and the frames that did render are
+    /// often the reason someone cancelled, so deleting them would throw away
+    /// the only product of the work.
+    fn abort(self: Box<Self>) {}
 }
 
 /// How hard the encoder should work — the **two-button model**.
@@ -233,6 +255,20 @@ impl Quality {
             (Quality::Draft, _) => a(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]),
         }
     }
+}
+
+/// Whether an output path names a **video container** rather than a directory
+/// of stills. Extension-driven, because deciding for the user is how you end up
+/// owning a codec table ([0007](../../docs/decisions/0007-never-implement-codecs.md)).
+///
+/// Lives here rather than in a caller so the CLI and the editor's render queue
+/// cannot disagree about what `.mkv` means — one container table, one answer.
+pub fn is_video_container(path: &Path) -> bool {
+    const VIDEO: [&str; 8] = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mxf", "gif"];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 /// The `ffmpeg` binary to invoke. Shared with [`crate::decode`], so a bundled
@@ -354,6 +390,25 @@ impl Encoder for FfmpegEncoder {
             path_label(&self.path),
             String::from_utf8_lossy(&out.stderr).trim()
         )))
+    }
+
+    /// Kill ffmpeg and remove the partial file.
+    ///
+    /// The kill has to come *before* stdin is dropped. Dropping the pipe first
+    /// is how you finalize a container — ffmpeg reads EOF, writes the trailer,
+    /// and exits successfully, leaving a file that plays perfectly and is the
+    /// wrong length. Killing first means the process dies mid-stream and the
+    /// container is never finalized.
+    ///
+    /// Removing the file is then not optional: ffmpeg has already truncated
+    /// whatever was at that path on open, so leaving the fragment behind trades
+    /// a missing file for a corrupt one wearing a deliverable's name. A failure
+    /// to remove it is ignored — this path is already the error path, and there
+    /// is nothing useful to say to a user who has just pressed Cancel.
+    fn abort(mut self: Box<Self>) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -487,6 +542,47 @@ mod tests {
     ///
     /// Skips rather than fails without ffmpeg, the same contract as the decoder
     /// test — the tool is a runtime dependency, not a build one.
+    /// Cancelling must not leave a file that looks like a deliverable.
+    ///
+    /// The interesting half is that the naive implementation *passes* a
+    /// "did it stop?" test while failing this one: dropping the encoder makes
+    /// ffmpeg finalize a perfectly playable, wrong-length video. So the
+    /// assertion is about the file being **gone**, not about the process.
+    #[test]
+    fn an_aborted_ffmpeg_encode_leaves_no_file() {
+        if !FfmpegEncoder::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pbc_abort_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cancelled.mp4");
+        let spec = OutputSpec { width: 32, height: 32, fps: 24.0 };
+        let mut enc =
+            FfmpegEncoder::new(&path, spec, &Quality::Draft.ffmpeg_args(&path)).unwrap();
+        for _ in 0..4 {
+            enc.push(&vec![255u8; spec.frame_bytes()]).unwrap();
+        }
+        Box::new(enc).abort();
+        assert!(!path.exists(), "a cancelled render must not leave {}", path.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled still sequence keeps what it wrote: the frames are visibly
+    /// partial, and they are often the reason someone cancelled.
+    #[test]
+    fn an_aborted_png_sequence_keeps_its_frames() {
+        let dir = std::env::temp_dir().join(format!("pbc_abort_png_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = OutputSpec { width: 4, height: 4, fps: 24.0 };
+        let mut enc = PngSequence::new(&dir, "shot", spec).unwrap();
+        enc.push(&vec![0u8; spec.frame_bytes()]).unwrap();
+        enc.push(&vec![0u8; spec.frame_bytes()]).unwrap();
+        Box::new(enc).abort();
+        let n = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(n, 2, "the frames that rendered are kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_real_ffmpeg_encode_writes_a_playable_file() {
         if !FfmpegEncoder::available() {

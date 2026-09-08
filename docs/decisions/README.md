@@ -25,6 +25,7 @@ itself teaches nothing.
 | [0016](0016-svg-mattes-are-luminance-masks.md) | Track mattes in SVG are luminance masks, and divergences are reported |
 | [0017](0017-offline-cpu-rasterizer.md) | The offline renderer rasterizes on the CPU; parity with the preview is structural |
 | [0018](0018-two-render-buttons.md) | Two render buttons: Draft and Master |
+| [0020](0020-the-render-job-is-stepped-not-threaded.md) | The GUI render job is stepped from the redraw loop, not threaded |
 
 ## Decided, not yet built
 

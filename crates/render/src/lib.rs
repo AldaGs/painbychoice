@@ -10,7 +10,9 @@ pub mod encode;
 pub mod raster;
 
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
-pub use encode::{Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence, Quality};
+pub use encode::{
+    is_video_container, Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence, Quality,
+};
 pub use raster::{output_size, rasterize, RasterError};
 
 use kurbo::Shape as _;

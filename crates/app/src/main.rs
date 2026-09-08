@@ -26,8 +26,8 @@ use std::process::ExitCode;
 
 use motion_core::{demo::demo_document, evaluate_comp, Color, CompId, Project};
 use motion_render::{
-    output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder, OutputSpec,
-    PngSequence, Quality,
+    is_video_container, output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder,
+    OutputSpec, PngSequence, Quality,
 };
 
 const USAGE: &str = "\
@@ -169,16 +169,6 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// Whether the output path names a video container. Extension-driven, because
-/// deciding for the user is how you end up owning a codec table.
-fn is_video(path: &Path) -> bool {
-    const VIDEO: [&str; 8] = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mxf", "gif"];
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| VIDEO.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
 fn render(args: &[String]) -> Result<(), String> {
     let o = parse(args)?;
     let project = match &o.project {
@@ -207,7 +197,7 @@ fn render(args: &[String]) -> Result<(), String> {
     let (w, h) = output_size(comp.width, comp.height, o.scale);
     let spec = OutputSpec { width: w, height: h, fps: o.fps.unwrap_or(comp.fps) };
 
-    let mut encoder: Box<dyn Encoder> = if is_video(&o.out) {
+    let mut encoder: Box<dyn Encoder> = if is_video_container(&o.out) {
         // The preset first, the user's own arguments after it, so `--arg` can
         // override anything the preset chose rather than fighting it.
         let mut args = o.quality.ffmpeg_args(&o.out);
@@ -320,10 +310,10 @@ mod tests {
     /// no guess — so a `.mp4` is a video and a bare directory is a sequence.
     #[test]
     fn the_extension_chooses_the_encoder() {
-        assert!(is_video(Path::new("film.mp4")));
-        assert!(is_video(Path::new("MASTER.MOV")), "case-insensitive");
-        assert!(!is_video(Path::new("frames")));
-        assert!(!is_video(Path::new("frames/shot_01")));
+        assert!(is_video_container(Path::new("film.mp4")));
+        assert!(is_video_container(Path::new("MASTER.MOV")), "case-insensitive");
+        assert!(!is_video_container(Path::new("frames")));
+        assert!(!is_video_container(Path::new("frames/shot_01")));
     }
 
     #[test]

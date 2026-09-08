@@ -46,8 +46,8 @@ pub use expr::{
 pub use path::{Anchor, PathPart, PathSample, VectorPath};
 pub use pathfinder::{combine as combine_paths, BoolOp};
 pub use node::{
-    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project, Shape,
-    Stroke, Transform, ViewAids,
+    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project,
+    RenderPreset, Shape, Stroke, Transform, ViewAids,
 };
 pub use graph::{
     Binding, ConnectError, Edge, Endpoint, GraphCtx, GraphError, GraphNode, GraphNodeId, NodeGraph,

@@ -8,8 +8,10 @@ close it.
 
 ## 1. Where the project actually is
 
-Measured, not remembered: 37k lines of Rust across four crates, `cargo test
---workspace` green (553 tests: 304 core, 239 live, 10 render).
+Measured, not remembered: ~38k lines of Rust across four crates, `cargo test
+--workspace` green (628 tests: 317 core, 272 live, 31 render, 8 CLI). The render
+and live counts include tests that need a real GPU or a real `ffmpeg`; both skip
+cleanly where those are absent, so a headless CI box sees fewer.
 
 | Area | State |
 | --- | --- |
@@ -19,16 +21,18 @@ Measured, not remembered: 37k lines of Rust across four crates, `cargo test
 | Editor (`live`) | Broad. Dockable panels, timeline + dopesheet + curves, gizmo, pen tool, snapping, guides, onion skins, motion path, layer strips, font picker, undo/redo. |
 | Compositing | Model only. Blend modes, masks, track mattes exist in `Scene` and both backends. No effect stack, no GPU effect passes. |
 | Footage | Import works: stills (incl. HEIC/RAW), video via an `ffmpeg` sidecar, threaded decode cache with a warm frame stream. |
-| **Export** | **Does not exist.** No encoder, no render queue, no PNG sequence. `motion` still writes the 9-frame SVG demo. |
+| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gaps: no frame range, no frame-parallelism, and blurred layers don't reach a GUI export. |
 | **Audio** | **Does not exist.** No decode, no playback, no waveform, no master clock. |
 | Effects | Does not exist. `NodeCategory::Effect` is a registry slot with nothing in it. |
 | Motion blur | Does not exist. |
 | Project robustness | No autosave, no crash recovery, no asset relink UI, no "collect files". |
 
 **The honest summary:** PBC is a strong *animation authoring engine* with a
-capable editor on top, and it is **not yet a video tool**, because nothing
-comes out of it. Everything on the roadmap past this point has been engine
-depth; the gap to production is delivery, sound, and the finishing pass.
+capable editor on top, and as of 2026-09-08 **things come out of it** — a `.pbc`
+becomes an mp4, a ProRes master or a PNG sequence, from a button or from the
+command line. The remaining gap to production is **sound**, the **finishing
+pass** (effects), and **not losing work**. Everything on the roadmap before this
+point was engine depth; delivery is no longer the blocker.
 
 ## 2. What "ready to make production videos" requires
 
@@ -82,7 +86,7 @@ The second fix matters more than it looks: the SVG backend is the headless way
 to verify compositing semantics without a GPU, which is what Phase 1's
 preview-equals-export tests will assert against.
 
-### Phase 1 — Export (the unblocker) — *in progress*
+### Phase 1 — Export (the unblocker) — *in progress, nearly closed*
 
 The single highest-value change in the project. Nothing else here matters if a
 piece cannot leave the app.
@@ -108,25 +112,50 @@ piece cannot leave the app.
   `--scale`, `--fps`, ffmpeg pass-through, and `--demo` for rendering the
   built-in document on a machine with no project to hand.
 
+**Landed 2026-09-08 — the GUI half:**
+
+- ✅ **An offscreen vello render target** (`live/src/offscreen.rs`). The editor's
+  export renders through **the same vello renderer as the preview**, into a
+  texture instead of a surface, and reads the pixels back. There is no second
+  rasterizer in this path and therefore no parity *question* — the export is the
+  preview, minus the editor's furniture. That last clause is now enforced rather
+  than hoped for: the onion skins, passepartout, frame border and selection
+  outline were four separate arguments to `to_vello` and are now one `Chrome`
+  parameter, of which export passes `Chrome::none()`. The frame border in
+  particular was drawn *unconditionally*, so before this every rendered frame
+  would have carried a 1.5px grey rectangle exactly on the crop.
+- ✅ **A render queue in the GUI** (`live/src/renderqueue.rs`), hosting the two
+  buttons under the composition bar. A job is **stepped from the redraw loop**
+  rather than threaded — the device, the vello renderer and the footage cache all
+  belong to the preview, and the alternatives cost either a second adapter or a
+  lock that freezes the editor anyway. See
+  [`decisions/0020`](decisions/0020-the-render-job-is-stepped-not-threaded.md).
+- ✅ **Named render presets saved in the `.pbc`** (`Project::render_presets`,
+  `#[serde(default)]`, so no migration). Master renders from the project's
+  preset, which is what makes two people on one project produce the same file.
+- ✅ **`Encoder::abort`**, which the Cancel button forced into existence:
+  dropping a process-backed encoder closes ffmpeg's stdin, and that is precisely
+  the signal meaning *finalize the container* — so a cancelled render would have
+  produced a complete, playable, wrong-length video with nothing to mark it as
+  partial.
+
 **Still ahead in this phase:**
 
-- **An offscreen vello render target**, so the *editor's* export uses the same
-  rasterizer as its preview and per-pixel parity becomes provable. Belongs where
-  a GPU device already exists.
-- **A render queue in the GUI**, hosting **two buttons** rather than one dialog:
-  **Draft** (no questions, one keystroke) and **Master** (full settings, saved
-  with the project so a team renders identically). The `Quality` model behind
-  them is built and tested; the buttons are a thin call.
-  See [`decisions/0018-two-render-buttons.md`](decisions/0018-two-render-buttons.md).
-- **Named render presets saved in the `.pbc`**, so an export spec travels with
-  the piece instead of living in whoever last opened the dialog.
 - **Frame-parallel rendering.** The loop is single-threaded and cleanly
   pixel-bound; frames are independent and `evaluate` is pure, so this is the
-  largest easy win available. See [`performance.md`](performance.md).
+  largest easy win available. It composes with the stepped job rather than
+  replacing it: the parallel half is `evaluate`, the GPU half stays serial
+  because there is one device. See [`performance.md`](performance.md).
+- **A range control.** A job renders the whole comp; the work area exists in the
+  timeline and does not reach the render yet.
+- **Blurred layers in a GUI export.** The preview's effect-stack readback
+  (`rasterize_effect_layers`) is not wired into the offscreen path, so a layer
+  with a blur exports without it. The colour effects ride the in-scene path and
+  are unaffected. This is the one place the GUI export is *not* yet the preview.
 
 **Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI *and*
 from the command line, and the exported frame equals the preview frame.
-*Half of that is true today: the command line half.*
+*True today except for blurred layers, noted above.*
 
 ### Phase 2 — Audio and the master clock
 
@@ -409,8 +438,8 @@ we intend to hand over.
 
 ## 6. The one-line version
 
-The engine is ready. The **frame-count and matte-parity** gaps are closed; next
-is **export**, then **audio**, the **compositor and effects**, and **autosave and relink**
-— and stop adding engine depth until a finished video can leave the
-application. Extensibility (§4) costs nothing today but discipline: keep every
-built-in going through the registry, and every edit through an op.
+The engine is ready and **export now works from both the CLI and the GUI**. Next
+is **audio and the master clock**, then the **compositor and effects**, then
+**autosave and relink** — and still no new engine depth until those land.
+Extensibility (§4) costs nothing today but discipline: keep every built-in going
+through the registry, and every edit through an op.
