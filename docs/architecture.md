@@ -16,7 +16,8 @@ crates/
   core/    document model + evaluation engine. No GPU, no windowing. (unit-tested)
   render/  evaluated Scene -> pixels, and pixels -> a file:
              raster.rs   CPU rasterizer (the offline backend)
-             encode.rs   the Encoder trait: PNG sequence + ffmpeg sidecar
+             encode.rs   the Encoder trait: PNG sequence + ffmpeg sidecar,
+                         split into a Preparer (any thread) and a writer (one)
              decode.rs   footage in, through the same ffmpeg discipline
              parallel.rs frames across cores, delivered in order
            The SVG backend lives in lib.rs. vello lives in live/.

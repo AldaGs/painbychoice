@@ -78,25 +78,33 @@ same release profile, CPU rasterizer), which is roughly 3× the container:
 **Frame-parallel rendering, measured 2026-09-08 on the same machine** (16
 logical cores, demo at 1920x1080, PNG sequence, `--threads n`):
 
-| Threads | Frames/sec | Speedup |
+| Threads | Compression on the writer | Compression on the workers |
 | --- | --- | --- |
-| 1 | 68.5 | 1.0x |
-| 2 | 169.9 | 2.5x |
-| 4 | 267.5 | 3.9x |
-| 8 | 312.8 | 4.6x |
-| 16 (default) | 307.3 | 4.5x |
+| 1 | 68.5 | 72.8 |
+| 2 | 169.9 | 143.3 |
+| 4 | 267.5 | 225.8 |
+| 8 | 312.8 | 345.4 |
+| 16 (default) | 307.3 | **434.1** |
 
-**It stops scaling at about 8, and the reason is the writer.** Frames are
-rendered in parallel but written by one thread, and at 1080p PNG encoding is a
-large enough share of a frame's cost to become the serial bottleneck — Amdahl's
-law, arriving early. Adding threads past that point buys nothing and the default
-(one per core) is slightly *worse* than 8 through oversubscription.
+The left column stopped scaling at about eight threads, and the reason was the
+writer: frames rendered in parallel but were *compressed* by the one thread that
+wrote them. Measured directly, `PngSequence::push` was **1.78 ms/frame** at
+1080p, against an Amdahl-implied serial fraction of ~2.9 ms/frame — so
+compression was most of the ceiling.
 
-So the next parallelism win is not more workers, it is taking PNG compression
-off the writer thread. Note the 2-thread row is superlinear, which is a
-measurement artefact rather than magic: single-run timings on a loaded desktop
-carry a few percent of noise, and 68.5 here against 76.4 in the table above is
-that spread.
+Moving it to the workers ([`Preparer`], `encode.rs`) is the right column: **6.0x
+over sequential**, and it keeps scaling past eight where it used to flatten. The
+low-thread rows are slightly *worse*, which is the honest cost — `push` now
+copies the frame before compressing it, and with one worker there is nothing to
+win back. The crossover is around four threads.
+
+**The ffmpeg path is unaffected by that change and is capped lower** (~215 fps at
+8 threads): its `Preparer` is a passthrough because ffmpeg compresses in its own
+process, so the ceiling there is the sidecar and the pipe, not our writer.
+
+Note the 2-thread row in the left column is superlinear, which is measurement
+noise rather than magic: single-run timings on a loaded desktop carry a few
+percent, and 68.5 there against 76.4 in the table above is that spread.
 
 The encoder spread is the useful part: **master costs ~4% over draft**, and
 ProRes ~25% over H.264, at this resolution. Both are small next to the

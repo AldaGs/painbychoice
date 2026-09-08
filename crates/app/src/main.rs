@@ -254,6 +254,11 @@ fn render(args: &[String]) -> Result<(), String> {
     // split precisely along what is pure: `evaluate` + `rasterize` take only
     // the project and a frame number and are called from many threads, while
     // the encoder — a pipe with no notion of frame numbers — stays on this one.
+    // The encoder's off-thread half, taken once. It borrows nothing from the
+    // encoder, which is what lets a worker compress a frame while the writer
+    // still holds the encoder mutably.
+    let preparer = encoder.preparer();
+
     let render_frame = |frame: i64| {
         let scene = evaluate_comp(&project, comp_id, frame as f64);
         // Warnings are collected per frame and merged by the writer rather than
@@ -264,7 +269,12 @@ fn render(args: &[String]) -> Result<(), String> {
         let (pixels, report) =
             rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)
                 .map_err(|e| e.to_string())?;
-        Ok((pixels, warnings, report))
+        // Compression happens here, on the worker, not on the writer. For a PNG
+        // sequence this is most of a frame's encoding cost and was the serial
+        // fraction that capped the whole render; for an ffmpeg sidecar it is a
+        // move and costs nothing.
+        let prepared = preparer.prepare(pixels).map_err(|e| e.to_string())?;
+        Ok((prepared, warnings, report))
     };
 
     let mut written = 0i64;
@@ -272,11 +282,11 @@ fn render(args: &[String]) -> Result<(), String> {
         start..=end,
         threads,
         render_frame,
-        |frame, (pixels, warnings, report)| {
+        |frame, (prepared, warnings, report)| {
             for note in warnings.into_iter().chain(report) {
                 *notes.entry(note).or_default() += 1;
             }
-            encoder.push(&pixels).map_err(|e| e.to_string())?;
+            encoder.write_prepared(prepared).map_err(|e| e.to_string())?;
             written += 1;
             if !o.quiet && (frame - start) % 25 == 0 {
                 eprint!("\r  frame {frame}/{end}");

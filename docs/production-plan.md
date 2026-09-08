@@ -86,7 +86,7 @@ The second fix matters more than it looks: the SVG backend is the headless way
 to verify compositing semantics without a GPU, which is what Phase 1's
 preview-equals-export tests will assert against.
 
-### Phase 1 — Export (the unblocker) — *in progress, nearly closed*
+### Phase 1 — Export (the unblocker) — ✅ **done**
 
 The single highest-value change in the project. Nothing else here matters if a
 piece cannot leave the app.
@@ -168,14 +168,22 @@ piece cannot leave the app.
   converted to the inclusive form the renderer and `--start/--end` share, once,
   at the caller.
 
-**Still ahead in this phase:**
+- ✅ **Parallel encoding.** Compression moved off the writer thread. An encoder
+  hands out a `Preparer` — a small `Send + Sync` value holding no borrow of the
+  encoder — which does the half of the work that needs only the pixels, on any
+  thread; the encoder keeps only the writing, which is inherently serial because
+  an output file has one cursor. PNG went from 4.3x to **6.0x** and now scales
+  past eight threads. ffmpeg's preparer is a passthrough, since it compresses in
+  its own process.
 
-- **Parallel encoding.** The next win after the above, and the thing that would
-  let the frame parallelism keep scaling: compression currently happens on the
-  one thread that writes.
+**Phase 1 is complete.**
 **Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI *and*
 from the command line, and the exported frame equals the preview frame.
-**True today**, for both halves.
+**Met.** The remaining known limit is that the *GUI* export is GPU-serial — there
+is one device, shared with the preview — which is a property of that path rather
+than a gap in it.
+
+**Next: Phase 2, audio and the master clock.**
 
 ### Phase 2 — Audio and the master clock
 

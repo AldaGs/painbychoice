@@ -76,16 +76,22 @@ constraints were load-bearing and which were taste.
 
 ## The boundaries we are deliberately keeping open
 
-18. **`render/` abstracts `Scene → pixels` with more than one backend.** That
+18. **An encoder's `Preparer` shares nothing with its encoder.** It is called
+    from many threads at once, so it holds pixels-in, bytes-out and no state.
+    An encoder that overrides `preparer` must override `write_prepared` to
+    match — they are two halves of one operation running on different threads,
+    and `push` routes through both so the sequential and parallel paths cannot
+    write different files. Pinned by a test.
+19. **`render/` abstracts `Scene → pixels` with more than one backend.** That
     boundary is the escape hatch if vello's maturity bites; compositor code must
     not reach around it. ([0004](decisions/0004-vector-first-raster-compositor.md))
-19. **We never implement a codec.** Frames out, encoder in.
+20. **We never implement a codec.** Frames out, encoder in.
     ([0007](decisions/0007-never-implement-codecs.md))
-20. **Built-ins register through the same seam a plugin would.** A seam we do
+21. **Built-ins register through the same seam a plugin would.** A seam we do
     not dogfood is a seam that will rot.
     ([0009](decisions/0009-plugin-shaped-now.md))
-21. **Plugins read a projection and write only ops.** No plugin ever gets
+22. **Plugins read a projection and write only ops.** No plugin ever gets
     `&mut Document` — that would bypass undo, migration, and every test.
-22. **We do not ship a promise the evaluator cannot honour.**
+23. **We do not ship a promise the evaluator cannot honour.**
     `NodeCategory::is_buildable_now()` exists for exactly this, and a test pins
     it.

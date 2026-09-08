@@ -12,7 +12,8 @@ pub mod raster;
 
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
 pub use encode::{
-    is_video_container, Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence, Quality,
+    is_video_container, Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence, Preparer,
+    Quality,
 };
 pub use parallel::{default_threads, render_in_order};
 pub use raster::{output_size, rasterize, RasterError};

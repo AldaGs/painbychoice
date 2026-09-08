@@ -82,6 +82,38 @@ pub trait Encoder {
     /// [`OutputSpec::frame_bytes`] long.
     fn push(&mut self, rgba: &[u8]) -> Result<(), EncodeError>;
 
+    /// The half of this encoder's work that does **not** need the encoder.
+    ///
+    /// Writing frames is inherently serial — an output file has one cursor and
+    /// frames have an order — but *compressing* one does not have to be. A PNG
+    /// sequence spends most of a frame in deflate, which depends on nothing but
+    /// the pixels; with the rasterizer parallelised that compression became the
+    /// serial fraction that capped the whole render (see
+    /// [`crate::parallel`] and `docs/performance.md`).
+    ///
+    /// So an encoder hands out a small, `Send + Sync`, self-contained value that
+    /// can do that work on any thread, and keeps only the writing to itself.
+    /// Returning a [`Preparer`] rather than taking `&self` in a `prepare` method
+    /// is what lets a worker prepare a frame while the writer still holds the
+    /// encoder mutably — the two halves genuinely do not share state.
+    ///
+    /// The default says "there is nothing to precompute", which is right for a
+    /// sidecar encoder: ffmpeg compresses in its own process, on its own
+    /// threads, and the only work on our side is the pipe.
+    fn preparer(&self) -> Preparer {
+        Preparer::Passthrough
+    }
+
+    /// Write a frame that [`Preparer::prepare`] already processed.
+    ///
+    /// The default treats the prepared bytes as raw pixels, which pairs with
+    /// [`Preparer::Passthrough`]. An encoder that overrides `preparer` must
+    /// override this too, and the two must agree about what the bytes are —
+    /// they are two halves of one operation that happen on different threads.
+    fn write_prepared(&mut self, frame: Vec<u8>) -> Result<(), EncodeError> {
+        self.push(&frame)
+    }
+
     /// Close the output. Takes `Box<Self>` so it can consume the encoder
     /// through a trait object — an encoder that is merely dropped has no way to
     /// report that the muxer failed, and a truncated video that reported
@@ -103,6 +135,58 @@ pub trait Encoder {
     /// output is self-evidently partial (numbered stills). Anything that muxes a
     /// container should override it.
     fn abort(self: Box<Self>) {}
+}
+
+/// The per-frame work an encoder can hand to any thread.
+///
+/// Deliberately a small enum rather than a boxed closure: it is `Copy`, it
+/// carries no borrow of the encoder, and a new variant is a visible change to
+/// the one place that decides what can be done off the writer thread. A trait
+/// object here would let an implementation smuggle in shared state, which is
+/// exactly what must not happen — a `Preparer` is called from many threads at
+/// once and holds nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preparer {
+    /// Nothing to precompute; the frame reaches the writer as raw pixels.
+    Passthrough,
+    /// Compress to a PNG file's bytes at this size.
+    Png { width: u32, height: u32 },
+}
+
+impl Preparer {
+    /// Do the off-thread half of encoding one frame.
+    ///
+    /// Takes the pixels **by value** so the passthrough case is a move rather
+    /// than an 8MB memcpy per 1080p frame — which would have handed back a good
+    /// share of what the parallelism won.
+    pub fn prepare(&self, rgba: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
+        match *self {
+            Preparer::Passthrough => Ok(rgba),
+            Preparer::Png { width, height } => {
+                let expected = width as usize * height as usize * 4;
+                if rgba.len() != expected {
+                    return Err(EncodeError::Failed(format!(
+                        "frame is {} bytes, expected {expected} for {width}x{height} RGBA",
+                        rgba.len(),
+                    )));
+                }
+                // Encoded into memory rather than straight to the file: the
+                // write is the writer thread's job, and doing it here would put
+                // the frames back out of order.
+                let mut out = std::io::Cursor::new(Vec::new());
+                image::write_buffer_with_format(
+                    &mut out,
+                    &rgba,
+                    width,
+                    height,
+                    image::ColorType::Rgba8,
+                    image::ImageFormat::Png,
+                )
+                .map_err(|e| EncodeError::Failed(format!("encoding a PNG frame: {e}")))?;
+                Ok(out.into_inner())
+            }
+        }
+    }
 }
 
 /// Frames as numbered PNGs in a directory.
@@ -142,27 +226,31 @@ impl Encoder for PngSequence {
         "png-sequence"
     }
 
+    /// Routed through the two-phase pair rather than duplicating them, so the
+    /// sequential and parallel paths cannot drift into writing different files.
+    /// The copy this costs is the price of the borrowed-slice signature, and it
+    /// is paid only by callers that are not parallelising anyway.
     fn push(&mut self, rgba: &[u8]) -> Result<(), EncodeError> {
-        if rgba.len() != self.spec.frame_bytes() {
-            return Err(EncodeError::Failed(format!(
-                "frame is {} bytes, expected {} for {}x{} RGBA",
-                rgba.len(),
-                self.spec.frame_bytes(),
-                self.spec.width,
-                self.spec.height
-            )));
-        }
+        let prepared = self.preparer().prepare(rgba.to_vec())?;
+        self.write_prepared(prepared)
+    }
+
+    fn preparer(&self) -> Preparer {
+        Preparer::Png { width: self.spec.width, height: self.spec.height }
+    }
+
+    /// `frame` is an encoded PNG file, so this is a plain write.
+    ///
+    /// The index is assigned **here**, not in `prepare`: it is the writer's
+    /// counter, and frames reach the writer in order. Numbering during
+    /// preparation would name each file after whichever worker happened to
+    /// finish it.
+    fn write_prepared(&mut self, frame: Vec<u8>) -> Result<(), EncodeError> {
         // Five digits: a hundred thousand frames is over an hour at 24fps, and
         // fixed width is what makes the sequence sort correctly everywhere.
         let path = self.dir.join(format!("{}_{:05}.png", self.stem, self.index));
-        image::save_buffer(
-            &path,
-            rgba,
-            self.spec.width,
-            self.spec.height,
-            image::ColorType::Rgba8,
-        )
-        .map_err(|e| EncodeError::Failed(format!("writing {}: {e}", path.display())))?;
+        std::fs::write(&path, &frame)
+            .map_err(|e| EncodeError::Failed(format!("writing {}: {e}", path.display())))?;
         self.written.push(path);
         self.index += 1;
         Ok(())
@@ -542,6 +630,80 @@ mod tests {
     ///
     /// Skips rather than fails without ffmpeg, the same contract as the decoder
     /// test — the tool is a runtime dependency, not a build one.
+    /// **The two paths must write the same bytes.** `push` and
+    /// `prepare` + `write_prepared` are the sequential and parallel routes to
+    /// one output, and a divergence would mean a `--threads 1` render and a
+    /// `--threads 16` render of the same project produced different files —
+    /// which is exactly the property the whole parallel design is verified
+    /// against elsewhere.
+    #[test]
+    fn preparing_and_pushing_produce_identical_files() {
+        let spec = OutputSpec { width: 8, height: 4, fps: 24.0 };
+        let mut rgba = vec![0u8; spec.frame_bytes()];
+        for (i, b) in rgba.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let seq_dir = std::env::temp_dir().join(format!("pbc_prep_seq_{}", std::process::id()));
+        let par_dir = std::env::temp_dir().join(format!("pbc_prep_par_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&seq_dir);
+        let _ = std::fs::remove_dir_all(&par_dir);
+
+        let mut sequential = PngSequence::new(&seq_dir, "f", spec).unwrap();
+        sequential.push(&rgba).unwrap();
+
+        let mut parallel = PngSequence::new(&par_dir, "f", spec).unwrap();
+        let prepared = parallel.preparer().prepare(rgba.clone()).unwrap();
+        parallel.write_prepared(prepared).unwrap();
+
+        let a = std::fs::read(seq_dir.join("f_00000.png")).unwrap();
+        let b = std::fs::read(par_dir.join("f_00000.png")).unwrap();
+        assert_eq!(a, b, "the sequential and parallel encodings must be byte-identical");
+
+        let _ = std::fs::remove_dir_all(&seq_dir);
+        let _ = std::fs::remove_dir_all(&par_dir);
+    }
+
+    /// A PNG preparer rejects a wrong-sized frame, and does it *on the worker*
+    /// rather than letting a bad buffer reach the writer — the check has to
+    /// live in both halves because either can be the entry point.
+    #[test]
+    fn a_png_preparer_refuses_a_wrongly_sized_frame() {
+        let p = Preparer::Png { width: 4, height: 4 };
+        let err = p.prepare(vec![0u8; 10]).expect_err("must refuse");
+        assert!(format!("{err}").contains("expected 64"), "{err}");
+    }
+
+    /// The passthrough preparer moves the pixels rather than copying them: at
+    /// 1080p a copy per frame is 8MB of memcpy that would hand back a good part
+    /// of what the parallelism won. Asserted by capacity identity, which a
+    /// reallocating implementation would not preserve.
+    #[test]
+    fn the_passthrough_preparer_does_not_copy() {
+        let mut rgba = Vec::with_capacity(4096);
+        rgba.extend_from_slice(&[7u8; 4096]);
+        let before = rgba.as_ptr();
+        let out = Preparer::Passthrough.prepare(rgba).unwrap();
+        assert_eq!(out.as_ptr(), before, "the frame must be moved, not reallocated");
+    }
+
+    /// A sidecar encoder has nothing to precompute — ffmpeg compresses in its
+    /// own process — so it must not claim otherwise and start doing work twice.
+    #[test]
+    fn an_ffmpeg_encoder_prepares_nothing() {
+        if !FfmpegEncoder::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pbc_prep_ff_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.mp4");
+        let spec = OutputSpec { width: 16, height: 16, fps: 24.0 };
+        let enc = FfmpegEncoder::new(&path, spec, &Quality::Draft.ffmpeg_args(&path)).unwrap();
+        assert_eq!(enc.preparer(), Preparer::Passthrough);
+        Box::new(enc).abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Cancelling must not leave a file that looks like a deliverable.
     ///
     /// The interesting half is that the naive implementation *passes* a
