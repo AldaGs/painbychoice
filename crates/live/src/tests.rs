@@ -5330,6 +5330,7 @@ fn the_composition_bar_fits_its_fixed_height() {
                     RenderBar {
                         active: None,
                         last: None,
+                        draft_out: "titles_draft.mp4",
                         master_out: Some("master.mp4"),
                         out: &mut render_edits,
                     },
@@ -5388,6 +5389,7 @@ fn the_composition_bar_still_fits_while_a_render_runs() {
                     RenderBar {
                         active: Some(&progress),
                         last: None,
+                        draft_out: "titles_draft.mp4",
                         master_out: Some("master.mp4"),
                         out: &mut render_edits,
                     },

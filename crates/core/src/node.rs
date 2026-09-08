@@ -1440,6 +1440,18 @@ pub struct Project {
     /// `#[serde(default)]` so a file written before presets existed still loads.
     #[serde(default)]
     pub render_presets: Vec<RenderPreset>,
+    /// Where **Draft** writes, when the derived default is not wanted.
+    ///
+    /// `None` means the default: `<project stem>_draft.mp4` beside the project.
+    /// That default is the point of Draft — a destination you can guess without
+    /// being told — so this is an *override*, not a setting Draft depends on. A
+    /// project that has never touched it behaves exactly as one from before the
+    /// field existed.
+    ///
+    /// Stored like a preset's path: relative to the project when it sits under
+    /// it, absolute otherwise.
+    #[serde(default)]
+    pub draft_out: Option<String>,
 }
 
 /// A named export spec, saved in the `.pbc`.
@@ -1510,6 +1522,7 @@ impl Project {
             legacy_bindings: Vec::new(),
             legacy_shape_bindings: Vec::new(),
             render_presets: Vec::new(),
+            draft_out: None,
         }
     }
 

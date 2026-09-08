@@ -2599,7 +2599,10 @@ impl App {
     /// (rule 2 of decision 0018). Refusing loudly beats quietly choosing another
     /// name, which would leave the user hunting for a file.
     pub(crate) fn start_draft(&mut self) {
-        let out = crate::renderqueue::draft_path(self.project_path.as_deref());
+        let out = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        );
         if crate::renderqueue::collides_with_a_preset(
             &out,
             &self.project.render_presets,
@@ -2646,6 +2649,21 @@ impl App {
         let Some(chosen) = dialog.save_file() else {
             return false;
         };
+        // The same rule from the other side: a Master aimed at the draft's path
+        // would have every draft overwrite the deliverable from then on.
+        let draft = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        );
+        if chosen == draft {
+            self.report_render_failure(
+                chosen,
+                Quality::Master,
+                "Draft already writes this path; pick another so a preview                  cannot overwrite the deliverable"
+                    .to_string(),
+            );
+            return false;
+        }
         let stored =
             crate::renderqueue::preset_path_for(self.project_path.as_deref(), &chosen);
         if self.project.render_presets.is_empty() {
@@ -2653,6 +2671,48 @@ impl App {
         }
         self.project.render_presets[0].out = stored;
         true
+    }
+
+    /// Choose where Draft writes, through the system Save dialog.
+    ///
+    /// Draft still asks nothing when *pressed* — this changes which known place
+    /// it goes to, and 0018's "no dialog, ever" is about the press.
+    ///
+    /// Refuses a path a Master preset claims, which is rule 2 of that decision
+    /// enforced at the point the mistake is made rather than at render time:
+    /// telling someone their draft just overwrote a deliverable is too late.
+    pub(crate) fn pick_draft_output(&mut self) {
+        let current = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "mkv", "webm"])
+            .add_filter("Any (no video extension writes a PNG sequence)", &["*"])
+            .set_file_name(
+                current.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            );
+        if let Some(dir) = current.parent().filter(|d| !d.as_os_str().is_empty()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(chosen) = dialog.save_file() else {
+            return;
+        };
+        if crate::renderqueue::collides_with_a_preset(
+            &chosen,
+            &self.project.render_presets,
+            self.project_path.as_deref(),
+        ) {
+            self.report_render_failure(
+                chosen,
+                Quality::Draft,
+                "a Master preset already writes this path; a draft will not                  overwrite a deliverable"
+                    .to_string(),
+            );
+            return;
+        }
+        self.project.draft_out =
+            Some(crate::renderqueue::preset_path_for(self.project_path.as_deref(), &chosen));
     }
 
     /// Start a Master render from the project's first saved preset, asking for
@@ -3271,6 +3331,12 @@ impl App {
         });
         let render_summary = self.queue.last().map(crate::renderqueue::RenderSummary::of);
         let master_out = self.project.render_presets.first().map(|p| p.out.clone());
+        let draft_out = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        )
+        .display()
+        .to_string();
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
@@ -3369,6 +3435,7 @@ impl App {
                         RenderBar {
                             active: render_progress.as_ref(),
                             last: render_summary.as_ref(),
+                            draft_out: &draft_out,
                             master_out: master_out.as_deref(),
                             out: &mut render_edits,
                         },
@@ -3754,6 +3821,8 @@ impl App {
             self.start_master();
         } else if render_edits.pick_output {
             self.pick_master_output();
+        } else if render_edits.pick_draft_output {
+            self.pick_draft_output();
         }
 
         if let Some(name) = comp.rename {

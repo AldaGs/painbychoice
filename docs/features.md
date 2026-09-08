@@ -99,7 +99,9 @@ produce a finished video.
   verbs** rather than one button with a mode
   ([0018](decisions/0018-two-render-buttons.md)).
   - **Draft** asks nothing: the whole comp, **full resolution**, fast encoder
-    settings, written beside the project as `<name>_draft.mp4`. It is cheaper to
+    settings, written beside the project as `<name>_draft.mp4`. The save icon
+    beside it picks a different destination — Draft still never asks when
+    *pressed*, it just goes somewhere else known. It is cheaper to
     *encode*, never cheaper to render — a preview that silently halved
     resolution would be the quickest way to ship the wrong file. It also refuses
     to write a path a saved preset claims, so a draft can never overwrite a

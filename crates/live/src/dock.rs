@@ -613,7 +613,9 @@ pub(crate) struct CameraBar {
 pub(crate) struct RenderBar<'a> {
     pub(crate) active: Option<&'a crate::renderqueue::RenderProgress>,
     pub(crate) last: Option<&'a crate::renderqueue::RenderSummary>,
-    /// Where Master currently writes, for the output button's tooltip.
+    /// Where Draft currently writes, for its output button's tooltip.
+    pub(crate) draft_out: &'a str,
+    /// Where Master currently writes, for its output button's tooltip.
     pub(crate) master_out: Option<&'a str>,
     pub(crate) out: &'a mut crate::renderqueue::RenderEdits,
 }
@@ -900,6 +902,7 @@ pub(crate) fn comp_ui(
             ui,
             render.active,
             render.last,
+            render.draft_out,
             render.master_out,
             render.out,
         );

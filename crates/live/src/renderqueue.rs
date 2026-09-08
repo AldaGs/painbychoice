@@ -214,6 +214,10 @@ impl RenderQueue {
 /// Showing the destination on hover is what makes the "Master does not ask"
 /// rule liveable — the setting is invisible otherwise, and an export you cannot
 /// see the destination of is one you check by rendering it.
+fn draft_hint(draft_out: &str) -> String {
+    format!("Draft writes to {draft_out} — click to change")
+}
+
 fn output_hint(master_out: Option<&str>) -> String {
     match master_out {
         Some(out) => format!("Master writes to {out} — click to change"),
@@ -230,7 +234,16 @@ fn output_hint(master_out: Option<&str>) -> String {
 /// An unsaved project has no directory to be next to, so it goes to the
 /// system temp directory. That is deliberate over the current working
 /// directory, which for a windowed app is wherever the launcher happened to be.
-pub(crate) fn draft_path(project: Option<&Path>) -> PathBuf {
+///
+/// `override_out` is the project's `draft_out`, when someone has chosen one.
+/// Setting it does not make Draft *ask* anything at press time — it is still one
+/// keystroke to a known place — it only changes which known place.
+pub(crate) fn draft_path(project: Option<&Path>, override_out: Option<&str>) -> PathBuf {
+    // An explicit destination wins, resolved exactly the way a preset's is so
+    // the two halves of "where does this write" cannot disagree.
+    if let Some(out) = override_out.map(str::trim).filter(|s| !s.is_empty()) {
+        return resolve_out(project, out);
+    }
     match project.and_then(|p| p.file_stem().map(|s| (p, s.to_string_lossy().into_owned()))) {
         Some((path, stem)) => {
             let dir = path.parent().unwrap_or(Path::new("."));
@@ -406,6 +419,13 @@ pub(crate) struct RenderEdits {
     /// on one project still produce the same file. A dialog on every press
     /// would be the output-module habit that decision exists to avoid.
     pub(crate) pick_output: bool,
+    /// Choose where Draft writes.
+    ///
+    /// Draft still never asks *at press time* — 0018's "no dialog, ever" is
+    /// about pressing the button, not about whether the destination can be
+    /// configured at all. This changes which known place it writes to; the
+    /// default stays the guessable one beside the project.
+    pub(crate) pick_draft_output: bool,
 }
 
 /// A running job as the bar needs to show it — an owned snapshot, so the UI
@@ -481,6 +501,7 @@ pub(crate) fn render_ui(
     ui: &mut egui::Ui,
     active: Option<&RenderProgress>,
     last: Option<&RenderSummary>,
+    draft_out: &str,
     master_out: Option<&str>,
     out: &mut RenderEdits,
 ) {
@@ -496,26 +517,32 @@ pub(crate) fn render_ui(
             }
         }
         None => {
+            // Each button is followed by its own destination picker, so which
+            // path a save icon sets is never a guess. An icon rather than a
+            // word because the row is fixed-height and already busy.
             if ui
                 .button("Draft")
                 .on_hover_text(
-                    "Render the whole comp at full resolution with fast encoder                      settings, beside the project. No questions asked.",
+                    "Render the whole comp at full resolution, fast encoder settings, \
+                     no questions asked.",
                 )
                 .clicked()
             {
                 out.draft = true;
             }
+            if crate::icon::button(ui, crate::icon::SAVE, &draft_hint(draft_out)).clicked() {
+                out.pick_draft_output = true;
+            }
             if ui
                 .button("Master")
                 .on_hover_text(
-                    "Render the deliverable using the project's saved render                      preset, so everyone on this project produces the same file.",
+                    "Render the deliverable from the project's saved preset, so \
+                     everyone on this project produces the same file.",
                 )
                 .clicked()
             {
                 out.master = true;
             }
-            // Where Master writes. An icon rather than a word: the row is
-            // full, and this is the third control on it.
             if crate::icon::button(ui, crate::icon::SAVE, &output_hint(master_out)).clicked() {
                 out.pick_output = true;
             }
@@ -545,7 +572,7 @@ mod tests {
     /// that lets Draft ask no questions.
     #[test]
     fn a_draft_goes_next_to_the_project() {
-        let p = draft_path(Some(Path::new("/films/titles.pbc")));
+        let p = draft_path(Some(Path::new("/films/titles.pbc")), None);
         assert_eq!(p.file_name().unwrap(), "titles_draft.mp4");
         assert_eq!(p.parent().unwrap(), Path::new("/films"));
     }
@@ -554,9 +581,44 @@ mod tests {
     /// directory of a windowed app is not a place a user can find.
     #[test]
     fn an_unsaved_project_drafts_to_the_temp_directory() {
-        let p = draft_path(None);
+        let p = draft_path(None, None);
         assert_eq!(p.parent().unwrap(), std::env::temp_dir());
         assert_eq!(p.file_name().unwrap(), "pbc_draft.mp4");
+    }
+
+    /// A chosen draft destination overrides the derived one, and is resolved
+    /// against the project exactly as a preset's path is — so "where does Draft
+    /// write" has one answer whether or not anyone has set it.
+    #[test]
+    fn a_chosen_draft_destination_overrides_the_derived_one() {
+        let project = Some(Path::new("/films/titles.pbc"));
+        assert_eq!(
+            draft_path(project, Some("previews/look.mp4")),
+            Path::new("/films/previews/look.mp4")
+        );
+    }
+
+    /// The override is *optional*, and blank is not a destination: a project
+    /// that has never set one, or has an empty string in the field, still gets
+    /// the guessable default rather than writing to the project directory
+    /// itself.
+    #[test]
+    fn an_absent_or_blank_draft_override_falls_back_to_the_default() {
+        let project = Some(Path::new("/films/titles.pbc"));
+        let default = draft_path(project, None);
+        assert_eq!(default.file_name().unwrap(), "titles_draft.mp4");
+        assert_eq!(draft_path(project, Some("   ")), default);
+        assert_eq!(draft_path(project, Some("")), default);
+    }
+
+    /// Rule 2 still holds once Draft's destination is configurable — which is
+    /// the whole risk of making it configurable. A draft pointed at a preset's
+    /// path is a collision and must be caught.
+    #[test]
+    fn a_chosen_draft_destination_can_still_collide_with_a_master() {
+        let project = Some(Path::new("/films/titles.pbc"));
+        let draft = draft_path(project, Some("deliver/final.mp4"));
+        assert!(collides_with_a_preset(&draft, &[preset("deliver/final.mp4")], project));
     }
 
     /// A preset's relative path is anchored to the project file, so the same
@@ -578,7 +640,7 @@ mod tests {
     #[test]
     fn a_draft_that_would_overwrite_a_master_is_detected() {
         let project = Some(Path::new("/films/titles.pbc"));
-        let draft = draft_path(project);
+        let draft = draft_path(project, None);
         assert!(
             collides_with_a_preset(&draft, &[preset("titles_draft.mp4")], project),
             "a preset naming the draft path must be caught"
@@ -595,7 +657,7 @@ mod tests {
     #[test]
     fn the_default_master_never_collides_with_a_draft() {
         let project = Some(Path::new("/films/titles.pbc"));
-        let draft = draft_path(project);
+        let draft = draft_path(project, None);
         assert!(!collides_with_a_preset(&draft, &[RenderPreset::default_master()], project));
     }
 
