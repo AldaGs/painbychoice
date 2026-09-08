@@ -365,6 +365,14 @@ fn ffmpeg_bin() -> String {
     std::env::var("PBC_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
 }
 
+/// The same binary, reachable from sibling modules' tests that need to *make*
+/// a media file to decode. Test-only so it cannot become a second production
+/// route to the tool.
+#[cfg(test)]
+pub(crate) fn ffmpeg_bin_for_tests() -> String {
+    ffmpeg_bin()
+}
+
 /// Raw frames piped to `ffmpeg`, which does the actual encoding.
 ///
 /// The container and codec come from the output path's extension — `.mp4`,

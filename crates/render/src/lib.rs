@@ -5,11 +5,13 @@
 //! real-time GPU backend (vello on wgpu) slots in behind the same `Scene`
 //! input later without touching `motion-core`.
 
+pub mod audio;
 pub mod decode;
 pub mod encode;
 pub mod parallel;
 pub mod raster;
 
+pub use audio::{decode_sound, is_audio_file, probe_sound, Sound};
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
 pub use encode::{
     is_video_container, Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence, Preparer,
