@@ -613,6 +613,8 @@ pub(crate) struct CameraBar {
 pub(crate) struct RenderBar<'a> {
     pub(crate) active: Option<&'a crate::renderqueue::RenderProgress>,
     pub(crate) last: Option<&'a crate::renderqueue::RenderSummary>,
+    /// Where Master currently writes, for the output button's tooltip.
+    pub(crate) master_out: Option<&'a str>,
     pub(crate) out: &'a mut crate::renderqueue::RenderEdits,
 }
 
@@ -894,6 +896,12 @@ pub(crate) fn comp_ui(
         // The render controls, on this same row. An export belongs to the comp
         // you are looking at, and Draft has to be one click from it.
         ui.separator();
-        crate::renderqueue::render_ui(ui, render.active, render.last, render.out);
+        crate::renderqueue::render_ui(
+            ui,
+            render.active,
+            render.last,
+            render.master_out,
+            render.out,
+        );
     });
 }

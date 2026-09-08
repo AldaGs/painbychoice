@@ -106,8 +106,13 @@ produce a finished video.
     deliverable.
   - **Master** renders the project's saved **render preset** — name, path,
     quality, scale and extra ffmpeg flags, stored in the `.pbc` — so two people
-    on one project produce identical files. A project with no preset yet gets a
-    default one written into it, which makes the *next* press reproducible.
+    on one project produce identical files. The first press opens the **system
+    Save dialog** to pick a destination and writes it into the project; every
+    press after that renders straight there. The save icon beside the buttons
+    changes it later, and its tooltip names where Master currently writes — an
+    export whose destination you cannot see is one you find out about by
+    rendering it. A destination inside the project's folder is stored
+    **relative**, so the project and its output folder travel together.
   - The extension picks the container, exactly as on the command line: `.mp4`
     is H.264, a `.mov` master is **ProRes**, and a path with no video extension
     becomes a numbered **PNG sequence**.

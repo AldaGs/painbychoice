@@ -133,6 +133,11 @@ piece cannot leave the app.
 - ✅ **Named render presets saved in the `.pbc`** (`Project::render_presets`,
   `#[serde(default)]`, so no migration). Master renders from the project's
   preset, which is what makes two people on one project produce the same file.
+  The destination is chosen through the **system Save dialog once** and written
+  into the project — asking every time would be the output-module habit 0018
+  declines, and never asking would land a deliverable at a guessed path. A
+  destination under the project's own folder is stored relative so the preset
+  travels.
 - ✅ **Blurred layers export blurred.** The GUI export runs the preview's own
   `rasterize_effect_layers` readback, because vello has no layer-filter
   primitive and a blur can only be done by rendering the layer alone, reading it

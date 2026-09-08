@@ -2623,16 +2623,51 @@ impl App {
         });
     }
 
-    /// Start a Master render from the project's first saved preset, or from a
-    /// default one if the project has none yet.
+    /// Choose where Master writes, through the system Save dialog, and store it
+    /// in the project's preset.
     ///
-    /// Defaulting rather than opening a dialog keeps the button usable on a
-    /// project nobody has configured, and the default is written into the
-    /// project so the *next* press is reproducible — which is what makes the
-    /// preset project data rather than app state.
-    pub(crate) fn start_master(&mut self) {
+    /// The dialog **sets the preset**; it does not render. That split is the
+    /// whole of decision 0018's reproducibility claim: the destination becomes
+    /// project data, travels in the `.pbc`, and every later Master press writes
+    /// there without asking anyone anything.
+    ///
+    /// Returns whether a path was chosen — `start_master` uses that to decide
+    /// whether to go ahead after asking.
+    pub(crate) fn pick_master_output(&mut self) -> bool {
+        let current = self.project.render_presets.first().map(|p| p.out.clone());
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "mkv", "webm"])
+            .add_filter("Any (no video extension writes a PNG sequence)", &["*"])
+            .set_file_name(current.as_deref().unwrap_or("master.mp4"));
+        // Start where the project lives, so the common answer is one click.
+        if let Some(dir) = self.project_path.as_deref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(chosen) = dialog.save_file() else {
+            return false;
+        };
+        let stored =
+            crate::renderqueue::preset_path_for(self.project_path.as_deref(), &chosen);
         if self.project.render_presets.is_empty() {
             self.project.render_presets.push(motion_core::RenderPreset::default_master());
+        }
+        self.project.render_presets[0].out = stored;
+        true
+    }
+
+    /// Start a Master render from the project's first saved preset, asking for
+    /// a destination the first time and never again.
+    ///
+    /// Asking *once* rather than every time is the reproducibility rule: the
+    /// answer is written into the project, so the next press — and the next
+    /// person's — writes the same file without a dialog. Asking rather than
+    /// silently defaulting is because a deliverable landing at a guessed path is
+    /// how you render an hour of footage into the wrong place.
+    pub(crate) fn start_master(&mut self) {
+        if self.project.render_presets.is_empty() && !self.pick_master_output() {
+            // Cancelled the dialog: no destination, so no render, and no
+            // half-configured preset left behind.
+            return;
         }
         let preset = self.project.render_presets[0].clone();
         let out = crate::renderqueue::resolve_out(self.project_path.as_deref(), &preset.out);
@@ -3235,6 +3270,7 @@ impl App {
             crate::renderqueue::RenderProgress { frac, line, quality: j.quality() }
         });
         let render_summary = self.queue.last().map(crate::renderqueue::RenderSummary::of);
+        let master_out = self.project.render_presets.first().map(|p| p.out.clone());
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
@@ -3333,6 +3369,7 @@ impl App {
                         RenderBar {
                             active: render_progress.as_ref(),
                             last: render_summary.as_ref(),
+                            master_out: master_out.as_deref(),
                             out: &mut render_edits,
                         },
                         doc_w,
@@ -3715,6 +3752,8 @@ impl App {
             self.start_draft();
         } else if render_edits.master {
             self.start_master();
+        } else if render_edits.pick_output {
+            self.pick_master_output();
         }
 
         if let Some(name) = comp.rename {

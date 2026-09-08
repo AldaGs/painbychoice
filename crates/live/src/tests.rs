@@ -5271,6 +5271,19 @@ fn set_num_ignores_a_param_from_another_kind() {
     ));
 }
 
+/// An egui context set up the way the app sets its own up.
+///
+/// The icon font and the theme both change widget metrics, and the comp bar is
+/// measured against a fixed height — so a bare `Context::default()` would be
+/// measuring a different bar than the one that ships. It also panics outright
+/// on an icon button, the font family being unbound.
+fn test_ctx() -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::icon::install(&ctx);
+    crate::theme::install(&ctx);
+    ctx
+}
+
 /// A raw input describing a comfortably wide window. The comp bar is one row,
 /// so a narrow screen would wrap it and the height assertion would be measuring
 /// the window width rather than the bar's content.
@@ -5300,7 +5313,7 @@ fn wide_input() -> egui::RawInput {
 /// context has no font subset loaded.
 #[test]
 fn the_composition_bar_fits_its_fixed_height() {
-    let ctx = egui::Context::default();
+    let ctx = test_ctx();
     let mut used = 0.0_f32;
     // Two passes: egui sizes some widgets from the previous frame's galley, so
     // a first-frame measurement can read low.
@@ -5317,6 +5330,7 @@ fn the_composition_bar_fits_its_fixed_height() {
                     RenderBar {
                         active: None,
                         last: None,
+                        master_out: Some("master.mp4"),
                         out: &mut render_edits,
                     },
                     1920.0,
@@ -5354,7 +5368,7 @@ fn the_composition_bar_fits_its_fixed_height() {
 /// two buttons, and that swap must not be taller than what it replaced.
 #[test]
 fn the_composition_bar_still_fits_while_a_render_runs() {
-    let ctx = egui::Context::default();
+    let ctx = test_ctx();
     let progress = crate::renderqueue::RenderProgress {
         frac: 0.5,
         line: "150/300 · 12.0s · ~12s left".to_string(),
@@ -5374,6 +5388,7 @@ fn the_composition_bar_still_fits_while_a_render_runs() {
                     RenderBar {
                         active: Some(&progress),
                         last: None,
+                        master_out: Some("master.mp4"),
                         out: &mut render_edits,
                     },
                     1920.0,

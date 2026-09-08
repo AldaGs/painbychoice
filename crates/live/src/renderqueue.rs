@@ -209,6 +209,18 @@ impl RenderQueue {
     }
 }
 
+/// The output button's tooltip: what Master will write, or that nothing is set.
+///
+/// Showing the destination on hover is what makes the "Master does not ask"
+/// rule liveable — the setting is invisible otherwise, and an export you cannot
+/// see the destination of is one you check by rendering it.
+fn output_hint(master_out: Option<&str>) -> String {
+    match master_out {
+        Some(out) => format!("Master writes to {out} — click to change"),
+        None => "Choose where Master writes…".to_string(),
+    }
+}
+
 /// Where a Draft render writes, given the project's own path.
 ///
 /// Predictable is the entire requirement — Draft asks no questions, so a user
@@ -241,6 +253,33 @@ pub(crate) fn resolve_out(project: Option<&Path>, out: &str) -> PathBuf {
     match project.and_then(|p| p.parent()) {
         Some(dir) => dir.join(candidate),
         None => candidate.to_path_buf(),
+    }
+}
+
+/// Turn a path chosen in the Save dialog into what the preset should store.
+///
+/// **Relative to the project when it is underneath it**, absolute otherwise.
+/// That is what makes a preset travel: a project and its `deliver/` folder moved
+/// to another machine still render to the same place, while a path on some other
+/// volume stays the absolute thing the user actually picked. Storing everything
+/// absolute would make the preset useless to the second person on the project —
+/// which is the property it exists for.
+pub(crate) fn preset_path_for(project: Option<&Path>, chosen: &Path) -> String {
+    match project
+        .and_then(|p| p.parent())
+        .and_then(|dir| chosen.strip_prefix(dir).ok())
+    {
+        // Forward slashes for the relative case: a `.pbc` written on Windows is
+        // opened on macOS, and a stored `deliverinal.mp4` is one path
+        // component there rather than two. Only worth doing here — this is the
+        // half that is meant to survive the trip to another machine.
+        Some(rel) => {
+            rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+        }
+        // An absolute path is machine-specific whatever we do to it, so it is
+        // stored exactly as the user picked it. Normalizing separators here
+        // would corrupt it: a root component's `OsStr` is itself a separator.
+        None => chosen.to_string_lossy().into_owned(),
     }
 }
 
@@ -358,6 +397,15 @@ pub(crate) struct RenderEdits {
     pub(crate) draft: bool,
     pub(crate) master: bool,
     pub(crate) cancel: bool,
+    /// Choose where Master writes, through the system Save dialog.
+    ///
+    /// Deliberately its own control rather than something Master does every
+    /// time. [0018](../../docs/decisions/0018-two-render-buttons.md) puts the
+    /// export spec in the **project**, so the dialog's job is to *set the
+    /// preset*, once; after that Master renders without asking and two people
+    /// on one project still produce the same file. A dialog on every press
+    /// would be the output-module habit that decision exists to avoid.
+    pub(crate) pick_output: bool,
 }
 
 /// A running job as the bar needs to show it — an owned snapshot, so the UI
@@ -433,6 +481,7 @@ pub(crate) fn render_ui(
     ui: &mut egui::Ui,
     active: Option<&RenderProgress>,
     last: Option<&RenderSummary>,
+    master_out: Option<&str>,
     out: &mut RenderEdits,
 ) {
     match active {
@@ -464,6 +513,11 @@ pub(crate) fn render_ui(
                 .clicked()
             {
                 out.master = true;
+            }
+            // Where Master writes. An icon rather than a word: the row is
+            // full, and this is the third control on it.
+            if crate::icon::button(ui, crate::icon::SAVE, &output_hint(master_out)).clicked() {
+                out.pick_output = true;
             }
             // The outcome as a short chip with the detail on hover. A rendered
             // path is easily eighty characters and this row has no room for it.
@@ -543,6 +597,60 @@ mod tests {
         let project = Some(Path::new("/films/titles.pbc"));
         let draft = draft_path(project);
         assert!(!collides_with_a_preset(&draft, &[RenderPreset::default_master()], project));
+    }
+
+    /// A destination inside the project's own folder is stored **relative**, so
+    /// the project and its output folder can move together — to another
+    /// machine, or into someone else's checkout — and still render to the same
+    /// place. This is the property that makes a preset worth saving at all.
+    #[test]
+    fn a_chosen_path_under_the_project_is_stored_relative() {
+        let stored = preset_path_for(
+            Some(Path::new("/films/titles.pbc")),
+            Path::new("/films/deliver/final.mp4"),
+        );
+        assert_eq!(stored, "deliver/final.mp4");
+    }
+
+    /// A destination somewhere else stays absolute: there is no relative path
+    /// from the project to another volume that means anything portable.
+    #[test]
+    fn a_chosen_path_outside_the_project_stays_absolute() {
+        let stored = preset_path_for(
+            Some(Path::new("/films/titles.pbc")),
+            Path::new("/mnt/deliveries/final.mp4"),
+        );
+        assert_eq!(stored, "/mnt/deliveries/final.mp4");
+    }
+
+    /// An unsaved project has nothing to be relative *to*, so the absolute path
+    /// is the only one that will still resolve after the project is saved
+    /// somewhere unrelated.
+    #[test]
+    fn an_unsaved_project_stores_the_absolute_path() {
+        let stored = preset_path_for(None, Path::new("/tmp/out.mp4"));
+        assert_eq!(stored, "/tmp/out.mp4");
+    }
+
+    /// What is stored round-trips through the resolver: store a relative path,
+    /// resolve it back, and land on the file the user actually picked. The two
+    /// functions are each other's inverse and a test should say so — they are
+    /// in different halves of the module and could drift apart.
+    #[test]
+    fn a_stored_path_resolves_back_to_what_was_chosen() {
+        let project = Some(Path::new("/films/titles.pbc"));
+        let chosen = Path::new("/films/deliver/final.mp4");
+        let stored = preset_path_for(project, chosen);
+        assert_eq!(resolve_out(project, &stored), chosen);
+    }
+
+    /// The tooltip names the destination, because Master never asks again once
+    /// it is set — an export whose destination you cannot see is one you find
+    /// out about by rendering it.
+    #[test]
+    fn the_output_hint_names_the_destination() {
+        assert!(output_hint(Some("deliver/final.mp4")).contains("deliver/final.mp4"));
+        assert!(output_hint(None).to_lowercase().contains("choose"));
     }
 
     #[test]
