@@ -437,3 +437,263 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Write interleaved stereo `f32` as a 16-bit PCM WAV.
+///
+/// Hand-written rather than pulling in a WAV crate: the header is 44 bytes of
+/// entirely specified layout, this is the only place that needs it, and
+/// [0007](../../docs/decisions/0007-never-implement-codecs.md)'s "never
+/// implement a codec" is about *compression*, not about a container that is a
+/// length and some samples.
+///
+/// 16-bit because the destination is an ffmpeg mux that will re-encode to AAC
+/// anyway, so the file exists for seconds and 32-bit float would double it for
+/// no audible gain. Samples are clamped before scaling — a value outside
+/// `[-1, 1]` would otherwise wrap and turn a loud passage into noise.
+pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let channels: u16 = 2;
+    let bits: u16 = 16;
+    let byte_rate = sample_rate * channels as u32 * (bits / 8) as u32;
+    let block_align = channels * (bits / 8);
+    let data_len = (samples.len() * 2) as u32;
+
+    let file = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+
+    w.write_all(b"RIFF")?;
+    w.write_all(&(36 + data_len).to_le_bytes())?;
+    w.write_all(b"WAVE")?;
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?; // PCM chunk size
+    w.write_all(&1u16.to_le_bytes())?; // format: PCM
+    w.write_all(&channels.to_le_bytes())?;
+    w.write_all(&sample_rate.to_le_bytes())?;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&block_align.to_le_bytes())?;
+    w.write_all(&bits.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_len.to_le_bytes())?;
+
+    for s in samples {
+        // Rounded, not truncated: `as i16` rounds toward zero, which biases
+        // every sample inward by up to a full step and is a quantisation error
+        // twice as large as it needs to be.
+        //
+        // 32767 rather than 32768 because the positive range of i16 stops one
+        // short, and scaling by 32768 makes a full-scale sample wrap negative.
+        let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        w.write_all(&v.to_le_bytes())?;
+    }
+    w.flush()
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::*;
+
+    #[test]
+    fn a_written_wav_reads_back_as_what_went_in() {
+        let dir = std::env::temp_dir().join(format!("pbc_wavw_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+
+        // A ramp, so a channel swap or an off-by-one in the header shows up.
+        let mut samples = Vec::new();
+        for i in 0..1000 {
+            samples.push(i as f32 / 1000.0);
+            samples.push(-(i as f32) / 1000.0);
+        }
+        write_wav(&path, &samples, 48_000).expect("write");
+
+        let back = decode_sound(&path).expect("the wav we just wrote must decode");
+        assert_eq!(back.sample_rate, 48_000);
+        assert_eq!(back.frames(), 1000);
+        // Two quantisations sit between what went in and what came back — the
+        // f32→i16 write and symphonia's i16→f32 read, which do not agree on
+        // whether the divisor is 32767 or 32768 — so the tolerance is two
+        // steps, not one.
+        for i in (0..2000).step_by(97) {
+            assert!(
+                (back.samples[i] - samples[i]).abs() < 2.0 / 32767.0,
+                "sample {i}: wrote {} read {}",
+                samples[i],
+                back.samples[i]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full scale must stay full scale rather than wrapping to negative, which
+    /// is what scaling by 32768 instead of 32767 would do.
+    #[test]
+    fn full_scale_does_not_wrap() {
+        let dir = std::env::temp_dir().join(format!("pbc_wavf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loud.wav");
+        write_wav(&path, &[1.0, -1.0, 2.0, -2.0], 48_000).expect("write");
+        let back = decode_sound(&path).expect("decode");
+        assert!(back.samples[0] > 0.99, "+1.0 stayed positive: {}", back.samples[0]);
+        assert!(back.samples[1] < -0.99, "-1.0 stayed negative: {}", back.samples[1]);
+        assert!(back.samples[2] > 0.99, "out-of-range clamped, not wrapped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Mix a comp's sound for a frame range into interleaved stereo.
+///
+/// The export counterpart of the playback callback, and deliberately *not*
+/// realtime: this allocates the whole mix at once, because a render has no
+/// deadline and a file is easier to reason about than a stream.
+///
+/// The range is inclusive, matching the renderer and `--start/--end`, and the
+/// result is exactly as long as the picture — `end - start + 1` frames' worth of
+/// samples — so the two streams cannot disagree about the length of the piece.
+///
+/// Automation is resolved **per block** rather than per frame, at
+/// [`AUTOMATION_BLOCK`] sample frames, for the same reason the callback does it:
+/// level and pan are control-rate parameters, and at ~21ms a block the
+/// difference is inaudible while the saving is a whole tree walk per block
+/// instead of per sample.
+pub fn mix_comp(
+    project: &motion_core::Project,
+    comp: motion_core::CompId,
+    start: i64,
+    end: i64,
+    sample_rate: u32,
+    sounds: &std::collections::HashMap<motion_core::AssetId, Sound>,
+) -> Vec<f32> {
+    use motion_core::audio::frames_to_sample_frames as to_sf;
+
+    let Some(c) = project.comp(comp) else { return Vec::new() };
+    let fps = c.timebase().fps();
+    if sample_rate == 0 || fps <= 0.0 || end < start {
+        return Vec::new();
+    }
+
+    let from = to_sf(start as f64, fps, sample_rate);
+    let to = to_sf((end + 1) as f64, fps, sample_rate);
+    let total = (to - from).max(0) as usize;
+    let mut out = vec![0.0f32; total * 2];
+    let mut scratch = vec![0.0f32; AUTOMATION_BLOCK * 2];
+
+    let mut done = 0usize;
+    while done < total {
+        let block = AUTOMATION_BLOCK.min(total - done);
+        let origin = from + done as i64;
+        // The frame this block starts on, for resolving level and pan.
+        let at_frame = motion_core::audio::sample_frames_to_frames(origin, fps, sample_rate);
+        let sources = motion_core::evaluate_audio(project, comp, at_frame, sample_rate);
+        motion_core::mix_into(
+            &mut out[done * 2..(done + block) * 2],
+            &mut scratch,
+            origin,
+            &sources,
+            |asset, at, buf| match sounds.get(&asset) {
+                Some(sound) => {
+                    sound.read_into(at, buf, sample_rate);
+                    true
+                }
+                None => false,
+            },
+        );
+        done += block;
+    }
+    out
+}
+
+/// How many sample frames share one resolution of level and pan.
+///
+/// 1024 at 48kHz is about 21ms. Small enough that a fade sounds continuous,
+/// large enough that resolving the document per block is not the dominant cost
+/// of a mixdown.
+pub const AUTOMATION_BLOCK: usize = 1024;
+
+#[cfg(test)]
+mod mix_tests {
+    use super::*;
+    use motion_core::asset::AssetId;
+    use motion_core::node::{Comp, LayerTiming, Node, Project};
+    use motion_core::AudioClip;
+
+    fn project_with_sound(frames: i64) -> (Project, std::collections::HashMap<AssetId, Sound>) {
+        let mut layer = Node::group(1, "sound");
+        layer.timing = Some(LayerTiming::new(0, frames));
+        layer.audio = Some(AudioClip::new(AssetId(1)));
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root").with_child(layer));
+        comp.fps = 24.0;
+        comp.duration_frames = frames;
+
+        let mut sounds = std::collections::HashMap::new();
+        sounds.insert(
+            AssetId(1),
+            Sound { sample_rate: 48_000, samples: vec![0.5; 48_000 * 2 * 4] },
+        );
+        (Project::single(comp), sounds)
+    }
+
+    /// **The mix is exactly as long as the picture.** A soundtrack that is even
+    /// slightly the wrong length drifts against the video, and `-shortest`
+    /// would silently truncate whichever lost.
+    #[test]
+    fn the_mix_is_exactly_as_long_as_the_frame_range() {
+        let (project, sounds) = project_with_sound(48);
+        // Frames 0..=23 at 24fps is one second.
+        let mix = mix_comp(&project, project.root, 0, 23, 48_000, &sounds);
+        assert_eq!(mix.len(), 48_000 * 2, "one second of stereo at 48kHz");
+    }
+
+    /// A partial range mixes only its own span, and starts from the right place
+    /// in the sound rather than from zero.
+    #[test]
+    fn a_partial_range_mixes_only_itself() {
+        let (project, sounds) = project_with_sound(96);
+        let mix = mix_comp(&project, project.root, 24, 47, 48_000, &sounds);
+        assert_eq!(mix.len(), 48_000 * 2, "one second");
+        assert!(mix.iter().any(|s| *s != 0.0), "the second second is not silent");
+    }
+
+    /// A comp with no sound mixes to silence of the right length rather than to
+    /// nothing — the video still needs a track of the right duration if one is
+    /// requested at all.
+    #[test]
+    fn a_silent_comp_still_mixes_the_right_length() {
+        let mut comp = Comp::new(64.0, 64.0, Node::group(0, "root"));
+        comp.fps = 24.0;
+        comp.duration_frames = 24;
+        let project = Project::single(comp);
+        let mix = mix_comp(&project, project.root, 0, 23, 48_000, &Default::default());
+        assert_eq!(mix.len(), 48_000 * 2);
+        assert!(mix.iter().all(|s| *s == 0.0));
+    }
+
+    /// The layer's gain reaches the mixdown, so a level of 0.5 on a 0.5 sound
+    /// arrives at 0.25 times the centre-pan gain.
+    #[test]
+    fn the_layers_level_reaches_the_mix() {
+        let (mut project, sounds) = project_with_sound(48);
+        {
+            let comp = project.comps.get_mut(&project.root).unwrap();
+            let layer = comp.root.find_mut(motion_core::NodeId(1)).unwrap();
+            layer.audio.as_mut().unwrap().level = motion_core::Value::constant(0.5);
+        }
+        let mix = mix_comp(&project, project.root, 0, 23, 48_000, &sounds);
+        // 0.5 sample * 0.5 level * √½ centre pan.
+        let expected = 0.5 * 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (mix[0] - expected).abs() < 1e-5,
+            "expected {expected}, got {}",
+            mix[0]
+        );
+    }
+
+    /// A degenerate or reversed range mixes nothing rather than allocating a
+    /// nonsense length.
+    #[test]
+    fn a_reversed_range_mixes_nothing() {
+        let (project, sounds) = project_with_sound(48);
+        assert!(mix_comp(&project, project.root, 20, 10, 48_000, &sounds).is_empty());
+        assert!(mix_comp(&project, project.root, 0, 23, 0, &sounds).is_empty());
+    }
+}

@@ -185,7 +185,49 @@ than a gap in it.
 
 **Next: Phase 2, audio and the master clock.**
 
-### Phase 2 — Audio and the master clock
+### Phase 2 — Audio and the master clock — *in progress*
+
+**Landed 2026-09-08:**
+
+- ✅ **The document model for sound.** `Node::audio` beside `matte`/`effects`,
+  not a `Shape` variant — a video with a soundtrack is one layer with picture
+  *and* sound, so audio cannot be the thing a layer draws. Level and pan are
+  ordinary `Value<f64>`, so they keyframe and take expressions for free; timing
+  rides the existing `LayerTiming`. Everything is measured in **sample frames**,
+  never samples. Panning is constant-power, so a centred sound sits at √½ and a
+  pan sweep holds its loudness.
+- ✅ **Decoding with symphonia** (`render/src/audio.rs`), in-process rather than
+  through the ffmpeg sidecar that decodes video: playback wants a few
+  milliseconds on a realtime callback and must seek the instant the playhead
+  moves, and spawning a process per seek would be audible. Sounds are decoded
+  whole and held at their native rate; conversion happens on read, with matched
+  rates taking a bit-exact copy path.
+- ✅ **The clock inversion** (`live/src/clock.rs`). A sound card does not run at
+  wall-clock speed — a "48000Hz" device is 48000 ± a few ppm — so a picture on
+  the wall clock drifts off the sound by about a frame every few minutes, and
+  differently on every machine. With sound, the device is now the time source
+  and the frame is derived from the samples it consumed; without it, the wall
+  clock, unchanged.
+- ✅ **The output stream** (`live/src/playback.rs`), allocation-free and
+  lock-free on the callback: an immutable mix snapshot swapped wholesale, read
+  through a `try_lock` held only long enough to clone an `Arc`.
+- ✅ **Export mixes and muxes.** A rendered video carries the comp's sound, as a
+  finished WAV handed to ffmpeg as a second input — two pipes into one process
+  is a deadlock waiting to happen.
+
+**Still ahead in this phase:**
+
+- **A waveform in the timeline** — the actual reason sync is editable.
+- **Audio in the GUI export path.** The CLI muxes sound; the editor's render
+  queue does not yet.
+- **A level/pan UI.** The properties are animatable but have no controls.
+- **Resampling quality.** Mismatched rates use linear interpolation, which is a
+  documented floor rather than a considered choice.
+
+**Done when:** a cut can be edited to music and the exported file carries it.
+*The export half is true today; the editing half needs the waveform.*
+
+#### The original plan for this phase
 
 Playback is a wall clock today. Sound forces the correct model, and every timing
 bug is easier to see once something is audible.

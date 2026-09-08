@@ -409,6 +409,27 @@ impl FfmpegEncoder {
         spec: OutputSpec,
         extra: &[String],
     ) -> Result<Self, EncodeError> {
+        Self::with_audio(path, spec, extra, None)
+    }
+
+    /// The same, muxing a **soundtrack** in alongside the piped video.
+    ///
+    /// `audio` is a finished WAV on disk rather than a second pipe. Two pipes
+    /// into one ffmpeg is possible and is a deadlock waiting to happen: the
+    /// writer must keep both fed or the process blocks on whichever it starves,
+    /// and the video side is already driven by a render loop with its own
+    /// pacing. A file has no such coupling — the mix is complete before the
+    /// first frame is written, and ffmpeg reads it at whatever rate it likes.
+    ///
+    /// The audio is encoded to **AAC**, which every container here accepts, and
+    /// `-shortest` ends the file with whichever stream runs out first so a
+    /// soundtrack longer than the render does not pad the video with a freeze.
+    pub fn with_audio(
+        path: impl AsRef<Path>,
+        spec: OutputSpec,
+        extra: &[String],
+        audio: Option<&Path>,
+    ) -> Result<Self, EncodeError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -423,11 +444,19 @@ impl FfmpegEncoder {
             .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-s", &format!("{}x{}", spec.width, spec.height)])
             .args(["-framerate", &format_rate(spec.fps)])
-            .args(["-i", "-"])
-            // yuv420p rather than ffmpeg's pick: it is the one chroma format
-            // every player and browser handles, and the default for H.264 from
-            // RGBA input is not it.
-            .args(["-pix_fmt", "yuv420p"]);
+            .args(["-i", "-"]);
+        // The soundtrack as a second input, *after* the video so stream 0 stays
+        // the picture — some players and most editing tools assume that.
+        if let Some(audio) = audio {
+            cmd.args(["-i"]).arg(audio);
+        }
+        // yuv420p rather than ffmpeg's pick: it is the one chroma format
+        // every player and browser handles, and the default for H.264 from
+        // RGBA input is not it.
+        cmd.args(["-pix_fmt", "yuv420p"]);
+        if audio.is_some() {
+            cmd.args(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
+        }
         for a in extra {
             cmd.arg(a);
         }

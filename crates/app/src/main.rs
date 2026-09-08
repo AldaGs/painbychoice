@@ -185,6 +185,96 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
+/// A mixed soundtrack on disk, deleted when it drops.
+///
+/// The file only has to outlive the ffmpeg process reading it, and tying that
+/// to a value's lifetime is more reliable than remembering to unlink it on
+/// every exit path — including the error ones.
+struct TempAudio(PathBuf);
+
+impl TempAudio {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempAudio {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether this comp has anything to hear.
+fn project_has_audio(project: &Project, comp: CompId) -> bool {
+    !motion_core::evaluate_audio(project, comp, 0.0, 48_000).is_empty()
+}
+
+/// Decode the comp's sounds, mix the frame range, and write it as a WAV.
+///
+/// `None` when the comp is silent, which is the ordinary case and must not cost
+/// an empty audio stream in the output.
+fn mix_soundtrack(
+    project: &Project,
+    comp: CompId,
+    start: i64,
+    end: i64,
+    o: &Opts,
+) -> Result<Option<TempAudio>, String> {
+    if !project_has_audio(project, comp) {
+        return Ok(None);
+    }
+    // 48kHz regardless of what the sources are: the mix has to land on one
+    // grid, and picking the highest common broadcast rate means a 44.1kHz
+    // source is resampled up rather than everything else being dragged down.
+    const RATE: u32 = 48_000;
+
+    let mut sounds = std::collections::HashMap::new();
+    for asset in project.assets.values().filter(|a| a.has_audio()) {
+        match motion_render::decode_sound(&asset.path) {
+            Ok(sound) => {
+                sounds.insert(asset.id, sound);
+            }
+            // A sound that will not decode is reported and skipped, exactly as
+            // unrenderable footage is: a render that fails outright because one
+            // layer's file moved is worse than one that says so.
+            Err(e) => {
+                if !o.quiet {
+                    eprintln!("note: {}: {e}", asset.path.display());
+                }
+            }
+        }
+    }
+
+    // A layer that names a sound nobody could decode is reported, not silently
+    // mixed as silence. Without this an export whose asset had moved produced a
+    // perfectly valid file with an empty audio stream and nothing to say why —
+    // the same class of failure as footage being dropped from a render, and the
+    // same answer: say so.
+    if !o.quiet {
+        let sources = motion_core::evaluate_audio(project, comp, start as f64, RATE);
+        let mut missing: Vec<u64> =
+            sources.iter().filter(|s| !sounds.contains_key(&s.asset)).map(|s| s.asset.0).collect();
+        missing.sort_unstable();
+        missing.dedup();
+        for id in missing {
+            let name = project
+                .asset(motion_core::AssetId(id))
+                .map(|a| a.path.display().to_string())
+                .unwrap_or_else(|| format!("asset {id}"));
+            eprintln!("note: {name} could not be read; that layer is silent");
+        }
+    }
+
+    let mix = motion_render::mix_comp(project, comp, start, end, RATE, &sounds);
+    if mix.is_empty() {
+        return Ok(None);
+    }
+    let path = std::env::temp_dir().join(format!("pbc_mix_{}.wav", std::process::id()));
+    motion_render::write_wav(&path, &mix, RATE)
+        .map_err(|e| format!("writing the mixed soundtrack: {e}"))?;
+    Ok(Some(TempAudio(path)))
+}
+
 fn render(args: &[String]) -> Result<(), String> {
     let o = parse(args)?;
     let project = match &o.project {
@@ -213,12 +303,33 @@ fn render(args: &[String]) -> Result<(), String> {
     let (w, h) = output_size(comp.width, comp.height, o.scale);
     let spec = OutputSpec { width: w, height: h, fps: o.fps.unwrap_or(comp.fps) };
 
+    // The soundtrack, mixed and written before the first frame is rendered.
+    //
+    // Ahead of the video rather than alongside it because ffmpeg reads it as a
+    // file: two pipes into one process is a deadlock waiting to happen, since
+    // the writer must keep both fed. Kept alive in `_audio_temp` — a
+    // `TempAudio` deletes the file when it drops, and it must outlive the
+    // encoder that is reading it.
+    let audio_temp = if is_video_container(&o.out) {
+        mix_soundtrack(&project, comp_id, start, end, &o)?
+    } else {
+        // A PNG sequence has nowhere to put sound. Silently mixing it would
+        // waste the work; silently *not* mentioning it would be worse.
+        if project_has_audio(&project, comp_id) && !o.quiet {
+            eprintln!("note: a PNG sequence carries no audio; the comp's sound is not exported");
+        }
+        None
+    };
+
     let mut encoder: Box<dyn Encoder> = if is_video_container(&o.out) {
         // The preset first, the user's own arguments after it, so `--arg` can
         // override anything the preset chose rather than fighting it.
         let mut args = o.quality.ffmpeg_args(&o.out);
         args.extend(o.ffmpeg_args.iter().cloned());
-        Box::new(FfmpegEncoder::new(&o.out, spec, &args).map_err(|e| e.to_string())?)
+        Box::new(
+            FfmpegEncoder::with_audio(&o.out, spec, &args, audio_temp.as_ref().map(|t| t.path()))
+                .map_err(|e| e.to_string())?,
+        )
     } else {
         let stem = o
             .project
