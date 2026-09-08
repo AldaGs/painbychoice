@@ -76,8 +76,21 @@ impl Sound {
     /// resampler is the upgrade, and the seam for it is this function alone.
     pub fn read(&self, from: i64, count: usize, rate: u32) -> Vec<f32> {
         let mut out = vec![0.0; count * 2];
+        self.read_into(from, &mut out, rate);
+        out
+    }
+
+    /// [`Sound::read`] into a caller-provided buffer.
+    ///
+    /// The form the audio callback uses: `read` allocates, and an allocation on
+    /// the device's realtime thread is an audible click rather than a slow
+    /// frame. `out` is interleaved stereo and its length decides how many sample
+    /// frames are read.
+    pub fn read_into(&self, from: i64, out: &mut [f32], rate: u32) {
+        out.fill(0.0);
+        let count = out.len() / 2;
         if self.sample_rate == 0 || rate == 0 || count == 0 {
-            return out;
+            return;
         }
         let frames = self.frames() as i64;
 
@@ -92,7 +105,7 @@ impl Sound {
                 out[i as usize * 2] = self.samples[src as usize * 2];
                 out[i as usize * 2 + 1] = self.samples[src as usize * 2 + 1];
             }
-            return out;
+            return;
         }
 
         let ratio = self.sample_rate as f64 / rate as f64;
@@ -114,7 +127,6 @@ impl Sound {
                 out[i * 2 + ch] = s0 + (s1 - s0) * frac;
             }
         }
-        out
     }
 }
 

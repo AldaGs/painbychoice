@@ -45,6 +45,7 @@ use winit::window::{Window, WindowId};
 // below) so no module needs its own import bookkeeping.
 mod aids;
 mod app;
+mod clock;
 mod curves;
 mod dock;
 mod footage;
@@ -58,6 +59,7 @@ mod nodegraph;
 mod offscreen;
 mod onion;
 mod pen;
+mod playback;
 mod props;
 mod renderqueue;
 mod scene;

@@ -148,9 +148,21 @@ pub fn sample_frames_to_frames(position: i64, fps: f64, sample_rate: u32) -> f64
 /// as "the mixer is fighting me". Clipping is the mixer's own business —
 /// [`mix_into`] hard-clips at the end because a sample outside `[-1, 1]` is
 /// undefined at the device, not because the sum was wrong.
-pub fn mix_into<F>(out: &mut [f32], origin: i64, sources: &[AudioSource], mut fetch: F)
-where
-    F: FnMut(AssetId, i64, usize) -> Option<Vec<f32>>,
+/// # Realtime safety
+///
+/// This allocates nothing and locks nothing, and `fetch` is handed a slice to
+/// **fill** rather than asked to return a `Vec` for exactly that reason: this
+/// runs on the audio device's callback thread, where an allocation is not a
+/// slow frame but an audible click. `scratch` is the caller's preallocated
+/// working buffer, sized for the largest block it will ask for.
+pub fn mix_into<F>(
+    out: &mut [f32],
+    scratch: &mut [f32],
+    origin: i64,
+    sources: &[AudioSource],
+    mut fetch: F,
+) where
+    F: FnMut(AssetId, i64, &mut [f32]) -> bool,
 {
     for s in out.iter_mut() {
         *s = 0.0;
@@ -170,19 +182,22 @@ where
         if to <= from {
             continue;
         }
-        let take = (to - from) as usize;
-        let asset_from = src.offset + (from - src.start);
-        let Some(samples) = fetch(src.asset, asset_from, take) else {
+        // Bounded by the scratch buffer as well as by the overlap: a caller
+        // that sized its scratch for a smaller block gets a quieter mix, never
+        // a panic on the audio thread.
+        let take = ((to - from) as usize).min(scratch.len() / 2);
+        if take == 0 {
             continue;
-        };
+        }
+        let asset_from = src.offset + (from - src.start);
+        let window = &mut scratch[..take * 2];
+        if !fetch(src.asset, asset_from, window) {
+            continue;
+        }
         let dest = (from - origin) as usize;
-        // `fetch` may return short — the tail of a file is a real case — so the
-        // copy is bounded by what actually came back rather than what was asked
-        // for.
-        let available = (samples.len() / 2).min(take);
-        for i in 0..available {
-            out[(dest + i) * 2] += samples[i * 2] * src.gain.0;
-            out[(dest + i) * 2 + 1] += samples[i * 2 + 1] * src.gain.1;
+        for i in 0..take {
+            out[(dest + i) * 2] += window[i * 2] * src.gain.0;
+            out[(dest + i) * 2 + 1] += window[i * 2 + 1] * src.gain.1;
         }
     }
 
@@ -282,9 +297,11 @@ mod tests {
             offset: 0,
             gain: (1.0, 1.0),
         };
-        mix_into(&mut out, 0, &[src], |_, _, n| {
+        let mut scratch = vec![0.0; 64];
+        mix_into(&mut out, &mut scratch, 0, &[src], |_, _, buf| {
             fetched += 1;
-            Some(vec![1.0; n * 2])
+            buf.fill(1.0);
+            true
         });
         assert_eq!(fetched, 0, "nothing outside the block should be fetched");
         assert!(out.iter().all(|s| *s == 0.0));
@@ -304,9 +321,11 @@ mod tests {
             offset: 50,
             gain: (1.0, 1.0),
         };
-        mix_into(&mut out, 100, &[src], |_, from, n| {
-            asked = Some((from, n));
-            Some(vec![1.0; n * 2])
+        let mut scratch = vec![0.0; 64];
+        mix_into(&mut out, &mut scratch, 100, &[src], |_, from, buf| {
+            asked = Some((from, buf.len() / 2));
+            buf.fill(1.0);
+            true
         });
         // Comp 100..102 overlaps, which is 2 sample frames starting 2 into the
         // source, so 52 in its own samples.
@@ -326,7 +345,11 @@ mod tests {
             offset: 0,
             gain: (0.25, 0.75),
         };
-        mix_into(&mut out, 0, &[src], |_, _, n| Some(vec![1.0; n * 2]));
+        let mut scratch = vec![0.0; 64];
+        mix_into(&mut out, &mut scratch, 0, &[src], |_, _, buf| {
+            buf.fill(1.0);
+            true
+        });
         assert_eq!(out, vec![0.25, 0.75, 0.25, 0.75]);
     }
 
@@ -342,7 +365,11 @@ mod tests {
             offset: 0,
             gain: (0.4, 0.4),
         };
-        mix_into(&mut out, 0, &[src(1), src(2)], |_, _, n| Some(vec![1.0; n * 2]));
+        let mut scratch = vec![0.0; 64];
+        mix_into(&mut out, &mut scratch, 0, &[src(1), src(2)], |_, _, buf| {
+            buf.fill(1.0);
+            true
+        });
         assert!((out[0] - 0.8).abs() < 1e-6, "two at 0.4 make 0.8, got {}", out[0]);
     }
 
@@ -358,7 +385,11 @@ mod tests {
             offset: 0,
             gain: (1.0, 1.0),
         };
-        mix_into(&mut out, 0, &[src(1), src(2), src(3)], |_, _, n| Some(vec![1.0; n * 2]));
+        let mut scratch = vec![0.0; 64];
+        mix_into(&mut out, &mut scratch, 0, &[src(1), src(2), src(3)], |_, _, buf| {
+            buf.fill(1.0);
+            true
+        });
         assert_eq!(out, vec![1.0, 1.0]);
     }
 
@@ -374,7 +405,8 @@ mod tests {
             offset: 0,
             gain: (1.0, 1.0),
         };
-        mix_into(&mut out, 0, &[src], |_, _, _| None);
+        let mut scratch = vec![0.0; 64];
+        mix_into(&mut out, &mut scratch, 0, &[src], |_, _, _| false);
         assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0], "the buffer is cleared, then left silent");
     }
 
@@ -391,7 +423,13 @@ mod tests {
             gain: (1.0, 1.0),
         };
         // Asked for 4 sample frames, only 2 come back.
-        mix_into(&mut out, 0, &[src], |_, _, _| Some(vec![1.0; 4]));
+        // The caller's scratch only covers two sample frames, so only two are
+        // mixed however many were asked for — the tail-of-a-file case.
+        let mut scratch = vec![0.0; 4];
+        mix_into(&mut out, &mut scratch, 0, &[src], |_, _, buf| {
+            buf.fill(1.0);
+            true
+        });
         assert_eq!(&out[0..4], &[1.0, 1.0, 1.0, 1.0]);
         assert_eq!(&out[4..8], &[0.0, 0.0, 0.0, 0.0]);
     }
@@ -401,7 +439,8 @@ mod tests {
     #[test]
     fn a_reused_buffer_is_cleared_first() {
         let mut out = vec![9.0; 4];
-        mix_into(&mut out, 0, &[], |_, _, _| None);
+        let mut scratch = vec![0.0; 8];
+        mix_into(&mut out, &mut scratch, 0, &[], |_, _, _| false);
         assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0]);
     }
 }
