@@ -162,6 +162,15 @@ pub(crate) enum EffectParam {
     Saturation,
     Lightness,
     TintAmount,
+    InBlack,
+    InWhite,
+    Gamma,
+    OutBlack,
+    OutWhite,
+    ShadowX,
+    ShadowY,
+    ShadowRadius,
+    ShadowOpacity,
 }
 
 impl EffectParam {
@@ -174,6 +183,15 @@ impl EffectParam {
             EffectParam::Saturation => "Saturation",
             EffectParam::Lightness => "Lightness",
             EffectParam::TintAmount => "Amount",
+            EffectParam::InBlack => "In Black",
+            EffectParam::InWhite => "In White",
+            EffectParam::Gamma => "Gamma",
+            EffectParam::OutBlack => "Out Black",
+            EffectParam::OutWhite => "Out White",
+            EffectParam::ShadowX => "Offset X",
+            EffectParam::ShadowY => "Offset Y",
+            EffectParam::ShadowRadius => "Softness",
+            EffectParam::ShadowOpacity => "Opacity",
         }
     }
 }
@@ -208,6 +226,10 @@ pub(crate) fn effect_params(kind: &motion_core::EffectKind) -> Vec<EffectParam> 
         K::BrightnessContrast { .. } => vec![P::Brightness, P::Contrast],
         K::HueSaturation { .. } => vec![P::Hue, P::Saturation, P::Lightness],
         K::Tint { .. } => vec![P::TintAmount],
+        K::Levels { .. } => vec![P::InBlack, P::InWhite, P::Gamma, P::OutBlack, P::OutWhite],
+        K::DropShadow { .. } => {
+            vec![P::ShadowX, P::ShadowY, P::ShadowRadius, P::ShadowOpacity]
+        }
     }
 }
 
@@ -227,6 +249,15 @@ pub(crate) fn effect_value<'a>(
         (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
         (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
         (K::Tint { amount, .. }, P::TintAmount) => amount,
+        (K::Levels { in_black, .. }, P::InBlack) => in_black,
+        (K::Levels { in_white, .. }, P::InWhite) => in_white,
+        (K::Levels { gamma, .. }, P::Gamma) => gamma,
+        (K::Levels { out_black, .. }, P::OutBlack) => out_black,
+        (K::Levels { out_white, .. }, P::OutWhite) => out_white,
+        (K::DropShadow { offset_x, .. }, P::ShadowX) => offset_x,
+        (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
+        (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
+        (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
         _ => return None,
     })
 }
@@ -247,6 +278,15 @@ pub(crate) fn effect_value_mut<'a>(
         (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
         (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
         (K::Tint { amount, .. }, P::TintAmount) => amount,
+        (K::Levels { in_black, .. }, P::InBlack) => in_black,
+        (K::Levels { in_white, .. }, P::InWhite) => in_white,
+        (K::Levels { gamma, .. }, P::Gamma) => gamma,
+        (K::Levels { out_black, .. }, P::OutBlack) => out_black,
+        (K::Levels { out_white, .. }, P::OutWhite) => out_white,
+        (K::DropShadow { offset_x, .. }, P::ShadowX) => offset_x,
+        (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
+        (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
+        (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
         _ => return None,
     })
 }
@@ -565,7 +605,8 @@ impl NodeInfo {
                     enabled: ef.enabled,
                     nums: effect_nums(&ef.kind, ctx),
                     color: match &ef.kind {
-                        motion_core::EffectKind::Tint { color, .. } => {
+                        motion_core::EffectKind::Tint { color, .. }
+                        | motion_core::EffectKind::DropShadow { color, .. } => {
                             let c = color.resolve(ctx);
                             Some([c.r as f32, c.g as f32, c.b as f32])
                         }
@@ -1413,7 +1454,15 @@ pub(crate) fn properties_ui(
                 let param = num.param;
                 ui.label(format!("  {}", param.label()));
                 let mut v = num.value;
-                let speed = if param == EffectParam::BlurRadius { 0.5 } else { 0.01 };
+                // Pixel distances drag coarsely, `0..1` amounts finely — a
+                // 0.01/frame offset would take a minute to move a shadow.
+                let speed = match param {
+                    EffectParam::BlurRadius
+                    | EffectParam::ShadowRadius
+                    | EffectParam::ShadowX
+                    | EffectParam::ShadowY => 0.5,
+                    _ => 0.01,
+                };
                 if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {
                     edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
                 }

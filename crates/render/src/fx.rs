@@ -53,6 +53,12 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             ResolvedEffect::Tint { color: t, amount } => {
                 tint_rgb(rgb, [t.r as f32, t.g as f32, t.b as f32], amount as f32)
             }
+            ResolvedEffect::Levels { in_black, in_white, gamma, out_black, out_white } => {
+                levels(rgb, in_black, in_white, gamma, out_black, out_white)
+            }
+            // A shadow is made of the layer's *alpha*, offset — there is no
+            // such thing as one pixel's shadow. The readback path draws it.
+            ResolvedEffect::DropShadow { .. } => rgb,
         };
     }
     MColor::rgba(
@@ -67,7 +73,9 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
 /// own — a blur. Such a layer needs the full-image readback pipeline; until that
 /// lands, the panel can warn that the effect won't show in the preview.
 pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
-    effects.iter().any(|e| matches!(e, ResolvedEffect::GaussianBlur { .. }))
+    effects.iter().any(|e| {
+        matches!(e, ResolvedEffect::GaussianBlur { .. } | ResolvedEffect::DropShadow { .. })
+    })
 }
 
 /// Apply an ordered effect stack to an RGBA8 image in place.
@@ -100,6 +108,12 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::Tint { color, amount } => {
             let tint = [color.r as f32, color.g as f32, color.b as f32];
             map_rgb(px, |c| tint_rgb(c, tint, amount as f32))
+        }
+        ResolvedEffect::Levels { in_black, in_white, gamma, out_black, out_white } => {
+            map_rgb(px, |c| levels(c, in_black, in_white, gamma, out_black, out_white))
+        }
+        ResolvedEffect::DropShadow { color, offset_x, offset_y, radius, opacity } => {
+            drop_shadow(px, width, height, color, offset_x, offset_y, radius, opacity)
         }
     }
 }
@@ -144,6 +158,101 @@ fn tint_rgb(c: [f32; 3], tint: [f32; 3], amount: f32) -> [f32; 3] {
         c[1] + (tint[1] - c[1]) * a,
         c[2] + (tint[2] - c[2]) * a,
     ]
+}
+
+/// Remap one channel's tonal range: `in_black`..`in_white` in, `gamma` bending
+/// the middle, `out_black`..`out_white` out.
+///
+/// A degenerate input range (white at or below black) collapses to a hard
+/// threshold rather than dividing by zero — which is what dragging the two
+/// handles past each other visibly means, so the edge case and the intent
+/// agree.
+fn levels(
+    c: [f32; 3],
+    in_black: f64,
+    in_white: f64,
+    gamma: f64,
+    out_black: f64,
+    out_white: f64,
+) -> [f32; 3] {
+    let (ib, iw) = (in_black as f32, in_white as f32);
+    let (ob, ow) = (out_black as f32, out_white as f32);
+    let inv_gamma = 1.0 / gamma.max(1e-6) as f32;
+    let span = iw - ib;
+    c.map(|v| {
+        let t = if span.abs() < 1e-6 {
+            if v >= iw { 1.0 } else { 0.0 }
+        } else {
+            ((v - ib) / span).clamp(0.0, 1.0)
+        };
+        ob + t.powf(inv_gamma) * (ow - ob)
+    })
+}
+
+/// Paint a blurred, offset copy of the image's own alpha underneath it.
+///
+/// The shadow is built as a full RGBA image — the shadow colour everywhere,
+/// carrying the *shifted* alpha — and then blurred with the same kernel a
+/// Gaussian Blur effect uses, so a shadow's softness and a blur's mean the same
+/// thing. The composite is `source over shadow`, done in premultiplied f32 and
+/// converted back at the end, which is the only way the semi-transparent edge
+/// of the artwork ends up over the shadow rather than mixed into it.
+///
+/// A positive offset moves the shadow **right and down**, matching the y-down
+/// pixel grid every backend here writes into.
+#[allow(clippy::too_many_arguments)]
+fn drop_shadow(
+    px: &mut [u8],
+    width: usize,
+    height: usize,
+    color: MColor,
+    offset_x: f64,
+    offset_y: f64,
+    radius: f64,
+    opacity: f64,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let (dx, dy) = (offset_x.round() as isize, offset_y.round() as isize);
+    let rgb = [to_u8(color.r as f32), to_u8(color.g as f32), to_u8(color.b as f32)];
+
+    // The shadow's own image: sampled from where the artwork *was*, so the
+    // copy lands where the offset puts it.
+    let mut shadow = vec![0u8; px.len()];
+    for y in 0..height as isize {
+        for x in 0..width as isize {
+            let (sx, sy) = (x - dx, y - dy);
+            if sx < 0 || sy < 0 || sx >= width as isize || sy >= height as isize {
+                continue;
+            }
+            let src = ((sy as usize) * width + sx as usize) * 4;
+            let dst = ((y as usize) * width + x as usize) * 4;
+            shadow[dst] = rgb[0];
+            shadow[dst + 1] = rgb[1];
+            shadow[dst + 2] = rgb[2];
+            shadow[dst + 3] = px[src + 3];
+        }
+    }
+    gaussian_blur(&mut shadow, width, height, radius);
+
+    let strength = opacity.clamp(0.0, 1.0) as f32;
+    for (out, sh) in px.chunks_exact_mut(4).zip(shadow.chunks_exact(4)) {
+        let sa = (sh[3] as f32 / 255.0) * strength;
+        let oa = out[3] as f32 / 255.0;
+        // src over shadow, in premultiplied terms.
+        let a = oa + sa * (1.0 - oa);
+        if a <= 0.0 {
+            out.fill(0);
+            continue;
+        }
+        for ch in 0..3 {
+            let s = out[ch] as f32 / 255.0 * oa;
+            let d = sh[ch] as f32 / 255.0 * sa * (1.0 - oa);
+            out[ch] = to_u8((s + d) / a);
+        }
+        out[3] = to_u8(a);
+    }
 }
 
 /// Rotate hue (degrees) and shift saturation / lightness (signed amounts) via
@@ -306,6 +415,152 @@ mod tests {
         for chunk in px.chunks_exact(4) {
             assert_eq!(chunk, &[255, 0, 0, 200]);
         }
+    }
+
+    /// The identity curve — full range in, full range out, straight gamma —
+    /// changes nothing. Adding Levels must not alter the frame until it is
+    /// dialled in.
+    #[test]
+    fn identity_levels_change_nothing() {
+        let mut px = solid([10, 128, 240, 200], 4);
+        let before = px.clone();
+        apply_stack(
+            &mut px,
+            2,
+            2,
+            &[ResolvedEffect::Levels {
+                in_black: 0.0,
+                in_white: 1.0,
+                gamma: 1.0,
+                out_black: 0.0,
+                out_white: 1.0,
+            }],
+        );
+        assert_eq!(px, before);
+    }
+
+    /// Levels stretches the input range onto the output range: half-grey with
+    /// the input white pulled down to 0.5 lands on white.
+    #[test]
+    fn levels_stretch_the_range() {
+        let mut px = solid([128, 128, 128, 255], 1);
+        apply_stack(
+            &mut px,
+            1,
+            1,
+            &[ResolvedEffect::Levels {
+                in_black: 0.0,
+                in_white: 0.5,
+                gamma: 1.0,
+                out_black: 0.0,
+                out_white: 1.0,
+            }],
+        );
+        assert!(px[0] > 250, "128 with white at 0.5 should clip to white, got {}", px[0]);
+        assert_eq!(px[3], 255, "and alpha is untouched");
+    }
+
+    /// Gamma bends the middle without moving the ends — the property that
+    /// makes it a *curve* control rather than another brightness.
+    #[test]
+    fn gamma_moves_the_midtones_and_leaves_the_ends() {
+        let mut px = vec![0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255];
+        apply_stack(
+            &mut px,
+            3,
+            1,
+            &[ResolvedEffect::Levels {
+                in_black: 0.0,
+                in_white: 1.0,
+                gamma: 2.0,
+                out_black: 0.0,
+                out_white: 1.0,
+            }],
+        );
+        assert_eq!(px[0], 0, "black stays black");
+        assert_eq!(px[8], 255, "white stays white");
+        assert!(px[4] > 140, "the midtone lifts, got {}", px[4]);
+    }
+
+    /// A drop shadow paints where the artwork is *not*, offset from it, and
+    /// leaves the artwork itself opaque and its own colour.
+    #[test]
+    fn a_drop_shadow_lands_beside_the_artwork() {
+        // One opaque white pixel at (2,2) of a 9x9 transparent field.
+        let (w, h) = (9usize, 9usize);
+        let mut px = vec![0u8; w * h * 4];
+        let at = |x: usize, y: usize| (y * w + x) * 4;
+        px[at(2, 2)..at(2, 2) + 4].copy_from_slice(&[255, 255, 255, 255]);
+
+        apply_stack(
+            &mut px,
+            w,
+            h,
+            &[ResolvedEffect::DropShadow {
+                color: Color::rgb(0.0, 0.0, 0.0),
+                offset_x: 3.0,
+                offset_y: 3.0,
+                // Hard-edged, so the assertions are about placement rather
+                // than about the blur kernel.
+                radius: 0.0,
+                opacity: 1.0,
+            }],
+        );
+
+        let alpha = |x: usize, y: usize| px[at(x, y) + 3];
+        assert_eq!(alpha(5, 5), 255, "the shadow lands down-right of the artwork");
+        assert_eq!(&px[at(5, 5)..at(5, 5) + 3], &[0, 0, 0], "and is the shadow colour");
+        assert_eq!(&px[at(2, 2)..at(2, 2) + 4], &[255, 255, 255, 255], "the artwork is untouched");
+        assert_eq!(alpha(8, 8), 0, "and nothing lands where neither is");
+    }
+
+    /// A transparent layer casts no shadow: the shadow is made of the layer's
+    /// own alpha, so nothing in means nothing out.
+    #[test]
+    fn nothing_casts_no_shadow() {
+        let mut px = vec![0u8; 4 * 16];
+        let before = px.clone();
+        apply_stack(
+            &mut px,
+            4,
+            4,
+            &[ResolvedEffect::DropShadow {
+                color: Color::rgb(0.0, 0.0, 0.0),
+                offset_x: 1.0,
+                offset_y: 1.0,
+                radius: 2.0,
+                opacity: 1.0,
+            }],
+        );
+        assert_eq!(px, before);
+    }
+
+    /// Shadow opacity scales the shadow and not the artwork — the two are
+    /// composited, not blended together.
+    #[test]
+    fn shadow_opacity_dims_only_the_shadow() {
+        let (w, h) = (9usize, 9usize);
+        let at = |x: usize, y: usize| (y * w + x) * 4;
+        let render = |opacity: f64| {
+            let mut px = vec![0u8; w * h * 4];
+            px[at(2, 2)..at(2, 2) + 4].copy_from_slice(&[255, 255, 255, 255]);
+            apply_stack(
+                &mut px,
+                w,
+                h,
+                &[ResolvedEffect::DropShadow {
+                    color: Color::rgb(0.0, 0.0, 0.0),
+                    offset_x: 3.0,
+                    offset_y: 3.0,
+                    radius: 0.0,
+                    opacity,
+                }],
+            );
+            px
+        };
+        let half = render(0.5);
+        assert!((120..=136).contains(&half[at(5, 5) + 3]), "half-strength shadow");
+        assert_eq!(half[at(2, 2) + 3], 255, "the artwork keeps its own alpha");
     }
 
     /// A zero-amount tint is an identity pass.

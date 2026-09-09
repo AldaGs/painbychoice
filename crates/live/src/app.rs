@@ -616,11 +616,13 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
         },
         EffectOp::SetColor { index, rgb } => match node.effects.get_mut(index) {
             Some(ef) => {
-                if let K::Tint { color, .. } = &mut ef.kind {
-                    color.set_at(frame, rgb_color(rgb));
-                    true
-                } else {
-                    false
+                match &mut ef.kind {
+                    K::Tint { color, .. } | K::DropShadow { color, .. } => {
+                        color.set_at(frame, rgb_color(rgb));
+                        true
+                    }
+                    // A kind with no colour: a stale panel, which no-ops.
+                    _ => false,
                 }
             }
             None => false,
