@@ -634,19 +634,18 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
 /// than writing the wrong field. The one place the `EffectParam`→`Value` mapping
 /// is written, mirroring `effect_nums` on the read side.
 fn set_effect_num(kind: &mut motion_core::EffectKind, param: EffectParam, frame: i64, v: f64) -> bool {
-    use motion_core::EffectKind as K;
-    use EffectParam as P;
-    match (kind, param) {
-        (K::GaussianBlur { radius }, P::BlurRadius) => radius.set_at(frame, v),
-        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness.set_at(frame, v),
-        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast.set_at(frame, v),
-        (K::HueSaturation { hue, .. }, P::Hue) => hue.set_at(frame, v),
-        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation.set_at(frame, v),
-        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness.set_at(frame, v),
-        (K::Tint { amount, .. }, P::TintAmount) => amount.set_at(frame, v),
-        _ => return false,
+    // `set_at`, so dragging an animated parameter writes a key and dragging a
+    // constant one leaves it constant — the gizmo's behaviour, and what makes
+    // the stopwatch the only thing that decides whether an effect animates.
+    match crate::props::effect_value_mut(kind, param) {
+        Some(value) => {
+            value.set_at(frame, v);
+            true
+        }
+        // A parameter this kind does not have: a stale panel index, which
+        // no-ops rather than panicking.
+        None => false,
     }
-    true
 }
 
 /// The properties that live on a node's **artwork** rather than its placement,

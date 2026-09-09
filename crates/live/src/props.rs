@@ -109,10 +109,6 @@ pub(crate) struct NodeInfo {
     /// The layer's effect stack, top to bottom in application order — resolved
     /// for display and paired with which parameters to edit.
     pub(crate) effects: Vec<EffectInfo>,
-    /// The stack contains an effect the in-scene fast path can't show yet (a
-    /// blur), so the preview under-represents it. Surfaced as a note rather than
-    /// silently drawing the wrong thing.
-    pub(crate) effects_preview_gap: bool,
 }
 
 /// A sound layer's mix, resolved for this frame.
@@ -138,14 +134,26 @@ pub(crate) struct EffectInfo {
     pub(crate) enabled: bool,
     /// Numeric parameters in editing order, each tagged with which parameter it
     /// is so an edit routes back to the right `Value`.
-    pub(crate) nums: Vec<(EffectParam, f64)>,
+    pub(crate) nums: Vec<EffectNum>,
     /// The tint colour, `Some` only for a `Tint` effect.
     pub(crate) color: Option<[f32; 3]>,
 }
 
+/// One numeric effect parameter as the panel shows it: which one, its value on
+/// this frame, and whether it is already a track (so the stopwatch can say so).
+pub(crate) struct EffectNum {
+    pub(crate) param: EffectParam,
+    pub(crate) value: f64,
+    pub(crate) anim: bool,
+}
+
 /// Names one editable numeric parameter of an effect, so a `DragValue` edit can
 /// say which `Value` it changed without the panel knowing the effect's layout.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered and hashable because it rides inside [`PropKind::Effect`], which is
+/// the key of a `BTreeSet` — declaration order there decides dopesheet row
+/// order, so it decides this enum's too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum EffectParam {
     BlurRadius,
     Brightness,
@@ -176,21 +184,71 @@ impl EffectParam {
 pub(crate) fn effect_nums(
     kind: &motion_core::EffectKind,
     ctx: &mut EvalCtx,
-) -> Vec<(EffectParam, f64)> {
+) -> Vec<EffectNum> {
+    effect_params(kind)
+        .into_iter()
+        .filter_map(|param| {
+            let value = effect_value(kind, param)?;
+            Some(EffectNum { param, value: value.resolve(ctx), anim: value.is_animated() })
+        })
+        .collect()
+}
+
+/// Which numeric parameters an effect kind has, in editing order.
+///
+/// **The** layout, in one place: the panel's rows, the dopesheet's rows and
+/// `prop_kinds_of` all read it, so none of them can disagree about what an
+/// effect exposes. Adding a parameter to an effect is this list plus an arm in
+/// [`effect_value`] and [`effect_value_mut`].
+pub(crate) fn effect_params(kind: &motion_core::EffectKind) -> Vec<EffectParam> {
     use motion_core::EffectKind as K;
+    use EffectParam as P;
     match kind {
-        K::GaussianBlur { radius } => vec![(EffectParam::BlurRadius, radius.resolve(ctx))],
-        K::BrightnessContrast { brightness, contrast } => vec![
-            (EffectParam::Brightness, brightness.resolve(ctx)),
-            (EffectParam::Contrast, contrast.resolve(ctx)),
-        ],
-        K::HueSaturation { hue, saturation, lightness } => vec![
-            (EffectParam::Hue, hue.resolve(ctx)),
-            (EffectParam::Saturation, saturation.resolve(ctx)),
-            (EffectParam::Lightness, lightness.resolve(ctx)),
-        ],
-        K::Tint { amount, .. } => vec![(EffectParam::TintAmount, amount.resolve(ctx))],
+        K::GaussianBlur { .. } => vec![P::BlurRadius],
+        K::BrightnessContrast { .. } => vec![P::Brightness, P::Contrast],
+        K::HueSaturation { .. } => vec![P::Hue, P::Saturation, P::Lightness],
+        K::Tint { .. } => vec![P::TintAmount],
     }
+}
+
+/// One effect parameter of one kind, or `None` if that kind has no such
+/// parameter — a stale panel index asking a blur for its hue.
+pub(crate) fn effect_value<'a>(
+    kind: &'a motion_core::EffectKind,
+    param: EffectParam,
+) -> Option<&'a Value<f64>> {
+    use motion_core::EffectKind as K;
+    use EffectParam as P;
+    Some(match (kind, param) {
+        (K::GaussianBlur { radius }, P::BlurRadius) => radius,
+        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness,
+        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast,
+        (K::HueSaturation { hue, .. }, P::Hue) => hue,
+        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
+        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
+        (K::Tint { amount, .. }, P::TintAmount) => amount,
+        _ => return None,
+    })
+}
+
+/// Mutable twin of [`effect_value`]. Adjacent on purpose, like
+/// `prop_of`/`prop_of_mut`: the two are only correct read together.
+pub(crate) fn effect_value_mut<'a>(
+    kind: &'a mut motion_core::EffectKind,
+    param: EffectParam,
+) -> Option<&'a mut Value<f64>> {
+    use motion_core::EffectKind as K;
+    use EffectParam as P;
+    Some(match (kind, param) {
+        (K::GaussianBlur { radius }, P::BlurRadius) => radius,
+        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness,
+        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast,
+        (K::HueSaturation { hue, .. }, P::Hue) => hue,
+        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
+        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
+        (K::Tint { amount, .. }, P::TintAmount) => amount,
+        _ => return None,
+    })
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -515,11 +573,6 @@ impl NodeInfo {
                     },
                 })
                 .collect(),
-            effects_preview_gap: {
-                let resolved: Vec<_> =
-                    node.effects.iter().filter_map(|e| e.resolve(ctx)).collect();
-                motion_render::fx::needs_readback(&resolved)
-            },
         }
     }
 }
@@ -1353,15 +1406,20 @@ pub(crate) fn properties_ui(
             });
             ui.end_row();
 
-            // Parameter rows, indented under the effect they belong to.
-            for &(param, value) in &ef.nums {
+            // Parameter rows, indented under the effect they belong to. Each
+            // gets a stopwatch, so an effect animates through the same gesture
+            // every other property uses.
+            for num in &ef.nums {
+                let param = num.param;
                 ui.label(format!("  {}", param.label()));
-                let mut v = value;
+                let mut v = num.value;
                 let speed = if param == EffectParam::BlurRadius { 0.5 } else { 0.01 };
                 if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {
                     edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
                 }
-                ui.label("");
+                if key_button(ui, num.anim) {
+                    edits.key.insert(PropKind::Effect { index: i, param });
+                }
                 ui.end_row();
             }
             if let Some(rgb) = ef.color {
@@ -1373,12 +1431,6 @@ pub(crate) fn properties_ui(
                 ui.label("");
                 ui.end_row();
             }
-        }
-        if n.effects_preview_gap {
-            ui.label("");
-            ui.colored_label(WARN_COLOR, "blur not shown in preview yet")
-                .on_hover_text("Colour effects preview live; blur needs the full-image compositor, still being built.");
-            ui.end_row();
         }
 
         // --- Footage. The source is a read-only fact about a file; the only
@@ -1583,6 +1635,15 @@ pub(crate) enum PropKind {
     /// loudness rather than geometry.
     AudioLevel,
     AudioPan,
+    /// One numeric parameter of one effect in the layer's stack. **Indexed**
+    /// like [`PropKind::PathPoint`], and discovered per node by
+    /// [`prop_kinds_of`], because a stack's shape is data rather than a fixed
+    /// set — a layer has as many as it has effects.
+    ///
+    /// This is what cashes in "every parameter is a `Value<T>`, so animation
+    /// comes along at no cost": with it, a blur radius keyframes, plots and
+    /// retimes through exactly the machinery a position does.
+    Effect { index: usize, param: EffectParam },
     /// One control point of a vector path anchor. **Indexed**, so unlike every
     /// variant above it is not a fixed member of `ALL` — a path has as many as it
     /// has anchors, discovered per node by [`prop_kinds_of`]. It sorts last (after
@@ -1620,6 +1681,11 @@ impl PropKind {
         if let PropKind::PathPoint { index, part } = self {
             return Cow::Owned(format!("P{}{}", index + 1, part.suffix()));
         }
+        // The stack position is part of the name: two blurs on one layer have
+        // the same parameter names and are not the same row.
+        if let PropKind::Effect { index, param } = self {
+            return Cow::Owned(format!("FX{} {}", index + 1, param.label()));
+        }
         Cow::Borrowed(self.fixed_label())
     }
 
@@ -1643,8 +1709,9 @@ impl PropKind {
             PropKind::MaskSize => "Mask Size",
             PropKind::AudioLevel => "Level",
             PropKind::AudioPan => "Pan",
-            // Intercepted by `label` before this is reached.
+            // Intercepted by `label` before these are reached.
             PropKind::PathPoint { .. } => "Path Point",
+            PropKind::Effect { .. } => "Effect",
         }
     }
 
@@ -1984,6 +2051,11 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { content, .. } => PropRef::Str(content),
             _ => return None,
         },
+        // An effect parameter. A plain `Value<f64>`, so it keyframes and plots
+        // like an opacity — the effect stack needs no machinery of its own.
+        PropKind::Effect { index, param } => {
+            PropRef::Num(effect_value(&node.effects.get(index)?.kind, param)?)
+        }
         // One control point of a vector path — a plain `Value<Vec2>`, so it
         // keyframes, retimes, and plots (as X/Y) exactly like a shape's size.
         PropKind::PathPoint { index, part } => match node.shape.as_ref()? {
@@ -2002,6 +2074,11 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
 /// for a dozen empty ones.
 pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
     let mut kinds: Vec<PropKind> = PropKind::ALL.to_vec();
+    for (index, effect) in node.effects.iter().enumerate() {
+        for param in effect_params(&effect.kind) {
+            kinds.push(PropKind::Effect { index, param });
+        }
+    }
     if let Some(MShape::Vector { path }) = &node.shape {
         for index in 0..path.anchors.len() {
             for part in PathPart::ALL {
@@ -2049,6 +2126,9 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             MShape::Text { size, .. } => PropRefMut::Num(size),
             _ => return None,
         },
+        PropKind::Effect { index, param } => {
+            PropRefMut::Num(effect_value_mut(&mut node.effects.get_mut(index)?.kind, param)?)
+        }
         PropKind::PathPoint { index, part } => match node.shape.as_mut()? {
             MShape::Vector { path } => PropRefMut::Vec2(path.value_mut(index, part)?),
             _ => return None,

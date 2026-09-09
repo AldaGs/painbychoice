@@ -49,6 +49,19 @@ produce a finished video.
   imported `Path` no size. **All of them are animatable**, on equal footing:
   every one gets a stopwatch, a dopesheet row, and the full selection /
   retime / copy-paste / easing treatment.
+- **Effects** — a per-layer stack of pixel operations, in the properties panel
+  beside blend and matte (a non-empty stack isolates the layer, exactly as a
+  blend mode does). **Gaussian blur, brightness/contrast, hue/saturation** and
+  **tint**, applied top to bottom; each one can be muted, reordered or removed,
+  and a muted effect is dropped from the stack rather than run as an identity
+  pass.
+  - Every numeric parameter is animatable on the same footing as everything
+    else: a stopwatch on the row, a dopesheet row, a curve, retiming and
+    copy/paste. A blur radius keyframes exactly the way a position does.
+  - The stack renders **everywhere**: the preview (through a per-layer readback
+    for the blur), the editor's Draft and Master exports, and the offline CPU
+    rasterizer that `motion render` uses. The SVG backend cannot express one,
+    so it reports the layer rather than silently drawing it plain.
 - **Timeline / dopesheet** (bottom) — a **frame ruler** with adaptive ticks
   (1/2/5/10-frame steps plus whole-second multiples, so labels land on round
   timecodes when zoomed out; per-frame minor ticks once frames are ≥6px apart),

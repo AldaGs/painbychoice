@@ -5322,6 +5322,79 @@ fn toggle_and_set_num_reach_the_right_field() {
 }
 
 #[test]
+fn an_effect_parameter_is_an_ordinary_animatable_property() {
+    // The claim the effect stack was written against — "every parameter is a
+    // `Value<T>`, so animation comes along at no cost" — is only true once a
+    // `PropKind` addresses one. This is that claim, tested.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    let kind = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+
+    assert!(prop_of(&node, kind).is_some(), "the radius is addressable");
+    assert!(dope_rows(&node).is_empty(), "a constant radius is not a row");
+
+    prop_of_mut(&mut node, kind).unwrap().insert_key(10);
+    let row = dope_rows(&node).into_iter().find(|r| r.kind == kind);
+    assert_eq!(row.expect("the radius now has a row").frames, vec![10]);
+}
+
+#[test]
+fn an_animated_radius_actually_changes_over_time() {
+    // End to end: two keys through the ordinary keyframe machinery, resolved
+    // through the effect's own `resolve` — the value the compositor reads.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    let kind = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+    prop_of_mut(&mut node, kind).unwrap().insert_key(0);
+    apply_effect_op(
+        &mut node,
+        20,
+        &EffectOp::SetNum { index: 0, param: EffectParam::BlurRadius, value: 40.0 },
+    );
+
+    let at = |f: f64| {
+        let mut ctx = EvalCtx::at(f);
+        match node.effects[0].resolve(&mut ctx) {
+            Some(motion_core::ResolvedEffect::GaussianBlur { radius }) => radius,
+            other => panic!("expected a blur, got {other:?}"),
+        }
+    };
+    let (start, mid, end) = (at(0.0), at(10.0), at(20.0));
+    assert_eq!(end, 40.0, "the second key is where it was put");
+    assert!(mid > start && mid < end, "and the frames between interpolate: {start} {mid} {end}");
+}
+
+#[test]
+fn each_effect_in_a_stack_gets_its_own_rows() {
+    // Two blurs on one layer have identically-named parameters and are not the
+    // same property. The index is what tells them apart, in the row label as
+    // well as in the key.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    let kinds = prop_kinds_of(&node);
+    let first = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+    let second = PropKind::Effect { index: 1, param: EffectParam::BlurRadius };
+    assert!(kinds.contains(&first) && kinds.contains(&second));
+    assert_eq!(first.label(), "FX1 Radius");
+    assert_eq!(second.label(), "FX2 Radius");
+}
+
+#[test]
+fn a_layer_offers_only_the_parameters_its_effects_have() {
+    // `prop_kinds_of` is what the dopesheet enumerates. A layer with no stack
+    // must not grow effect rows, and a blur must not offer a hue.
+    let plain = effect_layer();
+    assert!(!prop_kinds_of(&plain).iter().any(|k| matches!(k, PropKind::Effect { .. })));
+
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    assert!(prop_of(&node, PropKind::Effect { index: 0, param: EffectParam::Hue }).is_none());
+    // And an index past the end of the stack is a stale panel, not a panic.
+    assert!(prop_of(&node, PropKind::Effect { index: 9, param: EffectParam::BlurRadius }).is_none());
+}
+
+#[test]
 fn set_num_ignores_a_param_from_another_kind() {
     // The panel only ever offers a kind's own params, but the apply path guards
     // against a mismatch rather than writing the wrong field.
