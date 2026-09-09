@@ -248,15 +248,25 @@ this phase that could not be verified from a test.
   reuses. Synchronous, as import is; a file that will not decode is named and
   its layer is silent, never a failed load.
 
-**Still ahead in this phase — start here:**
+- ✅ **Resampling quality.** `Sound::read_into` is a Blackman-windowed sinc
+  (16 taps a side) instead of linear interpolation. The half that is easy to
+  miss: when converting *down*, the cutoff has to follow the **output's**
+  Nyquist, or the resampler faithfully reconstructs frequencies the output grid
+  cannot hold and they fold back as alias tones nothing downstream can remove.
+  Matched rates still take the exact-copy path, so the common case costs
+  nothing. Tested against an analytic sine (upsampling) and an unrepresentable
+  15kHz tone (downsampling).
 
-1. **Resampling quality.** Mismatched rates use linear interpolation, which
-   `Sound::read` documents as a floor rather than a choice. A windowed-sinc
-   resampler is the upgrade and that function is the only seam it needs.
+**Phase 2 is complete as of 2026-09-08.**
 
 **Done when:** a cut can be edited to music and the exported file carries it.
-*Both halves are true. What is left in this phase is quality, not capability:
-linear interpolation on a mismatched sample rate.*
+*Both are true: the waveform makes sync editable, level and pan make the mix
+editable, and Draft, Master and the CLI all carry the sound.*
+
+Left for later, deliberately: the mix is one stereo bus with no meters and no
+solo, and a very long sound is decoded whole into memory (written down in
+`render/src/audio.rs` rather than discovered). Neither blocks editing to
+music, which is what this phase was for.
 
 #### The original plan for this phase
 

@@ -119,6 +119,10 @@ produce a finished video.
   - **Opening a project reloads its sounds**, so a reopened `.pbc` plays,
     draws its waveforms and exports with its mix. A file that has moved is
     named and leaves its layer silent rather than failing the load.
+  - A file whose rate is not the project's is converted with a
+    **windowed-sinc** resampler, which keeps the top octave intact going up and
+    filters out what will not fit going down. Matched rates are copied
+    untouched.
   - Formats are whatever symphonia handles: wav, mp3, flac, ogg, m4a, aac, aiff.
     A sound that will not decode leaves that layer silent and says so, rather
     than failing the render.

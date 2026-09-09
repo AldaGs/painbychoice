@@ -68,12 +68,10 @@ impl Sound {
     /// buffer or an error: running off the end of a sound is ordinary, not
     /// exceptional.
     ///
-    /// The resampling is **linear interpolation**, and that is a deliberate
-    /// floor rather than a considered choice. It is transparent when the rates
-    /// match (the common case, and an exact copy — no arithmetic touches the
-    /// samples), and audibly imperfect on a large ratio, where it will alias in
-    /// the top octave. Good enough to edit and preview against; a windowed-sinc
-    /// resampler is the upgrade, and the seam for it is this function alone.
+    /// Matched rates take an **exact copy** — the overwhelmingly common case,
+    /// where no arithmetic touches the samples at all. Mismatched rates go
+    /// through a **windowed-sinc** resampler; see [`Sound::read_into`] for what
+    /// it does and what it costs.
     pub fn read(&self, from: i64, count: usize, rate: u32) -> Vec<f32> {
         let mut out = vec![0.0; count * 2];
         self.read_into(from, &mut out, rate);
@@ -86,6 +84,34 @@ impl Sound {
     /// the device's realtime thread is an audible click rather than a slow
     /// frame. `out` is interleaved stereo and its length decides how many sample
     /// frames are read.
+    ///
+    /// # The resampler
+    ///
+    /// Sample-rate conversion is band-limited interpolation: a Blackman-windowed
+    /// sinc of [`SINC_TAPS`] taps either side, normalised so its gain is unity.
+    /// This replaced linear interpolation, which was documented as a floor
+    /// rather than a choice — linear is a triangular filter with a very soft
+    /// rolloff, so it both dulls the top octave and lets everything above
+    /// Nyquist fold back into the band as alias tones that no later stage can
+    /// remove.
+    ///
+    /// **Downsampling moves the cutoff**, which is the half people skip: the
+    /// filter has to stop at the *output's* Nyquist, not the input's, or the
+    /// resampler faithfully reconstructs frequencies the output grid cannot
+    /// hold. So the kernel is stretched by the rate ratio when converting down,
+    /// which is what makes it an anti-alias filter rather than only an
+    /// interpolator.
+    ///
+    /// Outside the sound is **silence**, and the normalisation counts those
+    /// taps, so a sound fades over its last half-kernel instead of being
+    /// boosted by a partial window at the edge.
+    ///
+    /// The cost is ~32 multiply-adds per sample per channel against linear's
+    /// one, and more when converting far *down*, since the kernel widens with
+    /// the ratio. That is real, and it is affordable here: it runs only when
+    /// the rates differ, and even then a realtime callback's few milliseconds
+    /// is a few hundred thousand operations — the matched-rate path, which is
+    /// what most sessions actually run, still copies.
     pub fn read_into(&self, from: i64, out: &mut [f32], rate: u32) {
         out.fill(0.0);
         let count = out.len() / 2;
@@ -109,25 +135,78 @@ impl Sound {
         }
 
         let ratio = self.sample_rate as f64 / rate as f64;
+        // Where the filter has to stop, in cycles of the *source* rate. Going
+        // up (ratio < 1) the source's own band already fits, so the cutoff
+        // stays at its Nyquist; going down it must come back to the output's.
+        let cutoff = (1.0 / ratio).min(1.0);
         for i in 0..count {
             let pos = (from + i as i64) as f64 * ratio;
             let base = pos.floor();
-            let frac = (pos - base) as f32;
-            let a = base as i64;
-            let b = a + 1;
-            if a < 0 || a >= frames {
-                continue;
+            let frac = pos - base;
+            let b = base as i64;
+            // The kernel widens with the cutoff, so a big downsample keeps the
+            // same number of *cycles* of sinc rather than the same number of
+            // source samples — the taps are the resolution of the filter, and
+            // narrowing the filter without widening its support would truncate
+            // it into a much worse one.
+            let half = ((SINC_TAPS as f64) / cutoff).ceil() as i64;
+            let (mut l, mut r, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+            for j in (-half + 1)..=half {
+                // Distance from this output position to that source sample.
+                let t = j as f64 - frac;
+                let w = sinc(cutoff * t) * blackman(t / half as f64) * cutoff;
+                // Out-of-range taps still count towards the norm: they are
+                // silence, and letting them shrink the divisor would boost a
+                // sound's first and last few milliseconds instead of fading
+                // them.
+                norm += w;
+                let src = b + j;
+                if src < 0 || src >= frames {
+                    continue;
+                }
+                l += w * self.samples[src as usize * 2] as f64;
+                r += w * self.samples[src as usize * 2 + 1] as f64;
             }
-            // The last sample has no successor to interpolate towards; holding
-            // it is correct and avoids reading past the end.
-            let bi = if b >= frames { a } else { b };
-            for ch in 0..2 {
-                let s0 = self.samples[a as usize * 2 + ch];
-                let s1 = self.samples[bi as usize * 2 + ch];
-                out[i * 2 + ch] = s0 + (s1 - s0) * frac;
+            if norm.abs() > f64::EPSILON {
+                out[i * 2] = (l / norm) as f32;
+                out[i * 2 + 1] = (r / norm) as f32;
             }
         }
     }
+}
+
+/// Taps either side of the sample being reconstructed, at unity ratio.
+///
+/// 16 is the usual "good enough that nobody argues" point for a preview-and-
+/// edit resampler: the stopband is deep enough that alias tones sit below the
+/// noise floor of anything being auditioned, and the cost stays a few dozen
+/// operations per sample rather than the few hundred a mastering-grade kernel
+/// would want.
+pub const SINC_TAPS: usize = 16;
+
+/// The normalised sinc, `sin(πx)/(πx)` — the ideal band-limited interpolator,
+/// and infinite, which is why it has to be windowed.
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-9 {
+        return 1.0;
+    }
+    let px = std::f64::consts::PI * x;
+    px.sin() / px
+}
+
+/// The Blackman window over `u` in `[-1, 1]`, zero outside.
+///
+/// It tapers the sinc to a finite length. Truncating one without a window
+/// leaves the abrupt ends ringing as a ~-21dB stopband — audible as a whistle
+/// on a swept tone — where Blackman's is below -74dB for the cost of two
+/// cosines.
+fn blackman(u: f64) -> f64 {
+    if u.abs() >= 1.0 {
+        return 0.0;
+    }
+    let x = (u + 1.0) * 0.5;
+    let tau = std::f64::consts::TAU;
+    0.42 - 0.5 * (tau * x).cos() + 0.08 * (2.0 * tau * x).cos()
 }
 
 /// One bucket's worth of sample frames in a [`Peaks`] reduction.
@@ -482,20 +561,87 @@ mod tests {
         // The last frame read should be near the end of the sound, not halfway.
         let last_left = got[98];
         let expected = s.samples[98 * 2]; // frame 98 of 100
+        // A loose tolerance on purpose, and only here: this samples one kernel
+        // width from the end of a ramp that stops dead, and a band-limited
+        // reconstruction of a discontinuity rings around it (Gibbs). What the
+        // test is asserting is the *mapping* — that half the frames at half the
+        // rate still reach the end of the sound — not the reconstruction.
         assert!(
-            (last_left - expected).abs() < 0.05,
+            (last_left - expected).abs() < 0.15,
             "reading 50 frames at half rate must span the whole sound: {last_left} vs {expected}"
         );
     }
 
     /// Interpolation lands between its neighbours rather than snapping — the
     /// property that distinguishes it from nearest-neighbour.
+    ///
+    /// Between, but *not* at the midpoint: a step is not band-limited, so the
+    /// band-limited reconstruction of one overshoots it. That is the resampler
+    /// being correct, not sloppy — the same ringing every sinc-based converter
+    /// has, and the reason this asserts a range rather than a number.
     #[test]
     fn interpolation_lands_between_neighbours() {
         let s = Sound { sample_rate: 2, samples: vec![0.0, 0.0, 1.0, 1.0] };
         // At the caller's 4Hz, frame 1 sits halfway between the two.
         let got = s.read(1, 1, 4);
-        assert!((got[0] - 0.5).abs() < 1e-6, "expected the midpoint, got {}", got[0]);
+        assert!(got[0] > 0.25 && got[0] < 1.0, "expected between the two, got {}", got[0]);
+    }
+
+    /// A sine, resampled up, is still that sine.
+    ///
+    /// The property linear interpolation could not hold: it flattens the peaks
+    /// of anything near the top of the band, which reads as a dulled mix rather
+    /// than an obvious fault.
+    #[test]
+    fn a_tone_survives_being_resampled_up() {
+        // 4kHz at 44.1k, read at 48k — the everyday case of a music file in a
+        // 48k project.
+        let hz = 4_000.0;
+        let src_rate = 44_100u32;
+        let frames = src_rate as usize;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (std::f64::consts::TAU * hz * i as f64 / src_rate as f64).sin() as f32;
+            samples.push(v);
+            samples.push(v);
+        }
+        let sound = Sound { sample_rate: src_rate, samples };
+
+        // Read from well inside the sound, so no edge taper is involved.
+        let out_rate = 48_000u32;
+        let from = out_rate as i64 / 4;
+        let got = sound.read(from, 480, out_rate);
+        let mut worst = 0.0f64;
+        for i in 0..480 {
+            let t = (from + i as i64) as f64 / out_rate as f64;
+            let want = (std::f64::consts::TAU * hz * t).sin();
+            worst = worst.max((got[i * 2] as f64 - want).abs());
+        }
+        assert!(worst < 0.01, "the tone should come through intact; worst error {worst}");
+    }
+
+    /// Downsampling filters to the *output's* Nyquist, so what cannot fit is
+    /// removed rather than folded back as an alias tone.
+    ///
+    /// This is the whole reason the kernel's cutoff moves with the ratio. A
+    /// 15kHz tone read at 8kHz has nowhere to go: reconstructed without a
+    /// filter it comes back as a loud whistle at some unrelated frequency, and
+    /// no later stage can tell it from real content.
+    #[test]
+    fn downsampling_removes_what_it_cannot_carry_instead_of_folding_it() {
+        let src_rate = 48_000u32;
+        let frames = src_rate as usize / 2;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (std::f64::consts::TAU * 15_000.0 * i as f64 / src_rate as f64).sin() as f32;
+            samples.push(v);
+            samples.push(v);
+        }
+        let sound = Sound { sample_rate: src_rate, samples };
+
+        let got = sound.read(1_000, 2_000, 8_000);
+        let peak = got.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.1, "an unrepresentable tone must not survive as an alias; peak {peak}");
     }
 
     /// A zero rate on either side is a device or a file that has not reported
