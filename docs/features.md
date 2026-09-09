@@ -111,8 +111,11 @@ produce a finished video.
     local time, so trimming the head scrolls the sound inside the bar exactly
     as it scrolls a trimmed video layer's picture, and a muted layer keeps a
     dimmed waveform rather than losing it.
-  - A rendered **video carries the mix** — `motion render` muxes it. The
-    editor's own render buttons do not yet.
+  - A rendered **video carries the mix** — both `motion render` and the
+    editor's own Draft and Master buttons mux it. A PNG sequence has nowhere to
+    put sound, so it isn't mixed at all. If a layer's sound isn't loaded, the
+    render still succeeds and the result chip is marked with a warning naming
+    what went out silent.
   - Formats are whatever symphonia handles: wav, mp3, flac, ogg, m4a, aac, aiff.
     A sound that will not decode leaves that layer silent and says so, rather
     than failing the render.

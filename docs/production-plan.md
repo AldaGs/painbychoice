@@ -226,23 +226,35 @@ this phase that could not be verified from a test.
   same `start` conversion `collect_audio` makes, so what you see and what you
   hear cannot disagree.
 
+- ✅ **Level and pan controls.** They join `PropKind`, which is the whole
+  change: ordinary `Value<f64>`s get a dopesheet row, a curve, a stopwatch and
+  retiming from one variant plus two match arms. The panel edits level linearly
+  with a dB read-out beside it — dB is how loudness is read, linear is what the
+  mixer multiplies by. Mix edits republish the mix; `PropEdits::touches_audio`
+  keeps every other drag from walking the comp for sound nobody changed.
+- ✅ **Audio in the GUI export path.** `renderqueue::mix_soundtrack` writes a
+  temp WAV owned by the `RenderJob`, because ffmpeg reads it for the whole
+  render and the job outlives the call that started it. It reuses the editor's
+  already-decoded `Arc<Sound>`s rather than decoding again — `mix_comp` is now
+  generic over `Borrow<Sound>` so both callers hold sounds the way that suits
+  them. A sound the editor doesn't hold is mixed as silence and **named** on
+  the result chip; the render succeeds, so it is a note, not an error.
+
 **Still ahead in this phase — start here:**
 
-1. **A level/pan UI.** The properties animate already; they need controls in the
-   properties panel and rows in the dopesheet. Small, and it makes the mix
-   editable rather than only programmable.
-2. **Audio in the GUI export path.** `motion render` muxes sound;
-   `renderqueue.rs` does not. The pieces exist (`mix_comp`, `write_wav`,
-   `FfmpegEncoder::with_audio`) — the work is threading a temp WAV through the
-   stepped job's lifetime, which is fiddlier than the CLI's because the job
-   outlives the call that starts it.
-3. **Resampling quality.** Mismatched rates use linear interpolation, which
+1. **Sounds are not reloaded when a project is opened.** Only `import_audio`
+   fills `App::sounds`, so a reopened `.pbc` plays silent, draws no waveform,
+   and exports with the warning above. The fix belongs beside footage relinking
+   (Phase 4) but the decode itself is one call — `motion_render::decode_sound`
+   over `project.assets` where `has_audio()`.
+2. **Resampling quality.** Mismatched rates use linear interpolation, which
    `Sound::read` documents as a floor rather than a choice. A windowed-sinc
    resampler is the upgrade and that function is the only seam it needs.
 
 **Done when:** a cut can be edited to music and the exported file carries it.
-*Both halves are true today; what remains is comfort — a mix you can set with
-controls rather than keyframes, and the GUI's own render buttons carrying it.*
+*Both halves are true for a session that imported its sound. What remains is
+that a **reopened** project does not reload them, which is the one thing left
+between this phase and done.*
 
 #### The original plan for this phase
 

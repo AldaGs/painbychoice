@@ -710,13 +710,17 @@ mod wav_tests {
 /// level and pan are control-rate parameters, and at ~21ms a block the
 /// difference is inaudible while the saving is a whole tree walk per block
 /// instead of per sample.
-pub fn mix_comp(
+/// `sounds` is generic over how the caller holds a [`Sound`] — the CLI decodes
+/// its own and owns them, while the editor already holds `Arc`s the audio
+/// callback shares. Borrowing rather than requiring ownership keeps the editor
+/// from cloning tens of megabytes per export to satisfy a signature.
+pub fn mix_comp<S: std::borrow::Borrow<Sound>>(
     project: &motion_core::Project,
     comp: motion_core::CompId,
     start: i64,
     end: i64,
     sample_rate: u32,
-    sounds: &std::collections::HashMap<motion_core::AssetId, Sound>,
+    sounds: &std::collections::HashMap<motion_core::AssetId, S>,
 ) -> Vec<f32> {
     use motion_core::audio::frames_to_sample_frames as to_sf;
 
@@ -746,7 +750,7 @@ pub fn mix_comp(
             &sources,
             |asset, at, buf| match sounds.get(&asset) {
                 Some(sound) => {
-                    sound.read_into(at, buf, sample_rate);
+                    sound.borrow().read_into(at, buf, sample_rate);
                     true
                 }
                 None => false,
@@ -817,7 +821,8 @@ mod mix_tests {
         comp.fps = 24.0;
         comp.duration_frames = 24;
         let project = Project::single(comp);
-        let mix = mix_comp(&project, project.root, 0, 23, 48_000, &Default::default());
+        let sounds: std::collections::HashMap<AssetId, Sound> = Default::default();
+        let mix = mix_comp(&project, project.root, 0, 23, 48_000, &sounds);
         assert_eq!(mix.len(), 48_000 * 2);
         assert!(mix.iter().all(|s| *s == 0.0));
     }

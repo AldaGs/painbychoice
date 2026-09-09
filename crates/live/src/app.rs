@@ -2796,6 +2796,10 @@ impl App {
             );
             return;
         }
+        // Both snapshots are taken before the call: the job borrows them, so
+        // they cannot be fields of the `self` it also mutates. Cloning the
+        // sound map copies `Arc`s, not samples.
+        let sounds = self.sounds.clone();
         self.begin_render(crate::renderqueue::JobSpec {
             project: &self.project.clone(),
             comp: self.current,
@@ -2804,6 +2808,7 @@ impl App {
             scale: 1.0,
             ffmpeg_args: Vec::new(),
             range: self.render_range(),
+            sounds: &sounds,
         });
     }
 
@@ -2929,6 +2934,10 @@ impl App {
         let preset = self.project.render_presets[0].clone();
         let out = crate::renderqueue::resolve_out(self.project_path.as_deref(), &preset.out);
         let quality = Quality::parse(&preset.quality).unwrap_or(Quality::Master);
+        // Both snapshots are taken before the call: the job borrows them, so
+        // they cannot be fields of the `self` it also mutates. Cloning the
+        // sound map copies `Arc`s, not samples.
+        let sounds = self.sounds.clone();
         self.begin_render(crate::renderqueue::JobSpec {
             project: &self.project.clone(),
             comp: self.current,
@@ -2937,6 +2946,7 @@ impl App {
             scale: preset.scale,
             ffmpeg_args: preset.ffmpeg_args.clone(),
             range: self.render_range(),
+            sounds: &sounds,
         });
     }
 
@@ -2971,6 +2981,7 @@ impl App {
             frames: 0,
             seconds: 0.0,
             error: Some(error),
+            note: None,
         });
     }
 

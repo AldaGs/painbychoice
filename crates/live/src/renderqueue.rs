@@ -81,6 +81,12 @@ pub(crate) struct RenderJob {
     encoder: Option<Box<dyn Encoder>>,
     target: OffscreenTarget,
     started: Instant,
+    /// The mixed soundtrack ffmpeg is reading, held for the job's lifetime and
+    /// deleted with it. `None` for a silent comp or a PNG sequence.
+    audio: Option<TempWav>,
+    /// What the mixdown could not do, carried into the finished record so it
+    /// reaches the user after the progress bar is gone.
+    note: Option<String>,
 }
 
 impl RenderJob {
@@ -162,6 +168,10 @@ pub(crate) struct RenderRecord {
     pub(crate) seconds: f64,
     /// `None` on success, the message on failure.
     pub(crate) error: Option<String>,
+    /// A caveat about an otherwise successful render — a sound that could not
+    /// be mixed, say. Separate from `error` because the file is real and
+    /// usable; it just isn't everything the comp asked for.
+    pub(crate) note: Option<String>,
 }
 
 /// The queue: at most one job running, plus what has finished.
@@ -203,6 +213,7 @@ impl RenderQueue {
             frames: job.done(),
             seconds: job.elapsed(),
             error,
+            note: job.note.take(),
         });
     }
 
@@ -341,13 +352,14 @@ fn encoder_for(
     spec: OutputSpec,
     quality: Quality,
     extra: &[String],
+    audio: Option<&Path>,
 ) -> Result<Box<dyn Encoder>, String> {
     if is_video_container(out) {
         // The preset first, the user's own arguments after it, so a saved
         // argument can override the preset rather than fight it.
         let mut args = quality.ffmpeg_args(out);
         args.extend(extra.iter().cloned());
-        FfmpegEncoder::new(out, spec, &args)
+        FfmpegEncoder::with_audio(out, spec, &args, audio)
             .map(|e| Box::new(e) as Box<dyn Encoder>)
             .map_err(|e| e.to_string())
     } else {
@@ -374,6 +386,16 @@ pub(crate) struct JobSpec<'a> {
     /// conversion happens once, at the caller, rather than being re-derived at
     /// every use.
     pub(crate) range: Option<(i64, i64)>,
+    /// The decoded sounds the editor already holds, borrowed for the mixdown.
+    ///
+    /// Passed in rather than decoded here: the editor imported them once, and
+    /// re-reading a file it already has in memory would add seconds to the
+    /// press of a button. A comp whose sound is missing from this map exports
+    /// silent and says so — see [`start`].
+    pub(crate) sounds: &'a std::collections::HashMap<
+        motion_core::AssetId,
+        std::sync::Arc<motion_render::Sound>,
+    >,
 }
 
 /// Clamp a requested inclusive frame range into a comp of `total` frames.
@@ -398,6 +420,85 @@ pub(crate) fn clamp_range(range: Option<(i64, i64)>, total: i64) -> (i64, i64) {
     }
 }
 
+/// The mixed soundtrack on disk, deleted when the job that made it is gone.
+///
+/// A file rather than a second pipe into ffmpeg, for the reason
+/// [`FfmpegEncoder::with_audio`] gives; and owned by the **job** rather than by
+/// the function that starts it, because the job is stepped from the redraw loop
+/// and outlives its own start by however long the render takes. ffmpeg holds
+/// the file open the whole time, so anything shorter-lived would delete the
+/// soundtrack out from under the process reading it.
+pub(crate) struct TempWav(PathBuf);
+
+impl Drop for TempWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The sample rate every GUI mixdown lands on.
+///
+/// The same 48kHz the CLI and the output stream use: one grid for the whole
+/// application, so a comp exported from the editor and from `motion render`
+/// cannot differ in rate.
+const MIX_RATE: u32 = 48_000;
+
+/// Mix the comp's sound for an inclusive frame range and write it beside the
+/// render, plus a note about anything that could not be found.
+///
+/// `None` when there is nothing to hear, which must not cost an empty audio
+/// stream in the output. A layer whose sound the editor does not hold — a
+/// project opened rather than imported into, today — is mixed as silence and
+/// **named** in the note: an export that quietly drops the music is the failure
+/// this is written to avoid.
+fn mix_soundtrack(
+    project: &MProject,
+    comp: CompId,
+    start: i64,
+    end: i64,
+    sounds: &std::collections::HashMap<
+        motion_core::AssetId,
+        std::sync::Arc<motion_render::Sound>,
+    >,
+) -> (Option<TempWav>, Option<String>) {
+    let sources = motion_core::evaluate_audio(project, comp, start as f64, MIX_RATE);
+    if sources.is_empty() {
+        return (None, None);
+    }
+    let mut missing: Vec<u64> =
+        sources.iter().filter(|s| !sounds.contains_key(&s.asset)).map(|s| s.asset.0).collect();
+    missing.sort_unstable();
+    missing.dedup();
+    let note = (!missing.is_empty()).then(|| {
+        let names: Vec<String> = missing
+            .iter()
+            .map(|id| {
+                project
+                    .asset(motion_core::AssetId(*id))
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| format!("asset {id}"))
+            })
+            .collect();
+        format!("silent in this render (that sound isn't loaded): {}", names.join(", "))
+    });
+
+    let mix = motion_render::mix_comp(project, comp, start, end, MIX_RATE, sounds);
+    if mix.is_empty() || mix.iter().all(|s| *s == 0.0) {
+        // Every source was missing, or they all resolved to silence. A silent
+        // track would still change the file's stream layout, so don't write one.
+        return (None, note);
+    }
+    let path =
+        std::env::temp_dir().join(format!("pbc_mix_{}_{}.wav", std::process::id(), start));
+    match motion_render::write_wav(&path, &mix, MIX_RATE) {
+        Ok(()) => (Some(TempWav(path)), note),
+        // A soundtrack that cannot be written must not fail the picture: the
+        // render is still worth having, and the note says what is missing from
+        // it.
+        Err(e) => (None, Some(format!("the soundtrack could not be written: {e}"))),
+    }
+}
+
 /// Start a render, allocating its target and opening its encoder.
 ///
 /// Fails before writing anything if the comp is missing or the encoder cannot
@@ -415,10 +516,26 @@ pub(crate) fn start(
     let target = OffscreenTarget::new(device, w, h)
         .ok_or_else(|| format!("could not allocate a {w}x{h} render target"))?;
 
-    let out_spec = OutputSpec { width: w, height: h, fps: comp.fps };
-    let encoder = encoder_for(&spec.out, out_spec, spec.quality, &spec.ffmpeg_args)?;
-
     let (start, end) = clamp_range(spec.range, comp.duration_frames);
+
+    // Mixed before the encoder opens, because the encoder's command line
+    // depends on whether there is a soundtrack to name. A PNG sequence has
+    // nowhere to put one, so it is not mixed at all rather than mixed and
+    // discarded.
+    let (audio, note) = if is_video_container(&spec.out) {
+        mix_soundtrack(spec.project, spec.comp, start, end, spec.sounds)
+    } else {
+        (None, None)
+    };
+
+    let out_spec = OutputSpec { width: w, height: h, fps: comp.fps };
+    let encoder = encoder_for(
+        &spec.out,
+        out_spec,
+        spec.quality,
+        &spec.ffmpeg_args,
+        audio.as_ref().map(|a| a.0.as_path()),
+    )?;
 
     Ok(RenderJob {
         project: spec.project.clone(),
@@ -431,6 +548,8 @@ pub(crate) fn start(
         encoder: Some(encoder),
         target,
         started: Instant::now(),
+        audio,
+        note,
     })
 }
 
@@ -504,14 +623,27 @@ impl RenderSummary {
                 failed: true,
             },
             None => RenderSummary {
-                short: format!("✓ {name}"),
-                text: format!(
-                    "{} · {} frames in {:.1}s → {}",
-                    record.quality.label(),
-                    record.frames,
-                    record.seconds,
-                    record.out.display()
-                ),
+                // A caveat marks the chip, not only the tooltip: a render that
+                // dropped the music looks identical to one that did not, and
+                // finding that out on playback is too late.
+                short: match &record.note {
+                    Some(_) => format!("✓ {name} ⚠"),
+                    None => format!("✓ {name}"),
+                },
+                text: {
+                    let mut t = format!(
+                        "{} · {} frames in {:.1}s → {}",
+                        record.quality.label(),
+                        record.frames,
+                        record.seconds,
+                        record.out.display()
+                    );
+                    if let Some(note) = &record.note {
+                        t.push('\n');
+                        t.push_str(note);
+                    }
+                    t
+                },
                 failed: false,
             },
         }
@@ -615,6 +747,72 @@ mod tests {
 
     fn preset(out: &str) -> RenderPreset {
         RenderPreset { out: out.to_string(), ..RenderPreset::default_master() }
+    }
+
+    /// A comp with a sound layer, and the decoded sound to go with it.
+    fn comp_with_sound(
+    ) -> (MProject, std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Sound>>)
+    {
+        let asset = motion_core::AssetId(1);
+        let mut layer = motion_core::Node::group(1, "music");
+        layer.timing = Some(motion_core::node::LayerTiming::new(0, 24));
+        layer.audio = Some(motion_core::AudioClip::new(asset));
+        let mut comp = motion_core::node::Comp::new(
+            64.0,
+            64.0,
+            motion_core::Node::group(0, "root").with_child(layer),
+        );
+        comp.fps = 24.0;
+        comp.duration_frames = 24;
+
+        let mut sounds = std::collections::HashMap::new();
+        sounds.insert(
+            asset,
+            std::sync::Arc::new(motion_render::Sound {
+                sample_rate: 48_000,
+                samples: vec![0.5; 48_000 * 2],
+            }),
+        );
+        (MProject::single(comp), sounds)
+    }
+
+    /// A silent comp writes no soundtrack — an empty audio stream in the
+    /// output is worse than none, and it would change the file's shape for
+    /// every project that has never imported a sound.
+    #[test]
+    fn a_silent_comp_mixes_nothing() {
+        let mut comp =
+            motion_core::node::Comp::new(64.0, 64.0, motion_core::Node::group(0, "root"));
+        comp.duration_frames = 10;
+        let project = MProject::single(comp);
+        let (wav, note) = mix_soundtrack(&project, project.root, 0, 9, &Default::default());
+        assert!(wav.is_none());
+        assert!(note.is_none());
+    }
+
+    /// The mix lands on disk while the job needs it, and takes itself away
+    /// when the job is gone.
+    #[test]
+    fn a_soundtrack_lives_exactly_as_long_as_its_job() {
+        let (project, sounds) = comp_with_sound();
+        let (wav, note) = mix_soundtrack(&project, project.root, 0, 23, &sounds);
+        let wav = wav.expect("a comp with a sound mixes one");
+        assert!(note.is_none(), "nothing was missing");
+        let path = wav.0.clone();
+        assert!(path.exists(), "ffmpeg has to be able to open it");
+        drop(wav);
+        assert!(!path.exists(), "and it must not be left behind");
+    }
+
+    /// A layer whose sound the editor does not hold is mixed as silence and
+    /// **named**. Quietly dropping the music is the failure this exists to
+    /// avoid — the render still succeeds, so it cannot be an error.
+    #[test]
+    fn a_sound_the_editor_does_not_hold_is_named_not_hidden() {
+        let (project, _) = comp_with_sound();
+        let (wav, note) = mix_soundtrack(&project, project.root, 0, 23, &Default::default());
+        assert!(wav.is_none(), "there was nothing to mix");
+        assert!(note.expect("the drop is reported").contains("silent"));
     }
 
     /// Draft lands beside the project under a guessable name — the property
@@ -823,6 +1021,7 @@ mod tests {
                 quality: Quality::Draft,
                 scale: 1.0,
                 ffmpeg_args: Vec::new(),
+                sounds: &Default::default(),
                 range: None,
             },
             &gpu.device,
@@ -916,6 +1115,7 @@ mod tests {
                 quality: Quality::Draft,
                 scale: 1.0,
                 ffmpeg_args: Vec::new(),
+                sounds: &Default::default(),
                 range: Some((3, 7)),
             },
             &gpu.device,
@@ -958,6 +1158,7 @@ mod tests {
                 quality: Quality::Draft,
                 scale: 1.0,
                 ffmpeg_args: Vec::new(),
+                sounds: &Default::default(),
                 range: None,
             },
             &gpu.device,
