@@ -51,8 +51,8 @@ produce a finished video.
   retime / copy-paste / easing treatment.
 - **Effects** — a per-layer stack of pixel operations, in the properties panel
   beside blend and matte (a non-empty stack isolates the layer, exactly as a
-  blend mode does). **Gaussian blur, brightness/contrast, hue/saturation** and
-  **tint**, applied top to bottom; each one can be muted, reordered or removed,
+  blend mode does). **Gaussian blur, brightness/contrast, hue/saturation, tint,
+  levels** and **drop shadow**, applied top to bottom; each one can be muted, reordered or removed,
   and a muted effect is dropped from the stack rather than run as an identity
   pass.
   - Every numeric parameter is animatable on the same footing as everything

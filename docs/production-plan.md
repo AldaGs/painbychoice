@@ -285,10 +285,45 @@ bug is easier to see once something is audible.
 
 **Done when:** a cut can be edited to music and the exported file carries it.
 
-### Phase 3 — Finishing: the compositor stage and effects
+### Phase 3 — Finishing: the compositor stage and effects — *in progress*
 
 The subsystem the README already identifies as shared by effects, keying,
 masking and 2.5D placement. Build it once, now that its clients are real.
+
+**Landed 2026-09-08:**
+
+- ✅ **Effects render in every backend.** The pixel maths moved from
+  `live/src/fx.rs` to `render/src/fx.rs`, where both rasterizers reach it, and
+  the CPU backend applies a layer's stack in `draw_group` — after the mask,
+  before blend and opacity, the same order the editor's readback compositor
+  uses. Before this, `motion render` drew every effect layer plain, which is
+  the "same in the preview and the export" clause failing silently. The SVG
+  backend still cannot express an effect and now *reports* one.
+- ✅ **Effect parameters keyframe.** `PropKind::Effect { index, param }` —
+  indexed and discovered per node like `PathPoint` — gives every parameter a
+  stopwatch, a dopesheet row, a curve, retiming and copy/paste, with no
+  effect-specific keyframe machinery. The layout is stated once in
+  `effect_params`, read by the panel, the dopesheet and `prop_kinds_of`.
+- ✅ **Levels and drop shadow**, the first two additions from the list below.
+  The shadow is the interesting one: it *looks* like it breaks the
+  same-bounds seam, and does not, because a layer's isolated target is the
+  whole canvas in both rasterizers — the shadow has somewhere to fall for the
+  same reason a blur's halo does.
+
+**Still ahead in this phase — start here:**
+
+1. **The rest of the first effect set:** glow, colour balance, chroma key.
+   Chroma key is the odd one — it writes *alpha* rather than colour, so it is
+   the first effect the in-scene colour fast path cannot approximate at all.
+2. **Effects as registry descriptors.** `registry.rs` still has its
+   `NodeCategory::Effect` stub. Routing the built-ins through the same seam a
+   plugin would is the plugin-shaped-now decision being cashed in, and it is
+   the point at which the panel stops matching on `EffectKind` by hand.
+3. **Motion blur.** Sub-frame sampling of `evaluate`, accumulated in the
+   compositor; gated per comp and per layer like AE's.
+4. **Known compositor gaps** (from the readback work): a blur inside a blur
+   loses the inner one, and a colour effect on a group *containing* a blurred
+   layer does not reach the blurred image.
 
 - Each isolated layer renders to its own offscreen target; an ordered stack of
   wgpu passes processes it; the result composites into the parent with blend,
