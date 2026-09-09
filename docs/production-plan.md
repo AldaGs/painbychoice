@@ -240,21 +240,23 @@ this phase that could not be verified from a test.
   them. A sound the editor doesn't hold is mixed as silence and **named** on
   the result chip; the render succeeds, so it is a note, not an error.
 
+- ✅ **Opening a project reloads its sound.** Samples live outside the
+  document, so a loaded `.pbc` arrived with references and nothing to play;
+  `App::reload_sounds` decodes every asset that `has_audio()` and clears the
+  old ones, for the same reason the footage cache is cleared — asset ids are
+  per-project, so the previous project's samples are keyed to ids this one
+  reuses. Synchronous, as import is; a file that will not decode is named and
+  its layer is silent, never a failed load.
+
 **Still ahead in this phase — start here:**
 
-1. **Sounds are not reloaded when a project is opened.** Only `import_audio`
-   fills `App::sounds`, so a reopened `.pbc` plays silent, draws no waveform,
-   and exports with the warning above. The fix belongs beside footage relinking
-   (Phase 4) but the decode itself is one call — `motion_render::decode_sound`
-   over `project.assets` where `has_audio()`.
-2. **Resampling quality.** Mismatched rates use linear interpolation, which
+1. **Resampling quality.** Mismatched rates use linear interpolation, which
    `Sound::read` documents as a floor rather than a choice. A windowed-sinc
    resampler is the upgrade and that function is the only seam it needs.
 
 **Done when:** a cut can be edited to music and the exported file carries it.
-*Both halves are true for a session that imported its sound. What remains is
-that a **reopened** project does not reload them, which is the one thing left
-between this phase and done.*
+*Both halves are true. What is left in this phase is quality, not capability:
+linear interpolation on a mismatched sample rate.*
 
 #### The original plan for this phase
 

@@ -116,6 +116,9 @@ produce a finished video.
     put sound, so it isn't mixed at all. If a layer's sound isn't loaded, the
     render still succeeds and the result chip is marked with a warning naming
     what went out silent.
+  - **Opening a project reloads its sounds**, so a reopened `.pbc` plays,
+    draws its waveforms and exports with its mix. A file that has moved is
+    named and leaves its layer silent rather than failing the load.
   - Formats are whatever symphonia handles: wav, mp3, flac, ogg, m4a, aac, aiff.
     A sound that will not decode leaves that layer silent and says so, rather
     than failing the render.

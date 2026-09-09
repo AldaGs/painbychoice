@@ -2630,6 +2630,44 @@ impl App {
         true
     }
 
+    /// Decode every sound this project references, replacing whatever the last
+    /// one left behind.
+    ///
+    /// Asset ids are per-project, so the previous project's samples are not
+    /// merely stale — they are keyed to ids this one reuses for different
+    /// files. The same reasoning clears the footage cache on load.
+    ///
+    /// Decoding is synchronous, as import is: the file's length is what the
+    /// timeline draws against, and a waveform that appeared some seconds after
+    /// the project did would be worse than the wait. A sound that will not
+    /// decode leaves its layer silent and is named, never a failed load — the
+    /// rest of the project is fine and should open.
+    pub(crate) fn reload_sounds(&mut self) {
+        self.sounds.clear();
+        self.peaks.clear();
+        let mut failed: Vec<String> = Vec::new();
+        let assets: Vec<_> = self
+            .project
+            .assets
+            .values()
+            .filter(|a| a.has_audio())
+            .map(|a| (a.id, a.path.clone(), a.name.clone()))
+            .collect();
+        for (id, path, name) in assets {
+            match motion_render::decode_sound(&path) {
+                Ok(sound) => {
+                    self.sounds.insert(id, std::sync::Arc::new(sound));
+                }
+                Err(_) => failed.push(name),
+            }
+        }
+        self.refresh_peaks();
+        if !failed.is_empty() {
+            self.ng_status = Some(format!("Couldn't read: {}", failed.join(", ")));
+        }
+        self.publish_mix();
+    }
+
     /// Reduce any newly arrived sound to peaks.
     ///
     /// Additive by design: an asset already reduced is left alone, because the
@@ -3121,6 +3159,12 @@ impl App {
         self.selected = None;
         self.selected_keys.clear();
         self.shown_props.clear();
+        // Sounds live outside the document, so an opened project arrives with
+        // references and no samples: without this it would play silent, draw
+        // no waveform, and export with a warning, for no reason the user could
+        // see. After `current` is set, because it republishes the mix and the
+        // mix is one comp's.
+        self.reload_sounds();
 
         // Restore the layout. Built-ins are always rebuilt from code; loaded user
         // presets (and the active dock) are validated, so a corrupt or edited
