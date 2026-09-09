@@ -733,7 +733,7 @@ fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {
     let mut c = color;
     for g in open.iter().rev() {
         if !g.effects.is_empty() {
-            c = crate::fx::apply_color_effects(c, &g.effects);
+            c = motion_render::fx::apply_color_effects(c, &g.effects);
         }
     }
     c
@@ -741,7 +741,7 @@ fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {
 
 /// Draw one item's raw fill/stroke/footage into a scene at `fit`, with **no**
 /// effects applied. Used to build the sub-scene a full-image effect layer is
-/// rasterized from — [`crate::fx::apply_stack`] applies the whole stack (colour
+/// rasterized from — [`motion_render::fx::apply_stack`] applies the whole stack (colour
 /// *and* blur) to the readback, so the sub-scene must be the untouched pixels.
 fn draw_item_raw(
     vs: &mut VScene,
@@ -774,7 +774,7 @@ fn draw_item_raw(
 /// pixel from its neighbours — can only be done by rendering the layer on its
 /// own, reading the pixels back, filtering them, and drawing the result back in.
 /// The colour adjustments don't need this (see [`with_effects`]); they ride the
-/// in-scene path and are applied here only because [`crate::fx::apply_stack`]
+/// in-scene path and are applied here only because [`motion_render::fx::apply_stack`]
 /// runs the whole stack in order on the readback.
 ///
 /// Robust by construction: any layer whose render or readback fails is simply
@@ -803,7 +803,7 @@ pub(crate) fn rasterize_effect_layers(
         return out;
     }
     for g in &scene.groups {
-        if !crate::fx::needs_readback(&g.effects) {
+        if !motion_render::fx::needs_readback(&g.effects) {
             continue;
         }
         // The layer's raw pixels, rasterized through the same `fit` as the main
@@ -844,7 +844,7 @@ pub(crate) fn rasterize_effect_layers(
         let Some(mut rgba) = read_texture_rgba(device, queue, &tex, width, height) else {
             continue;
         };
-        crate::fx::apply_stack(&mut rgba, width as usize, height as usize, &g.effects);
+        motion_render::fx::apply_stack(&mut rgba, width as usize, height as usize, &g.effects);
         out.insert(
             g.source,
             vello::peniko::ImageData {

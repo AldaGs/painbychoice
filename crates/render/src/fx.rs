@@ -1,7 +1,7 @@
 //! Pixel effects: the actual per-pixel math of the effect stack, applied to a
 //! layer's isolated RGBA image.
 //!
-//! This is the compositor's raster half. [`crate::props`] and `core` decide
+//! This is the compositor's raster half. The editor's properties panel and `core` decide
 //! *which* effects a layer has and *what their parameters are* on a frame;
 //! this module is where those resolved parameters finally touch pixels. It is
 //! kept deliberately **pure and backend-free** — it operates on a plain
@@ -10,6 +10,12 @@
 //! hand-computed pixels rather than by eyeballing a GPU frame, and so the same
 //! routines serve whichever application path the renderer uses (a CPU readback
 //! today, a WGSL port later; the maths must match either way).
+//!
+//! It lives in `render`, not in the editor, because **both** rasterizers need
+//! it: the editor's readback compositor and the CPU backend that `motion
+//! render` and every headless test go through. Two copies of this arithmetic
+//! would be two answers to "what does a 40% tint look like", and the one place
+//! that must never disagree is the preview and the file.
 //!
 //! **Straight, not premultiplied**, for the colour adjustments: a tint or a
 //! brightness change is defined on a pixel's own colour, independent of its
@@ -32,7 +38,7 @@ use motion_core::{Color as MColor, ResolvedEffect};
 /// with overlapping items composites them first, so per-item colour is then an
 /// approximation; a raster (footage) layer isn't reached this way at all. Both
 /// of those, and blur, are what the full-image path is for.
-pub(crate) fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor {
+pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor {
     let mut rgb = [color.r as f32, color.g as f32, color.b as f32];
     for e in effects {
         rgb = match *e {
@@ -60,7 +66,7 @@ pub(crate) fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> 
 /// Whether a stack has any effect that the in-scene colour path can't do on its
 /// own — a blur. Such a layer needs the full-image readback pipeline; until that
 /// lands, the panel can warn that the effect won't show in the preview.
-pub(crate) fn needs_readback(effects: &[ResolvedEffect]) -> bool {
+pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
     effects.iter().any(|e| matches!(e, ResolvedEffect::GaussianBlur { .. }))
 }
 
@@ -73,7 +79,7 @@ pub(crate) fn needs_readback(effects: &[ResolvedEffect]) -> bool {
 /// The full-image path, for the readback compositor (blur, footage layers,
 /// overlapping content). Not yet wired into the renderer — kept tested so the
 /// arithmetic is trustworthy before the GPU plumbing that will feed it lands.
-pub(crate) fn apply_stack(px: &mut [u8], width: usize, height: usize, effects: &[ResolvedEffect]) {
+pub fn apply_stack(px: &mut [u8], width: usize, height: usize, effects: &[ResolvedEffect]) {
     for effect in effects {
         apply_one(px, width, height, effect);
     }

@@ -8,6 +8,7 @@
 pub mod audio;
 pub mod decode;
 pub mod encode;
+pub mod fx;
 pub mod parallel;
 pub mod raster;
 
@@ -131,6 +132,18 @@ pub fn scene_to_svg_reporting(
             next_group += 1;
             if g.compose != ComposeMode::SrcOver {
                 continue;
+            }
+            // Effects have no SVG expression here — a blur could become a
+            // filter primitive, a hue shift could not — so a layer that has
+            // them is drawn plainly and **said so**. A backend that quietly
+            // omits an effect produces a frame that looks plausible and is
+            // wrong, which is the failure this report exists to prevent.
+            if !g.effects.is_empty() {
+                report.push(format!(
+                    "layer {} has {} effect(s); the SVG backend draws it without them",
+                    g.source.0,
+                    g.effects.len()
+                ));
             }
             // A mask becomes a `<clipPath>` defined inline and referenced by
             // the group it clips. `clipRule` carries the even-odd rule an

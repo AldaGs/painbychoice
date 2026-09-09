@@ -83,6 +83,10 @@ pub(crate) struct RenderJob {
     started: Instant,
     /// The mixed soundtrack ffmpeg is reading, held for the job's lifetime and
     /// deleted with it. `None` for a silent comp or a PNG sequence.
+    ///
+    /// Never read: it is held for its `Drop`, which is the whole job — the
+    /// file has to outlive the ffmpeg process reading it.
+    #[allow(dead_code)]
     audio: Option<TempWav>,
     /// What the mixdown could not do, carried into the finished record so it
     /// reaches the user after the progress bar is gone.

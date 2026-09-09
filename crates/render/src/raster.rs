@@ -170,6 +170,15 @@ fn draw_group(
         }
     }
 
+    // The effect stack runs on the isolated layer, before it meets the
+    // backdrop — after the mask, because an effect works on what the layer
+    // actually shows, and before blend and opacity, because those describe how
+    // the finished layer combines rather than what it is. The same order the
+    // editor's readback compositor uses, which is what lets the two agree.
+    if !g.effects.is_empty() {
+        apply_effects(&mut layer, &g.effects);
+    }
+
     let mut paint = PixmapPaint {
         opacity: g.alpha.clamp(0.0, 1.0) as f32,
         blend_mode: match g.compose {
@@ -184,6 +193,34 @@ fn draw_group(
         paint.opacity = 1.0;
     }
     target.draw_pixmap(0, 0, layer.as_ref(), &paint, Transform::identity(), None);
+}
+
+/// Run a layer's effect stack over its pixels.
+///
+/// tiny-skia works **premultiplied** and [`crate::fx`] works **straight**, so
+/// this converts both ways around the call. That is not a detail to optimise
+/// away: a tint or a brightness change is defined on a pixel's own colour, and
+/// applying it to premultiplied values would make the result depend on the
+/// layer's coverage — a 50%-transparent red would tint differently from an
+/// opaque one.
+///
+/// The layer pixmap is the full canvas, so an effect that spreads beyond the
+/// artwork (a blur's halo) has somewhere to spread to.
+fn apply_effects(layer: &mut Pixmap, effects: &[motion_core::ResolvedEffect]) {
+    let (w, h) = (layer.width() as usize, layer.height() as usize);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for px in layer.pixels() {
+        let a = px.alpha();
+        let un = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255) / a as u32).min(255) as u8 };
+        rgba.extend_from_slice(&[un(px.red()), un(px.green()), un(px.blue()), a]);
+    }
+
+    crate::fx::apply_stack(&mut rgba, w, h, effects);
+
+    for (px, out) in rgba.chunks_exact(4).zip(layer.pixels_mut()) {
+        // `from_rgba8` premultiplies, which is exactly the trip back.
+        *out = tiny_skia::ColorU8::from_rgba(px[0], px[1], px[2], px[3]).premultiply();
+    }
 }
 
 fn draw_item(scene: &Scene, i: usize, target: &mut Pixmap, scale: f64, report: &mut Vec<String>) {
@@ -353,6 +390,86 @@ mod tests {
         assert!(report.is_empty(), "{report:?}");
         assert_eq!(px(&buf, w, 20, 20), [255, 0, 0, 255], "centre is the shape");
         assert_eq!(px(&buf, w, 1, 1), [0, 0, 0, 255], "corner is the background");
+    }
+
+    /// An effect on a layer reaches the exported pixels.
+    ///
+    /// The claim Phase 3 is measured by: the offline backend is what `motion
+    /// render` and every headless test go through, and until now it drew the
+    /// layer and dropped its effect stack on the floor — so a comp with a tint
+    /// previewed one way and exported another.
+    #[test]
+    fn an_effect_reaches_the_rasterized_pixels() {
+        let mut layer = square_at(1, 20.0, Color::rgb(1.0, 1.0, 1.0), 20.0);
+        layer.effects.push(motion_core::Effect::new(motion_core::EffectKind::Tint {
+            color: Value::constant(Color::rgb(1.0, 0.0, 0.0)),
+            amount: Value::constant(1.0),
+        }));
+        let comp = Comp::new(40.0, 40.0, Node::group(0, "root").with_child(layer));
+        let (buf, report, w) = render(&comp, 1.0);
+        assert!(report.is_empty(), "{report:?}");
+        let [r, g, b, _] = px(&buf, w, 20, 20);
+        assert!(r > 200 && g < 60 && b < 60, "a full tint should paint it red, got {r},{g},{b}");
+    }
+
+    /// A muted effect contributes nothing — it is dropped from the resolved
+    /// stack rather than run as an identity pass, so this also pins that
+    /// `resolve` really drops it.
+    #[test]
+    fn a_disabled_effect_changes_nothing() {
+        let plain = square_at(1, 20.0, Color::rgb(1.0, 1.0, 1.0), 20.0);
+        let mut muted = plain.clone();
+        let mut effect = motion_core::Effect::new(motion_core::EffectKind::Tint {
+            color: Value::constant(Color::rgb(1.0, 0.0, 0.0)),
+            amount: Value::constant(1.0),
+        });
+        effect.enabled = false;
+        muted.effects.push(effect);
+
+        let a = render(&Comp::new(40.0, 40.0, Node::group(0, "root").with_child(plain)), 1.0).0;
+        let b = render(&Comp::new(40.0, 40.0, Node::group(0, "root").with_child(muted)), 1.0).0;
+        assert_eq!(a, b, "a muted effect must leave the frame byte-identical");
+    }
+
+    /// A blur spreads the layer beyond its own edges, and the isolated layer is
+    /// the whole canvas so it has somewhere to spread to. A halo shaved off at
+    /// the shape's bounding box is the classic symptom of compositing an effect
+    /// into a target sized to the artwork.
+    #[test]
+    fn a_blur_spreads_past_the_shapes_edge() {
+        let mut layer = square_at(1, 10.0, Color::rgb(1.0, 1.0, 1.0), 20.0);
+        layer.effects.push(motion_core::Effect::new(motion_core::EffectKind::GaussianBlur {
+            radius: Value::constant(4.0),
+        }));
+        let comp = Comp::new(40.0, 40.0, Node::group(0, "root").with_child(layer));
+        let (buf, _, w) = render(&comp, 1.0);
+
+        // The square spans 15..25; a few pixels outside it should have picked
+        // up some light from the blur, and the far corner none.
+        let [r, ..] = px(&buf, w, 27, 20);
+        assert!(r > 0, "the blur should reach past the edge");
+        assert_eq!(px(&buf, w, 1, 1), [0, 0, 0, 255], "but not across the whole frame");
+    }
+
+    /// Effects run **before** the layer's opacity, not after: opacity says how
+    /// the finished layer combines with the backdrop, and a stack that ran
+    /// after it would be adjusting the composite instead of the layer.
+    #[test]
+    fn an_effect_runs_inside_the_layer_not_on_the_composite() {
+        let mut layer = square_at(1, 20.0, Color::rgb(1.0, 1.0, 1.0), 20.0);
+        layer.transform.opacity = Value::constant(0.5);
+        layer.effects.push(motion_core::Effect::new(motion_core::EffectKind::Tint {
+            color: Value::constant(Color::rgb(1.0, 0.0, 0.0)),
+            amount: Value::constant(1.0),
+        }));
+        let comp = Comp::new(40.0, 40.0, Node::group(0, "root").with_child(layer));
+        let (buf, _, w) = render(&comp, 1.0);
+        // Red at half strength over black: the tint is full, the *layer* is
+        // half. Tinting the composite instead would drag the black backdrop
+        // into the tint and come out a different colour entirely.
+        let [r, g, b, _] = px(&buf, w, 20, 20);
+        assert!((100..=160).contains(&r), "half-strength red, got {r}");
+        assert!(g < 40 && b < 40, "and no green or blue, got {g},{b}");
     }
 
     /// Scale multiplies the picture, it does not crop or letterbox it: the same

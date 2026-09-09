@@ -3236,7 +3236,7 @@ impl App {
         fit: Affine,
     ) -> std::collections::HashMap<NodeId, vello::peniko::ImageData> {
         use std::collections::HashMap;
-        if !scene.groups.iter().any(|g| crate::fx::needs_readback(&g.effects)) {
+        if !scene.groups.iter().any(|g| motion_render::fx::needs_readback(&g.effects)) {
             return HashMap::new();
         }
         let (dev, w, h) = match &self.state {

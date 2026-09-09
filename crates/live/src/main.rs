@@ -49,7 +49,6 @@ mod clock;
 mod curves;
 mod dock;
 mod footage;
-mod fx;
 mod gizmo;
 mod history;
 mod icon;

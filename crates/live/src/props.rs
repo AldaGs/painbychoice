@@ -518,7 +518,7 @@ impl NodeInfo {
             effects_preview_gap: {
                 let resolved: Vec<_> =
                     node.effects.iter().filter_map(|e| e.resolve(ctx)).collect();
-                crate::fx::needs_readback(&resolved)
+                motion_render::fx::needs_readback(&resolved)
             },
         }
     }
