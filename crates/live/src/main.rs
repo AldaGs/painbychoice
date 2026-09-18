@@ -46,6 +46,7 @@ use winit::window::{Window, WindowId};
 mod aids;
 mod app;
 mod assets;
+mod calc;
 mod clock;
 mod curves;
 mod dock;
