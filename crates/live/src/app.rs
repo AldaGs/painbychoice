@@ -3457,11 +3457,13 @@ impl App {
                 )
             };
 
-        // Motion blur shows in the preview only while paused: each frame costs
-        // one render per sample. Skipped mid-drag so a gizmo stays responsive,
-        // and during a font-picker preview, which draws a different project.
+        // Motion blur in the preview, playing or paused. Each frame costs one
+        // render per sample, so heavy comps drop frames while playing (the
+        // clock keeps real time). Skipped mid-drag so a gizmo stays
+        // responsive, and during a font-picker preview, which draws a
+        // different project.
         let dragging = self.egui_ctx.input(|i| i.pointer.any_down());
-        if !self.playing && !dragging && previewing.is_none() && self.doc().motion_blur.enabled {
+        if !dragging && previewing.is_none() && self.doc().motion_blur.enabled {
             if let Some(vs) = self.motion_blur_preview(frame, fit, canvas) {
                 self.vscene = vs;
             }

@@ -601,23 +601,35 @@ pub fn average_frames(frames: &[Vec<u8>]) -> Vec<u8> {
     }
     let n = frames.len() as f32;
     let mut out = vec![0u8; first.len()];
-    for (i, px) in out.chunks_exact_mut(4).enumerate() {
-        let (mut rgb, mut a) = ([0f32; 3], 0f32);
-        for f in frames {
-            let s = &f[i * 4..i * 4 + 4];
-            let sa = s[3] as f32;
-            for c in 0..3 {
-                rgb[c] += s[c] as f32 * sa;
-            }
-            a += sa;
+    // Row-sized bands across threads: a preview frame is ~15 MB per sample,
+    // and this runs once per played frame when motion blur is on.
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    let band = (out.len() / 4).div_ceil(threads).max(1) * 4;
+    std::thread::scope(|scope| {
+        for (b, chunk) in out.chunks_mut(band).enumerate() {
+            scope.spawn(move || {
+                let base = b * band;
+                for (i, px) in chunk.chunks_exact_mut(4).enumerate() {
+                    let at = base + i * 4;
+                    let (mut rgb, mut a) = ([0f32; 3], 0f32);
+                    for f in frames {
+                        let s = &f[at..at + 4];
+                        let sa = s[3] as f32;
+                        for c in 0..3 {
+                            rgb[c] += s[c] as f32 * sa;
+                        }
+                        a += sa;
+                    }
+                    if a > 0.0 {
+                        for c in 0..3 {
+                            px[c] = (rgb[c] / a).round() as u8;
+                        }
+                    }
+                    px[3] = (a / n).round() as u8;
+                }
+            });
         }
-        if a > 0.0 {
-            for c in 0..3 {
-                px[c] = (rgb[c] / a).round() as u8;
-            }
-        }
-        px[3] = (a / n).round() as u8;
-    }
+    });
     out
 }
 
