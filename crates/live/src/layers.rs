@@ -105,6 +105,19 @@ pub(crate) fn reorder_delta(up: bool) -> i32 {
     }
 }
 
+/// Whether `id` or any layer above it in the tree is locked. Lock covers the
+/// subtree, so a child of a locked group is as untouchable as the group.
+pub(crate) fn is_locked(root: &motion_core::Node, id: NodeId) -> bool {
+    fn walk(n: &motion_core::Node, id: NodeId, above: bool) -> Option<bool> {
+        let here = above || n.locked;
+        if n.id == id {
+            return Some(here);
+        }
+        n.children.iter().find_map(|c| walk(c, id, here))
+    }
+    walk(root, id, false).unwrap_or(false)
+}
+
 /// A shape the "add" tools can create.
 #[derive(Clone, Copy)]
 pub(crate) enum NewShape {

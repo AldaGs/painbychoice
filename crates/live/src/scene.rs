@@ -538,12 +538,14 @@ pub(crate) fn passepartout_path(fit: Affine, comp: kurbo::Rect, canvas: kurbo::R
 
 /// Pick the front-most scene item under a point given in physical pixels.
 /// Returns the `NodeId` that produced it, or `None` for empty space.
-pub(crate) fn pick(scene: &MScene, fit: Affine, px: (f64, f64)) -> Option<NodeId> {
+/// `skip` passes over layers that can't be picked (locked ones), so a click
+/// reaches whatever is underneath them.
+pub(crate) fn pick(scene: &MScene, fit: Affine, px: (f64, f64), skip: impl Fn(NodeId) -> bool) -> Option<NodeId> {
     let comp_point = fit.inverse() * Point::new(px.0, px.1);
     // Iterate back-to-front: the last item drawn is on top.
     scene.items.iter().rev().find_map(|item| {
         let local = item.transform.inverse() * comp_point;
-        if item.fill.is_some() && item.path.contains(local) {
+        if item.fill.is_some() && !skip(item.source) && item.path.contains(local) {
             Some(item.source)
         } else {
             None

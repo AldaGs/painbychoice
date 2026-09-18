@@ -3556,7 +3556,8 @@ impl App {
         // Resolve any pending click into a selection (or a deselect). Changing
         // the selected node invalidates any keyframe selection.
         if let Some(px) = self.pending_pick.take() {
-            let picked = pick(&scene, fit, px);
+            let root = &self.doc().root;
+            let picked = pick(&scene, fit, px, |id| is_locked(root, id));
             if picked != self.selected {
                 self.selected = picked;
                 self.selected_keys.clear();
@@ -3673,8 +3674,10 @@ impl App {
             let mut ctx = EvalCtx::new(&comp, frame as f64);
             c.resolve_orbited(&mut ctx, comp.width, comp.height, self.nav.orbit_matrix())
         });
+        // A locked layer keeps its selection but loses its handles.
+        let sel_locked = self.selected.is_some_and(|id| is_locked(&self.doc().root, id));
         let gizmo_target = match (self.selected, &sel_info) {
-            (Some(id), Some(info)) => scene
+            (Some(id), Some(info)) if !sel_locked => scene
                 .place(id)
                 .map(|place| GizmoTarget::new(id.0, place.parent_xf, info, gizmo_view)),
             _ => None,
@@ -3683,7 +3686,7 @@ impl App {
         // its anchors resolved at this frame. Only gathered while the pen is
         // armed and a vector layer is selected — otherwise the canvas behaves
         // exactly as it did before the tool existed.
-        let pen_target = if self.tool.pen_mode().is_some() {
+        let pen_target = if self.tool.pen_mode().is_some() && !sel_locked {
             match (self.selected, sel_node) {
                 (Some(id), Some(node)) => scene.place(id).and_then(|place| match &node.shape {
                     Some(MShape::Vector { path }) => {
@@ -4015,16 +4018,22 @@ impl App {
                         ),
                     },
                     Editor::Properties => {
-                        properties_ui(
-                            ui,
-                            &sel_info,
-                            &mut edits,
-                            &ease_info,
-                            &mut ease_out,
-                            eases,
-                            &mut ease_lib,
-                            &FontList { all: font_families, recent: recent_fonts },
-                        )
+                        // A locked layer is shown but not editable.
+                        if sel_locked {
+                            ui.weak("Locked — unlock it in Layers to edit");
+                        }
+                        ui.add_enabled_ui(!sel_locked, |ui| {
+                            properties_ui(
+                                ui,
+                                &sel_info,
+                                &mut edits,
+                                &ease_info,
+                                &mut ease_out,
+                                eases,
+                                &mut ease_lib,
+                                &FontList { all: font_families, recent: recent_fonts },
+                            )
+                        });
                     }
                     Editor::NodeGraph => nodegraph_ui(
                         ui,

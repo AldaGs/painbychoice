@@ -309,9 +309,9 @@ fn pick_hits_shape_and_misses_empty_space() {
     let fit = Affine::IDENTITY;
 
     // The square sits at (300, 540) at t=0 with a 200x200 body.
-    assert_eq!(pick(&scene, fit, (300.0, 540.0)), Some(NodeId(1)));
+    assert_eq!(pick(&scene, fit, (300.0, 540.0), |_| false), Some(NodeId(1)));
     // Empty corner — nothing there.
-    assert_eq!(pick(&scene, fit, (5.0, 5.0)), None);
+    assert_eq!(pick(&scene, fit, (5.0, 5.0), |_| false), None);
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn pick_prefers_front_most_item() {
     let scene = motion_core::evaluate(&doc, 0.0);
     let fit = Affine::IDENTITY;
     // Dot center: square pos (300,540) + child offset (0,-120) = (300,420).
-    assert_eq!(pick(&scene, fit, (300.0, 420.0)), Some(NodeId(2)));
+    assert_eq!(pick(&scene, fit, (300.0, 420.0), |_| false), Some(NodeId(2)));
 }
 
 #[test]
@@ -5627,4 +5627,23 @@ fn a_library_asset_becomes_a_layer_at_native_size() {
         _ => panic!("not an image layer"),
     }
     assert_eq!(p.assets.len(), 1, "no second asset");
+}
+
+/// A locked layer is clicked through, and locking a parent locks its children.
+#[test]
+fn locked_layers_are_skipped_by_picking() {
+    let mut doc = demo_document();
+    let scene = motion_core::evaluate(&doc, 0.0);
+    let fit = Affine::IDENTITY;
+    doc.root.find_mut(NodeId(2)).unwrap().locked = true;
+    let root = &doc.root;
+    // The dot is locked, so clicking it selects nothing; the square still picks.
+    assert_eq!(pick(&scene, fit, (300.0, 420.0), |id| is_locked(root, id)), None);
+    assert_eq!(pick(&scene, fit, (300.0, 540.0), |id| is_locked(root, id)), Some(NodeId(1)));
+
+    doc.root.find_mut(NodeId(2)).unwrap().locked = false;
+    doc.root.find_mut(NodeId(1)).unwrap().locked = true;
+    assert!(is_locked(&doc.root, NodeId(2)), "inherits from the square");
+    let root = &doc.root;
+    assert_eq!(pick(&scene, fit, (300.0, 420.0), |id| is_locked(root, id)), None);
 }
