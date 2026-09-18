@@ -847,20 +847,41 @@ impl Node {
         self.children.iter_mut().find_map(|c| c.parent_of_mut(id))
     }
 
-    /// Move the child with `id` among its siblings by `delta` (e.g. -1 up, +1
-    /// down), clamped to the ends. Searches the whole subtree for the parent.
-    /// Returns whether a move happened. Child order is also draw order, so this
-    /// restacks the node visually.
-    pub fn reorder_child(&mut self, id: NodeId, delta: i32) -> bool {
-        if let Some(i) = self.children.iter().position(|c| c.id == id) {
-            let j = (i as i32 + delta).clamp(0, self.children.len() as i32 - 1) as usize;
-            if i != j {
-                self.children.swap(i, j);
-                return true;
-            }
+    /// Move the node `id` to be a child of `parent` at `index` in document
+    /// order (later = drawn on top), clamped to the end. `index` counts the
+    /// parent's children *as they are now*, so a move within one parent means
+    /// what it says. Refuses the root, a missing node or parent, and a move
+    /// into the node's own subtree. Returns whether anything changed.
+    pub fn move_node(&mut self, id: NodeId, parent: NodeId, index: usize) -> bool {
+        let valid = id != self.id
+            && self.find(parent).is_some()
+            && self.find(id).is_some_and(|n| n.find(parent).is_none());
+        if !valid {
             return false;
         }
-        self.children.iter_mut().any(|c| c.reorder_child(id, delta))
+        let from = self.parent_of_mut(id).expect("non-root node has a parent");
+        let old = from.children.iter().position(|c| c.id == id).unwrap();
+        let same_parent = from.id == parent;
+        let mut index = index;
+        if same_parent && old < index {
+            index -= 1;
+        }
+        if same_parent && old == index.min(from.children.len() - 1) {
+            return false;
+        }
+        let node = from.children.remove(old);
+        let to = self.find_mut(parent).expect("checked above");
+        let index = index.min(to.children.len());
+        to.children.insert(index, node);
+        true
+    }
+
+    /// The parent of `id`, read-only.
+    pub fn parent_of(&self, id: NodeId) -> Option<&Node> {
+        if self.children.iter().any(|c| c.id == id) {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.parent_of(id))
     }
 
     /// Swap the node with `id` for `new`, returning the old one. Keeps its
@@ -1739,6 +1760,41 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
+
+    fn ids(n: &Node) -> Vec<u64> {
+        n.children.iter().map(|c| c.id.0).collect()
+    }
+
+    /// root: [1, 2, 3], 3 holds [4].
+    fn tree() -> Node {
+        Node::group(0, "root")
+            .with_child(Node::group(1, "a"))
+            .with_child(Node::group(2, "b"))
+            .with_child(Node::group(3, "c").with_child(Node::group(4, "d")))
+    }
+
+    #[test]
+    fn move_node_reorders_reparents_and_refuses_cycles() {
+        let mut t = tree();
+        // Within a parent, `index` is a slot in the list as it is now.
+        assert!(t.move_node(NodeId(1), NodeId(0), 3));
+        assert_eq!(ids(&t), [2, 3, 1]);
+        assert!(t.move_node(NodeId(1), NodeId(0), 0));
+        assert_eq!(ids(&t), [1, 2, 3]);
+        assert!(!t.move_node(NodeId(2), NodeId(0), 2), "already there");
+        // Into another parent, and back out.
+        assert!(t.move_node(NodeId(2), NodeId(3), 0));
+        assert_eq!(ids(&t), [1, 3]);
+        assert_eq!(ids(t.find(NodeId(3)).unwrap()), [2, 4]);
+        assert!(t.move_node(NodeId(4), NodeId(0), 99));
+        assert_eq!(ids(&t), [1, 3, 4]);
+        // Never into itself or its own subtree, never the root.
+        assert!(!t.move_node(NodeId(3), NodeId(2), 0));
+        assert!(!t.move_node(NodeId(3), NodeId(3), 0));
+        assert!(!t.move_node(NodeId(0), NodeId(1), 0));
+        assert!(!t.move_node(NodeId(9), NodeId(0), 0));
+    }
+
     use super::*;
     use crate::vec3::Vec3;
     use crate::value::{Keyframe, Track};
