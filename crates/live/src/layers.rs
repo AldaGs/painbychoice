@@ -129,12 +129,9 @@ pub(crate) struct TreeEdits {
     /// up/down buttons invert this via [`reorder_delta`].
     pub(crate) reorder: Option<(NodeId, i32)>,
     pub(crate) add: Option<NewShape>,
-    /// Open a file dialog and import footage. A bare flag rather than a path
-    /// because the dialog is blocking and must not run during the UI pass —
-    /// same discipline as save/load.
-    pub(crate) import_footage: bool,
-    /// Import a sound file as a layer.
-    pub(crate) import_audio: bool,
+    /// Open the import dialog. A bare flag rather than a path because the
+    /// dialog is blocking and must not run during the UI pass.
+    pub(crate) import: bool,
     pub(crate) delete: Option<NodeId>,
     /// Move the selection into a new composition and leave an instance behind —
     /// the core AE workflow.
@@ -170,13 +167,8 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         if ui.button("Pen").on_hover_text("Draw a vector path with the pen tool").clicked() {
             out.add = Some(NewShape::Vector);
         }
-        if icon::button(ui, icon::IMPORT, "Import footage (image or video)").clicked() {
-            out.import_footage = true;
-        }
-        // A word rather than an icon: the subset has no speaker glyph, and
-        // adding one needs a font regeneration. Same call the pen tool makes.
-        if ui.button("Audio").on_hover_text("Import a sound file as a layer").clicked() {
-            out.import_audio = true;
+        if icon::button(ui, icon::IMPORT, "Import images, video or audio (Ctrl+I)").clicked() {
+            out.import = true;
         }
     });
     ui.weak("Adds into the selected node, else the root.");

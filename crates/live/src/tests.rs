@@ -5569,3 +5569,13 @@ fn save_increment_bumps_or_appends() {
     assert_eq!(n("shot_999.pbc"), "shot_1000.pbc");
     assert_eq!(n("v2.pbc"), "v2_001.pbc");
 }
+
+#[test]
+fn import_routes_audio_by_extension() {
+    use std::path::Path;
+    assert!(crate::app::is_audio_path(Path::new("a/b/Song.MP3")));
+    assert!(crate::app::is_audio_path(Path::new("x.wav")));
+    assert!(!crate::app::is_audio_path(Path::new("clip.mp4")));
+    assert!(!crate::app::is_audio_path(Path::new("still.png")));
+    assert!(!crate::app::is_audio_path(Path::new("noext")));
+}

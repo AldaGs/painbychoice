@@ -546,6 +546,7 @@ pub(crate) enum FileCmd {
     Save,
     SaveAs,
     SaveIncrement,
+    Import,
 }
 
 /// Composition-settings edits from the top bar. Any `Some` is a new value.
@@ -672,6 +673,7 @@ pub(crate) fn comp_ui(
             for (cmd, label, keys) in [
                 (FileCmd::New, "New", "Ctrl+N"),
                 (FileCmd::Open, "Open…", "Ctrl+O"),
+                (FileCmd::Import, "Import…", "Ctrl+I"),
                 (FileCmd::Save, "Save", "Ctrl+S"),
                 (FileCmd::SaveAs, "Save As…", "Ctrl+Shift+S"),
                 (FileCmd::SaveIncrement, "Save With Increment", "Ctrl+Alt+S"),

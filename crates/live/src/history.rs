@@ -95,8 +95,8 @@ pub(crate) fn edit_label(
     if tree.ungroup.is_some() {
         return "Ungroup";
     }
-    if tree.import_footage {
-        return "Import footage";
+    if tree.import || comp.file == Some(crate::dock::FileCmd::Import) {
+        return "Import";
     }
     if let Some(op) = &ng.op {
         return match op {

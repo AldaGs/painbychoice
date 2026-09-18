@@ -925,6 +925,23 @@ pub(crate) fn scoped_graph(project: &MProject, scope: NgScope) -> Option<&NodeGr
     }
 }
 
+/// Every extension File > Import accepts as picture: stills, camera raws and
+/// video. Whether one actually decodes is the footage registry's call.
+pub(crate) const FOOTAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "tga", "qoi", "heic", "heif", "hif",
+    "cr2", "crw", "nef", "nrw", "mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv",
+    "flv", "ogv", "mxf", "mts", "m2ts", "ts", "m2v", "3gp",
+];
+pub(crate) const AUDIO_EXTS: &[&str] = &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif"];
+
+/// Whether Import routes this file to the sound path. Anything else is tried
+/// as footage, which reports its own error if it isn't.
+pub(crate) fn is_audio_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| AUDIO_EXTS.contains(&e.as_str()))
+}
+
 /// The next name in a save-with-increment series: a trailing `_NNN` is bumped
 /// keeping its width, anything else gains `_001`. Pure; the caller skips names
 /// already taken.
@@ -2580,18 +2597,31 @@ impl App {
     /// A failure is reported through `ng_status` rather than `eprintln!`, which
     /// is invisible in a GUI and once made a refusal indistinguishable from a
     /// dead button.
-    pub(crate) fn import_footage(&mut self) -> bool {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Footage", &[
-                "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "tga", "qoi", "heic",
-                "heif", "hif", "cr2", "crw", "nef", "nrw", "mp4", "mov", "m4v", "avi", "mkv",
-                "webm", "mpg", "mpeg", "wmv", "flv", "ogv", "mxf", "mts", "m2ts", "ts", "m2v",
-                "3gp",
-            ])
-            .pick_file()
+    /// File > Import: one dialog for every supported file, several at once,
+    /// each routed by extension to the footage or the sound path. Returns
+    /// whether anything landed.
+    pub(crate) fn import_files(&mut self) -> bool {
+        let all: Vec<&str> = FOOTAGE_EXTS.iter().chain(AUDIO_EXTS).copied().collect();
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter("All supported", &all)
+            .add_filter("Footage", FOOTAGE_EXTS)
+            .add_filter("Audio", AUDIO_EXTS)
+            .pick_files()
         else {
             return false;
         };
+        let mut any = false;
+        for path in paths {
+            any |= if is_audio_path(&path) {
+                self.import_audio(path)
+            } else {
+                self.import_footage(path)
+            };
+        }
+        any
+    }
+
+    pub(crate) fn import_footage(&mut self, path: std::path::PathBuf) -> bool {
         let meta = match self.footage.probe(&path) {
             Ok(m) => m,
             Err(e) => {
@@ -2613,13 +2643,7 @@ impl App {
     /// samples live outside it, in `sounds`. The layer is placed at frame 0 and
     /// trimmed to the sound's own length, because an import is a source
     /// arriving — where it sits is an editing decision.
-    pub(crate) fn import_audio(&mut self) -> bool {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif"])
-            .pick_file()
-        else {
-            return false;
-        };
+    pub(crate) fn import_audio(&mut self, path: std::path::PathBuf) -> bool {
         // Decoded here rather than lazily, because the length is what decides
         // the layer's duration and a layer that resized itself once the file
         // finished loading would be worse than a moment's wait.
@@ -4548,6 +4572,7 @@ impl App {
                     (K::new(M::COMMAND | M::SHIFT, Key::S), FileCmd::SaveAs),
                     (K::new(M::COMMAND, Key::S), FileCmd::Save),
                     (K::new(M::COMMAND, Key::O), FileCmd::Open),
+                    (K::new(M::COMMAND, Key::I), FileCmd::Import),
                     (K::new(M::COMMAND, Key::N), FileCmd::New),
                 ]
                 .into_iter()
@@ -4565,14 +4590,12 @@ impl App {
             Some(FileCmd::SaveIncrement) => self.save_increment(),
             Some(FileCmd::Open) => replaced = self.load(),
             Some(FileCmd::New) => replaced = self.new_project(),
-            None => {}
+            // After the replace check, with the other layer additions.
+            Some(FileCmd::Import) | None => {}
         }
         dirty |= replaced;
-        if tree_edits.import_footage {
-            dirty |= self.import_footage();
-        }
-        if tree_edits.import_audio {
-            dirty |= self.import_audio();
+        if tree_edits.import || comp.file == Some(FileCmd::Import) || shortcut == Some(FileCmd::Import) {
+            dirty |= self.import_files();
         }
         // --- Undo: close the phase opened by `before`. ---------------------
         // One comparison covers every edit above. `PartialEq` on the document
