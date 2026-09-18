@@ -132,6 +132,9 @@ pub(crate) struct TreeEdits {
     /// Open the import dialog. A bare flag rather than a path because the
     /// dialog is blocking and must not run during the UI pass.
     pub(crate) import: bool,
+    /// Add this library item to the open comp — an Assets-panel drop or
+    /// double-click.
+    pub(crate) place: Option<AssetDrag>,
     pub(crate) delete: Option<NodeId>,
     /// Move the selection into a new composition and leave an instance behind —
     /// the core AE workflow.
@@ -187,6 +190,19 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
     }
     ui.separator();
+    // The whole list is a drop target for Assets-panel rows.
+    let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
+        ui.set_min_width(ui.available_width());
+        rows_ui(ui, rows, selected, out);
+        // Room below the last row, so there is always somewhere to drop.
+        ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
+    });
+    if let Some(item) = dropped {
+        out.place = Some(*item);
+    }
+}
+
+fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
     for row in rows {
         ui.horizontal(|ui| {
             ui.add_space(6.0 + row.depth as f32 * 14.0);

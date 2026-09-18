@@ -518,17 +518,30 @@ pub(crate) fn import_footage(
     seed: LayerSeed,
     comp: CompId,
 ) -> MNode {
-    let fps = project.comp(comp).map(|c| c.fps).unwrap_or(0.0);
     let asset = project.add_asset(meta.into_asset(motion_core::AssetId(0), path));
-    let name = project.asset(asset).map(|a| a.name.clone()).unwrap_or_default();
-    let duration = project.asset(asset).and_then(|a| a.duration_in_comp(fps));
+    footage_layer(project, asset, seed, comp)
+}
+
+/// A layer showing footage already in the library — what an import ends in,
+/// and what dragging an asset from the Assets panel makes.
+pub(crate) fn footage_layer(
+    project: &MProject,
+    asset: motion_core::AssetId,
+    seed: LayerSeed,
+    comp: CompId,
+) -> MNode {
+    let fps = project.comp(comp).map(|c| c.fps).unwrap_or(0.0);
+    let a = project.asset(asset);
+    let name = a.map(|a| a.name.clone()).unwrap_or_default();
+    let duration = a.and_then(|a| a.duration_in_comp(fps));
+    let (w, h) = a.map(|a| (a.width, a.height)).unwrap_or((100.0, 100.0));
 
     let mut node = MNode::shape(
         seed.id,
         name,
         MShape::Image {
             asset,
-            size: Value::constant(Vec2::new(meta.width, meta.height)),
+            size: Value::constant(Vec2::new(w, h)),
             time_remap: None,
         },
     )
@@ -541,6 +554,22 @@ pub(crate) fn import_footage(
         node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
     }
     node
+}
+
+/// Whether placing `comp` inside `into` would make a comp contain itself:
+/// true when they are the same or `comp` already instances `into` at any depth.
+pub(crate) fn would_nest_itself(project: &MProject, comp: CompId, into: CompId) -> bool {
+    fn instances(project: &MProject, n: &MNode, target: CompId, seen: &mut Vec<CompId>) -> bool {
+        n.precomp.is_some_and(|c| {
+            c == target
+                || (!seen.contains(&c) && {
+                    seen.push(c);
+                    project.comp(c).is_some_and(|inner| instances(project, &inner.root, target, seen))
+                })
+        }) || n.children.iter().any(|c| instances(project, c, target, seen))
+    }
+    comp == into
+        || project.comp(comp).is_some_and(|c| instances(project, &c.root, into, &mut vec![comp]))
 }
 
 /// The layer directly **above** `id` — its next sibling in document order.
@@ -2637,6 +2666,43 @@ impl App {
         true
     }
 
+    /// Put a library item into the open comp as a new layer: footage, a sound,
+    /// or an instance of another comp. Dragged from the Assets panel.
+    pub(crate) fn place_asset(&mut self, item: AssetDrag) -> bool {
+        match item {
+            AssetDrag::File(asset) => {
+                let Some(a) = self.project.asset(asset) else { return false };
+                if a.kind == motion_core::AssetKind::Audio {
+                    let secs = a.samples as f64 / a.sample_rate.max(1) as f64;
+                    let frames = ((secs * self.doc().fps).round() as i64).max(1);
+                    let mut node = MNode::group(self.next_id, a.name.clone());
+                    self.next_id += 1;
+                    node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
+                    node.audio = Some(motion_core::AudioClip::new(asset));
+                    self.push_layer(node, self.selected);
+                    self.publish_mix();
+                } else {
+                    let (id, at_center, fill) = self.new_layer_look();
+                    let seed = LayerSeed { id, transform: at_center, fill };
+                    let node = footage_layer(&self.project, asset, seed, self.current);
+                    self.push_layer(node, self.selected);
+                }
+            }
+            AssetDrag::Comp(comp) => {
+                if would_nest_itself(&self.project, comp, self.current) {
+                    self.ng_status = Some("A composition can't contain itself.".into());
+                    return false;
+                }
+                let Some(c) = self.project.comp(comp) else { return false };
+                let node = MNode::group(self.next_id, c.label(comp)).with_precomp(comp);
+                self.next_id += 1;
+                self.push_layer(node, self.selected);
+            }
+        }
+        self.ng_status = None;
+        true
+    }
+
     /// Import a sound file as a layer.
     ///
     /// Mirrors [`Self::import_footage`]: the document gets a reference and the
@@ -3911,7 +3977,7 @@ impl App {
                         redo_label,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
-                    Editor::Assets => assets_ui(ui, &self.project, &mut tree_edits),
+                    Editor::Assets => assets_ui(ui, &self.project, current_comp, &mut tree_edits),
                     Editor::Transport => transport_ui(
                         ui,
                         frame,
@@ -4595,6 +4661,9 @@ impl App {
             Some(FileCmd::Import) | None => {}
         }
         dirty |= replaced;
+        if let Some(item) = tree_edits.place.take() {
+            dirty |= self.place_asset(item);
+        }
         if tree_edits.import || comp.file == Some(FileCmd::Import) || shortcut == Some(FileCmd::Import) {
             dirty |= self.import_files();
         }

@@ -5598,3 +5598,33 @@ fn asset_info_line_per_kind() {
     let snd = Asset::audio(AssetId(2), "a.wav", 44_100, 1, 44_100 * 3);
     assert_eq!(crate::assets::asset_info(&snd), "44.1 kHz mono · 3.0 s");
 }
+
+#[test]
+fn a_comp_cannot_be_placed_inside_itself() {
+    let mut p = MProject::single(Comp::new(100.0, 100.0, MNode::group(0, "root")));
+    let main = p.root;
+    let a = p.insert(Comp::new(100.0, 100.0, MNode::group(0, "root")));
+    // main instances a.
+    p.comp_mut(main).unwrap().root.children.push(MNode::group(5, "a").with_precomp(a));
+    assert!(crate::app::would_nest_itself(&p, main, main), "itself");
+    assert!(crate::app::would_nest_itself(&p, main, a), "main already holds a");
+    assert!(!crate::app::would_nest_itself(&p, a, main), "a into main is fine");
+}
+
+#[test]
+fn a_library_asset_becomes_a_layer_at_native_size() {
+    use motion_core::{Asset, AssetId};
+    let mut p = MProject::single(Comp::new(100.0, 100.0, MNode::group(0, "root")));
+    let id = p.add_asset(Asset::image(AssetId(0), "logo.png", 320.0, 200.0));
+    let seed = LayerSeed { id: 9, transform: Transform::default(), fill: MColor::rgb(1.0, 1.0, 1.0) };
+    let node = crate::app::footage_layer(&p, id, seed, p.root);
+    assert_eq!(node.name, "logo.png");
+    match node.shape {
+        Some(MShape::Image { asset, ref size, .. }) => {
+            assert_eq!(asset, id);
+            assert_eq!(*size, Value::constant(Vec2::new(320.0, 200.0)));
+        }
+        _ => panic!("not an image layer"),
+    }
+    assert_eq!(p.assets.len(), 1, "no second asset");
+}

@@ -4,6 +4,22 @@
 use crate::*;
 use motion_core::{Asset, AssetKind};
 
+/// What an Assets-panel row carries when dragged: a file from the library or
+/// a composition, both of which become a layer when dropped on Layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AssetDrag {
+    File(motion_core::AssetId),
+    Comp(CompId),
+}
+
+/// A comp's info line, in the same shape as a file's.
+pub(crate) fn comp_info(c: &Comp) -> String {
+    let fps = format!("{:.3}", c.fps);
+    let fps = fps.trim_end_matches('0').trim_end_matches('.');
+    let secs = if c.fps > 0.0 { c.duration_frames as f64 / c.fps } else { 0.0 };
+    format!("{:.0}×{:.0} · {fps} fps · {secs:.1} s", c.width, c.height)
+}
+
 /// The one-line summary under an asset's name. Pure, so it is tested rather
 /// than only checked by eye.
 pub(crate) fn asset_info(a: &Asset) -> String {
@@ -70,7 +86,23 @@ fn kind_icon(ui: &mut egui::Ui, kind: AssetKind) {
     }
 }
 
-pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, out: &mut TreeEdits) {
+/// One draggable row: icon, name, info line.
+fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), name: &str, info: impl FnOnce(&mut egui::Ui), hover: String) {
+    let id = egui::Id::new(("asset_row", payload));
+    ui.dnd_drag_source(id, payload, |ui| {
+        ui.horizontal(|ui| {
+            icon(ui);
+            ui.vertical(|ui| {
+                ui.label(name);
+                info(ui);
+            });
+        });
+    })
+    .response
+    .on_hover_text(hover);
+}
+
+pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.heading("Assets");
@@ -78,16 +110,31 @@ pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, out: &mut TreeEdi
             out.import = true;
         }
     });
-    if project.assets.is_empty() {
-        ui.weak("Nothing imported yet.");
-        return;
-    }
+    ui.weak("Drag onto Layers to add to the open comp.");
     ui.separator();
+    // Compositions first: they are what the project is made of.
+    for (id, c) in &project.comps {
+        let open = *id == current;
+        row(
+            ui,
+            AssetDrag::Comp(*id),
+            |ui| {
+                ui.label(icon::text(icon::PRECOMP));
+            },
+            &c.label(*id),
+            |ui| {
+                ui.weak(comp_info(c));
+            },
+            if open { "The open composition".into() } else { "Composition".into() },
+        );
+    }
     for a in project.assets.values() {
-        ui.horizontal(|ui| {
-            kind_icon(ui, a.kind);
-            ui.vertical(|ui| {
-                ui.label(&a.name).on_hover_text(a.path.display().to_string());
+        row(
+            ui,
+            AssetDrag::File(a.id),
+            |ui| kind_icon(ui, a.kind),
+            &a.name,
+            |ui| {
                 // ponytail: a stat per asset per frame; cache if a library
                 // ever holds hundreds of files.
                 if a.path.exists() {
@@ -98,7 +145,8 @@ pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, out: &mut TreeEdi
                         format!("{} missing", icon::WARNING),
                     );
                 }
-            });
-        });
+            },
+            a.path.display().to_string(),
+        );
     }
 }
