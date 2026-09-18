@@ -5270,7 +5270,7 @@ fn a_stale_index_no_ops_instead_of_panicking() {
         EffectOp::Remove(3),
         EffectOp::Move { index: 2, delta: -1 },
         EffectOp::ToggleEnabled(5),
-        EffectOp::SetNum { index: 1, param: EffectParam::BlurRadius, value: 4.0 },
+        EffectOp::SetNum { index: 1, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius"), value: 4.0 },
         EffectOp::SetColor { index: 0, rgb: [1.0, 0.0, 0.0] },
     ] {
         assert!(!apply_effect_op(&mut node, 0, &op), "stale op should no-op");
@@ -5305,7 +5305,7 @@ fn toggle_and_set_num_reach_the_right_field() {
     assert!(apply_effect_op(
         &mut node,
         0,
-        &EffectOp::SetNum { index: 0, param: EffectParam::BlurRadius, value: 20.0 },
+        &EffectOp::SetNum { index: 0, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius"), value: 20.0 },
     ));
     let mut ctx = EvalCtx::at(0.0);
     match node.effects[0].resolve(&mut ctx) {
@@ -5328,7 +5328,7 @@ fn an_effect_parameter_is_an_ordinary_animatable_property() {
     // `PropKind` addresses one. This is that claim, tested.
     let mut node = effect_layer();
     apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
-    let kind = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+    let kind = PropKind::Effect { index: 0, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius") };
 
     assert!(prop_of(&node, kind).is_some(), "the radius is addressable");
     assert!(dope_rows(&node).is_empty(), "a constant radius is not a row");
@@ -5344,12 +5344,12 @@ fn an_animated_radius_actually_changes_over_time() {
     // through the effect's own `resolve` — the value the compositor reads.
     let mut node = effect_layer();
     apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
-    let kind = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+    let kind = PropKind::Effect { index: 0, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius") };
     prop_of_mut(&mut node, kind).unwrap().insert_key(0);
     apply_effect_op(
         &mut node,
         20,
-        &EffectOp::SetNum { index: 0, param: EffectParam::BlurRadius, value: 40.0 },
+        &EffectOp::SetNum { index: 0, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius"), value: 40.0 },
     );
 
     let at = |f: f64| {
@@ -5373,8 +5373,8 @@ fn each_effect_in_a_stack_gets_its_own_rows() {
     apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
     apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
     let kinds = prop_kinds_of(&node);
-    let first = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
-    let second = PropKind::Effect { index: 1, param: EffectParam::BlurRadius };
+    let first = PropKind::Effect { index: 0, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius") };
+    let second = PropKind::Effect { index: 1, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius") };
     assert!(kinds.contains(&first) && kinds.contains(&second));
     assert_eq!(first.label(), "FX1 Radius");
     assert_eq!(second.label(), "FX2 Radius");
@@ -5389,9 +5389,9 @@ fn a_layer_offers_only_the_parameters_its_effects_have() {
 
     let mut node = effect_layer();
     apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
-    assert!(prop_of(&node, PropKind::Effect { index: 0, param: EffectParam::Hue }).is_none());
+    assert!(prop_of(&node, PropKind::Effect { index: 0, param: EffectParam::of(motion_core::EffectType::HueSaturation, "hue") }).is_none());
     // And an index past the end of the stack is a stale panel, not a panic.
-    assert!(prop_of(&node, PropKind::Effect { index: 9, param: EffectParam::BlurRadius }).is_none());
+    assert!(prop_of(&node, PropKind::Effect { index: 9, param: EffectParam::of(motion_core::EffectType::GaussianBlur, "radius") }).is_none());
 }
 
 #[test]
@@ -5403,7 +5403,7 @@ fn set_num_ignores_a_param_from_another_kind() {
     assert!(!apply_effect_op(
         &mut node,
         0,
-        &EffectOp::SetNum { index: 0, param: EffectParam::Hue, value: 90.0 },
+        &EffectOp::SetNum { index: 0, param: EffectParam::of(motion_core::EffectType::HueSaturation, "hue"), value: 90.0 },
     ));
 }
 

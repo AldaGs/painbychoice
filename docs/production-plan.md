@@ -315,10 +315,12 @@ masking and 2.5D placement. Build it once, now that its clients are real.
 1. ✅ **The rest of the first effect set** (2026-09-18): glow, colour
    balance, chroma key. Glow and key are readback-only; key writes alpha and
    does no spill suppression yet.
-2. **Effects as registry descriptors.** `registry.rs` still has its
-   `NodeCategory::Effect` stub. Routing the built-ins through the same seam a
-   plugin would is the plugin-shaped-now decision being cashed in, and it is
-   the point at which the panel stops matching on `EffectKind` by hand.
+2. ✅ **Effects as registry descriptors** (2026-09-18). Each `EffectType`
+   has an id (`fx.*`), a parameter table and a `descriptor()`;
+   `NodeRegistry::with_effects()` registers them through `register`, and the
+   Add menu reads it. The panel, dopesheet and apply path index parameters
+   by slot, with no per-kind match left in `live`. Still open: a plugin effect
+   registers but has no pixel routine, and effects aren't graph nodes yet.
 3. **Motion blur.** Sub-frame sampling of `evaluate`, accumulated in the
    compositor; gated per comp and per layer like AE's.
 4. **Known compositor gaps** (from the readback work): a blur inside a blur

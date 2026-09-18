@@ -583,7 +583,7 @@ pub(crate) fn mask_seed_size(node: &MNode) -> Vec2 {
 /// earlier, so a stale op (from a stack that shrank in between) must no-op
 /// rather than panic — the same discipline the dock's deferred ops follow.
 pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bool {
-    use motion_core::{Effect, EffectKind as K};
+    use motion_core::Effect;
     match *op {
         EffectOp::Add(ty) => {
             node.effects.push(Effect::seed(ty));
@@ -611,20 +611,18 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
             None => false,
         },
         EffectOp::SetNum { index, param, value } => match node.effects.get_mut(index) {
-            Some(ef) => set_effect_num(&mut ef.kind, param, frame, value),
+            Some(ef) => set_effect_num(ef, param, frame, value),
             None => false,
         },
         EffectOp::SetColor { index, rgb } => match node.effects.get_mut(index) {
-            Some(ef) => {
-                match &mut ef.kind {
-                    K::Tint { color, .. } | K::DropShadow { color, .. } | K::ChromaKey { color, .. } => {
-                        color.set_at(frame, rgb_color(rgb));
-                        true
-                    }
-                    // A kind with no colour: a stale panel, which no-ops.
-                    _ => false,
+            // A kind with no colour: a stale panel, which no-ops.
+            Some(ef) => match ef.color_mut() {
+                Some(color) => {
+                    color.set_at(frame, rgb_color(rgb));
+                    true
                 }
-            }
+                None => false,
+            },
             None => false,
         },
     }
@@ -635,11 +633,11 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
 /// effect kind — a mismatch the panel shouldn't produce, but which no-ops rather
 /// than writing the wrong field. The one place the `EffectParam`→`Value` mapping
 /// is written, mirroring `effect_nums` on the read side.
-fn set_effect_num(kind: &mut motion_core::EffectKind, param: EffectParam, frame: i64, v: f64) -> bool {
+fn set_effect_num(effect: &mut motion_core::Effect, param: EffectParam, frame: i64, v: f64) -> bool {
     // `set_at`, so dragging an animated parameter writes a key and dragging a
     // constant one leaves it constant — the gizmo's behaviour, and what makes
     // the stopwatch the only thing that decides whether an effect animates.
-    match crate::props::effect_value_mut(kind, param) {
+    match crate::props::effect_value_mut(effect, param) {
         Some(value) => {
             value.set_at(frame, v);
             true

@@ -147,183 +147,76 @@ pub(crate) struct EffectNum {
     pub(crate) anim: bool,
 }
 
-/// Names one editable numeric parameter of an effect, so a `DragValue` edit can
-/// say which `Value` it changed without the panel knowing the effect's layout.
+/// Names one editable numeric parameter of an effect: its type and its slot in
+/// [`motion_core::EffectType::params`]. Carrying the type is what lets a stale
+/// panel index (a blur asked for its hue) miss instead of writing the wrong
+/// field.
 ///
 /// Ordered and hashable because it rides inside [`PropKind::Effect`], which is
-/// the key of a `BTreeSet` — declaration order there decides dopesheet row
-/// order, so it decides this enum's too.
+/// the key of a `BTreeSet` — slot order is dopesheet row order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum EffectParam {
-    BlurRadius,
-    Brightness,
-    Contrast,
-    Hue,
-    Saturation,
-    Lightness,
-    TintAmount,
-    InBlack,
-    InWhite,
-    Gamma,
-    OutBlack,
-    OutWhite,
-    ShadowX,
-    ShadowY,
-    ShadowRadius,
-    ShadowOpacity,
-    GlowThreshold,
-    GlowRadius,
-    GlowIntensity,
-    BalanceRed,
-    BalanceGreen,
-    BalanceBlue,
-    KeyTolerance,
-    KeySoftness,
+pub(crate) struct EffectParam {
+    pub(crate) ty: motion_core::EffectType,
+    pub(crate) slot: usize,
 }
 
 impl EffectParam {
+    /// The parameter of `ty` whose descriptor socket is `id`. Panics on an
+    /// unknown id — only ever called with literals.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn of(ty: motion_core::EffectType, id: &str) -> Self {
+        let slot = ty.params().iter().position(|p| p.id == id).expect("known effect param");
+        Self { ty, slot }
+    }
+
+    pub(crate) fn spec(self) -> &'static motion_core::EffectParamSpec {
+        &self.ty.params()[self.slot]
+    }
+
     pub(crate) fn label(self) -> &'static str {
-        match self {
-            EffectParam::BlurRadius => "Radius",
-            EffectParam::Brightness => "Brightness",
-            EffectParam::Contrast => "Contrast",
-            EffectParam::Hue => "Hue",
-            EffectParam::Saturation => "Saturation",
-            EffectParam::Lightness => "Lightness",
-            EffectParam::TintAmount => "Amount",
-            EffectParam::InBlack => "In Black",
-            EffectParam::InWhite => "In White",
-            EffectParam::Gamma => "Gamma",
-            EffectParam::OutBlack => "Out Black",
-            EffectParam::OutWhite => "Out White",
-            EffectParam::ShadowX => "Offset X",
-            EffectParam::ShadowY => "Offset Y",
-            EffectParam::ShadowRadius => "Softness",
-            EffectParam::ShadowOpacity => "Opacity",
-            EffectParam::GlowThreshold => "Threshold",
-            EffectParam::GlowRadius => "Radius",
-            EffectParam::GlowIntensity => "Intensity",
-            EffectParam::BalanceRed => "Red",
-            EffectParam::BalanceGreen => "Green",
-            EffectParam::BalanceBlue => "Blue",
-            EffectParam::KeyTolerance => "Tolerance",
-            EffectParam::KeySoftness => "Softness",
-        }
+        self.spec().label
     }
 }
 
 /// The numeric parameters of one effect, in editing order, paired with which
-/// parameter each is. One place enumerates each kind's layout so the readout and
-/// the apply path can't disagree about it.
-pub(crate) fn effect_nums(
-    kind: &motion_core::EffectKind,
-    ctx: &mut EvalCtx,
-) -> Vec<EffectNum> {
-    effect_params(kind)
+/// parameter each is.
+pub(crate) fn effect_nums(effect: &motion_core::Effect, ctx: &mut EvalCtx) -> Vec<EffectNum> {
+    effect_params(effect)
         .into_iter()
         .filter_map(|param| {
-            let value = effect_value(kind, param)?;
+            let value = effect_value(effect, param)?;
             Some(EffectNum { param, value: value.resolve(ctx), anim: value.is_animated() })
         })
         .collect()
 }
 
-/// Which numeric parameters an effect kind has, in editing order.
-///
-/// **The** layout, in one place: the panel's rows, the dopesheet's rows and
-/// `prop_kinds_of` all read it, so none of them can disagree about what an
-/// effect exposes. Adding a parameter to an effect is this list plus an arm in
-/// [`effect_value`] and [`effect_value_mut`].
-pub(crate) fn effect_params(kind: &motion_core::EffectKind) -> Vec<EffectParam> {
-    use motion_core::EffectKind as K;
-    use EffectParam as P;
-    match kind {
-        K::GaussianBlur { .. } => vec![P::BlurRadius],
-        K::BrightnessContrast { .. } => vec![P::Brightness, P::Contrast],
-        K::HueSaturation { .. } => vec![P::Hue, P::Saturation, P::Lightness],
-        K::Tint { .. } => vec![P::TintAmount],
-        K::Levels { .. } => vec![P::InBlack, P::InWhite, P::Gamma, P::OutBlack, P::OutWhite],
-        K::DropShadow { .. } => {
-            vec![P::ShadowX, P::ShadowY, P::ShadowRadius, P::ShadowOpacity]
-        }
-        K::Glow { .. } => vec![P::GlowThreshold, P::GlowRadius, P::GlowIntensity],
-        K::ColorBalance { .. } => vec![P::BalanceRed, P::BalanceGreen, P::BalanceBlue],
-        K::ChromaKey { .. } => vec![P::KeyTolerance, P::KeySoftness],
+/// Which numeric parameters an effect has, in editing order — read off its
+/// type's registry table, so a new effect needs nothing here.
+pub(crate) fn effect_params(effect: &motion_core::Effect) -> Vec<EffectParam> {
+    let ty = effect.effect_type();
+    (0..ty.params().len()).map(|slot| EffectParam { ty, slot }).collect()
+}
+
+/// One effect parameter, or `None` if `param` is for another effect type.
+pub(crate) fn effect_value(
+    effect: &motion_core::Effect,
+    param: EffectParam,
+) -> Option<&Value<f64>> {
+    if effect.effect_type() != param.ty {
+        return None;
     }
+    effect.num(param.slot)
 }
 
-/// One effect parameter of one kind, or `None` if that kind has no such
-/// parameter — a stale panel index asking a blur for its hue.
-pub(crate) fn effect_value<'a>(
-    kind: &'a motion_core::EffectKind,
+/// Mutable twin of [`effect_value`].
+pub(crate) fn effect_value_mut(
+    effect: &mut motion_core::Effect,
     param: EffectParam,
-) -> Option<&'a Value<f64>> {
-    use motion_core::EffectKind as K;
-    use EffectParam as P;
-    Some(match (kind, param) {
-        (K::GaussianBlur { radius }, P::BlurRadius) => radius,
-        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness,
-        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast,
-        (K::HueSaturation { hue, .. }, P::Hue) => hue,
-        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
-        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
-        (K::Tint { amount, .. }, P::TintAmount) => amount,
-        (K::Levels { in_black, .. }, P::InBlack) => in_black,
-        (K::Levels { in_white, .. }, P::InWhite) => in_white,
-        (K::Levels { gamma, .. }, P::Gamma) => gamma,
-        (K::Levels { out_black, .. }, P::OutBlack) => out_black,
-        (K::Levels { out_white, .. }, P::OutWhite) => out_white,
-        (K::DropShadow { offset_x, .. }, P::ShadowX) => offset_x,
-        (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
-        (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
-        (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
-        (K::Glow { threshold, .. }, P::GlowThreshold) => threshold,
-        (K::Glow { radius, .. }, P::GlowRadius) => radius,
-        (K::Glow { intensity, .. }, P::GlowIntensity) => intensity,
-        (K::ColorBalance { red, .. }, P::BalanceRed) => red,
-        (K::ColorBalance { green, .. }, P::BalanceGreen) => green,
-        (K::ColorBalance { blue, .. }, P::BalanceBlue) => blue,
-        (K::ChromaKey { tolerance, .. }, P::KeyTolerance) => tolerance,
-        (K::ChromaKey { softness, .. }, P::KeySoftness) => softness,
-        _ => return None,
-    })
-}
-
-/// Mutable twin of [`effect_value`]. Adjacent on purpose, like
-/// `prop_of`/`prop_of_mut`: the two are only correct read together.
-pub(crate) fn effect_value_mut<'a>(
-    kind: &'a mut motion_core::EffectKind,
-    param: EffectParam,
-) -> Option<&'a mut Value<f64>> {
-    use motion_core::EffectKind as K;
-    use EffectParam as P;
-    Some(match (kind, param) {
-        (K::GaussianBlur { radius }, P::BlurRadius) => radius,
-        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness,
-        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast,
-        (K::HueSaturation { hue, .. }, P::Hue) => hue,
-        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
-        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
-        (K::Tint { amount, .. }, P::TintAmount) => amount,
-        (K::Levels { in_black, .. }, P::InBlack) => in_black,
-        (K::Levels { in_white, .. }, P::InWhite) => in_white,
-        (K::Levels { gamma, .. }, P::Gamma) => gamma,
-        (K::Levels { out_black, .. }, P::OutBlack) => out_black,
-        (K::Levels { out_white, .. }, P::OutWhite) => out_white,
-        (K::DropShadow { offset_x, .. }, P::ShadowX) => offset_x,
-        (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
-        (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
-        (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
-        (K::Glow { threshold, .. }, P::GlowThreshold) => threshold,
-        (K::Glow { radius, .. }, P::GlowRadius) => radius,
-        (K::Glow { intensity, .. }, P::GlowIntensity) => intensity,
-        (K::ColorBalance { red, .. }, P::BalanceRed) => red,
-        (K::ColorBalance { green, .. }, P::BalanceGreen) => green,
-        (K::ColorBalance { blue, .. }, P::BalanceBlue) => blue,
-        (K::ChromaKey { tolerance, .. }, P::KeyTolerance) => tolerance,
-        (K::ChromaKey { softness, .. }, P::KeySoftness) => softness,
-        _ => return None,
-    })
+) -> Option<&mut Value<f64>> {
+    if effect.effect_type() != param.ty {
+        return None;
+    }
+    effect.num_mut(param.slot)
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -638,11 +531,9 @@ impl NodeInfo {
                 .map(|ef| EffectInfo {
                     ty: ef.effect_type(),
                     enabled: ef.enabled,
-                    nums: effect_nums(&ef.kind, ctx),
-                    color: match &ef.kind {
-                        motion_core::EffectKind::Tint { color, .. }
-                        | motion_core::EffectKind::DropShadow { color, .. }
-                        | motion_core::EffectKind::ChromaKey { color, .. } => {
+                    nums: effect_nums(ef, ctx),
+                    color: match ef.color() {
+                        Some(color) => {
                             let c = color.resolve(ctx);
                             Some([c.r as f32, c.g as f32, c.b as f32])
                         }
@@ -1447,8 +1338,11 @@ pub(crate) fn properties_ui(
         egui::ComboBox::from_id_salt("add_effect")
             .selected_text("Add…")
             .show_ui(ui, |ui| {
-                for ty in motion_core::EffectType::ALL {
-                    if ui.selectable_label(false, ty.label()).clicked() {
+                // Built from the effect registry, the seam a plugin effect
+                // registers through; ids with no built-in routine are skipped.
+                for desc in motion_core::NodeRegistry::with_effects().iter() {
+                    let Some(ty) = motion_core::EffectType::from_id(&desc.id) else { continue };
+                    if ui.selectable_label(false, &desc.label).clicked() {
                         edits.effect = Some(EffectOp::Add(ty));
                     }
                 }
@@ -1492,14 +1386,7 @@ pub(crate) fn properties_ui(
                 let mut v = num.value;
                 // Pixel distances drag coarsely, `0..1` amounts finely — a
                 // 0.01/frame offset would take a minute to move a shadow.
-                let speed = match param {
-                    EffectParam::BlurRadius
-                    | EffectParam::ShadowRadius
-                    | EffectParam::ShadowX
-                    | EffectParam::ShadowY
-                    | EffectParam::GlowRadius => 0.5,
-                    _ => 0.01,
-                };
+                let speed = param.spec().step;
                 if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {
                     edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
                 }
@@ -2140,7 +2027,7 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
         // An effect parameter. A plain `Value<f64>`, so it keyframes and plots
         // like an opacity — the effect stack needs no machinery of its own.
         PropKind::Effect { index, param } => {
-            PropRef::Num(effect_value(&node.effects.get(index)?.kind, param)?)
+            PropRef::Num(effect_value(node.effects.get(index)?, param)?)
         }
         // One control point of a vector path — a plain `Value<Vec2>`, so it
         // keyframes, retimes, and plots (as X/Y) exactly like a shape's size.
@@ -2161,7 +2048,7 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
 pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
     let mut kinds: Vec<PropKind> = PropKind::ALL.to_vec();
     for (index, effect) in node.effects.iter().enumerate() {
-        for param in effect_params(&effect.kind) {
+        for param in effect_params(effect) {
             kinds.push(PropKind::Effect { index, param });
         }
     }
@@ -2213,7 +2100,7 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             _ => return None,
         },
         PropKind::Effect { index, param } => {
-            PropRefMut::Num(effect_value_mut(&mut node.effects.get_mut(index)?.kind, param)?)
+            PropRefMut::Num(effect_value_mut(node.effects.get_mut(index)?, param)?)
         }
         PropKind::PathPoint { index, part } => match node.shape.as_mut()? {
             MShape::Vector { path } => PropRefMut::Vec2(path.value_mut(index, part)?),

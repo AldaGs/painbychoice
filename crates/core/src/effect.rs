@@ -32,6 +32,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::expr::EvalCtx;
 use crate::value::{Color, Value};
+use crate::registry::{NodeCategory, NodeDescriptor};
+use crate::socket::SocketType;
+
+/// `(colour, numbers)` of an `EffectKind`, numbers in [`EffectType::params`]
+/// order. A macro so one arm list serves `&` and `&mut` alike — match
+/// ergonomics picks the borrow from the scrutinee.
+macro_rules! effect_fields {
+    ($kind:expr) => {
+        match $kind {
+            EffectKind::GaussianBlur { radius } => (None, vec![radius]),
+            EffectKind::BrightnessContrast { brightness, contrast } => {
+                (None, vec![brightness, contrast])
+            }
+            EffectKind::HueSaturation { hue, saturation, lightness } => {
+                (None, vec![hue, saturation, lightness])
+            }
+            EffectKind::Tint { color, amount } => (Some(color), vec![amount]),
+            EffectKind::Levels { in_black, in_white, gamma, out_black, out_white } => {
+                (None, vec![in_black, in_white, gamma, out_black, out_white])
+            }
+            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity } => {
+                (Some(color), vec![offset_x, offset_y, radius, opacity])
+            }
+            EffectKind::Glow { threshold, radius, intensity } => {
+                (None, vec![threshold, radius, intensity])
+            }
+            EffectKind::ColorBalance { red, green, blue } => (None, vec![red, green, blue]),
+            EffectKind::ChromaKey { color, tolerance, softness } => {
+                (Some(color), vec![tolerance, softness])
+            }
+        }
+    };
+}
+
 
 /// One entry in a layer's effect stack: an animatable pixel operation plus
 /// whether it is currently switched on.
@@ -275,65 +309,63 @@ impl Effect {
     }
 
     /// Walk every scalar / colour `Value` in this effect, applying the matching
-    /// callback. The one place the parameter set of each variant is enumerated
-    /// for the grid operations, so migrate and retime can't drift apart.
+    /// callback. Built on [`effect_fields!`], so migrate and retime see exactly
+    /// the parameters the panel and the registry do.
     fn for_each_value(
         &mut self,
         mut num: impl FnMut(&mut Value<f64>),
         mut col: impl FnMut(&mut Value<Color>),
     ) {
-        match &mut self.kind {
-            EffectKind::GaussianBlur { radius } => num(radius),
-            EffectKind::BrightnessContrast { brightness, contrast } => {
-                num(brightness);
-                num(contrast);
-            }
-            EffectKind::HueSaturation { hue, saturation, lightness } => {
-                num(hue);
-                num(saturation);
-                num(lightness);
-            }
-            EffectKind::Tint { color, amount } => {
-                col(color);
-                num(amount);
-            }
-            EffectKind::Levels { in_black, in_white, gamma, out_black, out_white } => {
-                num(in_black);
-                num(in_white);
-                num(gamma);
-                num(out_black);
-                num(out_white);
-            }
-            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity } => {
-                col(color);
-                num(offset_x);
-                num(offset_y);
-                num(radius);
-                num(opacity);
-            }
-            EffectKind::Glow { threshold, radius, intensity } => {
-                num(threshold);
-                num(radius);
-                num(intensity);
-            }
-            EffectKind::ColorBalance { red, green, blue } => {
-                num(red);
-                num(green);
-                num(blue);
-            }
-            EffectKind::ChromaKey { color, tolerance, softness } => {
-                col(color);
-                num(tolerance);
-                num(softness);
-            }
-        }
+        let (color, nums) = effect_fields!(&mut self.kind);
+        color.map(&mut col);
+        nums.into_iter().for_each(&mut num);
     }
+
+    /// The effect's numeric parameter in `slot` — the slot's meaning is
+    /// [`EffectType::params`]`[slot]`.
+    pub fn num(&self, slot: usize) -> Option<&Value<f64>> {
+        effect_fields!(&self.kind).1.into_iter().nth(slot)
+    }
+
+    pub fn num_mut(&mut self, slot: usize) -> Option<&mut Value<f64>> {
+        effect_fields!(&mut self.kind).1.into_iter().nth(slot)
+    }
+
+    /// The effect's colour parameter, for the kinds that have one.
+    pub fn color(&self) -> Option<&Value<Color>> {
+        effect_fields!(&self.kind).0
+    }
+
+    pub fn color_mut(&mut self) -> Option<&mut Value<Color>> {
+        effect_fields!(&mut self.kind).0
+    }
+}
+
+
+/// One numeric parameter of an effect type, as the registry and the panel see
+/// it. Defaults are not here: they live in [`Effect::seed`], the one place an
+/// effect's starting values are written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectParamSpec {
+    /// Socket id on the effect's descriptor.
+    pub id: &'static str,
+    pub label: &'static str,
+    /// Drag speed per pixel: coarse for pixel distances, fine for `0..1` amounts.
+    pub step: f64,
+}
+
+/// A macro rather than a `const fn` so the tables below are struct literals,
+/// which `&[...]` promotes to `'static`; a call would not be.
+macro_rules! p {
+    ($id:expr, $label:expr, $step:expr) => {
+        EffectParamSpec { id: $id, label: $label, step: $step }
+    };
 }
 
 /// The flat discriminant of [`EffectKind`] — one value per effect kind, with no
 /// parameters. This is what an "add effect" menu is built from and what a label
 /// comes off of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum EffectType {
     GaussianBlur,
     BrightnessContrast,
@@ -372,6 +404,86 @@ impl EffectType {
             EffectType::ColorBalance => "Color Balance",
             EffectType::ChromaKey => "Chroma Key",
         }
+    }
+
+    /// The registry id: namespaced like a plugin's, so a built-in and an
+    /// `acme.blur` sit side by side without colliding.
+    pub fn id(self) -> &'static str {
+        match self {
+            EffectType::GaussianBlur => "fx.gaussian_blur",
+            EffectType::BrightnessContrast => "fx.brightness_contrast",
+            EffectType::HueSaturation => "fx.hue_saturation",
+            EffectType::Tint => "fx.tint",
+            EffectType::Levels => "fx.levels",
+            EffectType::DropShadow => "fx.drop_shadow",
+            EffectType::Glow => "fx.glow",
+            EffectType::ColorBalance => "fx.color_balance",
+            EffectType::ChromaKey => "fx.chroma_key",
+        }
+    }
+
+    /// The built-in effect a registry id names, or `None` for anything else
+    /// (a plugin's, which has no pixel routine yet).
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.id() == id)
+    }
+
+    /// The numeric parameters, in slot order — what [`Effect::num`] indexes.
+    pub fn params(self) -> &'static [EffectParamSpec] {
+        match self {
+            EffectType::GaussianBlur => &[p!("radius", "Radius", 0.5)],
+            EffectType::BrightnessContrast => {
+                &[p!("brightness", "Brightness", 0.01), p!("contrast", "Contrast", 0.01)]
+            }
+            EffectType::HueSaturation => &[
+                p!("hue", "Hue", 0.01),
+                p!("saturation", "Saturation", 0.01),
+                p!("lightness", "Lightness", 0.01),
+            ],
+            EffectType::Tint => &[p!("amount", "Amount", 0.01)],
+            EffectType::Levels => &[
+                p!("in_black", "In Black", 0.01),
+                p!("in_white", "In White", 0.01),
+                p!("gamma", "Gamma", 0.01),
+                p!("out_black", "Out Black", 0.01),
+                p!("out_white", "Out White", 0.01),
+            ],
+            EffectType::DropShadow => &[
+                p!("offset_x", "Offset X", 0.5),
+                p!("offset_y", "Offset Y", 0.5),
+                p!("radius", "Softness", 0.5),
+                p!("opacity", "Opacity", 0.01),
+            ],
+            EffectType::Glow => &[
+                p!("threshold", "Threshold", 0.01),
+                p!("radius", "Radius", 0.5),
+                p!("intensity", "Intensity", 0.01),
+            ],
+            EffectType::ColorBalance => {
+                &[p!("red", "Red", 0.01), p!("green", "Green", 0.01), p!("blue", "Blue", 0.01)]
+            }
+            EffectType::ChromaKey => {
+                &[p!("tolerance", "Tolerance", 0.01), p!("softness", "Softness", 0.01)]
+            }
+        }
+    }
+
+    /// This effect as a registry descriptor: a layer in, its parameters as
+    /// defaulted inputs (seed values), a layer out — the shape a plugin effect
+    /// declares too.
+    pub fn descriptor(self) -> NodeDescriptor {
+        use crate::expr::ExprValue;
+        let seed = Effect::seed(self);
+        let mut d = NodeDescriptor::new(self.id(), NodeCategory::Effect, self.label())
+            .input("layer", "Layer", SocketType::Layer);
+        if let Some(c) = seed.color() {
+            d = d.input_def("color", "Color", SocketType::Color, ExprValue::Color(c.resolve(&mut EvalCtx::at(0.0))));
+        }
+        for (slot, spec) in self.params().iter().enumerate() {
+            let v = seed.num(slot).expect("params() and effect_fields! agree").resolve(&mut EvalCtx::at(0.0));
+            d = d.input_def(spec.id, spec.label, SocketType::Number, ExprValue::Num(v));
+        }
+        d.output("layer", "Layer", SocketType::Layer)
     }
 }
 
@@ -485,5 +597,24 @@ mod tests {
             assert!(seen.insert(ty.label()), "{} listed twice", ty.label());
         }
         assert_eq!(seen.len(), EffectType::ALL.len());
+    }
+
+    /// The parameter table and the stored fields agree for every kind: same
+    /// count, and a descriptor socket per parameter. This is what lets the
+    /// panel index by slot without a per-kind match.
+    #[test]
+    fn param_tables_match_the_fields() {
+        for ty in EffectType::ALL {
+            let e = Effect::seed(ty);
+            let n = ty.params().len();
+            assert!(e.num(n - 1).is_some() && e.num(n).is_none(), "{ty:?}");
+            let d = ty.descriptor();
+            for spec in ty.params() {
+                assert!(d.find_input(spec.id).is_some(), "{ty:?}.{}", spec.id);
+            }
+            assert_eq!(EffectType::from_id(ty.id()), Some(ty));
+        }
+        let reg = crate::registry::NodeRegistry::with_effects();
+        assert_eq!(reg.len(), EffectType::ALL.len());
     }
 }

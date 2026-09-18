@@ -247,6 +247,18 @@ impl NodeRegistry {
         }
         reg
     }
+
+    /// A registry of the built-in effects, registered through the same
+    /// `register` a plugin effect would use. Separate from
+    /// [`Self::with_builtins`] because effects live on a layer's stack, not in
+    /// the node graph, until the compositor can evaluate an effect *node*.
+    pub fn with_effects() -> Self {
+        let mut reg = Self::new();
+        for ty in crate::EffectType::ALL {
+            reg.register(ty.descriptor()).expect("built-in effect ids are unique");
+        }
+        reg
+    }
 }
 
 /// The built-in descriptors, in palette order. A free function so the list is
