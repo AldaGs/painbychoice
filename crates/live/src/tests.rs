@@ -5699,3 +5699,26 @@ fn folding_a_layer_hides_everything_inside_it() {
     assert_eq!(shown(&[1]), ["root", "after", "g"], "the fold's own row stays");
     assert_eq!(shown(&[0]), ["root"]);
 }
+
+#[test]
+fn unparent_moves_out_one_level_or_all_the_way() {
+    // root: [a, g[b, h[x]]]
+    let root = MNode::group(0, "root").with_child(MNode::group(1, "a")).with_child(
+        MNode::group(2, "g")
+            .with_child(MNode::group(3, "b"))
+            .with_child(MNode::group(4, "h").with_child(MNode::group(5, "x"))),
+    );
+    // One level: x lands in g, just in front of h.
+    assert_eq!(unparent_target(&root, NodeId(5), false), Some((NodeId(2), 2)));
+    // All the way: x lands in root, just in front of g.
+    assert_eq!(unparent_target(&root, NodeId(5), true), Some((NodeId(0), 2)));
+    assert_eq!(unparent_target(&root, NodeId(3), false), Some((NodeId(0), 2)));
+    assert_eq!(unparent_target(&root, NodeId(1), false), None, "already top level");
+    assert_eq!(unparent_target(&root, NodeId(0), true), None);
+
+    let mut moved = root.clone();
+    let (p, i) = unparent_target(&root, NodeId(5), true).unwrap();
+    assert!(moved.move_node(NodeId(5), p, i));
+    let ids: Vec<u64> = moved.children.iter().map(|c| c.id.0).collect();
+    assert_eq!(ids, [1, 2, 5]);
+}

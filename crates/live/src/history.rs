@@ -80,6 +80,9 @@ pub(crate) fn edit_label(
     if tree.delete.is_some() {
         return "Delete layer";
     }
+    if tree.unparent.is_some() {
+        return "Unparent layer";
+    }
     if tree.move_to.is_some() {
         return "Move layer";
     }

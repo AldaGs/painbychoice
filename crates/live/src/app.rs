@@ -1824,9 +1824,6 @@ impl ApplicationHandler for App {
                     Key::Character(ref s) if s == "n" || s == "N" => {
                         self.set_work_end(self.current_frame());
                     }
-                    Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
-                        self.delete_selected_keys();
-                    }
                     _ => {}
                 }
                 window.request_redraw();
@@ -4196,6 +4193,20 @@ impl App {
         // phase; a snapshot around the whole of it is what makes undo cover
         // every edit site at once. Taken here, where the edit structs are still
         // whole, so the label can read intents that are `take`n further down.
+        // Delete / Backspace: selected keyframes if there are any, else the
+        // selected layer. Read here, inside the recorded phase, so either is
+        // undoable. Not while typing, and not with the pen armed — there it
+        // removes anchors. A locked layer and the root can't be deleted.
+        let del_key = self.tool.pen_mode().is_none()
+            && !self.egui_ctx.egui_wants_keyboard_input()
+            && self.egui_ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+        let delete_keys = del_key && !self.selected_keys.is_empty();
+        if del_key && !delete_keys {
+            let root = &self.doc().root;
+            tree_edits.delete = tree_edits
+                .delete
+                .or(self.selected.filter(|id| *id != root.id && !is_locked(root, *id)));
+        }
         let before = self.project.clone();
         let edit_label = edit_label(&tree_edits, &ng_edits, &dope, &comp, &aid_edits);
         // Apply a composition node-graph edit (add/move/remove/connect/
@@ -4531,6 +4542,9 @@ impl App {
         // changes nothing you can hear.
         let touched_audio = edits.touches_audio();
         let mut dirty = self.apply_edits(frame, &edits);
+        if delete_keys {
+            dirty |= self.delete_selected_keys();
+        }
         if touched_audio && dirty {
             self.publish_mix();
         }
@@ -4647,6 +4661,11 @@ impl App {
         }
         if let Some((id, parent, index)) = tree_edits.move_to {
             dirty |= self.move_layer(id, parent, index, &scene, t);
+        }
+        if let Some((id, all)) = tree_edits.unparent {
+            if let Some((parent, index)) = unparent_target(&self.doc().root, id, all) {
+                dirty |= self.move_layer(id, parent, index, &scene, t);
+            }
         }
         if let Some(id) = tree_edits.toggle_hidden {
             if let Some(n) = self.doc_mut().root.find_mut(id) {

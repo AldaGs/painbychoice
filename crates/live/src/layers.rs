@@ -143,6 +143,25 @@ pub(crate) fn drop_target(row: &TreeRow, zone: DropZone) -> (NodeId, usize) {
     }
 }
 
+/// Where "unparent" moves `id`: one level up (`all == false`) to sit just in
+/// front of its old parent, or all the way to the comp root (`all`) in front
+/// of the top-level layer it was inside. `None` when it is already top-level.
+pub(crate) fn unparent_target(root: &motion_core::Node, id: NodeId, all: bool) -> Option<(NodeId, usize)> {
+    let parent = root.parent_of(id)?;
+    if parent.id == root.id {
+        return None;
+    }
+    // The ancestor whose slot we land beside, and the node that holds it.
+    let beside = if all {
+        root.children.iter().find(|c| c.find(id).is_some())?.id
+    } else {
+        parent.id
+    };
+    let holder = root.parent_of(beside)?;
+    let i = holder.children.iter().position(|c| c.id == beside)?;
+    Some((holder.id, i + 1))
+}
+
 /// A layer being dragged in the panel.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LayerDrag(pub(crate) NodeId);
@@ -184,6 +203,8 @@ pub(crate) struct TreeEdits {
     pub(crate) toggle_hidden: Option<NodeId>,
     pub(crate) toggle_locked: Option<NodeId>,
     pub(crate) rename: Option<(NodeId, String)>,
+    /// (layer, all the way to the root?) — out of its parent.
+    pub(crate) unparent: Option<(NodeId, bool)>,
     pub(crate) add: Option<NewShape>,
     /// Open the import dialog. A bare flag rather than a path because the
     /// dialog is blocking and must not run during the UI pass.
@@ -476,8 +497,22 @@ fn context_menu(resp: &egui::Response, row: &TreeRow, out: &mut TreeEdits) -> bo
             out.ungroup = Some(row.id);
             ui.close();
         }
+        // Out of the parent: one level, or out of every parent at once.
+        if row.depth > 1 {
+            ui.separator();
+            if ui.button("Unparent").on_hover_text("Move out one level, keeping its place on screen").clicked() {
+                out.unparent = Some((row.id, false));
+                ui.close();
+            }
+            if row.depth > 2
+                && ui.button("Unparent to root").on_hover_text("Move out of every parent to the top level").clicked()
+            {
+                out.unparent = Some((row.id, true));
+                ui.close();
+            }
+        }
         ui.separator();
-        if ui.button("Delete").clicked() {
+        if ui.button("Delete").on_hover_text("Delete (Del)").clicked() {
             out.delete = Some(row.id);
             ui.close();
         }
