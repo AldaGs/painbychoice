@@ -381,6 +381,19 @@ pub(crate) fn is_anim(node: &MNode, kind: PropKind) -> bool {
     prop_of(node, kind).is_some_and(|p| p.is_animated())
 }
 
+/// egui's `color_edit_button_rgb` edits *linear* RGB, but every colour in the
+/// document is sRGB-encoded (it goes to vello as-is). Convert across the call so
+/// the picker shows the stored value and writes back what it shows.
+pub(crate) fn color_button(ui: &mut egui::Ui, rgb: &mut [f32; 3]) -> egui::Response {
+    use egui::ecolor::{gamma_from_linear, linear_from_gamma};
+    let mut lin = rgb.map(linear_from_gamma);
+    let r = ui.color_edit_button_rgb(&mut lin);
+    if r.changed() {
+        *rgb = lin.map(gamma_from_linear);
+    }
+    r
+}
+
 /// A linear gain as decibels, for reading.
 ///
 /// Silence is `-inf dB`, spelled out rather than shown as a very negative
@@ -1079,7 +1092,7 @@ pub(crate) fn properties_ui(
 
         ui.label("Fill");
         if let Some(mut rgb) = n.fill {
-            if ui.color_edit_button_rgb(&mut rgb).changed() {
+            if crate::props::color_button(ui, &mut rgb).changed() {
                 edits.fill = Some(rgb);
             }
             if key_button(ui, n.fill_anim) {
@@ -1097,7 +1110,7 @@ pub(crate) fn properties_ui(
         ui.label("Stroke");
         if let Some((mut rgb, _)) = n.stroke {
             ui.horizontal(|ui| {
-                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                if crate::props::color_button(ui, &mut rgb).changed() {
                     edits.stroke_color = Some(rgb);
                 }
                 if ui.small_button("✕").on_hover_text("Remove stroke").clicked() {
@@ -1413,7 +1426,7 @@ pub(crate) fn properties_ui(
             if let Some(rgb) = ef.color {
                 ui.label("  Color");
                 let mut c = rgb;
-                if ui.color_edit_button_rgb(&mut c).changed() {
+                if crate::props::color_button(ui, &mut c).changed() {
                     edits.effect = Some(EffectOp::SetColor { index: i, rgb: c });
                 }
                 ui.label("");

@@ -802,8 +802,7 @@ pub(crate) fn comp_ui(
         // document and is saved with it.
         ui.label("BG");
         let mut rgb = [bg.r as f32, bg.g as f32, bg.b as f32];
-        if ui
-            .color_edit_button_rgb(&mut rgb)
+        if crate::props::color_button(ui, &mut rgb)
             .on_hover_text("Composition background")
             .changed()
         {

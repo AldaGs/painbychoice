@@ -685,7 +685,7 @@ fn literal_field(
         ExprValue::Color(c) => {
             let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
             let _ = salt;
-            ui.color_edit_button_rgb(&mut rgb)
+            crate::props::color_button(ui, &mut rgb)
                 .changed()
                 .then(|| ExprValue::Color(MColor::rgba(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64, c.a)))
         }
@@ -2178,7 +2178,7 @@ fn socket_field(
             }
             ExprValue::Color(c) => {
                 let mut rgb = [c.r as f32, c.g as f32, c.b as f32];
-                egui::color_picker::color_edit_button_rgb(ui, &mut rgb).changed().then(|| {
+                crate::props::color_button(ui, &mut rgb).changed().then(|| {
                     ExprValue::Color(MColor::rgba(
                         rgb[0] as f64,
                         rgb[1] as f64,
