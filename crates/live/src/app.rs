@@ -43,6 +43,9 @@ pub(crate) struct App {
     pub(crate) renderers: Vec<Option<Renderer>>,
     pub(crate) state: RenderState,
     pub(crate) vscene: VScene,
+    /// The paused preview's motion-blurred frame, keyed by everything that
+    /// changes it, so a still frame is averaged once rather than per repaint.
+    pub(crate) mb_preview: Option<(String, vello::peniko::ImageData)>,
     /// Every composition in the project. The editor always edits *one* of them
     /// (`current`); a precomp layer instances another.
     pub(crate) project: MProject,
@@ -950,6 +953,7 @@ impl App {
             state: RenderState::Suspended(None),
             warnings: Vec::new(),
             vscene: VScene::new(),
+            mb_preview: None,
             project,
             current,
             egui_ctx: {
@@ -3233,6 +3237,75 @@ impl App {
     /// cache, and hands them to [`rasterize_effect_layers`]. Early-outs before
     /// touching the GPU when no layer needs the full-image path, so the common
     /// document pays nothing.
+    /// The preview frame with motion blur: every shutter sample rendered the
+    /// way the preview draws it (chrome included), read back and averaged,
+    /// then shown as one image. `None` when the GPU isn't ready or a render
+    /// fails, and the sharp frame stays.
+    fn motion_blur_preview(&mut self, frame: i64, fit: Affine, canvas: kurbo::Rect) -> Option<VScene> {
+        let (dev, w, h) = match &self.state {
+            RenderState::Active { surface, .. } => {
+                (surface.dev_id, surface.config.width, surface.config.height)
+            }
+            RenderState::Suspended(_) => return None,
+        };
+        let key = format!(
+            "{:?}",
+            (self.doc_rev, frame, self.current, fit, (w, h), self.selected, self.nav.orbit_matrix())
+        );
+        let image = match &self.mb_preview {
+            Some((k, img)) if *k == key => img.clone(),
+            _ => {
+                let doc = self.doc();
+                let (mb, dims, bg, pp) = (doc.motion_blur, (doc.width, doc.height), doc.bg, doc.passepartout);
+                let target = crate::offscreen::OffscreenTarget::new(&self.context.devices[dev].device, w, h)?;
+                let mut frames = Vec::new();
+                for shutter in mb.offsets() {
+                    let scene = motion_core::evaluate_comp_sample(
+                        &self.project,
+                        self.current,
+                        frame as f64,
+                        shutter,
+                        self.nav.orbit_matrix(),
+                    );
+                    let effect_images = self.effect_images(&scene, fit);
+                    let chrome = crate::scene::Chrome {
+                        ghosts: &self.onion.ghosts,
+                        selected: self.selected,
+                        passepartout: pp,
+                        canvas,
+                        border: true,
+                    };
+                    let vs = to_vello(
+                        &scene,
+                        fit,
+                        dims,
+                        bg,
+                        &chrome,
+                        &mut self.footage,
+                        &self.project.assets,
+                        &effect_images,
+                    );
+                    let device = &self.context.devices[dev].device;
+                    let queue = &self.context.devices[dev].queue;
+                    let renderer = self.renderers[dev].as_mut()?;
+                    frames.push(target.render(device, queue, renderer, &vs).ok()?);
+                }
+                let img = vello::peniko::ImageData {
+                    data: vello::peniko::Blob::new(std::sync::Arc::new(motion_render::average_frames(&frames))),
+                    format: vello::peniko::ImageFormat::Rgba8,
+                    alpha_type: vello::peniko::ImageAlphaType::Alpha,
+                    width: w,
+                    height: h,
+                };
+                self.mb_preview = Some((key, img.clone()));
+                img
+            }
+        };
+        let mut vs = VScene::new();
+        vs.draw_image(&vello::peniko::ImageBrush::new(image), Affine::IDENTITY);
+        Some(vs)
+    }
+
     fn effect_images(
         &mut self,
         scene: &MScene,
@@ -3383,6 +3456,16 @@ impl App {
                     &effect_images,
                 )
             };
+
+        // Motion blur shows in the preview only while paused: each frame costs
+        // one render per sample. Skipped mid-drag so a gizmo stays responsive,
+        // and during a font-picker preview, which draws a different project.
+        let dragging = self.egui_ctx.input(|i| i.pointer.any_down());
+        if !self.playing && !dragging && previewing.is_none() && self.doc().motion_blur.enabled {
+            if let Some(vs) = self.motion_blur_preview(frame, fit, canvas) {
+                self.vscene = vs;
+            }
+        }
 
         // Motion path: only for a layer whose *position* is actually animated —
         // a constant position has no trajectory, and drawing one dot under the
