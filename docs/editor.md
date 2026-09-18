@@ -97,8 +97,8 @@ mutate mid-render: an area header only *records* a `DockCmd` against the leaf's
 the egui pass is done. Restructuring the tree while its panels are still laid
 out would desync egui's per-panel ids.
 
-- **Only the three content editors are `SWAPPABLE`** (Layers, Properties,
-  Dopesheet). The canvas and the comp/transport toolbars are *structural* leaves
+- **Only the content editors are `SWAPPABLE`** (Layers, Assets, Properties,
+  Timeline, Nodes). The canvas and the comp/transport toolbars are *structural* leaves
   with **no header** — so a user can't duplicate, retype, or close them. That's
   not a UI nicety, it's what keeps the two canvas invariants safe: there is
   always exactly one canvas leaf to measure (`canvas_rect`), and it stays the
@@ -223,6 +223,26 @@ while a text field has focus (same rule as keyframe copy/paste — Ctrl+Z in a
 name field belongs to the field). The comp bar carries Undo/Redo buttons whose
 tooltips name the step; they are words rather than icons because a glyph would
 mean regenerating the icon font subset.
+
+## Menus, assets and the layers panel
+
+- **File / Render menus** ride on the comp bar's single row (`dock::comp_ui`),
+  since the `Comp` leaf is fixed-height. File commands are a `FileCmd` run after
+  the UI pass (dialogs block). Save writes straight back to `project_path` once
+  there is one; Save With Increment (`app::increment_path`) never overwrites.
+- **Import vs. place.** `import_footage`/`import_audio` only add a library
+  asset; `place_asset` makes a layer from one (or a precomp from a comp) and is
+  what an Assets-panel drag onto Layers runs. File > Import does both; the
+  Assets panel's own button only imports.
+- **Layers panel** (`layers.rs`): rows are front-first; `drop_target` maps a
+  drop above / into / below a row back to document order for
+  `Node::move_node`. A reparent keeps the layer's screen position
+  (`keep_position`, translation only). `hidden` skips a subtree in eval and the
+  audio mix; `locked` (inherited, `is_locked`) blocks picking, handles and the
+  properties panel. Fold state and the rename buffer live in egui temp memory.
+- **Delete** is read inside the recorded phase: selected keys first, else the
+  selected layer, never the root or a locked one.
+- **Number fields** are all `calc::num`, so any accepts `+ - * /` and parens.
 
 ## Stacking order
 
