@@ -35,7 +35,7 @@
 use crate::scene::{read_texture_rgba, Chrome};
 use kurbo::Affine;
 use motion_core::node::CompId;
-use motion_core::{evaluate_comp, Project as MProject};
+use motion_core::Project as MProject;
 use vello::wgpu;
 use vello::Scene as VScene;
 
@@ -179,15 +179,22 @@ impl FrameRenderer<'_> {
         // render at `frame`.
         let samples = doc
             .motion_blur
-            .sample_frames(frame)
+            .offsets()
             .into_iter()
-            .map(|t| self.frame_at(project, comp, t))
+            .map(|shutter| self.frame_at(project, comp, frame, shutter))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(motion_render::average_frames(&samples))
     }
 
-    /// One unblurred render of `comp` at `frame`.
-    fn frame_at(&mut self, project: &MProject, comp: CompId, frame: f64) -> Result<Vec<u8>, String> {
+    /// One motion-blur sample of `comp`: switched layers `shutter` frames off
+    /// `frame`, the rest at `frame`.
+    fn frame_at(
+        &mut self,
+        project: &MProject,
+        comp: CompId,
+        frame: f64,
+        shutter: f64,
+    ) -> Result<Vec<u8>, String> {
         let doc = project
             .comp(comp)
             .ok_or_else(|| format!("no composition {} in this project", comp.0))?;
@@ -199,7 +206,13 @@ impl FrameRenderer<'_> {
         // rendered into.
         let fit = Affine::scale(w as f64 / dims.0.max(1e-6));
 
-        let scene = evaluate_comp(project, comp, frame);
+        let scene = motion_core::evaluate_comp_sample(
+            project,
+            comp,
+            frame,
+            shutter,
+            motion_core::mat4::Mat4::IDENTITY,
+        );
         // Blurred layers rasterized and filtered first, so `to_vello` can drop
         // each one's processed image in place of its raw items — the same order
         // the preview uses. A layer whose readback fails is simply absent from

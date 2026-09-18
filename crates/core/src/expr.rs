@@ -1617,6 +1617,12 @@ pub struct EvalCtx<'a> {
     /// timing. Layer-local time is derived from this; expressions that want
     /// comp time (and the timeline UI) read it directly.
     pub comp_frame: f64,
+    /// This motion-blur sample's shutter offset, in frames. `0` outside a
+    /// blurred render.
+    pub shutter: f64,
+    /// Whether `frame`/`comp_frame` currently include `shutter`. The walk
+    /// toggles it per layer from the layer's own switch.
+    pub shifted: bool,
     /// Project-wide modules, if this evaluation has a project behind it. `None`
     /// for a bare single-comp evaluate, where a link warns like a precomp does.
     pub modules: Option<&'a std::collections::BTreeMap<ModuleId, Module>>,
@@ -1656,6 +1662,8 @@ impl<'a> EvalCtx<'a> {
         Self {
             frame,
             comp_frame: frame,
+            shutter: 0.0,
+            shifted: false,
             timing: None,
             modules: None,
             assets: None,
@@ -1675,6 +1683,8 @@ impl<'a> EvalCtx<'a> {
         Self {
             frame,
             comp_frame: frame,
+            shutter: 0.0,
+            shifted: false,
             timing: None,
             modules: None,
             assets: None,

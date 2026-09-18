@@ -1980,6 +1980,10 @@ impl App {
             node.blend = mode;
             changed = true;
         }
+        if let Some(on) = e.motion_blur {
+            node.motion_blur = on;
+            changed = true;
+        }
         if let Some(op) = e.set_compound {
             node.compound = op;
             changed = true;

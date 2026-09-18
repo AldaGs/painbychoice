@@ -251,8 +251,21 @@ pub fn evaluate_comp_orbited(
     frame: f64,
     orbit: crate::mat4::Mat4,
 ) -> Scene {
+    evaluate_comp_sample(project, comp, frame, 0.0, orbit)
+}
+
+/// Evaluate a comp for one motion-blur sample: `shutter` frames off `frame`
+/// for layers whose [`Node::motion_blur`] switch is on, `frame` itself for the
+/// rest. A render averages these over [`crate::MotionBlur::offsets`].
+pub fn evaluate_comp_sample(
+    project: &Project,
+    comp: CompId,
+    frame: f64,
+    shutter: f64,
+    orbit: crate::mat4::Mat4,
+) -> Scene {
     let mut scene = Scene::default();
-    eval_comp(project, comp, frame, Xf::IDENTITY, 1.0, None, &mut Vec::new(), &mut scene, orbit);
+    eval_comp(project, comp, frame, shutter, Xf::IDENTITY, 1.0, None, &mut Vec::new(), &mut scene, orbit);
     scene
 }
 
@@ -267,6 +280,7 @@ fn eval_comp(
     project: &Project,
     id: CompId,
     frame: f64,
+    shutter: f64,
     xf: Xf,
     opacity: f64,
     view: Option<Projector>,
@@ -284,6 +298,7 @@ fn eval_comp(
     // Each comp gets its own resolve context: its cache and name lookups are
     // scoped to its own tree, which is exactly what "a comp is a boundary" means.
     let mut ctx = EvalCtx::new(comp, frame);
+    ctx.shutter = shutter;
     // Modules are project-wide: the same definition resolves from any comp.
     ctx.modules = Some(&project.modules);
     // So is footage — one import, shown from any comp.
@@ -347,6 +362,17 @@ fn walk(
     // uses for off-time sampling) so a sibling can't inherit the shift.
     let prev_frame = ctx.frame;
     let prev_timing = ctx.timing;
+    // Motion blur: a layer's own properties resolve through the shutter when
+    // its switch is on and at the frame centre when off. Motion inherited from
+    // a parent comes along either way. Liveness was judged at the centre
+    // above, so a layer doesn't flicker in or out within one frame.
+    let (prev_comp_frame, prev_shifted) = (ctx.comp_frame, ctx.shifted);
+    if node.motion_blur != ctx.shifted {
+        let d = if node.motion_blur { ctx.shutter } else { -ctx.shutter };
+        ctx.comp_frame += d;
+        ctx.frame += d;
+        ctx.shifted = node.motion_blur;
+    }
     if let Some(timing) = &node.timing {
         ctx.frame = timing.local_frame(ctx.comp_frame);
         // Also publish the window, so `Expr::Time` (in/out/t01) reads *this*
@@ -383,6 +409,7 @@ fn walk(
         // coherent place in frame either.
         ctx.frame = prev_frame;
         ctx.timing = prev_timing;
+        (ctx.comp_frame, ctx.shifted) = (prev_comp_frame, prev_shifted);
         ctx.exit_node(prev_node);
         return None;
     };
@@ -465,6 +492,7 @@ fn walk(
         ctx.exit_node(prev_node);
         ctx.frame = prev_frame;
         ctx.timing = prev_timing;
+        (ctx.comp_frame, ctx.shifted) = (prev_comp_frame, prev_shifted);
         return bounds;
     }
 
@@ -533,7 +561,10 @@ fn walk(
             // is also where nested timing becomes properly relative — a comp
             // boundary is what stage 1 left open.
             Some(project) if !stack.contains(&id) => {
-                eval_comp(project, id, ctx.frame, xf, opacity, view, stack, scene, orbit);
+                // Handed over unshifted: the nested comp's layers apply the shutter by
+                // their own switches.
+                let centre = if ctx.shifted { ctx.frame - ctx.shutter } else { ctx.frame };
+                eval_comp(project, id, centre, ctx.shutter, xf, opacity, view, stack, scene, orbit);
             }
             // Comp-level cycle guard, mirroring the expression one: a comp that
             // contains itself warns and stops rather than recursing forever.
@@ -676,6 +707,7 @@ fn walk(
 
     ctx.frame = prev_frame;
     ctx.timing = prev_timing;
+    (ctx.comp_frame, ctx.shifted) = (prev_comp_frame, prev_shifted);
     bounds
 }
 
@@ -2724,5 +2756,40 @@ fn collect_audio_node(
 
     for child in &node.children {
         collect_audio_node(child, project, ctx, fps, sample_rate, shift, at_frame, stack, out);
+    }
+}
+
+#[cfg(test)]
+mod motion_blur_tests {
+    use crate::node::{Comp, Node, Project, Shape};
+    use crate::value::{Keyframe, Track, Value};
+    use crate::vec3::Vec3;
+
+    /// A shutter offset moves only the layers whose switch is on; a layer
+    /// with it off stays at the frame centre.
+    #[test]
+    fn the_shutter_moves_only_switched_layers() {
+        let slide = |id, on| {
+            let mut n = Node::group(id, "box");
+            n.shape = Some(Shape::Rect { size: Value::constant(kurbo::Vec2::new(10.0, 10.0)), radius: Value::constant(0.0) });
+            n.transform.position = Value::Keyframed(Track::new(vec![
+                Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+                Keyframe::linear(10, Vec3::flat(100.0, 0.0)),
+            ]));
+            n.motion_blur = on;
+            n
+        };
+        let mut root = Node::group(0, "root");
+        root.children = vec![slide(1, true), slide(2, false)];
+        let project = Project::single(Comp::new(100.0, 100.0, root));
+        let x = |shutter, id| {
+            super::evaluate_comp_sample(&project, project.root, 5.0, shutter, crate::mat4::Mat4::IDENTITY)
+                .pivot(crate::node::NodeId(id))
+                .unwrap()
+                .x
+        };
+        assert!((x(0.0, 1) - x(0.0, 2)).abs() < 1e-9, "no shutter, same place");
+        assert!(x(0.5, 1) > x(0.0, 1), "the switched layer moves with the shutter");
+        assert_eq!(x(0.5, 2), x(0.0, 2), "the unswitched one stays at the centre");
     }
 }

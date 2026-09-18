@@ -54,6 +54,8 @@ pub(crate) struct NodeInfo {
     /// How this layer combines with the backdrop. Anything but `Normal` makes
     /// it composite in isolation — see [`motion_core::BlendMode`].
     pub(crate) blend: MBlendMode,
+    /// The layer's motion-blur switch (renders only, with the comp's on).
+    pub(crate) motion_blur: bool,
     /// The layer's mask, if it has one.
     pub(crate) mask: Option<MaskInfo>,
     pub(crate) matte: Option<MatteMode>,
@@ -440,6 +442,7 @@ impl NodeInfo {
             anchor: (anchor.x, anchor.y, anchor.z),
             opacity: tr.opacity.resolve(ctx),
             blend: node.blend,
+            motion_blur: node.motion_blur,
             matte: node.matte,
             // The caller fills this in; `resolve_in` only sees one node, and a
             // layer has no idea what sits above it.
@@ -601,6 +604,7 @@ pub(crate) struct PropEdits {
     pub(crate) scale_z: Option<f64>,
     pub(crate) opacity: Option<f64>,
     pub(crate) blend: Option<MBlendMode>,
+    pub(crate) motion_blur: Option<bool>,
     /// Mix edits, meaningful only on a layer that carries sound.
     pub(crate) audio_level: Option<f64>,
     pub(crate) audio_pan: Option<f64>,
@@ -1060,6 +1064,17 @@ pub(crate) fn properties_ui(
                     }
                 }
             });
+        ui.end_row();
+
+        ui.label("Motion Blur");
+        let mut mb = n.motion_blur;
+        if ui
+            .checkbox(&mut mb, "")
+            .on_hover_text("Blur this layer when the comp's motion blur is on (renders only)")
+            .changed()
+        {
+            edits.motion_blur = Some(mb);
+        }
         ui.end_row();
 
         ui.label("Fill");

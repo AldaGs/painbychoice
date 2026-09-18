@@ -38,7 +38,7 @@ pub use asset::{
 };
 pub use composite::{BlendMode, ComposeMode, Mask, MatteMode};
 pub use effect::{Effect, EffectKind, EffectParamSpec, EffectType, ResolvedEffect};
-pub use eval::{evaluate, evaluate_comp, evaluate_comp_orbited, evaluate_project, LayerGroup, MaskPath, RenderItem, Scene};
+pub use eval::{evaluate, evaluate_comp, evaluate_comp_orbited, evaluate_comp_sample, evaluate_project, LayerGroup, MaskPath, RenderItem, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
     Axis, MathOp, UnOp,

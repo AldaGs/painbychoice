@@ -664,6 +664,12 @@ pub struct Node {
     /// `#[serde(default)]`, so a pre-audio `.pbc` loads silent.
     #[serde(default)]
     pub audio: Option<crate::audio::AudioClip>,
+    /// This layer's motion-blur switch. It only matters when the comp's
+    /// [`MotionBlur`] is on; then a layer with it off renders at the frame
+    /// centre while switched layers move through the shutter. Covers the
+    /// subtree. On by default so the comp switch alone blurs everything.
+    #[serde(default = "Node::default_motion_blur")]
+    pub motion_blur: bool,
     pub children: Vec<Node>,
 }
 
@@ -678,6 +684,10 @@ impl Node {
 }
 
 impl Node {
+    fn default_motion_blur() -> bool {
+        true
+    }
+
     pub fn group(id: u64, name: impl Into<String>) -> Self {
         Self {
             id: NodeId(id),
@@ -695,6 +705,7 @@ impl Node {
             compound: None,
             effects: Vec::new(),
             audio: None,
+            motion_blur: true,
             children: Vec::new(),
         }
     }
@@ -716,6 +727,7 @@ impl Node {
             compound: None,
             effects: Vec::new(),
             audio: None,
+            motion_blur: true,
             children: Vec::new(),
         }
     }
@@ -993,8 +1005,7 @@ pub struct Comp {
 /// Motion blur as a render setting: each output frame is the average of
 /// `samples` evaluations spread across the shutter.
 ///
-/// Comp-wide for now. Per-layer switches are the follow-up; they need the
-/// evaluator to hold unblurred layers at the frame centre while the rest move.
+/// Gated per layer by [`Node::motion_blur`].
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MotionBlur {
@@ -1012,15 +1023,15 @@ impl Default for MotionBlur {
 }
 
 impl MotionBlur {
-    /// The sub-frame times to evaluate for `frame`, centred on it (AE's
-    /// default phase of minus half the angle). Just `[frame]` when off.
-    pub fn sample_frames(&self, frame: f64) -> Vec<f64> {
+    /// The shutter offsets to sample, relative to the frame and centred on it
+    /// (AE's default phase of minus half the angle). Just `[0.0]` when off.
+    pub fn offsets(&self) -> Vec<f64> {
         let n = self.samples.clamp(1, 64);
         let span = self.shutter_angle.clamp(0.0, 720.0) / 360.0;
         if !self.enabled || n == 1 || span == 0.0 {
-            return vec![frame];
+            return vec![0.0];
         }
-        (0..n).map(|i| frame - span / 2.0 + span * (i as f64 + 0.5) / n as f64).collect()
+        (0..n).map(|i| -span / 2.0 + span * (i as f64 + 0.5) / n as f64).collect()
     }
 }
 
@@ -2173,10 +2184,10 @@ mod knob_tests {
     #[test]
     fn motion_blur_samples_centre_on_the_frame() {
         let mut mb = MotionBlur::default();
-        assert_eq!(mb.sample_frames(10.0), vec![10.0]);
+        assert_eq!(mb.offsets(), vec![0.0]);
         mb.enabled = true;
         mb.samples = 4;
         mb.shutter_angle = 360.0;
-        assert_eq!(mb.sample_frames(10.0), vec![9.625, 9.875, 10.125, 10.375]);
+        assert_eq!(mb.offsets(), vec![-0.375, -0.125, 0.125, 0.375]);
     }
 }

@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use motion_core::{demo::demo_document, evaluate_comp, Color, CompId, Project};
+use motion_core::{demo::demo_document, Color, CompId, Project};
 use motion_render::{
     is_video_container, output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder,
     OutputSpec, PngSequence, Quality,
@@ -375,10 +375,16 @@ fn render(args: &[String]) -> Result<(), String> {
         // shared through a lock: the map would be contended on every frame to
         // record something that is nearly always identical across all of them.
         // With motion blur on, one frame is several sub-frame renders averaged;
-        // off, `sample_frames` is just this frame.
+        // off, `offsets` is just `[0.0]`.
         let (mut warnings, mut report, mut samples) = (Vec::new(), Vec::new(), Vec::new());
-        for t in comp.motion_blur.sample_frames(frame as f64) {
-            let scene = evaluate_comp(&project, comp_id, t);
+        for shutter in comp.motion_blur.offsets() {
+            let scene = motion_core::evaluate_comp_sample(
+                &project,
+                comp_id,
+                frame as f64,
+                shutter,
+                motion_core::mat4::Mat4::IDENTITY,
+            );
             warnings.extend(scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)));
             let (px, r) =
                 rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)

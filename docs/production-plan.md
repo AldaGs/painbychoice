@@ -321,11 +321,12 @@ masking and 2.5D placement. Build it once, now that its clients are real.
    Add menu reads it. The panel, dopesheet and apply path index parameters
    by slot, with no per-kind match left in `live`. Still open: a plugin effect
    registers but has no pixel routine, and effects aren't graph nodes yet.
-3. ◐ **Motion blur** (2026-09-18): per-comp `MotionBlur` (shutter angle,
+3. ✅ **Motion blur** (2026-09-18): per-comp `MotionBlur` (shutter angle,
    samples) averages sub-frame renders in both export paths — `motion render`
-   and the GUI's Draft/Master. Still open: **per-layer switches** (the
-   evaluator must hold unblurred layers at the frame centre) and blur in the
-   live preview.
+   and the GUI's Draft/Master. Per-layer switches too: a layer's own
+   properties sample the shutter only when its switch is on (default on).
+   Motion inherited from a parent still blurs a switched-off child — AE holds
+   the parent chain too. Still open: that, and blur in the live preview.
 4. **Known compositor gaps** (from the readback work): a blur inside a blur
    loses the inner one, and a colour effect on a group *containing* a blurred
    layer does not reach the blurred image.
