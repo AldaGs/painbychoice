@@ -175,6 +175,22 @@ impl FrameRenderer<'_> {
         let doc = project
             .comp(comp)
             .ok_or_else(|| format!("no composition {} in this project", comp.0))?;
+        // Motion blur: several sub-frame renders averaged. Off, this is one
+        // render at `frame`.
+        let samples = doc
+            .motion_blur
+            .sample_frames(frame)
+            .into_iter()
+            .map(|t| self.frame_at(project, comp, t))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(motion_render::average_frames(&samples))
+    }
+
+    /// One unblurred render of `comp` at `frame`.
+    fn frame_at(&mut self, project: &MProject, comp: CompId, frame: f64) -> Result<Vec<u8>, String> {
+        let doc = project
+            .comp(comp)
+            .ok_or_else(|| format!("no composition {} in this project", comp.0))?;
         let dims = (doc.width, doc.height);
         let bg = doc.bg;
         let (w, h) = self.target.size();

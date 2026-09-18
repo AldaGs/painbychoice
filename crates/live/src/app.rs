@@ -3528,6 +3528,7 @@ impl App {
         let comp_bg = self.doc().bg;
         let comp_pp = self.doc().passepartout;
         let comp_path_range = self.doc().motion_path_range;
+        let comp_mb = self.doc().motion_blur;
         // The camera's *resolved* transform at this frame — the popup edits the
         // numbers you can see, so a keyframed dolly or truck reads back as it
         // plays.
@@ -3703,6 +3704,7 @@ impl App {
                         comp_bg,
                         comp_pp,
                         comp_path_range,
+                        comp_mb,
                         comp_camera,
                         &mut comp,
                         &preset_names,
@@ -4253,6 +4255,10 @@ impl App {
         if let Some(pp) = comp.passepartout {
             self.doc_mut().passepartout = pp.clamp(0.0, 1.0);
             dirty = true;
+        }
+        // A render setting: nothing on the canvas changes, so no dirty flag.
+        if let Some(mb) = comp.motion_blur {
+            self.doc_mut().motion_blur = mb;
         }
         if let Some(r) = comp.motion_path_range {
             self.doc_mut().motion_path_range = r.clamp(0, MAX_RANGE);

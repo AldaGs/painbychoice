@@ -984,7 +984,44 @@ pub struct Comp {
     /// *is* the absence of projection.
     #[serde(default)]
     pub camera: Option<crate::camera::Camera>,
+    /// Render-time motion blur. Off by default, and absent from old files.
+    #[serde(default)]
+    pub motion_blur: MotionBlur,
     pub root: Node,
+}
+
+/// Motion blur as a render setting: each output frame is the average of
+/// `samples` evaluations spread across the shutter.
+///
+/// Comp-wide for now. Per-layer switches are the follow-up; they need the
+/// evaluator to hold unblurred layers at the frame centre while the rest move.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MotionBlur {
+    pub enabled: bool,
+    /// Degrees of a frame the shutter is open: 180 is the film standard, 360
+    /// smears across the whole frame interval.
+    pub shutter_angle: f64,
+    pub samples: u32,
+}
+
+impl Default for MotionBlur {
+    fn default() -> Self {
+        Self { enabled: false, shutter_angle: 180.0, samples: 8 }
+    }
+}
+
+impl MotionBlur {
+    /// The sub-frame times to evaluate for `frame`, centred on it (AE's
+    /// default phase of minus half the angle). Just `[frame]` when off.
+    pub fn sample_frames(&self, frame: f64) -> Vec<f64> {
+        let n = self.samples.clamp(1, 64);
+        let span = self.shutter_angle.clamp(0.0, 720.0) / 360.0;
+        if !self.enabled || n == 1 || span == 0.0 {
+            return vec![frame];
+        }
+        (0..n).map(|i| frame - span / 2.0 + span * (i as f64 + 0.5) / n as f64).collect()
+    }
 }
 
 /// The preview's alignment aids. Grouped rather than five loose fields on
@@ -1202,6 +1239,7 @@ impl Comp {
             // reads it until you add a camera. New work behaves like old work
             // until you ask for otherwise.
             camera: None,
+            motion_blur: MotionBlur::default(),
             width,
             height,
             fps: 60.0,
@@ -2128,5 +2166,17 @@ mod knob_tests {
         let mut tr = Transform::default();
         tr.rotation = Value::constant(Vec3::new(30.0, 0.0, 0.0));
         assert!(!resolve(&tr).is_flat(), "an X tilt leaves the plane");
+    }
+
+    /// Off is one sample at the frame; on spreads samples evenly across the
+    /// shutter, centred on the frame.
+    #[test]
+    fn motion_blur_samples_centre_on_the_frame() {
+        let mut mb = MotionBlur::default();
+        assert_eq!(mb.sample_frames(10.0), vec![10.0]);
+        mb.enabled = true;
+        mb.samples = 4;
+        mb.shutter_angle = 360.0;
+        assert_eq!(mb.sample_frames(10.0), vec![9.625, 9.875, 10.125, 10.375]);
     }
 }

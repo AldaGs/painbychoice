@@ -371,15 +371,27 @@ fn render(args: &[String]) -> Result<(), String> {
     let preparer = encoder.preparer();
 
     let render_frame = |frame: i64| {
-        let scene = evaluate_comp(&project, comp_id, frame as f64);
         // Warnings are collected per frame and merged by the writer rather than
         // shared through a lock: the map would be contended on every frame to
         // record something that is nearly always identical across all of them.
-        let warnings: Vec<String> =
-            scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)).collect();
-        let (pixels, report) =
-            rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)
-                .map_err(|e| e.to_string())?;
+        // With motion blur on, one frame is several sub-frame renders averaged;
+        // off, `sample_frames` is just this frame.
+        let (mut warnings, mut report, mut samples) = (Vec::new(), Vec::new(), Vec::new());
+        for t in comp.motion_blur.sample_frames(frame as f64) {
+            let scene = evaluate_comp(&project, comp_id, t);
+            warnings.extend(scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)));
+            let (px, r) =
+                rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)
+                    .map_err(|e| e.to_string())?;
+            samples.push(px);
+            report.extend(r);
+        }
+        // Samples repeat the same notes; keep one each so counts stay per frame.
+        warnings.sort_unstable();
+        warnings.dedup();
+        report.sort_unstable();
+        report.dedup();
+        let pixels = motion_render::average_frames(&samples);
         // Compression happens here, on the worker, not on the writer. For a PNG
         // sequence this is most of a frame's encoding cost and was the serial
         // fraction that capped the whole render; for an ffmpeg sidecar it is a

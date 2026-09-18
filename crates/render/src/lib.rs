@@ -19,7 +19,7 @@ pub use encode::{
     Quality,
 };
 pub use parallel::{default_threads, render_in_order};
-pub use raster::{output_size, rasterize, RasterError};
+pub use raster::{average_frames, output_size, rasterize, RasterError};
 
 use kurbo::Shape as _;
 use motion_core::{Asset, BlendMode, Color, ComposeMode, Scene};

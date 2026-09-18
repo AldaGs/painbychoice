@@ -588,3 +588,48 @@ mod tests {
     }
 }
 
+
+/// Average equally sized straight-RGBA8 frames — motion blur's accumulate.
+///
+/// Weighted by alpha, so a transparent sample adds coverage but no colour:
+/// a shape sweeping over an empty background blurs to its own colour, not
+/// toward black.
+pub fn average_frames(frames: &[Vec<u8>]) -> Vec<u8> {
+    let Some(first) = frames.first() else { return Vec::new() };
+    if frames.len() == 1 {
+        return first.clone();
+    }
+    let n = frames.len() as f32;
+    let mut out = vec![0u8; first.len()];
+    for (i, px) in out.chunks_exact_mut(4).enumerate() {
+        let (mut rgb, mut a) = ([0f32; 3], 0f32);
+        for f in frames {
+            let s = &f[i * 4..i * 4 + 4];
+            let sa = s[3] as f32;
+            for c in 0..3 {
+                rgb[c] += s[c] as f32 * sa;
+            }
+            a += sa;
+        }
+        if a > 0.0 {
+            for c in 0..3 {
+                px[c] = (rgb[c] / a).round() as u8;
+            }
+        }
+        px[3] = (a / n).round() as u8;
+    }
+    out
+}
+
+#[cfg(test)]
+mod average_tests {
+    use super::average_frames;
+
+    #[test]
+    fn averaging_blends_coverage_and_keeps_colour() {
+        let red = vec![255, 0, 0, 255];
+        let clear = vec![0, 0, 0, 0];
+        assert_eq!(average_frames(&[red.clone(), clear]), vec![255, 0, 0, 128]);
+        assert_eq!(average_frames(&[red.clone()]), red);
+    }
+}

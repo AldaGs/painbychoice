@@ -554,6 +554,8 @@ pub(crate) struct CompEdits {
     pub(crate) passepartout: Option<f64>,
     /// A new motion-path half-window, in frames.
     pub(crate) motion_path_range: Option<i64>,
+    /// New render-time motion blur settings.
+    pub(crate) motion_blur: Option<motion_core::MotionBlur>,
     /// Add the camera (`Some(true)`) or remove it (`Some(false)`). Distinct
     /// from the transform edits below so "add a camera" and "move the camera"
     /// stay separate answers — you cannot move one that does not exist.
@@ -634,6 +636,7 @@ pub(crate) fn comp_ui(
     bg: MColor,
     passepartout: f64,
     motion_path_range: i64,
+    motion_blur: motion_core::MotionBlur,
     // The open comp's camera at the current frame, or `None` when flat.
     camera: Option<CameraBar>,
     out: &mut CompEdits,
@@ -850,6 +853,28 @@ pub(crate) fn comp_ui(
         {
             out.motion_path_range = Some(range);
         }
+
+        // Motion blur: a render setting, so it lives in a menu rather than
+        // taking row space. The preview stays sharp; renders blur.
+        let mut mb = motion_blur;
+        let title = if mb.enabled { "MB on" } else { "MB" };
+        ui.menu_button(title, |ui| {
+            let mut changed = ui.checkbox(&mut mb.enabled, "Motion blur (renders only)").changed();
+            ui.add_enabled_ui(mb.enabled, |ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut mb.shutter_angle).range(0.0..=720.0).suffix("°").prefix("Shutter "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut mb.samples).range(2..=64).prefix("Samples "))
+                    .on_hover_text("Renders per frame: smoother blur, proportionally slower export")
+                    .changed();
+            });
+            if changed {
+                out.motion_blur = Some(mb);
+            }
+        })
+        .response
+        .on_hover_text("Motion blur for Draft and Master renders");
         ui.separator();
 
         // Undo / redo. The keyboard is the real route (Ctrl+Z / Ctrl+Shift+Z),
