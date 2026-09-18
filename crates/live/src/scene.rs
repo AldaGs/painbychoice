@@ -135,7 +135,7 @@ pub(crate) fn canvas_toolbar(
                     let mut spacing = aids.grid.spacing;
                     if ui
                         .add(
-                            egui::DragValue::new(&mut spacing)
+                            crate::calc::num(&mut spacing)
                                 .speed(1.0)
                                 .range(Grid::MIN_SPACING..=Grid::MAX_SPACING)
                                 .prefix("spacing ")
@@ -148,7 +148,7 @@ pub(crate) fn canvas_toolbar(
                     let mut subs = aids.grid.subdivisions;
                     if ui
                         .add(
-                            egui::DragValue::new(&mut subs)
+                            crate::calc::num(&mut subs)
                                 .speed(0.1)
                                 .range(1..=100)
                                 .prefix("subdivisions "),
@@ -183,13 +183,13 @@ pub(crate) fn canvas_toolbar(
                     ui.label("Onion skins");
                     let (mut before, mut after) = (aids.onion.before, aids.onion.after);
                     let b = ui.add(
-                        egui::DragValue::new(&mut before)
+                        crate::calc::num(&mut before)
                             .speed(0.1)
                             .range(0..=Onion::MAX_GHOSTS)
                             .prefix("before "),
                     );
                     let a = ui.add(
-                        egui::DragValue::new(&mut after)
+                        crate::calc::num(&mut after)
                             .speed(0.1)
                             .range(0..=Onion::MAX_GHOSTS)
                             .prefix("after "),
@@ -200,7 +200,7 @@ pub(crate) fn canvas_toolbar(
                     let mut step = aids.onion.step;
                     if ui
                         .add(
-                            egui::DragValue::new(&mut step)
+                            crate::calc::num(&mut step)
                                 .speed(0.2)
                                 .range(1..=240)
                                 .prefix("every ")
@@ -214,7 +214,7 @@ pub(crate) fn canvas_toolbar(
                     let mut pct = aids.onion.opacity * 100.0;
                     if ui
                         .add(
-                            egui::DragValue::new(&mut pct)
+                            crate::calc::num(&mut pct)
                                 .speed(1.0)
                                 .range(1.0..=100.0)
                                 .prefix("opacity ")

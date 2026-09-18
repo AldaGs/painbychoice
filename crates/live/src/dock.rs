@@ -699,10 +699,10 @@ pub(crate) fn comp_ui(
             let mut changed = ui.checkbox(&mut mb.enabled, "Motion blur").changed();
             ui.add_enabled_ui(mb.enabled, |ui| {
                 changed |= ui
-                    .add(egui::DragValue::new(&mut mb.shutter_angle).range(0.0..=720.0).suffix("°").prefix("Shutter "))
+                    .add(crate::calc::num(&mut mb.shutter_angle).range(0.0..=720.0).suffix("°").prefix("Shutter "))
                     .changed();
                 changed |= ui
-                    .add(egui::DragValue::new(&mut mb.samples).range(2..=64).prefix("Samples "))
+                    .add(crate::calc::num(&mut mb.samples).range(2..=64).prefix("Samples "))
                     .on_hover_text("Renders per frame: smoother blur, proportionally slower export")
                     .changed();
             });
@@ -764,12 +764,12 @@ pub(crate) fn comp_ui(
 
         ui.label("Size");
         let mut w = width;
-        if ui.add(egui::DragValue::new(&mut w).speed(1.0).range(1.0..=16384.0)).changed() {
+        if ui.add(crate::calc::num(&mut w).speed(1.0).range(1.0..=16384.0)).changed() {
             out.width = Some(w);
         }
         ui.label("×");
         let mut h = height;
-        if ui.add(egui::DragValue::new(&mut h).speed(1.0).range(1.0..=16384.0)).changed() {
+        if ui.add(crate::calc::num(&mut h).speed(1.0).range(1.0..=16384.0)).changed() {
             out.height = Some(h);
         }
         ui.separator();
@@ -779,7 +779,7 @@ pub(crate) fn comp_ui(
         // The drag edges bracket the retime: dragging the rate up or down
         // resolves live on every delta, but each delta is applied to the
         // pre-drag comp rather than stacked on the previous one.
-        let fps_res = ui.add(egui::DragValue::new(&mut f).speed(0.5).range(1.0..=240.0));
+        let fps_res = ui.add(crate::calc::num(&mut f).speed(0.5).range(1.0..=240.0));
         out.fps_drag_started = fps_res.drag_started();
         out.fps_drag_stopped = fps_res.drag_stopped();
         if fps_res.changed() {
@@ -790,7 +790,7 @@ pub(crate) fn comp_ui(
         ui.label("Duration");
         let mut dur = duration;
         if ui
-            .add(egui::DragValue::new(&mut dur).speed(0.1).range(0.1..=3600.0).suffix(" s"))
+            .add(crate::calc::num(&mut dur).speed(0.1).range(0.1..=3600.0).suffix(" s"))
             .changed()
         {
             out.duration = Some(dur);
@@ -835,10 +835,10 @@ pub(crate) fn comp_ui(
                 ui.label("Position");
                 ui.horizontal(|ui| {
                     let mut v = pos;
-                    if ui.add(egui::DragValue::new(&mut v.0).speed(1.0).prefix("x ")).changed() {
+                    if ui.add(crate::calc::num(&mut v.0).speed(1.0).prefix("x ")).changed() {
                         out.camera_pos[0] = Some(v.0);
                     }
-                    if ui.add(egui::DragValue::new(&mut v.1).speed(1.0).prefix("y ")).changed() {
+                    if ui.add(crate::calc::num(&mut v.1).speed(1.0).prefix("y ")).changed() {
                         out.camera_pos[1] = Some(v.1);
                     }
                 });
@@ -848,7 +848,7 @@ pub(crate) fn comp_ui(
                 // negation of the other.
                 let mut eye = -pos.2;
                 if ui
-                    .add(egui::DragValue::new(&mut eye).speed(10.0).range(1.0..=1_000_000.0).prefix("eye "))
+                    .add(crate::calc::num(&mut eye).speed(10.0).range(1.0..=1_000_000.0).prefix("eye "))
                     .on_hover_text("Distance from the eye to the z=0 plane. Larger is flatter.")
                     .changed()
                 {
@@ -858,13 +858,13 @@ pub(crate) fn comp_ui(
                 ui.label("Rotation");
                 ui.horizontal(|ui| {
                     let mut r = rot;
-                    if ui.add(egui::DragValue::new(&mut r.0).speed(0.5).prefix("x ").suffix("°")).changed() {
+                    if ui.add(crate::calc::num(&mut r.0).speed(0.5).prefix("x ").suffix("°")).changed() {
                         out.camera_rot[0] = Some(r.0);
                     }
-                    if ui.add(egui::DragValue::new(&mut r.1).speed(0.5).prefix("y ").suffix("°")).changed() {
+                    if ui.add(crate::calc::num(&mut r.1).speed(0.5).prefix("y ").suffix("°")).changed() {
                         out.camera_rot[1] = Some(r.1);
                     }
-                    if ui.add(egui::DragValue::new(&mut r.2).speed(0.5).prefix("z ").suffix("°")).changed() {
+                    if ui.add(crate::calc::num(&mut r.2).speed(0.5).prefix("z ").suffix("°")).changed() {
                         out.camera_rot[2] = Some(r.2);
                     }
                 });
@@ -883,7 +883,7 @@ pub(crate) fn comp_ui(
         let mut pct = passepartout * 100.0;
         if ui
             .add(
-                egui::DragValue::new(&mut pct)
+                crate::calc::num(&mut pct)
                     .speed(1.0)
                     .range(0.0..=100.0)
                     .suffix("%"),
@@ -901,7 +901,7 @@ pub(crate) fn comp_ui(
         let mut range = motion_path_range;
         if ui
             .add(
-                egui::DragValue::new(&mut range)
+                crate::calc::num(&mut range)
                     .speed(1.0)
                     .range(0..=MAX_RANGE)
                     .suffix(" f"),

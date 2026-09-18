@@ -80,7 +80,7 @@ pub(crate) fn transport_ui(
             ui.add_space(8.0);
             let mut end = work_area.map_or(last_frame, |w| w.end - 1);
             if ui
-                .add(egui::DragValue::new(&mut end).speed(1.0).range(0..=last_frame))
+                .add(crate::calc::num(&mut end).speed(1.0).range(0..=last_frame))
                 .on_hover_text("Last frame of the preview range (N)")
                 .changed()
             {
@@ -89,7 +89,7 @@ pub(crate) fn transport_ui(
             ui.weak("End");
             let mut start = work_area.map_or(0, |w| w.start);
             if ui
-                .add(egui::DragValue::new(&mut start).speed(1.0).range(0..=last_frame))
+                .add(crate::calc::num(&mut start).speed(1.0).range(0..=last_frame))
                 .on_hover_text("First frame of the preview range (B)")
                 .changed()
             {

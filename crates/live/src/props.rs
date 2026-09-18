@@ -909,7 +909,7 @@ pub(crate) fn ease_editor(ui: &mut egui::Ui, ease: &EaseInfo, out: &mut Option<(
             (&mut p2.1, -OVERSHOOT, 1.0 + OVERSHOOT),
         ] {
             let r = ui.add(
-                egui::DragValue::new(v)
+                crate::calc::num(v)
                     .speed(0.005)
                     .range(lo..=hi)
                     .max_decimals(3),
@@ -962,13 +962,13 @@ pub(crate) fn properties_ui(
         ui.label("Anchor");
         ui.horizontal(|ui| {
             let (mut x, mut y, mut z) = n.anchor;
-            if ui.add(egui::DragValue::new(&mut x).speed(0.5).prefix("x ")).changed() {
+            if ui.add(crate::calc::num(&mut x).speed(0.5).prefix("x ")).changed() {
                 edits.anchor_x = Some(x);
             }
-            if ui.add(egui::DragValue::new(&mut y).speed(0.5).prefix("y ")).changed() {
+            if ui.add(crate::calc::num(&mut y).speed(0.5).prefix("y ")).changed() {
                 edits.anchor_y = Some(y);
             }
-            if ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ")).changed() {
+            if ui.add(crate::calc::num(&mut z).speed(0.5).prefix("z ")).changed() {
                 edits.anchor_z = Some(z);
             }
         });
@@ -982,13 +982,13 @@ pub(crate) fn properties_ui(
         ui.label("Position");
         ui.horizontal(|ui| {
             let (mut x, mut y, mut z) = n.pos;
-            if ui.add(egui::DragValue::new(&mut x).speed(0.5).prefix("x ")).changed() {
+            if ui.add(crate::calc::num(&mut x).speed(0.5).prefix("x ")).changed() {
                 edits.pos_x = Some(x);
             }
-            if ui.add(egui::DragValue::new(&mut y).speed(0.5).prefix("y ")).changed() {
+            if ui.add(crate::calc::num(&mut y).speed(0.5).prefix("y ")).changed() {
                 edits.pos_y = Some(y);
             }
-            if ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ")).changed() {
+            if ui.add(crate::calc::num(&mut z).speed(0.5).prefix("z ")).changed() {
                 edits.pos_z = Some(z);
             }
         });
@@ -1004,13 +1004,13 @@ pub(crate) fn properties_ui(
         ui.label("Rotation");
         ui.horizontal(|ui| {
             let (mut z, mut rx, mut ry) = (n.rot, n.rot_xy.0, n.rot_xy.1);
-            if ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ").suffix("°")).changed() {
+            if ui.add(crate::calc::num(&mut z).speed(0.5).prefix("z ").suffix("°")).changed() {
                 edits.rot = Some(z);
             }
-            if ui.add(egui::DragValue::new(&mut rx).speed(0.5).prefix("x ").suffix("°")).changed() {
+            if ui.add(crate::calc::num(&mut rx).speed(0.5).prefix("x ").suffix("°")).changed() {
                 edits.rot_x = Some(rx);
             }
-            if ui.add(egui::DragValue::new(&mut ry).speed(0.5).prefix("y ").suffix("°")).changed() {
+            if ui.add(crate::calc::num(&mut ry).speed(0.5).prefix("y ").suffix("°")).changed() {
                 edits.rot_y = Some(ry);
             }
         });
@@ -1022,13 +1022,13 @@ pub(crate) fn properties_ui(
         ui.label("Scale");
         ui.horizontal(|ui| {
             let (mut sx, mut sy, mut sz) = n.scale;
-            if ui.add(egui::DragValue::new(&mut sx).speed(0.01).prefix("x ")).changed() {
+            if ui.add(crate::calc::num(&mut sx).speed(0.01).prefix("x ")).changed() {
                 edits.scale_x = Some(sx);
             }
-            if ui.add(egui::DragValue::new(&mut sy).speed(0.01).prefix("y ")).changed() {
+            if ui.add(crate::calc::num(&mut sy).speed(0.01).prefix("y ")).changed() {
                 edits.scale_y = Some(sy);
             }
-            if ui.add(egui::DragValue::new(&mut sz).speed(0.01).prefix("z ")).changed() {
+            if ui.add(crate::calc::num(&mut sz).speed(0.01).prefix("z ")).changed() {
                 edits.scale_z = Some(sz);
             }
         });
@@ -1119,7 +1119,7 @@ pub(crate) fn properties_ui(
             ui.label("Stroke W");
             let mut w = w;
             if ui
-                .add(egui::DragValue::new(&mut w).speed(0.1).range(0.0..=f64::MAX))
+                .add(crate::calc::num(&mut w).speed(0.1).range(0.0..=f64::MAX))
                 .changed()
             {
                 edits.stroke_width = Some(w);
@@ -1137,13 +1137,13 @@ pub(crate) fn properties_ui(
             ui.horizontal(|ui| {
                 let (mut w, mut h) = (w, h);
                 if ui
-                    .add(egui::DragValue::new(&mut w).speed(0.5).range(0.0..=f64::MAX))
+                    .add(crate::calc::num(&mut w).speed(0.5).range(0.0..=f64::MAX))
                     .changed()
                 {
                     edits.size_x = Some(w);
                 }
                 if ui
-                    .add(egui::DragValue::new(&mut h).speed(0.5).range(0.0..=f64::MAX))
+                    .add(crate::calc::num(&mut h).speed(0.5).range(0.0..=f64::MAX))
                     .changed()
                 {
                     edits.size_y = Some(h);
@@ -1159,7 +1159,7 @@ pub(crate) fn properties_ui(
             ui.label("Radius");
             let mut r = r;
             if ui
-                .add(egui::DragValue::new(&mut r).speed(0.5).range(0.0..=f64::MAX))
+                .add(crate::calc::num(&mut r).speed(0.5).range(0.0..=f64::MAX))
                 .changed()
             {
                 edits.radius = Some(r);
@@ -1248,10 +1248,10 @@ pub(crate) fn properties_ui(
                 ui.label("Mask size");
                 ui.horizontal(|ui| {
                     let (mut w, mut h) = (w, h);
-                    if ui.add(egui::DragValue::new(&mut w).speed(1.0)).changed() {
+                    if ui.add(crate::calc::num(&mut w).speed(1.0)).changed() {
                         edits.mask_size_x = Some(w);
                     }
-                    if ui.add(egui::DragValue::new(&mut h).speed(1.0)).changed() {
+                    if ui.add(crate::calc::num(&mut h).speed(1.0)).changed() {
                         edits.mask_size_y = Some(h);
                     }
                 });
@@ -1402,7 +1402,7 @@ pub(crate) fn properties_ui(
                 // Pixel distances drag coarsely, `0..1` amounts finely — a
                 // 0.01/frame offset would take a minute to move a shadow.
                 let speed = param.spec().step;
-                if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {
+                if ui.add(crate::calc::num(&mut v).speed(speed)).changed() {
                     edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
                 }
                 if key_button(ui, num.anim) {
@@ -1457,7 +1457,7 @@ pub(crate) fn properties_ui(
                     if let Some(v) = f.remap {
                         let mut v = v;
                         if ui
-                            .add(egui::DragValue::new(&mut v).speed(0.25).suffix(" f"))
+                            .add(crate::calc::num(&mut v).speed(0.25).suffix(" f"))
                             .changed()
                         {
                             edits.time_remap = Some(Some(v));
@@ -1522,7 +1522,7 @@ pub(crate) fn properties_ui(
             ui.label("Font Size");
             let mut size = t.size;
             if ui
-                .add(egui::DragValue::new(&mut size).speed(0.5).range(0.0..=f64::MAX))
+                .add(crate::calc::num(&mut size).speed(0.5).range(0.0..=f64::MAX))
                 .changed()
             {
                 edits.text_size = Some(size);
@@ -1550,7 +1550,7 @@ pub(crate) fn properties_ui(
                 Some(w) => {
                     let mut w = w;
                     if ui
-                        .add(egui::DragValue::new(&mut w).speed(1.0).range(1.0..=f64::MAX))
+                        .add(crate::calc::num(&mut w).speed(1.0).range(1.0..=f64::MAX))
                         .changed()
                     {
                         edits.text_max_width = Some(Some(w));

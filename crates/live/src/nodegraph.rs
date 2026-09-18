@@ -663,7 +663,7 @@ fn literal_field(
     match cur {
         ExprValue::Num(n) => {
             let mut v = n;
-            ui.add(egui::DragValue::new(&mut v).speed(0.1)).changed().then_some(ExprValue::Num(v))
+            ui.add(crate::calc::num(&mut v).speed(0.1)).changed().then_some(ExprValue::Num(v))
         }
         // Single-line: a knob row is one line tall, and the multi-line editor
         // belongs to the text node's own content field where the extra height
@@ -677,9 +677,9 @@ fn literal_field(
         ExprValue::Vec3(p) => {
             let (mut x, mut y, mut z) = (p.x, p.y, p.z);
             let mut changed = false;
-            changed |= ui.add(egui::DragValue::new(&mut x).speed(0.5).prefix("x ")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut y).speed(0.5).prefix("y ")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut z).speed(0.5).prefix("z ")).changed();
+            changed |= ui.add(crate::calc::num(&mut x).speed(0.5).prefix("x ")).changed();
+            changed |= ui.add(crate::calc::num(&mut y).speed(0.5).prefix("y ")).changed();
+            changed |= ui.add(crate::calc::num(&mut z).speed(0.5).prefix("z ")).changed();
             changed.then(|| ExprValue::Vec3(motion_core::Vec3::new(x, y, z)))
         }
         ExprValue::Color(c) => {
@@ -994,7 +994,7 @@ fn neutral_literal(ty: SocketType) -> ExprValue {
 fn num_field(ui: &mut egui::Ui, label: &str, cur: f64) -> Option<f64> {
     let mut v = cur;
     let changed =
-        ui.add(egui::DragValue::new(&mut v).speed(0.1).prefix(format!("{label}: "))).changed();
+        ui.add(crate::calc::num(&mut v).speed(0.1).prefix(format!("{label}: "))).changed();
     changed.then_some(v)
 }
 
@@ -1042,7 +1042,7 @@ fn text_editor(ui: &mut egui::Ui, node: &GraphNode, out: &mut NgEdits) {
             changed = true;
         }
         if let Some(w) = t.max_width.as_mut() {
-            changed |= ui.add(egui::DragValue::new(w).speed(1.0).range(1.0..=f64::MAX)).changed();
+            changed |= ui.add(crate::calc::num(w).speed(1.0).range(1.0..=f64::MAX)).changed();
         }
     });
     if changed {
@@ -2062,7 +2062,7 @@ fn ref_editor(ui: &mut egui::Ui, node: &GraphNode, layers: &[LayerInfo], out: &m
             }
         });
     if ui
-        .add(egui::DragValue::new(&mut off).speed(0.5).prefix("offset "))
+        .add(crate::calc::num(&mut off).speed(0.5).prefix("offset "))
         .on_hover_text("Frame offset — read the target this many frames away")
         .changed()
     {
@@ -2156,7 +2156,7 @@ fn socket_field(
             ExprValue::Num(n) => {
                 let mut v = n;
                 let w = ui.available_width();
-                ui.add_sized([w, row.height()], egui::DragValue::new(&mut v).speed(0.1))
+                ui.add_sized([w, row.height()], crate::calc::num(&mut v).speed(0.1))
                     .changed()
                     .then_some(ExprValue::Num(v))
             }
@@ -2166,13 +2166,13 @@ fn socket_field(
                 let w = (ui.available_width() - view.s(4.0)) / 3.0;
                 let mut changed = false;
                 changed |= ui
-                    .add_sized([w, row.height()], egui::DragValue::new(&mut x).speed(0.5))
+                    .add_sized([w, row.height()], crate::calc::num(&mut x).speed(0.5))
                     .changed();
                 changed |= ui
-                    .add_sized([w, row.height()], egui::DragValue::new(&mut y).speed(0.5))
+                    .add_sized([w, row.height()], crate::calc::num(&mut y).speed(0.5))
                     .changed();
                 changed |= ui
-                    .add_sized([w, row.height()], egui::DragValue::new(&mut z).speed(0.5))
+                    .add_sized([w, row.height()], crate::calc::num(&mut z).speed(0.5))
                     .changed();
                 changed.then(|| ExprValue::Vec3(motion_core::Vec3::new(x, y, z)))
             }
