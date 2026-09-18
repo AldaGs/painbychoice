@@ -45,6 +45,7 @@ use winit::window::{Window, WindowId};
 // below) so no module needs its own import bookkeeping.
 mod aids;
 mod app;
+mod assets;
 mod clock;
 mod curves;
 mod dock;
@@ -70,6 +71,7 @@ mod tests;
 
 use aids::*;
 use app::*;
+use assets::*;
 use curves::*;
 use dock::*;
 use footage::*;

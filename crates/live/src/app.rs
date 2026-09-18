@@ -3911,6 +3911,7 @@ impl App {
                         redo_label,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
+                    Editor::Assets => assets_ui(ui, &self.project, &mut tree_edits),
                     Editor::Transport => transport_ui(
                         ui,
                         frame,

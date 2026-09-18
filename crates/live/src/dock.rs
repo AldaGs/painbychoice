@@ -22,6 +22,8 @@ pub(crate) enum Editor {
     Canvas,
     Comp,
     Layers,
+    /// Every imported file in the project.
+    Assets,
     Properties,
     Transport,
     /// The keyframe editor: the dopesheet and the curve editor, which are two
@@ -44,8 +46,8 @@ pub(crate) enum Editor {
 /// and **Transport** are fixed chrome. So those three carry no area header:
 /// they can't be swapped away, split, or closed, which is exactly what keeps
 /// the canvas invariants intact while the content panels rearrange around them.
-pub(crate) const SWAPPABLE: [Editor; 4] =
-    [Editor::Layers, Editor::Properties, Editor::Timeline, Editor::NodeGraph];
+pub(crate) const SWAPPABLE: [Editor; 5] =
+    [Editor::Layers, Editor::Assets, Editor::Properties, Editor::Timeline, Editor::NodeGraph];
 
 impl Editor {
     /// Human name shown in the area-header picker.
@@ -54,6 +56,7 @@ impl Editor {
             Editor::Canvas => "Canvas",
             Editor::Comp => "Composition",
             Editor::Layers => "Layers",
+            Editor::Assets => "Assets",
             Editor::Properties => "Properties",
             Editor::Transport => "Transport",
             Editor::Timeline => "Timeline",
@@ -75,7 +78,7 @@ impl Editor {
     /// the vello target; **Comp** and **Transport** are single fixed-height
     /// bars in non-resizable panels, so they have nothing to overflow.
     pub(crate) fn scroll_wrapped(self) -> bool {
-        matches!(self, Editor::Layers | Editor::Properties | Editor::Timeline)
+        matches!(self, Editor::Layers | Editor::Assets | Editor::Properties | Editor::Timeline)
     }
 }
 
@@ -164,12 +167,13 @@ impl Dock {
             COMP_H,
             false,
             Editor::Comp,
-            Dock::split(
-                Left,
-                TREE_W,
-                true,
-                Editor::Layers,
-                Dock::split(
+            Dock::Split {
+                side: Left,
+                size: TREE_W,
+                resizable: true,
+                // Layers over Assets, like a project panel under a comp.
+                first: Box::new(Dock::split(Bottom, 200.0, true, Editor::Assets, Dock::Leaf(Editor::Layers))),
+                second: Box::new(Dock::split(
                     Bottom,
                     TRANSPORT_H,
                     false,
@@ -181,8 +185,8 @@ impl Dock {
                         Editor::Timeline,
                         Dock::split(Right, PROPS_W, true, Editor::Properties, Dock::Leaf(Editor::Canvas)),
                     ),
-                ),
-            ),
+                )),
+            },
         )
     }
 

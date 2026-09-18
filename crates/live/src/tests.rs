@@ -368,6 +368,7 @@ fn the_default_layout_shows_every_editor_exactly_once() {
     for e in [
         Editor::Comp,
         Editor::Layers,
+        Editor::Assets,
         Editor::Transport,
         Editor::Timeline,
         Editor::Properties,
@@ -375,7 +376,7 @@ fn the_default_layout_shows_every_editor_exactly_once() {
     ] {
         assert_eq!(found.iter().filter(|f| **f == e).count(), 1, "{e:?}");
     }
-    assert_eq!(found.len(), 6, "no extra leaves");
+    assert_eq!(found.len(), 7, "no extra leaves");
 }
 
 #[test]
@@ -453,7 +454,7 @@ fn retype_swaps_the_editor_in_place() {
     assert_eq!(count_editor(&d, Editor::Layers), 0, "old editor gone");
     assert_eq!(count_editor(&d, Editor::Properties), 2, "now shown twice");
     // Structure is otherwise untouched.
-    assert_eq!(dock_editors(&d).len(), 6);
+    assert_eq!(dock_editors(&d).len(), 7);
     assert!(innermost_is_canvas(&d));
 }
 
@@ -5578,4 +5579,22 @@ fn import_routes_audio_by_extension() {
     assert!(!crate::app::is_audio_path(Path::new("clip.mp4")));
     assert!(!crate::app::is_audio_path(Path::new("still.png")));
     assert!(!crate::app::is_audio_path(Path::new("noext")));
+}
+
+#[test]
+fn asset_info_line_per_kind() {
+    use motion_core::{Asset, AssetId, AssetKind};
+    let img = Asset::image(AssetId(1), "a.png", 1920.0, 1080.0);
+    assert_eq!(crate::assets::asset_info(&img), "1920×1080 · still");
+    let mut vid = img.clone();
+    vid.kind = AssetKind::Video;
+    vid.fps = 24.0;
+    vid.frames = 240;
+    assert_eq!(crate::assets::asset_info(&vid), "1920×1080 · 24 fps · 10.0 s");
+    vid.fps = 23.976;
+    vid.sample_rate = 48_000;
+    vid.channels = 2;
+    assert!(crate::assets::asset_info(&vid).ends_with("23.976 fps · 10.0 s · 48.0 kHz stereo"));
+    let snd = Asset::audio(AssetId(2), "a.wav", 44_100, 1, 44_100 * 3);
+    assert_eq!(crate::assets::asset_info(&snd), "44.1 kHz mono · 3.0 s");
 }
