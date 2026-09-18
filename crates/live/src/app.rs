@@ -45,7 +45,7 @@ pub(crate) struct App {
     pub(crate) vscene: VScene,
     /// The paused preview's motion-blurred frame, keyed by everything that
     /// changes it, so a still frame is averaged once rather than per repaint.
-    pub(crate) mb_preview: Option<(String, vello::peniko::ImageData)>,
+    pub(crate) mb_preview: Option<(String, VScene)>,
     /// Every composition in the project. The editor always edits *one* of them
     /// (`current`); a precomp layer instances another.
     pub(crate) project: MProject,
@@ -3237,73 +3237,67 @@ impl App {
     /// cache, and hands them to [`rasterize_effect_layers`]. Early-outs before
     /// touching the GPU when no layer needs the full-image path, so the common
     /// document pays nothing.
-    /// The preview frame with motion blur: every shutter sample rendered the
-    /// way the preview draws it (chrome included), read back and averaged,
-    /// then shown as one image. `None` when the GPU isn't ready or a render
-    /// fails, and the sharp frame stays.
+    /// The preview frame with motion blur, averaged **on the GPU**: sample
+    /// `k` (1-based) is drawn as a layer at opacity `1/k` over the ones before
+    /// it, which is exactly the running mean for opaque frames. One render, no
+    /// readback — the CPU average of window-sized readbacks was what made
+    /// playback choppy. `None` when the GPU isn't ready.
     fn motion_blur_preview(&mut self, frame: i64, fit: Affine, canvas: kurbo::Rect) -> Option<VScene> {
-        let (dev, w, h) = match &self.state {
-            RenderState::Active { surface, .. } => {
-                (surface.dev_id, surface.config.width, surface.config.height)
-            }
+        let (w, h) = match &self.state {
+            RenderState::Active { surface, .. } => (surface.config.width, surface.config.height),
             RenderState::Suspended(_) => return None,
         };
         let key = format!(
             "{:?}",
             (self.doc_rev, frame, self.current, fit, (w, h), self.selected, self.nav.orbit_matrix())
         );
-        let image = match &self.mb_preview {
-            Some((k, img)) if *k == key => img.clone(),
-            _ => {
-                let doc = self.doc();
-                let (mb, dims, bg, pp) = (doc.motion_blur, (doc.width, doc.height), doc.bg, doc.passepartout);
-                let target = crate::offscreen::OffscreenTarget::new(&self.context.devices[dev].device, w, h)?;
-                let mut frames = Vec::new();
-                for shutter in mb.offsets() {
-                    let scene = motion_core::evaluate_comp_sample(
-                        &self.project,
-                        self.current,
-                        frame as f64,
-                        shutter,
-                        self.nav.orbit_matrix(),
-                    );
-                    let effect_images = self.effect_images(&scene, fit);
-                    let chrome = crate::scene::Chrome {
-                        ghosts: &self.onion.ghosts,
-                        selected: self.selected,
-                        passepartout: pp,
-                        canvas,
-                        border: true,
-                    };
-                    let vs = to_vello(
-                        &scene,
-                        fit,
-                        dims,
-                        bg,
-                        &chrome,
-                        &mut self.footage,
-                        &self.project.assets,
-                        &effect_images,
-                    );
-                    let device = &self.context.devices[dev].device;
-                    let queue = &self.context.devices[dev].queue;
-                    let renderer = self.renderers[dev].as_mut()?;
-                    frames.push(target.render(device, queue, renderer, &vs).ok()?);
-                }
-                let img = vello::peniko::ImageData {
-                    data: vello::peniko::Blob::new(std::sync::Arc::new(motion_render::average_frames(&frames))),
-                    format: vello::peniko::ImageFormat::Rgba8,
-                    alpha_type: vello::peniko::ImageAlphaType::Alpha,
-                    width: w,
-                    height: h,
-                };
-                self.mb_preview = Some((key, img.clone()));
-                img
+        if let Some((k, vs)) = &self.mb_preview {
+            if *k == key {
+                return Some(vs.clone());
             }
-        };
-        let mut vs = VScene::new();
-        vs.draw_image(&vello::peniko::ImageBrush::new(image), Affine::IDENTITY);
-        Some(vs)
+        }
+        let doc = self.doc();
+        let (mb, dims, bg, pp) = (doc.motion_blur, (doc.width, doc.height), doc.bg, doc.passepartout);
+        let full = kurbo::Rect::new(0.0, 0.0, w as f64, h as f64);
+        let mut out = VScene::new();
+        for (i, shutter) in mb.offsets().into_iter().enumerate() {
+            let scene = motion_core::evaluate_comp_sample(
+                &self.project,
+                self.current,
+                frame as f64,
+                shutter,
+                self.nav.orbit_matrix(),
+            );
+            let effect_images = self.effect_images(&scene, fit);
+            let chrome = crate::scene::Chrome {
+                ghosts: &self.onion.ghosts,
+                selected: self.selected,
+                passepartout: pp,
+                canvas,
+                border: true,
+            };
+            let vs = to_vello(
+                &scene,
+                fit,
+                dims,
+                bg,
+                &chrome,
+                &mut self.footage,
+                &self.project.assets,
+                &effect_images,
+            );
+            out.push_layer(
+                vello::peniko::Fill::NonZero,
+                vello::peniko::BlendMode::default(),
+                1.0 / (i + 1) as f32,
+                Affine::IDENTITY,
+                &full,
+            );
+            out.append(&vs, None);
+            out.pop_layer();
+        }
+        self.mb_preview = Some((key, out.clone()));
+        Some(out)
     }
 
     fn effect_images(
