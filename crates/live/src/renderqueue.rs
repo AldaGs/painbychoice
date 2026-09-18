@@ -598,7 +598,7 @@ pub(crate) struct RenderProgress {
 ///
 /// Two strings rather than one because the comp bar cannot grow — `short` is
 /// bounded (a filename), `text` is not (a full path, or an ffmpeg error), and
-/// only the bounded one is allowed on the row. See [`render_ui`].
+/// only the bounded one is allowed on the row. See [`render_status`].
 pub(crate) struct RenderSummary {
     /// The bar chip. A filename, or nothing much.
     pub(crate) short: String,
@@ -668,80 +668,86 @@ impl RenderSummary {
 /// Draft and Master are **different verbs**, not one button with a mode, and
 /// the bar says so by never putting a settings affordance on Draft. While a job
 /// runs both are replaced by a progress bar and a Cancel — one GPU, one job.
-pub(crate) fn render_ui(
+pub(crate) fn render_status(
     ui: &mut egui::Ui,
     active: Option<&RenderProgress>,
     last: Option<&RenderSummary>,
-    draft_out: &str,
-    master_out: Option<&str>,
     // The work area as an inclusive frame range, when one is set.
     range: Option<(i64, i64)>,
     out: &mut RenderEdits,
 ) {
-    match active {
-        Some(p) => {
-            ui.add(
-                egui::ProgressBar::new(p.frac)
-                    .desired_width(120.0)
-                    .text(format!("{} {}", p.quality.label(), p.line)),
-            );
-            if ui.button("Cancel").clicked() {
-                out.cancel = true;
-            }
+    if let Some(p) = active {
+        ui.add(
+            egui::ProgressBar::new(p.frac)
+                .desired_width(120.0)
+                .text(format!("{} {}", p.quality.label(), p.line)),
+        );
+        if ui.button("Cancel").clicked() {
+            out.cancel = true;
         }
-        None => {
-            // Each button is followed by its own destination picker, so which
-            // path a save icon sets is never a guess. An icon rather than a
-            // word because the row is fixed-height and already busy.
-            if ui
-                .button("Draft")
-                .on_hover_text(
-                    "Render the whole comp at full resolution, fast encoder settings, \
-                     no questions asked.",
-                )
-                .clicked()
-            {
-                out.draft = true;
-            }
-            if crate::icon::button(ui, crate::icon::SAVE, &draft_hint(draft_out)).clicked() {
-                out.pick_draft_output = true;
-            }
-            if ui
-                .button("Master")
-                .on_hover_text(
-                    "Render the deliverable from the project's saved preset, so \
-                     everyone on this project produces the same file.",
-                )
-                .clicked()
-            {
-                out.master = true;
-            }
-            if crate::icon::button(ui, crate::icon::SAVE, &output_hint(master_out)).clicked() {
-                out.pick_output = true;
-            }
-            // A restricted range is shown, always, and never merely implied by
-            // the timeline. Both buttons honour the work area, so a leftover one
-            // would otherwise silently truncate a deliverable — and a master
-            // that is four seconds instead of forty is a mistake nobody catches
-            // until they play it.
-            if let Some((from, to)) = range {
-                ui.separator();
-                ui.weak(format!("{from}–{to}")).on_hover_text(format!(
-                    "Both buttons render the work area: frames {from} to {to}. \
-                     Clear it in the timeline to render the whole comp."
-                ));
-            }
-            // The outcome as a short chip with the detail on hover. A rendered
-            // path is easily eighty characters and this row has no room for it.
-            if let Some(s) = last {
-                if s.failed {
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 80), "Render failed")
-                        .on_hover_text(&s.text);
-                } else {
-                    ui.weak(&s.short).on_hover_text(&s.text);
-                }
-            }
+        return;
+    }
+    // A restricted range is shown, always, and never merely implied by the
+    // timeline. Both renders honour the work area, so a leftover one would
+    // otherwise silently truncate a deliverable — and a master that is four
+    // seconds instead of forty is a mistake nobody catches until they play it.
+    if let Some((from, to)) = range {
+        ui.weak(format!("{from}–{to}")).on_hover_text(format!(
+            "Renders use the work area: frames {from} to {to}.              Clear it in the timeline to render the whole comp."
+        ));
+    }
+    // The outcome as a short chip with the detail on hover. A rendered path is
+    // easily eighty characters and this row has no room for it.
+    if let Some(s) = last {
+        if s.failed {
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 80), "Render failed")
+                .on_hover_text(&s.text);
+        } else {
+            ui.weak(&s.short).on_hover_text(&s.text);
         }
+    }
+}
+
+/// The Render menu's commands. Draft and Master are **different verbs**, not
+/// one button with a mode (0018), so each keeps its own entry and its own
+/// destination picker.
+pub(crate) fn render_menu(
+    ui: &mut egui::Ui,
+    draft_out: &str,
+    master_out: Option<&str>,
+    range: Option<(i64, i64)>,
+    out: &mut RenderEdits,
+) {
+    let scope = match range {
+        Some((from, to)) => format!(" (frames {from}–{to})"),
+        None => String::new(),
+    };
+    if ui
+        .button(format!("Render Draft{scope}"))
+        .on_hover_text("Full resolution, fast encoder settings, no questions asked.")
+        .clicked()
+    {
+        out.draft = true;
+        ui.close();
+    }
+    if ui.button("Draft Output…").on_hover_text(draft_hint(draft_out)).clicked() {
+        out.pick_draft_output = true;
+        ui.close();
+    }
+    ui.separator();
+    if ui
+        .button(format!("Render Master{scope}"))
+        .on_hover_text(
+            "The deliverable, from the project's saved preset, so everyone on              this project produces the same file.",
+        )
+        .clicked()
+    {
+        out.master = true;
+        ui.close();
+    }
+    if ui.button("Master Output…").on_hover_text(output_hint(master_out)).clicked() {
+        out.pick_output = true;
+        ui.close();
     }
 }
 

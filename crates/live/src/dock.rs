@@ -537,9 +537,21 @@ pub(crate) fn area_header(ui: &mut egui::Ui, editor: Editor, path: &[Branch], cm
     ui.separator();
 }
 
+/// A File menu command. Run after the UI pass: every one opens a blocking
+/// dialog, which must not happen mid-frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FileCmd {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    SaveIncrement,
+}
+
 /// Composition-settings edits from the top bar. Any `Some` is a new value.
 #[derive(Default)]
 pub(crate) struct CompEdits {
+    pub(crate) file: Option<FileCmd>,
     pub(crate) width: Option<f64>,
     pub(crate) height: Option<f64>,
     pub(crate) fps: Option<f64>,
@@ -610,7 +622,7 @@ pub(crate) struct CameraBar {
 /// bar takes one more parameter rather than three.
 ///
 /// It rides on `comp_ui` because the render controls must share the comp bar's
-/// **single row** — see [`crate::renderqueue::render_ui`] for why a second row
+/// **single row** — see [`crate::renderqueue::render_status`] for why a second row
 /// is not available here.
 pub(crate) struct RenderBar<'a> {
     pub(crate) active: Option<&'a crate::renderqueue::RenderProgress>,
@@ -653,6 +665,46 @@ pub(crate) fn comp_ui(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
+        // The app menus. They ride on this row because the `Comp` leaf is the
+        // one fixed-height strip across the top; a second row would push the
+        // layout down (invariant 16). Popups cost no row space.
+        ui.menu_button("File", |ui| {
+            for (cmd, label, keys) in [
+                (FileCmd::New, "New", "Ctrl+N"),
+                (FileCmd::Open, "Open…", "Ctrl+O"),
+                (FileCmd::Save, "Save", "Ctrl+S"),
+                (FileCmd::SaveAs, "Save As…", "Ctrl+Shift+S"),
+                (FileCmd::SaveIncrement, "Save With Increment", "Ctrl+Alt+S"),
+            ] {
+                if ui.add(egui::Button::new(label).shortcut_text(keys)).clicked() {
+                    out.file = Some(cmd);
+                    ui.close();
+                }
+            }
+        });
+        let busy = render.active.is_some();
+        ui.menu_button("Render", |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                crate::renderqueue::render_menu(ui, render.draft_out, render.master_out, render.range, render.out);
+            });
+            ui.separator();
+            // Motion blur is a render setting, so it lives with the renders.
+            let mut mb = motion_blur;
+            let mut changed = ui.checkbox(&mut mb.enabled, "Motion blur").changed();
+            ui.add_enabled_ui(mb.enabled, |ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut mb.shutter_angle).range(0.0..=720.0).suffix("°").prefix("Shutter "))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut mb.samples).range(2..=64).prefix("Samples "))
+                    .on_hover_text("Renders per frame: smoother blur, proportionally slower export")
+                    .changed();
+            });
+            if changed {
+                out.motion_blur = Some(mb);
+            }
+        });
+        ui.separator();
         ui.strong("Composition");
 
         // The comp switcher. Only worth the space once there's more than one —
@@ -854,27 +906,6 @@ pub(crate) fn comp_ui(
             out.motion_path_range = Some(range);
         }
 
-        // Motion blur: a render setting, so it lives in a menu rather than
-        // taking row space. The preview stays sharp; renders blur.
-        let mut mb = motion_blur;
-        let title = if mb.enabled { "MB on" } else { "MB" };
-        ui.menu_button(title, |ui| {
-            let mut changed = ui.checkbox(&mut mb.enabled, "Motion blur (renders only)").changed();
-            ui.add_enabled_ui(mb.enabled, |ui| {
-                changed |= ui
-                    .add(egui::DragValue::new(&mut mb.shutter_angle).range(0.0..=720.0).suffix("°").prefix("Shutter "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut mb.samples).range(2..=64).prefix("Samples "))
-                    .on_hover_text("Renders per frame: smoother blur, proportionally slower export")
-                    .changed();
-            });
-            if changed {
-                out.motion_blur = Some(mb);
-            }
-        })
-        .response
-        .on_hover_text("Motion blur for Draft and Master renders");
         ui.separator();
 
         // Undo / redo. The keyboard is the real route (Ctrl+Z / Ctrl+Shift+Z),
@@ -923,17 +954,9 @@ pub(crate) fn comp_ui(
             });
         });
 
-        // The render controls, on this same row. An export belongs to the comp
-        // you are looking at, and Draft has to be one click from it.
+        // Render progress and the last outcome stay on the row: they are
+        // feedback, and feedback hidden in a menu is feedback nobody sees.
         ui.separator();
-        crate::renderqueue::render_ui(
-            ui,
-            render.active,
-            render.last,
-            render.draft_out,
-            render.master_out,
-            render.range,
-            render.out,
-        );
+        crate::renderqueue::render_status(ui, render.active, render.last, render.range, render.out);
     });
 }

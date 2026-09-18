@@ -5558,3 +5558,14 @@ fn the_composition_bar_still_fits_while_a_render_runs() {
     }
     assert!(used <= COMP_H, "the bar used {used}pt of {COMP_H}pt while rendering");
 }
+
+#[test]
+fn save_increment_bumps_or_appends() {
+    use std::path::Path;
+    let n = |p: &str| crate::app::increment_path(Path::new(p)).to_string_lossy().replace('\\', "/");
+    assert_eq!(n("a/shot.pbc"), "a/shot_001.pbc");
+    assert_eq!(n("shot_001.pbc"), "shot_002.pbc");
+    assert_eq!(n("shot_09.pbc"), "shot_10.pbc");
+    assert_eq!(n("shot_999.pbc"), "shot_1000.pbc");
+    assert_eq!(n("v2.pbc"), "v2_001.pbc");
+}

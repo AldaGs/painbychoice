@@ -36,8 +36,6 @@ pub(crate) const ZOOM_OUT: &str = "\u{eb57}";
 pub(crate) const ZOOM_FIT: &str = "\u{f295}";
 
 // Project / layer management.
-pub(crate) const SAVE: &str = "\u{eb62}";
-pub(crate) const LOAD: &str = "\u{faf7}";
 pub(crate) const RECT: &str = "\u{eb2c}";
 pub(crate) const ELLIPSE: &str = "\u{ea6b}";
 /// Tabler `typography` — the text-layer row and the "add text" button.

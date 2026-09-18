@@ -136,8 +136,6 @@ pub(crate) struct TreeEdits {
     /// Import a sound file as a layer.
     pub(crate) import_audio: bool,
     pub(crate) delete: Option<NodeId>,
-    pub(crate) save: bool,
-    pub(crate) load: bool,
     /// Move the selection into a new composition and leave an instance behind —
     /// the core AE workflow.
     pub(crate) precompose: Option<NodeId>,
@@ -154,14 +152,6 @@ pub(crate) struct TreeEdits {
 pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.heading("Layers");
-    ui.horizontal(|ui| {
-        if icon::button(ui, icon::SAVE, "Save the project (.pbc)").clicked() {
-            out.save = true;
-        }
-        if icon::button(ui, icon::LOAD, "Load a project").clicked() {
-            out.load = true;
-        }
-    });
     ui.horizontal(|ui| {
         if icon::button(ui, icon::RECT, "Add a rectangle").clicked() {
             out.add = Some(NewShape::Rect);

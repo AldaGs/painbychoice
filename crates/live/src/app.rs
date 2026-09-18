@@ -925,6 +925,24 @@ pub(crate) fn scoped_graph(project: &MProject, scope: NgScope) -> Option<&NodeGr
     }
 }
 
+/// The next name in a save-with-increment series: a trailing `_NNN` is bumped
+/// keeping its width, anything else gains `_001`. Pure; the caller skips names
+/// already taken.
+pub(crate) fn increment_path(path: &std::path::Path) -> std::path::PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "pbc".into());
+    let digits = stem.len() - stem.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let head = &stem[..stem.len() - digits];
+    let name = match head.strip_suffix('_') {
+        Some(base) if digits > 0 => {
+            let n: u64 = stem[head.len()..].parse().unwrap_or(0) + 1;
+            format!("{base}_{n:0digits$}.{ext}")
+        }
+        _ => format!("{stem}_001.{ext}"),
+    };
+    path.with_file_name(name)
+}
+
 /// The largest node id in a subtree, for seeding the id counter.
 pub(crate) fn max_id(node: &MNode) -> u64 {
     node.children.iter().fold(node.id.0, |m, c| m.max(max_id(c)))
@@ -3065,14 +3083,53 @@ impl App {
         }
     }
 
+    /// File > Save. A project that already has a home on disk is written back
+    /// there without a dialog — asking again is what Save As is for. Only a
+    /// never-saved project asks where to go.
     pub(crate) fn save(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Pain By Choice", &["pbc", "json"])
-            .set_file_name("project.pbc")
-            .save_file()
-        else {
-            return;
+        match self.project_path.clone() {
+            Some(path) => self.write_project(path),
+            None => self.save_as(),
+        }
+    }
+
+    /// File > Save As: always ask, starting from the current file's name.
+    pub(crate) fn save_as(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("Pain By Choice", &["pbc", "json"]);
+        dialog = match self.project_path.as_deref() {
+            Some(p) => {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                let d = dialog.set_file_name(name.unwrap_or_else(|| "project.pbc".into()));
+                match p.parent() {
+                    Some(dir) => d.set_directory(dir),
+                    None => d,
+                }
+            }
+            None => dialog.set_file_name("project.pbc"),
         };
+        if let Some(path) = dialog.save_file() {
+            self.write_project(path);
+        }
+    }
+
+    /// File > Save With Increment: `shot.pbc` → `shot_001.pbc`, `shot_001.pbc` →
+    /// `shot_002.pbc`, skipping any name already on disk so it never
+    /// overwrites. A never-saved project has nothing to increment, so it falls
+    /// back to Save As.
+    pub(crate) fn save_increment(&mut self) {
+        let Some(mut path) = self.project_path.clone() else {
+            return self.save_as();
+        };
+        loop {
+            path = increment_path(&path);
+            if !path.exists() {
+                break;
+            }
+        }
+        self.write_project(path);
+    }
+
+    fn write_project(&mut self, path: std::path::PathBuf) {
         let project = SaveFile {
             project: Some(self.project.clone()),
             document: None,
@@ -3094,6 +3151,63 @@ impl App {
             }
             Err(e) => eprintln!("serialize failed: {e}"),
         }
+    }
+
+    /// File > New: an empty comp with the open comp's size, rate and length,
+    /// after a confirmation — there is no dirty tracking yet, and history is
+    /// cleared by a replace, so without asking this would be one misclick from
+    /// losing the session. The layout is kept: it is the user's, not the file's.
+    pub(crate) fn new_project(&mut self) -> bool {
+        let sure = rfd::MessageDialog::new()
+            .set_title("New project")
+            .set_description("Discard the current project and start an empty one?")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if sure != rfd::MessageDialogResult::Yes {
+            return false;
+        }
+        let old = self.doc();
+        let mut comp = Comp::new(old.width, old.height, MNode::group(0, "root"));
+        comp.fps = old.fps;
+        comp.duration_frames = old.duration_frames;
+        comp.bg = old.bg;
+        self.replace_project(MProject::single(comp), None);
+        true
+    }
+
+    /// Swap in a whole project — opened or new — and reset everything that
+    /// belonged to the old one. The layout is the caller's business.
+    fn replace_project(&mut self, mut project: MProject, path: Option<std::path::PathBuf>) {
+        // Pre-frame-grid docs stored keyframes as float seconds; this converts
+        // them using each comp's own fps. No-op on new files.
+        project.migrate();
+        let open = project.root_comp();
+        self.next_id = max_id(&open.root) + 1;
+        self.view = TimelineView::full(open.duration_frames);
+        // The work area is view state, not saved with the document.
+        self.work_area = None;
+        self.project = project;
+        // Asset ids are per-project, so every cached frame is now keyed to
+        // footage that no longer exists. Keeping them would draw the previous
+        // project's pixels under this one's layers.
+        self.footage.clear();
+        self.project_path = path;
+        // A render in flight belongs to the project that started it, and that
+        // project is gone. The job holds its own snapshot so finishing would
+        // not be *wrong*, but it would write the previous piece to a path
+        // derived from this one — so it is dropped, and the log with it.
+        self.queue = crate::renderqueue::RenderQueue::default();
+        self.current = self.project.root;
+        self.selected = None;
+        self.selected_keys.clear();
+        self.shown_props.clear();
+        // Sounds live outside the document, so an opened project arrives with
+        // references and no samples: without this it would play silent, draw
+        // no waveform, and export with a warning, for no reason the user could
+        // see. After `current` is set, because it republishes the mix and the
+        // mix is one comp's.
+        self.reload_sounds();
+        self.seek_frame(0);
     }
 
     /// Load a `.pbc` via a native open dialog, replacing the current document
@@ -3121,7 +3235,7 @@ impl App {
         // Three formats, newest first: a project, a pre-comps wrapper holding a
         // single document, and a bare document from before the wrapper existed.
         // Each older one loads as a one-comp project, so nothing is stranded.
-        let (mut project, layout) = match serde_json::from_str::<SaveFile>(&text) {
+        let (project, layout) = match serde_json::from_str::<SaveFile>(&text) {
             Ok(f) => {
                 let layout = Some(f.layout);
                 match (f.project, f.document) {
@@ -3143,35 +3257,7 @@ impl App {
                 return false;
             }
         };
-        // Pre-frame-grid docs stored keyframes as float seconds; this converts
-        // them using each comp's own fps. No-op on new files.
-        project.migrate();
-        let open = project.root_comp();
-        self.next_id = max_id(&open.root) + 1;
-        self.view = TimelineView::full(open.duration_frames);
-        // The work area is view state, not saved with the document.
-        self.work_area = None;
-        self.project = project;
-        // Asset ids are per-project, so every cached frame is now keyed to
-        // footage that no longer exists. Keeping them would draw the previous
-        // project's pixels under this one's layers.
-        self.footage.clear();
-        self.project_path = Some(path);
-        // A render in flight belongs to the project that started it, and that
-        // project is gone. The job holds its own snapshot so finishing would
-        // not be *wrong*, but it would write the previous piece to a path
-        // derived from this one — so it is dropped, and the log with it.
-        self.queue = crate::renderqueue::RenderQueue::default();
-        self.current = self.project.root;
-        self.selected = None;
-        self.selected_keys.clear();
-        self.shown_props.clear();
-        // Sounds live outside the document, so an opened project arrives with
-        // references and no samples: without this it would play silent, draw
-        // no waveform, and export with a warning, for no reason the user could
-        // see. After `current` is set, because it republishes the mix and the
-        // mix is one comp's.
-        self.reload_sounds();
+        self.replace_project(project, Some(path));
 
         // Restore the layout. Built-ins are always rebuilt from code; loaded user
         // presets (and the active dock) are validated, so a corrupt or edited
@@ -4450,17 +4536,38 @@ impl App {
             }
             dirty = true;
         }
-        if tree_edits.save {
-            self.save();
-        }
+        // File commands: the menu, or their shortcuts — the latter not while a
+        // text field has focus, same rule as undo.
+        let shortcut = if self.egui_ctx.egui_wants_keyboard_input() {
+            None
+        } else {
+            self.egui_ctx.input_mut(|i| {
+                use egui::{Key, KeyboardShortcut as K, Modifiers as M};
+                [
+                    (K::new(M::COMMAND | M::ALT, Key::S), FileCmd::SaveIncrement),
+                    (K::new(M::COMMAND | M::SHIFT, Key::S), FileCmd::SaveAs),
+                    (K::new(M::COMMAND, Key::S), FileCmd::Save),
+                    (K::new(M::COMMAND, Key::O), FileCmd::Open),
+                    (K::new(M::COMMAND, Key::N), FileCmd::New),
+                ]
+                .into_iter()
+                .find(|(k, _)| i.consume_shortcut(k))
+                .map(|(_, c)| c)
+            })
+        };
         // Opening a different project is not an edit *of* the open one: undoing
         // across that boundary would resurrect a document the user has moved on
         // from, and the layout/selection restored with it are gone anyway.
         let mut replaced = false;
-        if tree_edits.load {
-            replaced = self.load();
-            dirty |= replaced;
+        match comp.file.or(shortcut) {
+            Some(FileCmd::Save) => self.save(),
+            Some(FileCmd::SaveAs) => self.save_as(),
+            Some(FileCmd::SaveIncrement) => self.save_increment(),
+            Some(FileCmd::Open) => replaced = self.load(),
+            Some(FileCmd::New) => replaced = self.new_project(),
+            None => {}
         }
+        dirty |= replaced;
         if tree_edits.import_footage {
             dirty |= self.import_footage();
         }
