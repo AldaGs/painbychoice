@@ -4053,28 +4053,62 @@ fn the_strips_view_agrees_with_the_layers_panel() {
     assert_eq!(panel, strips);
 }
 
+/// Drops read the way the panel looks: above a row is in front of it, below
+/// is behind it, the middle is inside it. Checked end to end through
+/// `move_node` and back out through the panel's own row order.
 #[test]
-fn moving_a_row_up_the_list_moves_it_towards_the_front() {
-    // The panel is front-first but `reorder_child` is document-space, so "up"
-    // has to be +1. Getting this backwards is the bug the helper exists to
-    // prevent: the tooltips used to claim the opposite of what they did.
+fn dropping_a_row_lands_where_the_panel_shows_it() {
+    let names = |root: &MNode| {
+        let mut rows = Vec::new();
+        tree_rows(root, 0, &mut rows);
+        rows.iter().skip(1).map(|r| r.name.clone()).collect::<Vec<_>>()
+    };
+    let drop = |root: &mut MNode, drag: &str, on: &str, zone: DropZone| {
+        let mut rows = Vec::new();
+        tree_rows(root, 0, &mut rows);
+        let id = rows.iter().find(|r| r.name == drag).unwrap().id;
+        let (parent, index) = drop_target(rows.iter().find(|r| r.name == on).unwrap(), zone);
+        root.move_node(id, parent, index)
+    };
     let mut root = root_with_three_layers();
-    root.reorder_child(NodeId(1), reorder_delta(true));
-    let order: Vec<u64> = root.children.iter().map(|c| c.id.0).collect();
-    assert_eq!(order, vec![2, 1, 3], "`a` swapped later in document order");
-
-    let mut rows = Vec::new();
-    tree_rows(&root, 0, &mut rows);
-    let names: Vec<&str> = rows.iter().skip(1).map(|r| r.name.as_str()).collect();
-    assert_eq!(names, vec!["c", "a", "b"], "and rose one row in the panel");
+    assert_eq!(names(&root), ["c", "b", "a"]);
+    assert!(drop(&mut root, "a", "c", DropZone::Above));
+    assert_eq!(names(&root), ["a", "c", "b"]);
+    assert!(drop(&mut root, "a", "b", DropZone::Below));
+    assert_eq!(names(&root), ["c", "b", "a"]);
+    assert!(drop(&mut root, "a", "c", DropZone::Into));
+    assert_eq!(names(&root), ["c", "a", "b"], "a now sits inside c");
+    assert!(drop(&mut root, "a", "root", DropZone::Into), "the root takes drops inside");
+    assert_eq!(names(&root), ["a", "c", "b"]);
 }
 
 #[test]
-fn moving_a_row_down_the_list_moves_it_behind() {
-    let mut root = root_with_three_layers();
-    root.reorder_child(NodeId(3), reorder_delta(false));
-    let order: Vec<u64> = root.children.iter().map(|c| c.id.0).collect();
-    assert_eq!(order, vec![1, 3, 2], "`c` swapped earlier in document order");
+fn the_drop_bands_split_a_row_in_quarters() {
+    assert_eq!(DropZone::at(2.0, 20.0), DropZone::Above);
+    assert_eq!(DropZone::at(10.0, 20.0), DropZone::Into);
+    assert_eq!(DropZone::at(18.0, 20.0), DropZone::Below);
+}
+
+#[test]
+fn reparenting_keeps_the_layer_where_it_is() {
+    use motion_core::Vec3;
+    let mut still = Value::constant(Vec3::flat(10.0, 20.0));
+    keep_position(&mut still, Point::new(4.0, 5.0), 0.0);
+    assert_eq!(still, Value::constant(Vec3::flat(4.0, 5.0)));
+    // Keys shift together, so the move keeps its shape.
+    let mut moving = Value::Keyframed(motion_core::Track::new(vec![
+        motion_core::Keyframe::linear(0, Vec3::flat(0.0, 0.0)),
+        motion_core::Keyframe::linear(10, Vec3::flat(100.0, 0.0)),
+    ]));
+    keep_position(&mut moving, Point::new(0.0, 50.0), 0.0);
+    assert_eq!(moving.key_frames(), vec![0, 10]);
+    match &moving {
+        Value::Keyframed(t) => {
+            assert_eq!(t.sample(0.0), Vec3::flat(0.0, 50.0));
+            assert_eq!(t.sample(10.0), Vec3::flat(100.0, 50.0));
+        }
+        _ => panic!("still keyframed"),
+    }
 }
 
 

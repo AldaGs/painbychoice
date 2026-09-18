@@ -42,6 +42,13 @@ pub(crate) struct TreeRow {
     /// Set when this layer instances a composition — the row then offers to
     /// open it, which is how you get *into* a precomp.
     pub(crate) precomp: Option<CompId>,
+    /// The containing layer and this row's slot among its siblings, in
+    /// **document** order — what a drop next to this row is measured against.
+    pub(crate) parent: Option<NodeId>,
+    pub(crate) index: usize,
+    pub(crate) children: usize,
+    pub(crate) hidden: bool,
+    pub(crate) locked: bool,
 }
 
 /// The icon a row shows. A precomp wins over its shape — the row is a comp
@@ -74,36 +81,71 @@ pub(crate) fn row_glyph(row: &TreeRow) -> &'static str {
 /// at the *top* of the list. Listing them in raw document order made the panel
 /// read upside-down to anyone with that muscle memory.
 ///
-/// This is a **display** order only: the document is untouched, and
-/// `Node::reorder_child` still speaks in document indices. What flips with it
-/// is the *meaning* of the panel's up/down buttons — see `layers_ui`.
+/// This is a **display** order only: the document is untouched, and a drop is
+/// translated back to document order by [`drop_target`].
 pub(crate) fn tree_rows(node: &motion_core::Node, depth: usize, out: &mut Vec<TreeRow>) {
+    push_rows(node, depth, None, 0, out);
+}
+
+fn push_rows(node: &motion_core::Node, depth: usize, parent: Option<NodeId>, index: usize, out: &mut Vec<TreeRow>) {
     out.push(TreeRow {
         id: node.id,
         name: node.name.clone(),
         depth,
         kind: RowKind::of(node),
         precomp: node.precomp,
+        parent,
+        index,
+        children: node.children.len(),
+        hidden: node.hidden,
+        locked: node.locked,
     });
-    for c in node.children.iter().rev() {
-        tree_rows(c, depth + 1, out);
+    for (i, c) in node.children.iter().enumerate().rev() {
+        push_rows(c, depth + 1, Some(node.id), i, out);
     }
 }
 
-/// The document-space delta for a "move up"/"move down" click.
-///
-/// The panel lists layers **front-most first** but `Node::reorder_child` speaks
-/// in document indices, where a *later* sibling paints on top. So moving a row
-/// up the list — towards the front — is `+1` in the document, not `-1`. The
-/// inversion lives here, named, because it is exactly the sort of sign flip
-/// that gets "fixed" back into a bug by someone reading only one side of it.
-pub(crate) fn reorder_delta(up: bool) -> i32 {
-    if up {
-        1
-    } else {
-        -1
+/// Where on a row a dragged layer is released.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DropZone {
+    /// The top band: in front of this row's layer.
+    Above,
+    /// The middle: inside it, as its front-most child.
+    Into,
+    /// The bottom band: behind it.
+    Below,
+}
+
+impl DropZone {
+    /// Which band of a row of height `h` the pointer at `y` (from the row's
+    /// top) is in. Quarter bands top and bottom, the rest means "into".
+    pub(crate) fn at(y: f32, h: f32) -> DropZone {
+        if y < h * 0.25 {
+            DropZone::Above
+        } else if y > h * 0.75 {
+            DropZone::Below
+        } else {
+            DropZone::Into
+        }
     }
 }
+
+/// Where a drop lands, as `(parent, document index)` for `Node::move_node`.
+///
+/// The panel lists front-most first but the document is back-to-front, so a
+/// drop *above* a row is the slot after it in the document (in front), and a
+/// drop *below* is its own slot (behind). The root takes drops only inside.
+pub(crate) fn drop_target(row: &TreeRow, zone: DropZone) -> (NodeId, usize) {
+    match (row.parent, zone) {
+        (Some(p), DropZone::Above) => (p, row.index + 1),
+        (Some(p), DropZone::Below) => (p, row.index),
+        _ => (row.id, row.children),
+    }
+}
+
+/// A layer being dragged in the panel.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LayerDrag(pub(crate) NodeId);
 
 /// Whether `id` or any layer above it in the tree is locked. Lock covers the
 /// subtree, so a child of a locked group is as untouchable as the group.
@@ -137,10 +179,11 @@ pub(crate) struct TreeEdits {
     /// Move this layer's own shape into a child layer, so it can be stacked
     /// against its siblings like any other layer.
     pub(crate) split_shape: Option<NodeId>,
-    /// (node, delta) — move among siblings in **document** order, where a
-    /// later sibling paints on top. The panel lists layers front-first, so its
-    /// up/down buttons invert this via [`reorder_delta`].
-    pub(crate) reorder: Option<(NodeId, i32)>,
+    /// (node, new parent, document index) — a drag-and-drop in the panel.
+    pub(crate) move_to: Option<(NodeId, NodeId, usize)>,
+    pub(crate) toggle_hidden: Option<NodeId>,
+    pub(crate) toggle_locked: Option<NodeId>,
+    pub(crate) rename: Option<(NodeId, String)>,
     pub(crate) add: Option<NewShape>,
     /// Open the import dialog. A bare flag rather than a path because the
     /// dialog is blocking and must not run during the UI pass.
@@ -217,76 +260,189 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
     }
 }
 
+/// A painted eye (open, or struck through) or padlock (shut, or open). Painted
+/// because the icon font subset has neither glyph.
+fn switch(ui: &mut egui::Ui, eye: bool, on: bool, tip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    let c = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    let p = ui.painter();
+    let m = rect.center();
+    if eye {
+        // Dimmed when hidden, like Blender's closed eye.
+        let c = if on { c } else { c.gamma_multiply(0.45) };
+        let st = egui::Stroke::new(1.3, c);
+        let lid = |sign: f32| {
+            (0..=8)
+                .map(|i| {
+                    let t = i as f32 / 8.0 * std::f32::consts::PI;
+                    m + egui::vec2(-6.0 * t.cos(), sign * 3.5 * t.sin())
+                })
+                .collect::<Vec<_>>()
+        };
+        p.add(egui::Shape::line(lid(-1.0), st));
+        p.add(egui::Shape::line(lid(1.0), st));
+        p.circle_filled(m, 1.8, c);
+        if !on {
+            p.line_segment([m + egui::vec2(-6.0, 5.0), m + egui::vec2(6.0, -5.0)], st);
+        }
+    } else {
+        // Dimmed when unlocked: the lock is the exception worth seeing.
+        let c = if on { c } else { c.gamma_multiply(0.45) };
+        let st = egui::Stroke::new(1.3, c);
+        let body = egui::Rect::from_center_size(m + egui::vec2(0.0, 2.5), egui::vec2(10.0, 7.0));
+        p.rect_filled(body, 1.5, c);
+        // The shackle: shut sits on both posts, open lifts off the right one.
+        let lift = if on { 0.0 } else { -2.5 };
+        let (l, r, top) = (body.left() + 2.0, body.right() - 2.0, body.top());
+        p.line_segment([egui::pos2(l, top), egui::pos2(l, top - 4.0)], st);
+        p.line_segment([egui::pos2(r, top + lift), egui::pos2(r, top - 4.0 + lift)], st);
+        p.line_segment([egui::pos2(l, top - 4.0), egui::pos2(r, top - 4.0 + lift)], st);
+    }
+    resp.on_hover_text(tip).clicked()
+}
+
 fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+    // The row whose name is being edited, kept in egui memory across frames.
+    let rename_id = egui::Id::new("layer_rename");
+    let mut renaming: Option<(NodeId, String)> = ui.data(|d| d.get_temp(rename_id));
+    let guide = ui.visuals().widgets.noninteractive.bg_stroke;
     for row in rows {
-        ui.horizontal(|ui| {
-            ui.add_space(6.0 + row.depth as f32 * 14.0);
-            ui.label(icon::text(row_glyph(row)));
-            let label = row.name.clone();
-            let resp = ui.selectable_label(selected == Some(row.id), label);
-            if resp.clicked() {
-                out.select = Some(row.id);
+        let row_resp = ui.horizontal(|ui| {
+            let indent = 6.0 + row.depth as f32 * 14.0;
+            let (space, _) = ui.allocate_exact_size(egui::vec2(indent, 18.0), egui::Sense::hover());
+            // Indent guides, one per ancestor level, like Blender's outliner.
+            for d in 1..=row.depth {
+                let x = space.left() + 6.0 + (d as f32 - 0.5) * 14.0;
+                ui.painter().vline(x, space.y_range(), guide);
             }
-            // Structural commands live in a context menu rather than another
-            // row button: they're rare, they need words to be unambiguous, and
-            // the row is already carrying four icons.
-            resp.context_menu(|ui| {
-                // Only a layer that *has* artwork of its own can be split, and
-                // splitting the root would restructure the comp itself.
-                if row.kind != RowKind::Group && row.depth > 0 {
-                    if ui
-                        .button("Split shape into child layer")
-                        .on_hover_text(
-                            "A layer's own shape always draws behind its children.
-                             This moves it into a real child layer, so it can be                              stacked like any other.",
-                        )
-                        .clicked()
-                    {
-                        out.split_shape = Some(row.id);
-                        ui.close();
-                    }
-                } else {
-                    ui.weak("No shape of its own to split.");
-                }
-                // Group / ungroup. A non-root layer can be wrapped; a group can
-                // be dissolved back into its parent.
-                if row.depth > 0 {
-                    if ui
-                        .button("Group")
-                        .on_hover_text("Wrap this layer in a new group node")
-                        .clicked()
-                    {
-                        out.group = Some(row.id);
-                        ui.close();
-                    }
-                    if row.kind == RowKind::Group
-                        && ui
-                            .button("Ungroup")
-                            .on_hover_text("Dissolve this group, keeping its children in place")
-                            .clicked()
-                    {
-                        out.ungroup = Some(row.id);
-                        ui.close();
+            ui.label(icon::text(row_glyph(row)));
+            match renaming.as_mut().filter(|(id, _)| *id == row.id) {
+                Some((_, buf)) => {
+                    let r = ui.add(egui::TextEdit::singleline(buf).desired_width(110.0));
+                    r.request_focus();
+                    if r.lost_focus() {
+                        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && !buf.trim().is_empty() {
+                            out.rename = Some((row.id, buf.trim().to_string()));
+                        }
+                        renaming = None;
                     }
                 }
-            });
+                None => {
+                    let name = if row.hidden {
+                        egui::RichText::new(&row.name).weak()
+                    } else {
+                        egui::RichText::new(&row.name)
+                    };
+                    // The name is the drag handle; the root never moves.
+                    let resp = if row.depth > 0 {
+                        ui.dnd_drag_source(egui::Id::new(("layer_row", row.id)), LayerDrag(row.id), |ui| {
+                            ui.selectable_label(selected == Some(row.id), name)
+                        })
+                        .inner
+                    } else {
+                        ui.selectable_label(selected == Some(row.id), name)
+                    };
+                    if resp.clicked() {
+                        out.select = Some(row.id);
+                    }
+                    if resp.double_clicked() && row.depth > 0 {
+                        renaming = Some((row.id, row.name.clone()));
+                    }
+                    if context_menu(&resp, row, out) {
+                        renaming = Some((row.id, row.name.clone()));
+                    }
+                }
+            }
             if let Some(comp) = row.precomp {
                 if icon::button(ui, icon::OPEN, "Edit this composition").clicked() {
                     out.open_comp = Some(comp);
                 }
             }
-            // Reorder + delete (not meaningful for the root).
             if row.depth > 0 {
-                if icon::button(ui, icon::UP, "Move up (in front)").clicked() {
-                    out.reorder = Some((row.id, reorder_delta(true)));
-                }
-                if icon::button(ui, icon::DOWN, "Move down (behind)").clicked() {
-                    out.reorder = Some((row.id, reorder_delta(false)));
-                }
-                if icon::button(ui, icon::DELETE, "Delete this layer").clicked() {
-                    out.delete = Some(row.id);
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    let tip = if row.locked { "Unlock" } else { "Lock: no picking or editing" };
+                    if switch(ui, false, row.locked, tip) {
+                        out.toggle_locked = Some(row.id);
+                    }
+                    let tip = if row.hidden { "Show" } else { "Hide" };
+                    if switch(ui, true, !row.hidden, tip) {
+                        out.toggle_hidden = Some(row.id);
+                    }
+                });
             }
         });
+        // Dropping a dragged layer on this row: above, into, or below it.
+        let r = row_resp.response;
+        let hover = r.dnd_hover_payload::<LayerDrag>().and_then(|_| ui.ctx().pointer_hover_pos());
+        if let Some(pos) = hover {
+            let zone = if row.depth == 0 { DropZone::Into } else { DropZone::at(pos.y - r.rect.top(), r.rect.height()) };
+            let st = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+            let p = ui.painter();
+            match zone {
+                DropZone::Above => p.hline(r.rect.x_range(), r.rect.top(), st),
+                DropZone::Below => p.hline(r.rect.x_range(), r.rect.bottom(), st),
+                DropZone::Into => p.rect_stroke(r.rect, 2.0, st, egui::StrokeKind::Inside),
+            };
+            if let Some(drag) = r.dnd_release_payload::<LayerDrag>() {
+                let (parent, index) = drop_target(row, zone);
+                out.move_to = Some((drag.0, parent, index));
+            }
+        }
     }
+    ui.data_mut(|d| match renaming {
+        Some(v) => {
+            d.insert_temp(rename_id, v);
+        }
+        None => d.remove::<(NodeId, String)>(rename_id),
+    });
+}
+
+/// The row's right-click menu: the structural commands that need words.
+/// Returns whether Rename was chosen.
+fn context_menu(resp: &egui::Response, row: &TreeRow, out: &mut TreeEdits) -> bool {
+    let mut rename = false;
+    resp.context_menu(|ui| {
+        if row.depth == 0 {
+            ui.weak("The composition root.");
+            return;
+        }
+        if ui.button("Rename").clicked() {
+            rename = true;
+            ui.close();
+        }
+        // Only a layer that *has* artwork of its own can be split.
+        if row.kind != RowKind::Group
+            && ui
+                .button("Split shape into child layer")
+                .on_hover_text(
+                    "A layer's own shape always draws behind its children. \
+                     This moves it into a real child layer, so it can be \
+                     stacked like any other.",
+                )
+                .clicked()
+        {
+            out.split_shape = Some(row.id);
+            ui.close();
+        }
+        if ui.button("Group").on_hover_text("Wrap this layer in a new group node").clicked() {
+            out.group = Some(row.id);
+            ui.close();
+        }
+        if row.kind == RowKind::Group
+            && ui
+                .button("Ungroup")
+                .on_hover_text("Dissolve this group, keeping its children in place")
+                .clicked()
+        {
+            out.ungroup = Some(row.id);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            out.delete = Some(row.id);
+            ui.close();
+        }
+    });
+    rename
 }

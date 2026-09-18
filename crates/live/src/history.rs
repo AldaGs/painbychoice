@@ -80,8 +80,17 @@ pub(crate) fn edit_label(
     if tree.delete.is_some() {
         return "Delete layer";
     }
-    if tree.reorder.is_some() {
-        return "Reorder layer";
+    if tree.move_to.is_some() {
+        return "Move layer";
+    }
+    if tree.toggle_hidden.is_some() {
+        return "Hide/show layer";
+    }
+    if tree.toggle_locked.is_some() {
+        return "Lock/unlock layer";
+    }
+    if tree.rename.is_some() {
+        return "Rename layer";
     }
     if tree.precompose.is_some() {
         return "Pre-compose";

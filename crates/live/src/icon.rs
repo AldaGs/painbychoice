@@ -43,8 +43,6 @@ pub(crate) const TEXT: &str = "\u{ebc5}";
 pub(crate) const GROUP: &str = "\u{eaad}";
 pub(crate) const ADD: &str = "\u{eb0b}";
 pub(crate) const DELETE: &str = "\u{eb41}";
-pub(crate) const UP: &str = "\u{ea62}";
-pub(crate) const DOWN: &str = "\u{ea5f}";
 pub(crate) const CLOSE: &str = "\u{eb55}";
 
 // Comps and the layer time model.

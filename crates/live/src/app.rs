@@ -556,6 +556,27 @@ pub(crate) fn footage_layer(
     node
 }
 
+/// Shift a position so it reads `target` (x, y) at frame `t`, moving every key
+/// by the same amount so the animation's shape survives. Depth is untouched,
+/// and an expression is left alone — there is no constant to shift.
+///
+/// ponytail: translation only. A new parent that rotates or scales still
+/// turns/scales the layer; compensating those needs a full transform
+/// decomposition, add it if reparenting under rotated nulls is common.
+pub(crate) fn keep_position(pos: &mut Value<motion_core::Vec3>, target: Point, t: f64) {
+    let now = match pos {
+        Value::Const(v) => *v,
+        Value::Keyframed(track) => track.sample(t),
+        Value::Expr(_) => return,
+    };
+    let d = motion_core::Vec3::flat(target.x - now.x, target.y - now.y);
+    match pos {
+        Value::Const(v) => *v += d,
+        Value::Keyframed(track) => *track = track.clone().map_value(|v| v + d),
+        Value::Expr(_) => {}
+    }
+}
+
 /// Whether placing `comp` inside `into` would make a comp contain itself:
 /// true when they are the same or `comp` already instances `into` at any depth.
 pub(crate) fn would_nest_itself(project: &MProject, comp: CompId, into: CompId) -> bool {
@@ -2668,6 +2689,24 @@ impl App {
         Some(self.project.add_asset(meta.into_asset(motion_core::AssetId(0), path)))
     }
 
+    /// Move a layer in the tree (a drag in the layers panel). A move to a new
+    /// parent keeps the layer where it is on screen at frame `t` by shifting
+    /// its position into the new parent's space.
+    pub(crate) fn move_layer(&mut self, id: NodeId, parent: NodeId, index: usize, scene: &MScene, t: f64) -> bool {
+        let old_parent = self.doc().root.parent_of(id).map(|p| p.id);
+        let pivot = scene.place(id).map(|p| p.pivot);
+        let parent_world = scene.place(parent).map(|p| p.world);
+        if !self.doc_mut().root.move_node(id, parent, index) {
+            return false;
+        }
+        if old_parent != Some(parent) {
+            if let (Some(at), Some(world), Some(node)) = (pivot, parent_world, self.doc_mut().root.find_mut(id)) {
+                keep_position(&mut node.transform.position, world.inverse() * at, t);
+            }
+        }
+        true
+    }
+
     /// Put a library item into the open comp as a new layer: footage, a sound,
     /// or an instance of another comp. Dragged from the Assets panel.
     pub(crate) fn place_asset(&mut self, item: AssetDrag) -> bool {
@@ -4606,8 +4645,26 @@ impl App {
         if let Some(id) = tree_edits.split_shape {
             dirty |= self.split_shape_of(id);
         }
-        if let Some((id, delta)) = tree_edits.reorder {
-            dirty |= self.doc_mut().root.reorder_child(id, delta);
+        if let Some((id, parent, index)) = tree_edits.move_to {
+            dirty |= self.move_layer(id, parent, index, &scene, t);
+        }
+        if let Some(id) = tree_edits.toggle_hidden {
+            if let Some(n) = self.doc_mut().root.find_mut(id) {
+                n.hidden = !n.hidden;
+                dirty = true;
+            }
+        }
+        if let Some(id) = tree_edits.toggle_locked {
+            if let Some(n) = self.doc_mut().root.find_mut(id) {
+                n.locked = !n.locked;
+                dirty = true;
+            }
+        }
+        if let Some((id, name)) = tree_edits.rename.take() {
+            if let Some(n) = self.doc_mut().root.find_mut(id) {
+                n.name = name;
+                dirty = true;
+            }
         }
         if let Some(kind) = tree_edits.add {
             dirty |= self.add_node(kind);
