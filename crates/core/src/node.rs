@@ -670,6 +670,15 @@ pub struct Node {
     /// subtree. On by default so the comp switch alone blurs everything.
     #[serde(default = "Node::default_motion_blur")]
     pub motion_blur: bool,
+    /// The eye switch. A hidden layer draws nothing and sounds nothing, and
+    /// neither do its children — hiding a group hides what is in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// The lock switch: an editor-only guard against touching the layer on the
+    /// canvas or in the properties panel. Renders exactly as unlocked. Covers
+    /// the subtree, like `hidden`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
     pub children: Vec<Node>,
 }
 
@@ -706,6 +715,8 @@ impl Node {
             effects: Vec::new(),
             audio: None,
             motion_blur: true,
+            hidden: false,
+            locked: false,
             children: Vec::new(),
         }
     }
@@ -728,6 +739,8 @@ impl Node {
             effects: Vec::new(),
             audio: None,
             motion_blur: true,
+            hidden: false,
+            locked: false,
             children: Vec::new(),
         }
     }

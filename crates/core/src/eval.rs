@@ -348,6 +348,10 @@ fn walk(
     stack: &mut Vec<CompId>,
     scene: &mut Scene,
 ) -> Option<kurbo::Rect> {
+    // Switched off with the eye: nothing here draws, children included.
+    if node.hidden {
+        return None;
+    }
     // A trimmed layer outside its window contributes nothing — and neither do
     // its children, which live in its time. Checked before anything resolves,
     // so a hidden layer costs nothing.
@@ -834,6 +838,28 @@ mod tests {
         let scene = evaluate(&doc, 0.0);
         assert_eq!(scene.items.len(), 2);
         assert!(scene.groups.is_empty(), "Normal costs nothing");
+    }
+
+    /// The eye hides a layer and everything under it; a sibling is untouched.
+    #[test]
+    fn a_hidden_layer_and_its_children_draw_nothing() {
+        let mut parent = box_at(1, 0.0);
+        parent.children.push(box_at(2, 10.0));
+        parent.hidden = true;
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(parent).with_child(box_at(3, 20.0)));
+        let scene = evaluate(&doc, 0.0);
+        let drawn: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
+        assert_eq!(drawn, vec![3]);
+    }
+
+    /// Old files have no switches and load visible and unlocked; saving an
+    /// untouched layer doesn't write them, so files stay as they were.
+    #[test]
+    fn the_layer_switches_default_off_and_stay_out_of_files() {
+        let json = serde_json::to_string(&box_at(1, 0.0)).unwrap();
+        assert!(!json.contains("hidden") && !json.contains("locked"));
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert!(!back.hidden && !back.locked);
     }
 
     /// **A blend mode is not inherited.** It covers the layer's own artwork and
@@ -2723,6 +2749,10 @@ fn collect_audio_node(
 ) {
     use crate::audio::frames_to_sample_frames as to_sf;
 
+    // The eye mutes as well as hides, for the whole subtree.
+    if node.hidden {
+        return;
+    }
     // A layer's own trim, or the whole comp when it has none.
     let timing = node.timing;
     if let Some(clip) = &node.audio {
