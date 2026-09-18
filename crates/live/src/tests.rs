@@ -735,6 +735,61 @@ fn prop_of_and_prop_of_mut_agree_on_what_exists() {
 }
 
 #[test]
+fn level_and_pan_exist_only_on_a_layer_that_carries_sound() {
+    // A shape layer offering a volume fader would advertise a mix it can
+    // never have — and its dopesheet would grow two rows that cannot animate.
+    let silent = MNode::group(1, "shape");
+    assert!(prop_of(&silent, PropKind::AudioLevel).is_none());
+    assert!(prop_of(&silent, PropKind::AudioPan).is_none());
+
+    let mut sounding = MNode::group(2, "music");
+    sounding.audio = Some(motion_core::AudioClip::new(motion_core::AssetId(1)));
+    assert!(prop_of(&sounding, PropKind::AudioLevel).is_some());
+    assert!(prop_of(&sounding, PropKind::AudioPan).is_some());
+}
+
+#[test]
+fn keying_a_level_makes_it_a_dopesheet_row() {
+    // The point of routing the mix through `PropKind`: no audio-specific
+    // keyframe machinery, so a level animates like a position does.
+    let mut node = MNode::group(1, "music");
+    node.audio = Some(motion_core::AudioClip::new(motion_core::AssetId(1)));
+    assert!(dope_rows(&node).is_empty(), "a constant level is not a row");
+    prop_of_mut(&mut node, PropKind::AudioLevel).unwrap().insert_key(12);
+    let row = dope_rows(&node).into_iter().find(|r| r.kind == PropKind::AudioLevel);
+    assert_eq!(row.expect("the level now has a row").frames, vec![12]);
+}
+
+#[test]
+fn a_level_reads_as_decibels_and_a_pan_as_a_side() {
+    // Unity is 0dB and silence is off, not merely very quiet.
+    assert_eq!(db_label(1.0), "+0.0 dB");
+    assert_eq!(db_label(0.0), "-inf dB");
+    assert!(db_label(0.5).starts_with("-6.0"));
+    assert!(db_label(2.0).starts_with("+6.0"));
+    assert_eq!(pan_label(0.0), "centre");
+    assert_eq!(pan_label(-0.4), "L40");
+    assert_eq!(pan_label(1.0), "R100");
+}
+
+#[test]
+fn only_mix_edits_ask_for_a_republish() {
+    // Republishing is cheap but not free, and doing it on every property drag
+    // would walk the comp for sound nobody changed.
+    let mut e = PropEdits::default();
+    assert!(!e.touches_audio());
+    e.opacity = Some(0.5);
+    assert!(!e.touches_audio());
+    e.audio_pan = Some(-1.0);
+    assert!(e.touches_audio());
+    // A stopwatch click changes the mix too: it writes the current value into
+    // a track.
+    let mut k = PropEdits::default();
+    k.key.insert(PropKind::AudioLevel);
+    assert!(k.touches_audio());
+}
+
+#[test]
 fn optional_properties_are_absent_when_the_node_lacks_them() {
     // A group has no paint and no geometry...
     let g = MNode::group(1, "g");
@@ -3915,6 +3970,25 @@ fn a_strip_carries_its_layers_window_and_keys() {
 }
 
 #[test]
+fn a_strip_carries_its_sound_so_the_row_can_draw_a_waveform() {
+    let mut sounding = MNode::group(1, "music");
+    sounding.audio = Some(motion_core::AudioClip::new(motion_core::AssetId(7)));
+    let mut muted = MNode::group(2, "muted");
+    let mut clip = motion_core::AudioClip::new(motion_core::AssetId(8));
+    clip.enabled = false;
+    muted.audio = Some(clip);
+    let silent = MNode::group(3, "shape");
+    let rows =
+        strip_rows(&MNode::group(0, "root").with_child(sounding).with_child(muted).with_child(silent));
+    let by_name = |n: &str| rows.iter().find(|r| r.name == n).expect("row").audio;
+    assert_eq!(by_name("music"), Some((motion_core::AssetId(7), true)));
+    // Muted keeps its waveform, dimmed: muting is temporary, and hiding the
+    // shape would blank the row you are about to unmute.
+    assert_eq!(by_name("muted"), Some((motion_core::AssetId(8), false)));
+    assert_eq!(by_name("shape"), None);
+}
+
+#[test]
 fn a_strips_keys_are_deduped_across_properties() {
     // Position and rotation keyed on the same frames must not draw one tick per
     // property stacked on itself.
@@ -4130,13 +4204,13 @@ struct FakeDecoder {
 
 impl FakeDecoder {
     fn meta(&self) -> motion_core::AssetMeta {
-        motion_core::AssetMeta {
-            kind: motion_core::AssetKind::Video,
-            width: self.side as f64,
-            height: self.side as f64,
-            frames: 1000,
-            fps: 24.0,
-        }
+        motion_core::AssetMeta::visual(
+            motion_core::AssetKind::Video,
+            self.side as f64,
+            self.side as f64,
+            1000,
+            24.0,
+        )
     }
 }
 
@@ -4230,13 +4304,7 @@ fn seed() -> LayerSeed {
 }
 
 fn clip_meta() -> motion_core::AssetMeta {
-    motion_core::AssetMeta {
-        kind: motion_core::AssetKind::Video,
-        width: 1920.0,
-        height: 1080.0,
-        frames: 48,
-        fps: 24.0,
-    }
+    motion_core::AssetMeta::visual(motion_core::AssetKind::Video, 1920.0, 1080.0, 48, 24.0)
 }
 
 /// Footage lands at 100%: the layer is sized to the source's native pixels, so
@@ -4276,13 +4344,8 @@ fn an_imported_clip_gets_a_layer_window_its_own_length() {
 fn an_imported_still_gets_no_layer_window() {
     let mut project = MProject::single(Comp::new(640.0, 360.0, MNode::group(0, "root")));
     let comp = project.root;
-    let meta = motion_core::AssetMeta {
-        kind: motion_core::AssetKind::Image,
-        width: 512.0,
-        height: 512.0,
-        frames: 1,
-        fps: 0.0,
-    };
+    let meta =
+        motion_core::AssetMeta::visual(motion_core::AssetKind::Image, 512.0, 512.0, 1, 0.0);
     let node = import_footage(&mut project, meta, "logo.png".into(), seed(), comp);
     assert!(node.timing.is_none());
 }
@@ -5259,6 +5322,79 @@ fn toggle_and_set_num_reach_the_right_field() {
 }
 
 #[test]
+fn an_effect_parameter_is_an_ordinary_animatable_property() {
+    // The claim the effect stack was written against — "every parameter is a
+    // `Value<T>`, so animation comes along at no cost" — is only true once a
+    // `PropKind` addresses one. This is that claim, tested.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    let kind = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+
+    assert!(prop_of(&node, kind).is_some(), "the radius is addressable");
+    assert!(dope_rows(&node).is_empty(), "a constant radius is not a row");
+
+    prop_of_mut(&mut node, kind).unwrap().insert_key(10);
+    let row = dope_rows(&node).into_iter().find(|r| r.kind == kind);
+    assert_eq!(row.expect("the radius now has a row").frames, vec![10]);
+}
+
+#[test]
+fn an_animated_radius_actually_changes_over_time() {
+    // End to end: two keys through the ordinary keyframe machinery, resolved
+    // through the effect's own `resolve` — the value the compositor reads.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    let kind = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+    prop_of_mut(&mut node, kind).unwrap().insert_key(0);
+    apply_effect_op(
+        &mut node,
+        20,
+        &EffectOp::SetNum { index: 0, param: EffectParam::BlurRadius, value: 40.0 },
+    );
+
+    let at = |f: f64| {
+        let mut ctx = EvalCtx::at(f);
+        match node.effects[0].resolve(&mut ctx) {
+            Some(motion_core::ResolvedEffect::GaussianBlur { radius }) => radius,
+            other => panic!("expected a blur, got {other:?}"),
+        }
+    };
+    let (start, mid, end) = (at(0.0), at(10.0), at(20.0));
+    assert_eq!(end, 40.0, "the second key is where it was put");
+    assert!(mid > start && mid < end, "and the frames between interpolate: {start} {mid} {end}");
+}
+
+#[test]
+fn each_effect_in_a_stack_gets_its_own_rows() {
+    // Two blurs on one layer have identically-named parameters and are not the
+    // same property. The index is what tells them apart, in the row label as
+    // well as in the key.
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    let kinds = prop_kinds_of(&node);
+    let first = PropKind::Effect { index: 0, param: EffectParam::BlurRadius };
+    let second = PropKind::Effect { index: 1, param: EffectParam::BlurRadius };
+    assert!(kinds.contains(&first) && kinds.contains(&second));
+    assert_eq!(first.label(), "FX1 Radius");
+    assert_eq!(second.label(), "FX2 Radius");
+}
+
+#[test]
+fn a_layer_offers_only_the_parameters_its_effects_have() {
+    // `prop_kinds_of` is what the dopesheet enumerates. A layer with no stack
+    // must not grow effect rows, and a blur must not offer a hue.
+    let plain = effect_layer();
+    assert!(!prop_kinds_of(&plain).iter().any(|k| matches!(k, PropKind::Effect { .. })));
+
+    let mut node = effect_layer();
+    apply_effect_op(&mut node, 0, &EffectOp::Add(motion_core::EffectType::GaussianBlur));
+    assert!(prop_of(&node, PropKind::Effect { index: 0, param: EffectParam::Hue }).is_none());
+    // And an index past the end of the stack is a stale panel, not a panic.
+    assert!(prop_of(&node, PropKind::Effect { index: 9, param: EffectParam::BlurRadius }).is_none());
+}
+
+#[test]
 fn set_num_ignores_a_param_from_another_kind() {
     // The panel only ever offers a kind's own params, but the apply path guards
     // against a mismatch rather than writing the wrong field.
@@ -5269,4 +5405,154 @@ fn set_num_ignores_a_param_from_another_kind() {
         0,
         &EffectOp::SetNum { index: 0, param: EffectParam::Hue, value: 90.0 },
     ));
+}
+
+/// An egui context set up the way the app sets its own up.
+///
+/// The icon font and the theme both change widget metrics, and the comp bar is
+/// measured against a fixed height — so a bare `Context::default()` would be
+/// measuring a different bar than the one that ships. It also panics outright
+/// on an icon button, the font family being unbound.
+fn test_ctx() -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::icon::install(&ctx);
+    crate::theme::install(&ctx);
+    ctx
+}
+
+/// A raw input describing a comfortably wide window. The comp bar is one row,
+/// so a narrow screen would wrap it and the height assertion would be measuring
+/// the window width rather than the bar's content.
+fn wide_input() -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1600.0, 900.0),
+        )),
+        ..Default::default()
+    }
+}
+
+/// **The composition bar must fit in `COMP_H`.**
+///
+/// Invariant 16's mechanism, pinned by actually laying the bar out rather than
+/// by asserting a flag. `Editor::Comp` is not scroll-wrapped, so egui hands it a
+/// content-driven rect: a bar whose content is taller than its area does not
+/// clip, it *resizes its panel*, pushing every other leaf down until the bottom
+/// one is off the screen. That is exactly what a second row in this bar did —
+/// the render controls went under the taskbar — and
+/// `every_content_leaf_is_kept_from_resizing_its_own_panel` could not catch it,
+/// because the flag it checks was already correct.
+///
+/// So this renders the real `comp_ui` in a headless egui context and measures
+/// what it consumed. Height only: widths depend on the font, and the test
+/// context has no font subset loaded.
+#[test]
+fn the_composition_bar_fits_its_fixed_height() {
+    let ctx = test_ctx();
+    let mut used = 0.0_f32;
+    // Two passes: egui sizes some widgets from the previous frame's galley, so
+    // a first-frame measurement can read low.
+    for _ in 0..2 {
+        let mut comp_edits = CompEdits::default();
+        let mut layout = LayoutEdits::default();
+        let mut preset_name_buf = String::new();
+        let mut comp_name_buf = String::new();
+        let mut render_edits = crate::renderqueue::RenderEdits::default();
+        let _ = ctx.run_ui(wide_input(), |ui| {
+            {
+                comp_ui(
+                    ui,
+                    RenderBar {
+                        active: None,
+                        last: None,
+                        draft_out: "titles_draft.mp4",
+                        master_out: Some("master.mp4"),
+                        range: Some((60, 180)),
+                        out: &mut render_edits,
+                    },
+                    1920.0,
+                    1080.0,
+                    24.0,
+                    5.0,
+                    MColor::rgb(0.0, 0.0, 0.0),
+                    0.0,
+                    12,
+                    None,
+                    &mut comp_edits,
+                    &["Default".to_string()],
+                    &mut preset_name_buf,
+                    &mut layout,
+                    &[],
+                    &[CompEntry { id: CompId(0), label: "Comp 1".to_string() }],
+                    CompId(0),
+                    &mut comp_name_buf,
+                    None,
+                    None,
+                );
+                used = ui.min_rect().height();
+            }
+        });
+    }
+    assert!(
+        used <= COMP_H,
+        "the composition bar used {used}pt of its {COMP_H}pt area — content \
+         taller than the area resizes the panel and pushes the bottom leaf \
+         off-screen (invariant 16)"
+    );
+}
+
+/// The same, with a render in flight: the progress bar and Cancel replace the
+/// two buttons, and that swap must not be taller than what it replaced.
+#[test]
+fn the_composition_bar_still_fits_while_a_render_runs() {
+    let ctx = test_ctx();
+    let progress = crate::renderqueue::RenderProgress {
+        frac: 0.5,
+        line: "150/300 · 12.0s · ~12s left".to_string(),
+        quality: motion_render::Quality::Master,
+    };
+    let mut used = 0.0_f32;
+    for _ in 0..2 {
+        let mut comp_edits = CompEdits::default();
+        let mut layout = LayoutEdits::default();
+        let mut preset_name_buf = String::new();
+        let mut comp_name_buf = String::new();
+        let mut render_edits = crate::renderqueue::RenderEdits::default();
+        let _ = ctx.run_ui(wide_input(), |ui| {
+            {
+                comp_ui(
+                    ui,
+                    RenderBar {
+                        active: Some(&progress),
+                        last: None,
+                        draft_out: "titles_draft.mp4",
+                        master_out: Some("master.mp4"),
+                        range: Some((60, 180)),
+                        out: &mut render_edits,
+                    },
+                    1920.0,
+                    1080.0,
+                    24.0,
+                    5.0,
+                    MColor::rgb(0.0, 0.0, 0.0),
+                    0.0,
+                    12,
+                    None,
+                    &mut comp_edits,
+                    &["Default".to_string()],
+                    &mut preset_name_buf,
+                    &mut layout,
+                    &[],
+                    &[CompEntry { id: CompId(0), label: "Comp 1".to_string() }],
+                    CompId(0),
+                    &mut comp_name_buf,
+                    None,
+                    None,
+                );
+                used = ui.min_rect().height();
+            }
+        });
+    }
+    assert!(used <= COMP_H, "the bar used {used}pt of {COMP_H}pt while rendering");
 }

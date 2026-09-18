@@ -5,6 +5,7 @@
 //! only edit was widening visibility to `pub(crate)`.
 
 use crate::*;
+use motion_render::Quality;
 
 pub(crate) enum RenderState {
     Active {
@@ -195,6 +196,33 @@ pub(crate) struct App {
     /// Decoded footage frames. Editor state, never saved: the document holds
     /// references and these are the pixels behind them.
     pub(crate) footage: FootageCache,
+    /// Where this project was last saved or opened from, or `None` if it has
+    /// never been on disk. The render queue needs it for two things a dialog
+    /// cannot supply: a Draft destination the user can guess, and the anchor a
+    /// preset's relative path resolves against.
+    pub(crate) project_path: Option<std::path::PathBuf>,
+    /// Exports in progress and finished. See [`crate::renderqueue`].
+    pub(crate) queue: crate::renderqueue::RenderQueue,
+    /// Playback time, from the audio device when there is one. See
+    /// [`crate::clock`] for why the clock inverts.
+    pub(crate) clock: crate::clock::MasterClock,
+    /// The output stream, held so it stays alive. `None` on a machine with no
+    /// usable device, which is an ordinary state, not an error.
+    pub(crate) audio_out: Option<crate::playback::AudioOut>,
+    /// What the audio callback reads. Republished whenever the mix changes.
+    pub(crate) shared_mix: crate::playback::SharedMix,
+    /// Decoded sounds, by asset. The audio counterpart of `footage` — and, like
+    /// it, outside the document entirely.
+    pub(crate) sounds: std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Sound>>,
+    /// Waveform reductions of `sounds`, by asset.
+    ///
+    /// Cached rather than recomputed because a strip redraws every frame and
+    /// the reduction walks the whole sound: at 48kHz that is millions of
+    /// samples per redraw, which would cost more than everything else the
+    /// timeline draws put together. Filled from `sounds` by
+    /// [`App::refresh_peaks`], never independently — a peak set with no sound
+    /// behind it would be a waveform for something that cannot be heard.
+    pub(crate) peaks: std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Peaks>>,
     /// Undo / redo. Whole-document snapshots taken around the edit phase —
     /// see [`crate::history`] for why that rather than inverse operations.
     pub(crate) history: History,
@@ -588,11 +616,13 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
         },
         EffectOp::SetColor { index, rgb } => match node.effects.get_mut(index) {
             Some(ef) => {
-                if let K::Tint { color, .. } = &mut ef.kind {
-                    color.set_at(frame, rgb_color(rgb));
-                    true
-                } else {
-                    false
+                match &mut ef.kind {
+                    K::Tint { color, .. } | K::DropShadow { color, .. } => {
+                        color.set_at(frame, rgb_color(rgb));
+                        true
+                    }
+                    // A kind with no colour: a stale panel, which no-ops.
+                    _ => false,
                 }
             }
             None => false,
@@ -606,19 +636,18 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
 /// than writing the wrong field. The one place the `EffectParam`→`Value` mapping
 /// is written, mirroring `effect_nums` on the read side.
 fn set_effect_num(kind: &mut motion_core::EffectKind, param: EffectParam, frame: i64, v: f64) -> bool {
-    use motion_core::EffectKind as K;
-    use EffectParam as P;
-    match (kind, param) {
-        (K::GaussianBlur { radius }, P::BlurRadius) => radius.set_at(frame, v),
-        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness.set_at(frame, v),
-        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast.set_at(frame, v),
-        (K::HueSaturation { hue, .. }, P::Hue) => hue.set_at(frame, v),
-        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation.set_at(frame, v),
-        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness.set_at(frame, v),
-        (K::Tint { amount, .. }, P::TintAmount) => amount.set_at(frame, v),
-        _ => return false,
+    // `set_at`, so dragging an animated parameter writes a key and dragging a
+    // constant one leaves it constant — the gizmo's behaviour, and what makes
+    // the stopwatch the only thing that decides whether an effect animates.
+    match crate::props::effect_value_mut(kind, param) {
+        Some(value) => {
+            value.set_at(frame, v);
+            true
+        }
+        // A parameter this kind does not have: a stale panel index, which
+        // no-ops rather than panicking.
+        None => false,
     }
-    true
 }
 
 /// The properties that live on a node's **artwork** rather than its placement,
@@ -977,6 +1006,13 @@ impl App {
             ng_scope: NgScope::Project,
             ng_status: None,
             footage: FootageCache::new(motion_render::default_registry()),
+            project_path: None,
+            queue: crate::renderqueue::RenderQueue::default(),
+            clock: crate::clock::MasterClock::new(),
+            audio_out: None,
+            shared_mix: crate::playback::SharedMix::default(),
+            sounds: std::collections::HashMap::new(),
+            peaks: std::collections::HashMap::new(),
             history: History::default(),
         }
     }
@@ -1477,7 +1513,14 @@ impl App {
     pub(crate) fn raw_time(&self) -> f64 {
         if self.playing {
             let (lo, hi) = self.loop_bounds_secs();
-            wrap_into(self.anchor.elapsed().as_secs_f64(), lo, hi)
+            // **The inversion.** With sound playing, the position comes from the
+            // sample frames the device actually consumed; without it, from the
+            // wall clock exactly as before. Both are folded into the loop span
+            // the same way, so nothing below here knows which clock it is on.
+            // See [`crate::clock`].
+            let wall = self.anchor.elapsed().as_secs_f64();
+            let t = self.clock.seconds(self.comp_has_audio(), wall);
+            crate::clock::fold_into_loop(t, lo, hi).0
         } else if self.doc().duration_frames > 0 {
             self.paused_t.rem_euclid(self.doc().duration_seconds())
         } else {
@@ -1528,15 +1571,27 @@ impl App {
         let t = t.rem_euclid(self.doc().duration_seconds().max(f64::MIN_POSITIVE));
         self.paused_t = t;
         self.anchor = Instant::now() - std::time::Duration::from_secs_f64(t);
+        // Both clocks are moved, not just the one currently running: a device
+        // that starts (or stops) after a seek must resume from where the
+        // playhead is, not from where it had itself got to.
+        let fps = self.doc().fps;
+        self.sync_audio_to_frame(t * fps);
+        self.publish_mix();
     }
 
     pub(crate) fn toggle_play(&mut self) {
         if self.playing {
             self.paused_t = self.current_time();
             self.playing = false;
+            self.publish_mix();
         } else {
+            // Start the sample counter where the playhead is, or the first block
+            // would be mixed from wherever the device last stopped.
+            let fps = self.doc().fps;
+            self.sync_audio_to_frame(self.paused_t * fps);
             self.anchor = Instant::now() - std::time::Duration::from_secs_f64(self.paused_t);
             self.playing = true;
+            self.publish_mix();
         }
     }
 }
@@ -1597,6 +1652,18 @@ impl ApplicationHandler for App {
             surface.format,
             egui_wgpu::RendererOptions::default(),
         ));
+
+        // The audio device, opened once. A machine with none is an ordinary
+        // state, not an error: the clock falls back to the wall and the editor
+        // works exactly as it did before sound existed.
+        if self.audio_out.is_none() {
+            self.audio_out =
+                crate::playback::start(self.shared_mix.clone(), self.clock.audio.clone());
+            self.clock.sample_rate = self.audio_out.as_ref().map(|a| a.sample_rate).unwrap_or(0);
+            if self.clock.sample_rate > 0 {
+                self.publish_mix();
+            }
+        }
 
         self.state = RenderState::Active { surface, window };
     }
@@ -1890,6 +1957,24 @@ impl App {
         if let Some(o) = e.opacity {
             tr.opacity.set_at(frame, o);
             changed = true;
+        }
+        // The mix. `set_at` like any other numeric property, so dragging the
+        // fader on a keyframed level writes a key and on a static one just
+        // moves it. Muting is plain data — there is no half-muted — so it
+        // assigns.
+        if let Some(clip) = node.audio.as_mut() {
+            if let Some(l) = e.audio_level {
+                clip.level.set_at(frame, l.max(0.0));
+                changed = true;
+            }
+            if let Some(pan) = e.audio_pan {
+                clip.pan.set_at(frame, pan.clamp(-1.0, 1.0));
+                changed = true;
+            }
+            if let Some(on) = e.audio_enabled {
+                clip.enabled = on;
+                changed = true;
+            }
         }
         // Plain data, so a direct assignment rather than `set_at`: there is no
         // interpolating between Multiply and Screen, so no track to key into.
@@ -2498,6 +2583,150 @@ impl App {
         true
     }
 
+    /// Import a sound file as a layer.
+    ///
+    /// Mirrors [`Self::import_footage`]: the document gets a reference and the
+    /// samples live outside it, in `sounds`. The layer is placed at frame 0 and
+    /// trimmed to the sound's own length, because an import is a source
+    /// arriving — where it sits is an editing decision.
+    pub(crate) fn import_audio(&mut self) -> bool {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif"])
+            .pick_file()
+        else {
+            return false;
+        };
+        // Decoded here rather than lazily, because the length is what decides
+        // the layer's duration and a layer that resized itself once the file
+        // finished loading would be worse than a moment's wait.
+        let sound = match motion_render::decode_sound(&path) {
+            Ok(s) => std::sync::Arc::new(s),
+            Err(e) => {
+                self.ng_status = Some(format!("Couldn't import {}: {e}", path.display()));
+                return false;
+            }
+        };
+        let meta = motion_core::AssetMeta::sound(
+            sound.sample_rate,
+            2,
+            sound.frames() as u64,
+        );
+        let fps = self.doc().fps;
+        let asset = self
+            .project
+            .add_asset(meta.into_asset(motion_core::AssetId(0), path));
+        let name = self.project.asset(asset).map(|a| a.name.clone()).unwrap_or_default();
+        // The sound's own length, in this comp's frames.
+        let frames = ((sound.seconds() * fps).round() as i64).max(1);
+
+        let mut node = MNode::group(self.next_id, name);
+        node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
+        node.audio = Some(motion_core::AudioClip::new(asset));
+
+        self.sounds.insert(asset, sound);
+        self.refresh_peaks();
+        self.push_layer(node, self.selected);
+        self.publish_mix();
+        self.ng_status = None;
+        true
+    }
+
+    /// Decode every sound this project references, replacing whatever the last
+    /// one left behind.
+    ///
+    /// Asset ids are per-project, so the previous project's samples are not
+    /// merely stale — they are keyed to ids this one reuses for different
+    /// files. The same reasoning clears the footage cache on load.
+    ///
+    /// Decoding is synchronous, as import is: the file's length is what the
+    /// timeline draws against, and a waveform that appeared some seconds after
+    /// the project did would be worse than the wait. A sound that will not
+    /// decode leaves its layer silent and is named, never a failed load — the
+    /// rest of the project is fine and should open.
+    pub(crate) fn reload_sounds(&mut self) {
+        self.sounds.clear();
+        self.peaks.clear();
+        let mut failed: Vec<String> = Vec::new();
+        let assets: Vec<_> = self
+            .project
+            .assets
+            .values()
+            .filter(|a| a.has_audio())
+            .map(|a| (a.id, a.path.clone(), a.name.clone()))
+            .collect();
+        for (id, path, name) in assets {
+            match motion_render::decode_sound(&path) {
+                Ok(sound) => {
+                    self.sounds.insert(id, std::sync::Arc::new(sound));
+                }
+                Err(_) => failed.push(name),
+            }
+        }
+        self.refresh_peaks();
+        if !failed.is_empty() {
+            self.ng_status = Some(format!("Couldn't read: {}", failed.join(", ")));
+        }
+        self.publish_mix();
+    }
+
+    /// Reduce any newly arrived sound to peaks.
+    ///
+    /// Additive by design: an asset already reduced is left alone, because the
+    /// samples behind it never change once decoded. Call it after anything
+    /// that puts a sound in `sounds`.
+    pub(crate) fn refresh_peaks(&mut self) {
+        for (asset, sound) in &self.sounds {
+            self.peaks
+                .entry(*asset)
+                .or_insert_with(|| std::sync::Arc::new(motion_render::Peaks::of(sound)));
+        }
+    }
+
+    /// Whether the open comp has anything to hear. Decides which clock runs.
+    pub(crate) fn comp_has_audio(&self) -> bool {
+        let rate = self.clock.sample_rate;
+        rate > 0
+            && !motion_core::evaluate_audio(&self.project, self.current, 0.0, rate).is_empty()
+    }
+
+    /// Hand the audio callback a fresh mix.
+    ///
+    /// Called after anything that changes what should be heard: an import, an
+    /// edit, a transport change, a new loop range. Cheap enough to call freely —
+    /// it walks the comp and clones a handful of `Arc`s — and getting it wrong
+    /// in the safe direction (publishing too often) costs nothing, while missing
+    /// a publish means the sound and the picture disagree.
+    pub(crate) fn publish_mix(&mut self) {
+        let rate = self.clock.sample_rate;
+        if rate == 0 {
+            return;
+        }
+        let frame = self.current_frame() as f64;
+        let sources = motion_core::evaluate_audio(&self.project, self.current, frame, rate);
+        let fps = self.doc().fps;
+        let (lo, hi) = self.loop_bounds_frames();
+        let to_sf = |f: i64| motion_core::audio::frames_to_sample_frames(f as f64, fps, rate);
+        self.shared_mix.publish(crate::playback::MixState {
+            sources,
+            sounds: self.sounds.clone(),
+            loop_span: (to_sf(lo), to_sf(hi)),
+            playing: self.playing,
+        });
+    }
+
+    /// Pull the device's sample counter to `frame`, so the clock restarts from
+    /// where the playhead was put rather than from wherever playback had got to.
+    pub(crate) fn sync_audio_to_frame(&mut self, frame: f64) {
+        let rate = self.clock.sample_rate;
+        if rate == 0 {
+            return;
+        }
+        let fps = self.doc().fps;
+        self.clock
+            .audio
+            .set(motion_core::audio::frames_to_sample_frames(frame, fps, rate));
+    }
+
     /// Create a layer whose shape **is** a graph geometry output — the other
     /// half of the geometry fold, and the thing that lets the node canvas bring
     /// something into existence rather than only decorate a layer you already
@@ -2582,7 +2811,255 @@ impl App {
     /// file chosen via a native save dialog. The layout (active dock + user
     /// presets) rides in a [`Project`] wrapper alongside the document; built-in
     /// presets are code, so only user ones are written.
-    pub(crate) fn save(&self) {
+    /// Start a Draft render: the whole comp, full resolution, fast encoder,
+    /// beside the project. No dialog — that is the entire point of the verb.
+    ///
+    /// The one thing it will refuse is writing a path a saved preset claims
+    /// (rule 2 of decision 0018). Refusing loudly beats quietly choosing another
+    /// name, which would leave the user hunting for a file.
+    pub(crate) fn start_draft(&mut self) {
+        let out = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        );
+        if crate::renderqueue::collides_with_a_preset(
+            &out,
+            &self.project.render_presets,
+            self.project_path.as_deref(),
+        ) {
+            self.report_render_failure(
+                out,
+                Quality::Draft,
+                "a saved render preset already writes this path; a draft will not                  overwrite a deliverable"
+                    .to_string(),
+            );
+            return;
+        }
+        // Both snapshots are taken before the call: the job borrows them, so
+        // they cannot be fields of the `self` it also mutates. Cloning the
+        // sound map copies `Arc`s, not samples.
+        let sounds = self.sounds.clone();
+        self.begin_render(crate::renderqueue::JobSpec {
+            project: &self.project.clone(),
+            comp: self.current,
+            out,
+            quality: Quality::Draft,
+            scale: 1.0,
+            ffmpeg_args: Vec::new(),
+            range: self.render_range(),
+            sounds: &sounds,
+        });
+    }
+
+    /// Choose where Master writes, through the system Save dialog, and store it
+    /// in the project's preset.
+    ///
+    /// The dialog **sets the preset**; it does not render. That split is the
+    /// whole of decision 0018's reproducibility claim: the destination becomes
+    /// project data, travels in the `.pbc`, and every later Master press writes
+    /// there without asking anyone anything.
+    ///
+    /// Returns whether a path was chosen — `start_master` uses that to decide
+    /// whether to go ahead after asking.
+    pub(crate) fn pick_master_output(&mut self) -> bool {
+        let current = self.project.render_presets.first().map(|p| p.out.clone());
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "mkv", "webm"])
+            .add_filter("Any (no video extension writes a PNG sequence)", &["*"])
+            .set_file_name(current.as_deref().unwrap_or("master.mp4"));
+        // Start where the project lives, so the common answer is one click.
+        if let Some(dir) = self.project_path.as_deref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(chosen) = dialog.save_file() else {
+            return false;
+        };
+        // The same rule from the other side: a Master aimed at the draft's path
+        // would have every draft overwrite the deliverable from then on.
+        let draft = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        );
+        if chosen == draft {
+            self.report_render_failure(
+                chosen,
+                Quality::Master,
+                "Draft already writes this path; pick another so a preview                  cannot overwrite the deliverable"
+                    .to_string(),
+            );
+            return false;
+        }
+        let stored =
+            crate::renderqueue::preset_path_for(self.project_path.as_deref(), &chosen);
+        if self.project.render_presets.is_empty() {
+            self.project.render_presets.push(motion_core::RenderPreset::default_master());
+        }
+        self.project.render_presets[0].out = stored;
+        true
+    }
+
+    /// The inclusive frame range a render will cover, or `None` for the whole
+    /// comp.
+    ///
+    /// This is the work area, converted from the half-open `[lo, hi)` playback
+    /// bounds to the inclusive form the renderer and the CLI both use. One
+    /// conversion, here, rather than a `- 1` at each use site.
+    ///
+    /// Both buttons honour it. A work area is how you say "this bit" — it is
+    /// what the preview loops over — and having Draft respect it while Master
+    /// ignored it would mean the two buttons rendered different films.
+    pub(crate) fn render_range(&self) -> Option<(i64, i64)> {
+        self.work_area?;
+        let (lo, hi) = self.loop_bounds_frames();
+        Some((lo, hi - 1))
+    }
+
+    /// Choose where Draft writes, through the system Save dialog.
+    ///
+    /// Draft still asks nothing when *pressed* — this changes which known place
+    /// it goes to, and 0018's "no dialog, ever" is about the press.
+    ///
+    /// Refuses a path a Master preset claims, which is rule 2 of that decision
+    /// enforced at the point the mistake is made rather than at render time:
+    /// telling someone their draft just overwrote a deliverable is too late.
+    pub(crate) fn pick_draft_output(&mut self) {
+        let current = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Video", &["mp4", "mov", "mkv", "webm"])
+            .add_filter("Any (no video extension writes a PNG sequence)", &["*"])
+            .set_file_name(
+                current.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            );
+        if let Some(dir) = current.parent().filter(|d| !d.as_os_str().is_empty()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(chosen) = dialog.save_file() else {
+            return;
+        };
+        if crate::renderqueue::collides_with_a_preset(
+            &chosen,
+            &self.project.render_presets,
+            self.project_path.as_deref(),
+        ) {
+            self.report_render_failure(
+                chosen,
+                Quality::Draft,
+                "a Master preset already writes this path; a draft will not                  overwrite a deliverable"
+                    .to_string(),
+            );
+            return;
+        }
+        self.project.draft_out =
+            Some(crate::renderqueue::preset_path_for(self.project_path.as_deref(), &chosen));
+    }
+
+    /// Start a Master render from the project's first saved preset, asking for
+    /// a destination the first time and never again.
+    ///
+    /// Asking *once* rather than every time is the reproducibility rule: the
+    /// answer is written into the project, so the next press — and the next
+    /// person's — writes the same file without a dialog. Asking rather than
+    /// silently defaulting is because a deliverable landing at a guessed path is
+    /// how you render an hour of footage into the wrong place.
+    pub(crate) fn start_master(&mut self) {
+        if self.project.render_presets.is_empty() && !self.pick_master_output() {
+            // Cancelled the dialog: no destination, so no render, and no
+            // half-configured preset left behind.
+            return;
+        }
+        let preset = self.project.render_presets[0].clone();
+        let out = crate::renderqueue::resolve_out(self.project_path.as_deref(), &preset.out);
+        let quality = Quality::parse(&preset.quality).unwrap_or(Quality::Master);
+        // Both snapshots are taken before the call: the job borrows them, so
+        // they cannot be fields of the `self` it also mutates. Cloning the
+        // sound map copies `Arc`s, not samples.
+        let sounds = self.sounds.clone();
+        self.begin_render(crate::renderqueue::JobSpec {
+            project: &self.project.clone(),
+            comp: self.current,
+            out,
+            quality,
+            scale: preset.scale,
+            ffmpeg_args: preset.ffmpeg_args.clone(),
+            range: self.render_range(),
+            sounds: &sounds,
+        });
+    }
+
+    /// Open a job, or log why it could not open.
+    ///
+    /// A render that cannot start must fail *at the button*, not at frame 200 —
+    /// so the encoder is opened here, where the user is still looking at the
+    /// thing they pressed.
+    fn begin_render(&mut self, spec: crate::renderqueue::JobSpec<'_>) {
+        let (out, quality) = (spec.out.clone(), spec.quality);
+        let RenderState::Active { surface, .. } = &self.state else {
+            self.report_render_failure(out, quality, "no GPU device yet".to_string());
+            return;
+        };
+        let device = &self.context.devices[surface.dev_id].device;
+        match crate::renderqueue::start(spec, device) {
+            Ok(job) => self.queue.active = Some(job),
+            Err(e) => self.report_render_failure(out, quality, e),
+        }
+    }
+
+    /// Record a render that never got off the ground, so the bar can say so.
+    fn report_render_failure(
+        &mut self,
+        out: std::path::PathBuf,
+        quality: Quality,
+        error: String,
+    ) {
+        self.queue.log.push(crate::renderqueue::RenderRecord {
+            out,
+            quality,
+            frames: 0,
+            seconds: 0.0,
+            error: Some(error),
+            note: None,
+        });
+    }
+
+    /// Advance the active render by one slice. Returns whether a job is still
+    /// running, which is the caller's cue to ask for another redraw.
+    ///
+    /// Every field borrowed here is disjoint — the job, the footage cache, the
+    /// device and the vello renderer are four different fields of `App`, which
+    /// is what lets the render borrow them all at once.
+    pub(crate) fn step_render(&mut self) -> bool {
+        if self.queue.active.is_none() {
+            return false;
+        }
+        let RenderState::Active { surface, .. } = &self.state else {
+            self.queue.finish(Some("the GPU device went away".to_string()));
+            return false;
+        };
+        let dev_id = surface.dev_id;
+        let Some(renderer) = self.renderers[dev_id].as_mut() else {
+            self.queue.finish(Some("the renderer went away".to_string()));
+            return false;
+        };
+        let handle = &self.context.devices[dev_id];
+        let job = self.queue.active.as_mut().expect("checked above");
+        let step = job.step(&handle.device, &handle.queue, renderer, &mut self.footage);
+        match step {
+            crate::renderqueue::Step::Working => true,
+            crate::renderqueue::Step::Done => {
+                self.queue.finish(None);
+                false
+            }
+            crate::renderqueue::Step::Failed(e) => {
+                self.queue.finish(Some(e));
+                false
+            }
+        }
+    }
+
+    pub(crate) fn save(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Pain By Choice", &["pbc", "json"])
             .set_file_name("project.pbc")
@@ -2602,6 +3079,11 @@ impl App {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
                     eprintln!("save failed: {e}");
+                } else {
+                    // Only on success: a failed save leaves the project where
+                    // it was, and a Draft must not aim at a file that isn't
+                    // there.
+                    self.project_path = Some(path);
                 }
             }
             Err(e) => eprintln!("serialize failed: {e}"),
@@ -2668,10 +3150,22 @@ impl App {
         // footage that no longer exists. Keeping them would draw the previous
         // project's pixels under this one's layers.
         self.footage.clear();
+        self.project_path = Some(path);
+        // A render in flight belongs to the project that started it, and that
+        // project is gone. The job holds its own snapshot so finishing would
+        // not be *wrong*, but it would write the previous piece to a path
+        // derived from this one — so it is dropped, and the log with it.
+        self.queue = crate::renderqueue::RenderQueue::default();
         self.current = self.project.root;
         self.selected = None;
         self.selected_keys.clear();
         self.shown_props.clear();
+        // Sounds live outside the document, so an opened project arrives with
+        // references and no samples: without this it would play silent, draw
+        // no waveform, and export with a warning, for no reason the user could
+        // see. After `current` is set, because it republishes the mix and the
+        // mix is one comp's.
+        self.reload_sounds();
 
         // Restore the layout. Built-ins are always rebuilt from code; loaded user
         // presets (and the active dock) are validated, so a corrupt or edited
@@ -2743,7 +3237,7 @@ impl App {
         fit: Affine,
     ) -> std::collections::HashMap<NodeId, vello::peniko::ImageData> {
         use std::collections::HashMap;
-        if !scene.groups.iter().any(|g| crate::fx::needs_readback(&g.effects)) {
+        if !scene.groups.iter().any(|g| motion_render::fx::needs_readback(&g.effects)) {
             return HashMap::new();
         }
         let (dev, w, h) = match &self.state {
@@ -2869,15 +3363,19 @@ impl App {
                 // the footage cache mutably, and `self.doc()` inside the
                 // argument list would be an overlapping shared borrow of self.
                 let dims = (self.doc().width, self.doc().height);
+                let chrome = crate::scene::Chrome {
+                    ghosts: &self.onion.ghosts,
+                    selected: self.selected,
+                    passepartout: pp,
+                    canvas,
+                    border: true,
+                };
                 to_vello(
                     &scene,
                     fit,
                     dims,
                     bg,
-                    pp,
-                    canvas,
-                    &self.onion.ghosts,
-                    self.selected,
+                    &chrome,
                     &mut self.footage,
                     &self.project.assets,
                     &effect_images,
@@ -2989,6 +3487,9 @@ impl App {
         // Strips are per *comp*, not per selection: the whole point is seeing
         // every layer's window at once.
         let strip_rows = strip_rows(&self.doc().root);
+        // Cloned handles rather than a borrow: the timeline draws inside a
+        // closure that also needs `&mut self` for the edits it collects.
+        let peaks = self.peaks.clone();
 
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -3077,6 +3578,23 @@ impl App {
         let eases: &[motion_core::EasePreset] = &self.project.eases;
         let mut ease_lib: Option<EaseLibEdit> = None;
         let mut comp = CompEdits::default();
+        // The render bar's state as owned snapshots, like every other panel
+        // input: the UI closure cannot borrow `App`.
+        let mut render_edits = crate::renderqueue::RenderEdits::default();
+        let render_progress = self.queue.active.as_ref().map(|j| {
+            let (frac, line) =
+                crate::renderqueue::progress(j.done(), j.total(), j.elapsed());
+            crate::renderqueue::RenderProgress { frac, line, quality: j.quality() }
+        });
+        let render_summary = self.queue.last().map(crate::renderqueue::RenderSummary::of);
+        let master_out = self.project.render_presets.first().map(|p| p.out.clone());
+        let draft_out = crate::renderqueue::draft_path(
+            self.project_path.as_deref(),
+            self.project.draft_out.as_deref(),
+        )
+        .display()
+        .to_string();
+        let render_range = self.render_range();
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
@@ -3172,6 +3690,14 @@ impl App {
                 &mut |editor, ui| match editor {
                     Editor::Comp => comp_ui(
                         ui,
+                        RenderBar {
+                            active: render_progress.as_ref(),
+                            last: render_summary.as_ref(),
+                            draft_out: &draft_out,
+                            master_out: master_out.as_deref(),
+                            range: render_range,
+                            out: &mut render_edits,
+                        },
                         doc_w,
                         doc_h,
                         doc_fps,
@@ -3226,6 +3752,7 @@ impl App {
                             selected_node,
                             work_area,
                             dope_label_w,
+                            &peaks,
                             &mut dope,
                         ),
                         TimelineMode::Curves => curves_ui(
@@ -3540,6 +4067,24 @@ impl App {
             self.view = self.view.clamped(self.doc().duration_frames);
         }
 
+        // The render bar's intent, applied like every other panel edit: after
+        // the pass, never during it. Cancel is checked first — a user who hits
+        // Cancel and Draft in one frame meant to stop.
+        if render_edits.cancel {
+            // Dropping the job drops its encoder unfinished, which is correct:
+            // a cancelled render has no output to close, and finishing the
+            // encoder would mux a partial file that looks complete.
+            self.queue.finish(Some("cancelled".to_string()));
+        } else if render_edits.draft {
+            self.start_draft();
+        } else if render_edits.master {
+            self.start_master();
+        } else if render_edits.pick_output {
+            self.pick_master_output();
+        } else if render_edits.pick_draft_output {
+            self.pick_draft_output();
+        }
+
         if let Some(name) = comp.rename {
             self.doc_mut().name = name.trim().to_string();
         }
@@ -3689,7 +4234,14 @@ impl App {
         if let Some(kop) = edits.knob.take() {
             self.apply_ng_knob_op(kop);
         }
+        // What the callback is playing was resolved before these edits; a new
+        // level that only reaches the picture would be a fader that moves and
+        // changes nothing you can hear.
+        let touched_audio = edits.touches_audio();
         let mut dirty = self.apply_edits(frame, &edits);
+        if touched_audio && dirty {
+            self.publish_mix();
+        }
         if self.apply_pen_edits(frame, &pen_edits) {
             dirty = true;
         }
@@ -3825,6 +4377,9 @@ impl App {
         if tree_edits.import_footage {
             dirty |= self.import_footage();
         }
+        if tree_edits.import_audio {
+            dirty |= self.import_audio();
+        }
         // --- Undo: close the phase opened by `before`. ---------------------
         // One comparison covers every edit above. `PartialEq` on the document
         // early-outs at the first difference, so an idle frame costs a few
@@ -3889,15 +4444,19 @@ impl App {
                 // the footage cache mutably, and `self.doc()` inside the
                 // argument list would be an overlapping shared borrow of self.
                 let dims = (self.doc().width, self.doc().height);
+                let chrome = crate::scene::Chrome {
+                    ghosts: &self.onion.ghosts,
+                    selected: self.selected,
+                    passepartout: pp,
+                    canvas,
+                    border: true,
+                };
                 to_vello(
                     &scene,
                     fit,
                     dims,
                     bg,
-                    pp,
-                    canvas,
-                    &self.onion.ghosts,
-                    self.selected,
+                    &chrome,
                     &mut self.footage,
                     &self.project.assets,
                     &effect_images,
@@ -4005,6 +4564,16 @@ impl App {
             .queue
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
+
+        // A slice of the active export, after the frame the user is watching
+        // has been presented. Rendering export frames *before* the present
+        // would delay the preview by the whole budget and make the editor feel
+        // frozen, which is the one thing the incremental design exists to
+        // avoid. Still running means ask for another redraw — otherwise a
+        // `ControlFlow::Wait` loop with no input would stall the job forever.
+        if self.step_render() {
+            window.request_redraw();
+        }
     }
 }
 

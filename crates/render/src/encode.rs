@@ -82,11 +82,111 @@ pub trait Encoder {
     /// [`OutputSpec::frame_bytes`] long.
     fn push(&mut self, rgba: &[u8]) -> Result<(), EncodeError>;
 
+    /// The half of this encoder's work that does **not** need the encoder.
+    ///
+    /// Writing frames is inherently serial — an output file has one cursor and
+    /// frames have an order — but *compressing* one does not have to be. A PNG
+    /// sequence spends most of a frame in deflate, which depends on nothing but
+    /// the pixels; with the rasterizer parallelised that compression became the
+    /// serial fraction that capped the whole render (see
+    /// [`crate::parallel`] and `docs/performance.md`).
+    ///
+    /// So an encoder hands out a small, `Send + Sync`, self-contained value that
+    /// can do that work on any thread, and keeps only the writing to itself.
+    /// Returning a [`Preparer`] rather than taking `&self` in a `prepare` method
+    /// is what lets a worker prepare a frame while the writer still holds the
+    /// encoder mutably — the two halves genuinely do not share state.
+    ///
+    /// The default says "there is nothing to precompute", which is right for a
+    /// sidecar encoder: ffmpeg compresses in its own process, on its own
+    /// threads, and the only work on our side is the pipe.
+    fn preparer(&self) -> Preparer {
+        Preparer::Passthrough
+    }
+
+    /// Write a frame that [`Preparer::prepare`] already processed.
+    ///
+    /// The default treats the prepared bytes as raw pixels, which pairs with
+    /// [`Preparer::Passthrough`]. An encoder that overrides `preparer` must
+    /// override this too, and the two must agree about what the bytes are —
+    /// they are two halves of one operation that happen on different threads.
+    fn write_prepared(&mut self, frame: Vec<u8>) -> Result<(), EncodeError> {
+        self.push(&frame)
+    }
+
     /// Close the output. Takes `Box<Self>` so it can consume the encoder
     /// through a trait object — an encoder that is merely dropped has no way to
     /// report that the muxer failed, and a truncated video that reported
     /// success is worse than an error.
     fn finish(self: Box<Self>) -> Result<(), EncodeError>;
+
+    /// Abandon the output: the render was **cancelled**, and whatever has been
+    /// written is not a deliverable.
+    ///
+    /// Distinct from `finish` because dropping an encoder is not neutral. A
+    /// process-backed encoder holds a pipe, and closing that pipe is exactly the
+    /// signal that means *"the stream ended, finalize the file"* — so simply
+    /// dropping a cancelled ffmpeg encoder produces a **complete, playable, and
+    /// wrong** video: the piece, truncated at the frame the user cancelled on,
+    /// with nothing about it to say so. That is the same failure `finish`'s
+    /// signature exists to prevent, reached from the other direction.
+    ///
+    /// The default is to drop, which is right for an encoder whose partial
+    /// output is self-evidently partial (numbered stills). Anything that muxes a
+    /// container should override it.
+    fn abort(self: Box<Self>) {}
+}
+
+/// The per-frame work an encoder can hand to any thread.
+///
+/// Deliberately a small enum rather than a boxed closure: it is `Copy`, it
+/// carries no borrow of the encoder, and a new variant is a visible change to
+/// the one place that decides what can be done off the writer thread. A trait
+/// object here would let an implementation smuggle in shared state, which is
+/// exactly what must not happen — a `Preparer` is called from many threads at
+/// once and holds nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preparer {
+    /// Nothing to precompute; the frame reaches the writer as raw pixels.
+    Passthrough,
+    /// Compress to a PNG file's bytes at this size.
+    Png { width: u32, height: u32 },
+}
+
+impl Preparer {
+    /// Do the off-thread half of encoding one frame.
+    ///
+    /// Takes the pixels **by value** so the passthrough case is a move rather
+    /// than an 8MB memcpy per 1080p frame — which would have handed back a good
+    /// share of what the parallelism won.
+    pub fn prepare(&self, rgba: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
+        match *self {
+            Preparer::Passthrough => Ok(rgba),
+            Preparer::Png { width, height } => {
+                let expected = width as usize * height as usize * 4;
+                if rgba.len() != expected {
+                    return Err(EncodeError::Failed(format!(
+                        "frame is {} bytes, expected {expected} for {width}x{height} RGBA",
+                        rgba.len(),
+                    )));
+                }
+                // Encoded into memory rather than straight to the file: the
+                // write is the writer thread's job, and doing it here would put
+                // the frames back out of order.
+                let mut out = std::io::Cursor::new(Vec::new());
+                image::write_buffer_with_format(
+                    &mut out,
+                    &rgba,
+                    width,
+                    height,
+                    image::ColorType::Rgba8,
+                    image::ImageFormat::Png,
+                )
+                .map_err(|e| EncodeError::Failed(format!("encoding a PNG frame: {e}")))?;
+                Ok(out.into_inner())
+            }
+        }
+    }
 }
 
 /// Frames as numbered PNGs in a directory.
@@ -126,27 +226,31 @@ impl Encoder for PngSequence {
         "png-sequence"
     }
 
+    /// Routed through the two-phase pair rather than duplicating them, so the
+    /// sequential and parallel paths cannot drift into writing different files.
+    /// The copy this costs is the price of the borrowed-slice signature, and it
+    /// is paid only by callers that are not parallelising anyway.
     fn push(&mut self, rgba: &[u8]) -> Result<(), EncodeError> {
-        if rgba.len() != self.spec.frame_bytes() {
-            return Err(EncodeError::Failed(format!(
-                "frame is {} bytes, expected {} for {}x{} RGBA",
-                rgba.len(),
-                self.spec.frame_bytes(),
-                self.spec.width,
-                self.spec.height
-            )));
-        }
+        let prepared = self.preparer().prepare(rgba.to_vec())?;
+        self.write_prepared(prepared)
+    }
+
+    fn preparer(&self) -> Preparer {
+        Preparer::Png { width: self.spec.width, height: self.spec.height }
+    }
+
+    /// `frame` is an encoded PNG file, so this is a plain write.
+    ///
+    /// The index is assigned **here**, not in `prepare`: it is the writer's
+    /// counter, and frames reach the writer in order. Numbering during
+    /// preparation would name each file after whichever worker happened to
+    /// finish it.
+    fn write_prepared(&mut self, frame: Vec<u8>) -> Result<(), EncodeError> {
         // Five digits: a hundred thousand frames is over an hour at 24fps, and
         // fixed width is what makes the sequence sort correctly everywhere.
         let path = self.dir.join(format!("{}_{:05}.png", self.stem, self.index));
-        image::save_buffer(
-            &path,
-            rgba,
-            self.spec.width,
-            self.spec.height,
-            image::ColorType::Rgba8,
-        )
-        .map_err(|e| EncodeError::Failed(format!("writing {}: {e}", path.display())))?;
+        std::fs::write(&path, &frame)
+            .map_err(|e| EncodeError::Failed(format!("writing {}: {e}", path.display())))?;
         self.written.push(path);
         self.index += 1;
         Ok(())
@@ -155,6 +259,12 @@ impl Encoder for PngSequence {
     fn finish(self: Box<Self>) -> Result<(), EncodeError> {
         Ok(())
     }
+
+    /// The written frames are kept. A half-finished PNG sequence is *visibly*
+    /// half-finished — the numbers stop — and the frames that did render are
+    /// often the reason someone cancelled, so deleting them would throw away
+    /// the only product of the work.
+    fn abort(self: Box<Self>) {}
 }
 
 /// How hard the encoder should work — the **two-button model**.
@@ -235,10 +345,32 @@ impl Quality {
     }
 }
 
+/// Whether an output path names a **video container** rather than a directory
+/// of stills. Extension-driven, because deciding for the user is how you end up
+/// owning a codec table ([0007](../../docs/decisions/0007-never-implement-codecs.md)).
+///
+/// Lives here rather than in a caller so the CLI and the editor's render queue
+/// cannot disagree about what `.mkv` means — one container table, one answer.
+pub fn is_video_container(path: &Path) -> bool {
+    const VIDEO: [&str; 8] = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mxf", "gif"];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// The `ffmpeg` binary to invoke. Shared with [`crate::decode`], so a bundled
 /// build points both halves at one binary.
 fn ffmpeg_bin() -> String {
     std::env::var("PBC_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+}
+
+/// The same binary, reachable from sibling modules' tests that need to *make*
+/// a media file to decode. Test-only so it cannot become a second production
+/// route to the tool.
+#[cfg(test)]
+pub(crate) fn ffmpeg_bin_for_tests() -> String {
+    ffmpeg_bin()
 }
 
 /// Raw frames piped to `ffmpeg`, which does the actual encoding.
@@ -277,6 +409,27 @@ impl FfmpegEncoder {
         spec: OutputSpec,
         extra: &[String],
     ) -> Result<Self, EncodeError> {
+        Self::with_audio(path, spec, extra, None)
+    }
+
+    /// The same, muxing a **soundtrack** in alongside the piped video.
+    ///
+    /// `audio` is a finished WAV on disk rather than a second pipe. Two pipes
+    /// into one ffmpeg is possible and is a deadlock waiting to happen: the
+    /// writer must keep both fed or the process blocks on whichever it starves,
+    /// and the video side is already driven by a render loop with its own
+    /// pacing. A file has no such coupling — the mix is complete before the
+    /// first frame is written, and ffmpeg reads it at whatever rate it likes.
+    ///
+    /// The audio is encoded to **AAC**, which every container here accepts, and
+    /// `-shortest` ends the file with whichever stream runs out first so a
+    /// soundtrack longer than the render does not pad the video with a freeze.
+    pub fn with_audio(
+        path: impl AsRef<Path>,
+        spec: OutputSpec,
+        extra: &[String],
+        audio: Option<&Path>,
+    ) -> Result<Self, EncodeError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -291,11 +444,19 @@ impl FfmpegEncoder {
             .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-s", &format!("{}x{}", spec.width, spec.height)])
             .args(["-framerate", &format_rate(spec.fps)])
-            .args(["-i", "-"])
-            // yuv420p rather than ffmpeg's pick: it is the one chroma format
-            // every player and browser handles, and the default for H.264 from
-            // RGBA input is not it.
-            .args(["-pix_fmt", "yuv420p"]);
+            .args(["-i", "-"]);
+        // The soundtrack as a second input, *after* the video so stream 0 stays
+        // the picture — some players and most editing tools assume that.
+        if let Some(audio) = audio {
+            cmd.args(["-i"]).arg(audio);
+        }
+        // yuv420p rather than ffmpeg's pick: it is the one chroma format
+        // every player and browser handles, and the default for H.264 from
+        // RGBA input is not it.
+        cmd.args(["-pix_fmt", "yuv420p"]);
+        if audio.is_some() {
+            cmd.args(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
+        }
         for a in extra {
             cmd.arg(a);
         }
@@ -354,6 +515,25 @@ impl Encoder for FfmpegEncoder {
             path_label(&self.path),
             String::from_utf8_lossy(&out.stderr).trim()
         )))
+    }
+
+    /// Kill ffmpeg and remove the partial file.
+    ///
+    /// The kill has to come *before* stdin is dropped. Dropping the pipe first
+    /// is how you finalize a container — ffmpeg reads EOF, writes the trailer,
+    /// and exits successfully, leaving a file that plays perfectly and is the
+    /// wrong length. Killing first means the process dies mid-stream and the
+    /// container is never finalized.
+    ///
+    /// Removing the file is then not optional: ffmpeg has already truncated
+    /// whatever was at that path on open, so leaving the fragment behind trades
+    /// a missing file for a corrupt one wearing a deliverable's name. A failure
+    /// to remove it is ignored — this path is already the error path, and there
+    /// is nothing useful to say to a user who has just pressed Cancel.
+    fn abort(mut self: Box<Self>) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -487,6 +667,121 @@ mod tests {
     ///
     /// Skips rather than fails without ffmpeg, the same contract as the decoder
     /// test — the tool is a runtime dependency, not a build one.
+    /// **The two paths must write the same bytes.** `push` and
+    /// `prepare` + `write_prepared` are the sequential and parallel routes to
+    /// one output, and a divergence would mean a `--threads 1` render and a
+    /// `--threads 16` render of the same project produced different files —
+    /// which is exactly the property the whole parallel design is verified
+    /// against elsewhere.
+    #[test]
+    fn preparing_and_pushing_produce_identical_files() {
+        let spec = OutputSpec { width: 8, height: 4, fps: 24.0 };
+        let mut rgba = vec![0u8; spec.frame_bytes()];
+        for (i, b) in rgba.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+
+        let seq_dir = std::env::temp_dir().join(format!("pbc_prep_seq_{}", std::process::id()));
+        let par_dir = std::env::temp_dir().join(format!("pbc_prep_par_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&seq_dir);
+        let _ = std::fs::remove_dir_all(&par_dir);
+
+        let mut sequential = PngSequence::new(&seq_dir, "f", spec).unwrap();
+        sequential.push(&rgba).unwrap();
+
+        let mut parallel = PngSequence::new(&par_dir, "f", spec).unwrap();
+        let prepared = parallel.preparer().prepare(rgba.clone()).unwrap();
+        parallel.write_prepared(prepared).unwrap();
+
+        let a = std::fs::read(seq_dir.join("f_00000.png")).unwrap();
+        let b = std::fs::read(par_dir.join("f_00000.png")).unwrap();
+        assert_eq!(a, b, "the sequential and parallel encodings must be byte-identical");
+
+        let _ = std::fs::remove_dir_all(&seq_dir);
+        let _ = std::fs::remove_dir_all(&par_dir);
+    }
+
+    /// A PNG preparer rejects a wrong-sized frame, and does it *on the worker*
+    /// rather than letting a bad buffer reach the writer — the check has to
+    /// live in both halves because either can be the entry point.
+    #[test]
+    fn a_png_preparer_refuses_a_wrongly_sized_frame() {
+        let p = Preparer::Png { width: 4, height: 4 };
+        let err = p.prepare(vec![0u8; 10]).expect_err("must refuse");
+        assert!(format!("{err}").contains("expected 64"), "{err}");
+    }
+
+    /// The passthrough preparer moves the pixels rather than copying them: at
+    /// 1080p a copy per frame is 8MB of memcpy that would hand back a good part
+    /// of what the parallelism won. Asserted by capacity identity, which a
+    /// reallocating implementation would not preserve.
+    #[test]
+    fn the_passthrough_preparer_does_not_copy() {
+        let mut rgba = Vec::with_capacity(4096);
+        rgba.extend_from_slice(&[7u8; 4096]);
+        let before = rgba.as_ptr();
+        let out = Preparer::Passthrough.prepare(rgba).unwrap();
+        assert_eq!(out.as_ptr(), before, "the frame must be moved, not reallocated");
+    }
+
+    /// A sidecar encoder has nothing to precompute — ffmpeg compresses in its
+    /// own process — so it must not claim otherwise and start doing work twice.
+    #[test]
+    fn an_ffmpeg_encoder_prepares_nothing() {
+        if !FfmpegEncoder::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pbc_prep_ff_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.mp4");
+        let spec = OutputSpec { width: 16, height: 16, fps: 24.0 };
+        let enc = FfmpegEncoder::new(&path, spec, &Quality::Draft.ffmpeg_args(&path)).unwrap();
+        assert_eq!(enc.preparer(), Preparer::Passthrough);
+        Box::new(enc).abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancelling must not leave a file that looks like a deliverable.
+    ///
+    /// The interesting half is that the naive implementation *passes* a
+    /// "did it stop?" test while failing this one: dropping the encoder makes
+    /// ffmpeg finalize a perfectly playable, wrong-length video. So the
+    /// assertion is about the file being **gone**, not about the process.
+    #[test]
+    fn an_aborted_ffmpeg_encode_leaves_no_file() {
+        if !FfmpegEncoder::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pbc_abort_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cancelled.mp4");
+        let spec = OutputSpec { width: 32, height: 32, fps: 24.0 };
+        let mut enc =
+            FfmpegEncoder::new(&path, spec, &Quality::Draft.ffmpeg_args(&path)).unwrap();
+        for _ in 0..4 {
+            enc.push(&vec![255u8; spec.frame_bytes()]).unwrap();
+        }
+        Box::new(enc).abort();
+        assert!(!path.exists(), "a cancelled render must not leave {}", path.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled still sequence keeps what it wrote: the frames are visibly
+    /// partial, and they are often the reason someone cancelled.
+    #[test]
+    fn an_aborted_png_sequence_keeps_its_frames() {
+        let dir = std::env::temp_dir().join(format!("pbc_abort_png_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = OutputSpec { width: 4, height: 4, fps: 24.0 };
+        let mut enc = PngSequence::new(&dir, "shot", spec).unwrap();
+        enc.push(&vec![0u8; spec.frame_bytes()]).unwrap();
+        enc.push(&vec![0u8; spec.frame_bytes()]).unwrap();
+        Box::new(enc).abort();
+        let n = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(n, 2, "the frames that rendered are kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_real_ffmpeg_encode_writes_a_playable_file() {
         if !FfmpegEncoder::available() {

@@ -24,6 +24,8 @@ live/src/
   curves.rs     the value-curve view
   nodegraph.rs  expression / node-graph panel and its GraphOps
   scene.rs      evaluated Scene -> vello, canvas fit/zoom/pan + pick, zoom toolbar
+  offscreen.rs  the export render target: vello -> texture -> RGBA8 readback
+  renderqueue.rs the two render buttons and the stepped export job
   gizmo.rs      the transform gizmo
   aids.rs       grid, rulers, guides, snapping
   pen.rs        the Bezier pen tool and point editing

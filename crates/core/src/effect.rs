@@ -19,13 +19,14 @@
 //! that cannot (the SVG backend, the offline `motion` binary) ignores it and
 //! draws the layer plainly — exactly the arrangement track mattes already have.
 //!
-//! **The first set is the same-bounds filters**: blur and colour adjustments,
-//! every one of which reads the isolated RGBA image and writes an image of the
-//! same size. That uniformity is deliberate — one backend seam (filter an image
-//! in place) covers all of them. Effects that *grow* the layer's bounds (drop
-//! shadow, glow) are a later addition: they need the offscreen target sized with
-//! margin, which is a real change to how isolation is measured, not just another
-//! filter.
+//! **Every effect here is an image-in, image-out filter at the same size**, and
+//! that uniformity is what keeps the backend seam to one operation. A drop
+//! shadow appears to break it — a shadow falls *outside* the artwork — but it
+//! does not, because a layer's isolated target is the **whole canvas** in both
+//! rasterizers, not a box around its artwork. The shadow has somewhere to fall
+//! for the same reason a blur's halo does. What would genuinely need a
+//! margin-sized target is a shadow that must survive being drawn *past the
+//! frame edge*, which nothing downstream can see anyway.
 
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,34 @@ pub enum EffectKind {
     /// Push every pixel toward `color` by `amount` in `[0, 1]` (a linear mix),
     /// preserving alpha. The classic single-colour wash.
     Tint { color: Value<Color>, amount: Value<f64> },
+    /// Remap the tonal range: everything at or below `in_black` becomes
+    /// `out_black`, everything at or above `in_white` becomes `out_white`, and
+    /// `gamma` bends the curve between them (`1` is straight, above `1`
+    /// brightens the midtones).
+    ///
+    /// The grading control people reach for first, and per-channel identical —
+    /// a colour cast is corrected by a hue shift or a tint, not by pretending
+    /// this is three effects.
+    Levels {
+        in_black: Value<f64>,
+        in_white: Value<f64>,
+        gamma: Value<f64>,
+        out_black: Value<f64>,
+        out_white: Value<f64>,
+    },
+    /// A blurred, offset copy of the layer's own alpha, painted in `color`
+    /// underneath it.
+    ///
+    /// The offset is in composition pixels and is **not** rotated with the
+    /// layer: a shadow is cast by a light in the scene, not by the artwork, so
+    /// spinning a layer must not spin its shadow around with it.
+    DropShadow {
+        color: Value<Color>,
+        offset_x: Value<f64>,
+        offset_y: Value<f64>,
+        radius: Value<f64>,
+        opacity: Value<f64>,
+    },
 }
 
 impl Effect {
@@ -101,6 +130,26 @@ impl Effect {
                 color: Value::constant(Color::rgb(1.0, 1.0, 1.0)),
                 amount: Value::constant(1.0),
             },
+            // The identity curve: full range in, full range out, straight
+            // gamma. Adding Levels changes nothing until it is dialled in.
+            EffectType::Levels => EffectKind::Levels {
+                in_black: Value::constant(0.0),
+                in_white: Value::constant(1.0),
+                gamma: Value::constant(1.0),
+                out_black: Value::constant(0.0),
+                out_white: Value::constant(1.0),
+            },
+            // A shadow *is* the effect, so unlike the others its seed is not a
+            // no-op: adding it with everything at zero would look broken.
+            // Down-right, soft, black, half strength — the default every
+            // compositor ships.
+            EffectType::DropShadow => EffectKind::DropShadow {
+                color: Value::constant(Color::rgb(0.0, 0.0, 0.0)),
+                offset_x: Value::constant(8.0),
+                offset_y: Value::constant(8.0),
+                radius: Value::constant(6.0),
+                opacity: Value::constant(0.5),
+            },
         };
         Self::new(kind)
     }
@@ -113,6 +162,8 @@ impl Effect {
             EffectKind::BrightnessContrast { .. } => EffectType::BrightnessContrast,
             EffectKind::HueSaturation { .. } => EffectType::HueSaturation,
             EffectKind::Tint { .. } => EffectType::Tint,
+            EffectKind::Levels { .. } => EffectType::Levels,
+            EffectKind::DropShadow { .. } => EffectType::DropShadow,
         }
     }
 
@@ -143,6 +194,27 @@ impl Effect {
                 color: color.resolve(ctx),
                 amount: amount.resolve(ctx).clamp(0.0, 1.0),
             },
+            EffectKind::Levels { in_black, in_white, gamma, out_black, out_white } => {
+                ResolvedEffect::Levels {
+                    in_black: in_black.resolve(ctx),
+                    in_white: in_white.resolve(ctx),
+                    // A gamma of zero is a division by zero downstream and a
+                    // negative one is meaningless; clamped here so no backend
+                    // has to guess.
+                    gamma: gamma.resolve(ctx).clamp(0.01, 100.0),
+                    out_black: out_black.resolve(ctx),
+                    out_white: out_white.resolve(ctx),
+                }
+            }
+            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity } => {
+                ResolvedEffect::DropShadow {
+                    color: color.resolve(ctx),
+                    offset_x: offset_x.resolve(ctx),
+                    offset_y: offset_y.resolve(ctx),
+                    radius: radius.resolve(ctx).max(0.0),
+                    opacity: opacity.resolve(ctx).clamp(0.0, 1.0),
+                }
+            }
         })
     }
 
@@ -177,6 +249,20 @@ impl Effect {
                 col(color);
                 num(amount);
             }
+            EffectKind::Levels { in_black, in_white, gamma, out_black, out_white } => {
+                num(in_black);
+                num(in_white);
+                num(gamma);
+                num(out_black);
+                num(out_white);
+            }
+            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity } => {
+                col(color);
+                num(offset_x);
+                num(offset_y);
+                num(radius);
+                num(opacity);
+            }
         }
     }
 }
@@ -190,15 +276,19 @@ pub enum EffectType {
     BrightnessContrast,
     HueSaturation,
     Tint,
+    Levels,
+    DropShadow,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 4] = [
+    pub const ALL: [EffectType; 6] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
         EffectType::Tint,
+        EffectType::Levels,
+        EffectType::DropShadow,
     ];
 
     pub fn label(self) -> &'static str {
@@ -207,6 +297,8 @@ impl EffectType {
             EffectType::BrightnessContrast => "Brightness & Contrast",
             EffectType::HueSaturation => "Hue / Saturation",
             EffectType::Tint => "Tint",
+            EffectType::Levels => "Levels",
+            EffectType::DropShadow => "Drop Shadow",
         }
     }
 }
@@ -225,6 +317,8 @@ pub enum ResolvedEffect {
     BrightnessContrast { brightness: f64, contrast: f64 },
     HueSaturation { hue: f64, saturation: f64, lightness: f64 },
     Tint { color: Color, amount: f64 },
+    Levels { in_black: f64, in_white: f64, gamma: f64, out_black: f64, out_white: f64 },
+    DropShadow { color: Color, offset_x: f64, offset_y: f64, radius: f64, opacity: f64 },
 }
 
 #[cfg(test)]
@@ -270,6 +364,39 @@ mod tests {
         match e.resolve(&mut ctx) {
             Some(ResolvedEffect::Tint { amount, .. }) => assert_eq!(amount, 1.0),
             other => panic!("expected a tint, got {other:?}"),
+        }
+    }
+
+    /// A gamma of zero would divide by zero in every backend; it is clamped
+    /// here so none of them has to decide what to do about it.
+    #[test]
+    fn levels_gamma_cannot_be_zero() {
+        let e = Effect::new(EffectKind::Levels {
+            in_black: Value::constant(0.0),
+            in_white: Value::constant(1.0),
+            gamma: Value::constant(0.0),
+            out_black: Value::constant(0.0),
+            out_white: Value::constant(1.0),
+        });
+        let mut ctx = EvalCtx::at(0.0);
+        match e.resolve(&mut ctx) {
+            Some(ResolvedEffect::Levels { gamma, .. }) => assert!(gamma > 0.0),
+            other => panic!("expected levels, got {other:?}"),
+        }
+    }
+
+    /// A drop shadow's seed is deliberately *not* neutral — it is the one
+    /// effect whose whole content is the thing it adds, so adding it must show
+    /// something rather than look broken.
+    #[test]
+    fn a_drop_shadow_seeds_visible() {
+        let mut ctx = EvalCtx::at(0.0);
+        match Effect::seed(EffectType::DropShadow).resolve(&mut ctx) {
+            Some(ResolvedEffect::DropShadow { offset_x, offset_y, opacity, .. }) => {
+                assert!(offset_x != 0.0 || offset_y != 0.0, "an unoffset shadow hides behind");
+                assert!(opacity > 0.0);
+            }
+            other => panic!("expected a shadow, got {other:?}"),
         }
     }
 

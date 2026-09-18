@@ -10,6 +10,7 @@
 //! must be testable by rendering a frame in a `cargo test`, not a window.
 
 pub mod asset;
+pub mod audio;
 pub mod camera;
 pub mod composite;
 pub mod demo;
@@ -46,8 +47,8 @@ pub use expr::{
 pub use path::{Anchor, PathPart, PathSample, VectorPath};
 pub use pathfinder::{combine as combine_paths, BoolOp};
 pub use node::{
-    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project, Shape,
-    Stroke, Transform, ViewAids,
+    Comp, CompId, Document, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project,
+    RenderPreset, Shape, Stroke, Transform, ViewAids,
 };
 pub use graph::{
     Binding, ConnectError, Edge, Endpoint, GraphCtx, GraphError, GraphNode, GraphNodeId, NodeGraph,
@@ -58,6 +59,8 @@ pub use raise::{raise, raise_geometry, RaiseShapeError};
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };
+pub use audio::{gains, mix_into, pan_gains, AudioClip, AudioSource};
+pub use eval::evaluate_audio;
 pub use camera::{Camera, Projector};
 pub use mat4::{Mat4, Xf};
 pub use socket::{Socket, SocketType};

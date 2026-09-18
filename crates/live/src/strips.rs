@@ -31,6 +31,12 @@ pub(crate) struct StripRow {
     /// very differently from one packed with them, and that is exactly what you
     /// want to see when laying out a comp.
     pub(crate) keys: Vec<i64>,
+    /// The sound this layer carries, if any, and whether it is unmuted.
+    ///
+    /// A muted layer keeps its waveform — dimmed — because muting is a
+    /// temporary state and hiding the shape would make the row you are about
+    /// to unmute the one you cannot read.
+    pub(crate) audio: Option<(motion_core::AssetId, bool)>,
 }
 
 /// Flatten a comp's layers into strip rows.
@@ -51,6 +57,7 @@ pub(crate) fn strip_rows(root: &MNode) -> Vec<StripRow> {
             precomp: node.precomp.is_some(),
             timing: node.timing,
             keys,
+            audio: node.audio.as_ref().map(|a| (a.asset, a.enabled)),
         });
         // Front-most first, matching the layers panel — the two are the same
         // list of layers and must not disagree about their order.
@@ -69,6 +76,56 @@ pub(crate) fn strip_rows(root: &MNode) -> Vec<StripRow> {
 /// bar so the same grab means the same thing in both places.
 const HANDLE_W: f32 = 6.0;
 
+/// Draw a sound's shape across a strip's bar.
+///
+/// One vertical segment per pixel column, spanning that column's loudest
+/// excursion either side of the centre line — the standard reading, and the
+/// one that makes a beat a visible landmark rather than a number.
+///
+/// `start` is the layer's local frame zero in comp frames, which is what turns
+/// a comp frame into a position in the source: the same conversion
+/// `collect_audio` makes when it decides which sample the in-point plays, so
+/// what you see and what you hear cannot disagree.
+fn waveform(
+    painter: &egui::Painter,
+    bar: egui::Rect,
+    axis: &Axis,
+    fps: f64,
+    start: f64,
+    peaks: &motion_render::Peaks,
+    enabled: bool,
+) {
+    if bar.width() < 1.0 || fps <= 0.0 {
+        return;
+    }
+    let col = if enabled {
+        egui::Color32::from_rgba_unmultiplied(190, 220, 255, 190)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(190, 190, 190, 80)
+    };
+    let mid = bar.center().y;
+    // Inset so a full-scale sample stops short of the bar's edge instead of
+    // merging with its outline.
+    let half = (bar.height() / 2.0 - 2.0).max(1.0);
+    let mut x = bar.left().floor();
+    while x < bar.right() {
+        let f0 = axis.x_to_frame_exact(x);
+        let f1 = axis.x_to_frame_exact(x + 1.0);
+        if let Some((lo, hi)) = peaks.range((f0 - start) / fps, (f1 - start) / fps) {
+            let top = mid - (hi.clamp(-1.0, 1.0) * half);
+            let bot = mid - (lo.clamp(-1.0, 1.0) * half);
+            // A quiet column is still a column: without the floor, near
+            // silence draws nothing and reads as "no sound here".
+            let (top, bot) = if bot - top < 1.0 { (mid - 0.5, mid + 0.5) } else { (top, bot) };
+            painter.line_segment(
+                [egui::pos2(x + 0.5, top), egui::pos2(x + 0.5, bot)],
+                egui::Stroke::new(1.0, col),
+            );
+        }
+        x += 1.0;
+    }
+}
+
 /// The layer-strips view.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn strips_ui(
@@ -81,6 +138,10 @@ pub(crate) fn strips_ui(
     selected: Option<NodeId>,
     work_area: Option<WorkArea>,
     label_w: f32,
+    peaks: &std::collections::HashMap<
+        motion_core::AssetId,
+        std::sync::Arc<motion_render::Peaks>,
+    >,
     out: &mut DopeEdits,
 ) {
     let label_w = clamp_label_w(label_w, ui.max_rect().width());
@@ -225,6 +286,18 @@ pub(crate) fn strips_ui(
                             egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
                         );
                     }
+                }
+            }
+
+            // The waveform, inside the bar and under the keyframe ticks. It
+            // is drawn from the layer's *own* time, so trimming the head
+            // scrolls the sound within the bar exactly as it scrolls the
+            // picture of a trimmed video layer — the whole reason this view
+            // makes sync editable rather than merely visible.
+            if let Some((asset, on)) = row.audio {
+                if let Some(pk) = peaks.get(&asset) {
+                    let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
+                    waveform(&painter, bar, &axis, tb.fps(), start, pk, on);
                 }
             }
 

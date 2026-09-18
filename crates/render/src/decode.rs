@@ -65,13 +65,7 @@ impl Decoder for ImageDecoder {
         // importing a folder of 4K stills needlessly slow.
         let (w, h) = image::image_dimensions(path)
             .map_err(|e| DecodeError::Malformed(format!("{}: {e}", path.display())))?;
-        Ok(AssetMeta {
-            kind: AssetKind::Image,
-            width: w as f64,
-            height: h as f64,
-            frames: 1,
-            fps: 0.0,
-        })
+        Ok(AssetMeta::visual(AssetKind::Image, w as f64, h as f64, 1, 0.0))
     }
 
     fn frame(
@@ -145,7 +139,7 @@ impl Decoder for RawDecoder {
 
     fn open(&self, path: &Path) -> Result<AssetMeta, DecodeError> {
         let (w, h, _) = Self::develop(path)?;
-        Ok(AssetMeta { kind: AssetKind::Image, width: w as f64, height: h as f64, frames: 1, fps: 0.0 })
+        Ok(AssetMeta::visual(AssetKind::Image, w as f64, h as f64, 1, 0.0))
     }
 
     fn frame(
@@ -244,7 +238,7 @@ impl Decoder for HeicDecoder {
                 path.display()
             )));
         };
-        Ok(AssetMeta { kind: AssetKind::Image, width, height, frames: 1, fps: 0.0 })
+        Ok(AssetMeta::visual(AssetKind::Image, width, height, 1, 0.0))
     }
 
     fn frame(
@@ -529,7 +523,7 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
         .or_else(|| duration.map(|d| (d * fps).round() as i64))
         .unwrap_or(1)
         .max(1);
-    Ok(AssetMeta { kind: AssetKind::Video, width, height, frames, fps })
+    Ok(AssetMeta::visual(AssetKind::Video, width, height, frames, fps))
 }
 
 #[cfg(test)]

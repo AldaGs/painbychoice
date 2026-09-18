@@ -2617,3 +2617,112 @@ mod tests {
         );
     }
 }
+
+/// Collect every sound a composition contributes, positioned in **comp sample
+/// frames**.
+///
+/// The audio counterpart of [`evaluate_comp`], and deliberately a separate
+/// entry point rather than another field on `Scene`: a `Scene` is one instant,
+/// while a sound has extent. Asking "what is on screen at frame 100" and "what
+/// is audible across this block" are different questions with different units,
+/// and folding them together would mean re-walking the tree per audio block for
+/// picture nobody asked for.
+///
+/// `at_frame` is where the *automation* is sampled — level and pan are ordinary
+/// `Value`s, so a block resolves them once at its own start. That makes
+/// parameter automation per-block rather than per-sample, which at any sane
+/// block size is inaudible and is what every mixer does with control-rate
+/// parameters.
+///
+/// Nested comps come through: a precomp instance offsets its children's sound
+/// by its own start, exactly as it offsets their pictures, and the same cycle
+/// guard keeps a self-referential project from recursing forever.
+pub fn evaluate_audio(
+    project: &Project,
+    comp: CompId,
+    at_frame: f64,
+    sample_rate: u32,
+) -> Vec<crate::audio::AudioSource> {
+    let mut out = Vec::new();
+    if sample_rate == 0 {
+        return out;
+    }
+    collect_audio(project, comp, at_frame, 0, &mut Vec::new(), sample_rate, &mut out);
+    out
+}
+
+/// One comp's contribution, with `shift` the comp-sample-frame position of this
+/// comp's own frame zero within the outermost timeline.
+fn collect_audio(
+    project: &Project,
+    id: CompId,
+    at_frame: f64,
+    shift: i64,
+    stack: &mut Vec<CompId>,
+    sample_rate: u32,
+    out: &mut Vec<crate::audio::AudioSource>,
+) {
+    if stack.contains(&id) {
+        return;
+    }
+    let Some(comp) = project.comp(id) else { return };
+    stack.push(id);
+
+    let fps = comp.timebase().fps();
+    let mut ctx = EvalCtx::new(comp, at_frame);
+    ctx.modules = Some(&project.modules);
+    ctx.assets = Some(&project.assets);
+    collect_audio_node(&comp.root, project, &mut ctx, fps, sample_rate, shift, at_frame, stack, out);
+
+    stack.pop();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_audio_node(
+    node: &Node,
+    project: &Project,
+    ctx: &mut EvalCtx,
+    fps: f64,
+    sample_rate: u32,
+    shift: i64,
+    at_frame: f64,
+    stack: &mut Vec<CompId>,
+    out: &mut Vec<crate::audio::AudioSource>,
+) {
+    use crate::audio::frames_to_sample_frames as to_sf;
+
+    // A layer's own trim, or the whole comp when it has none.
+    let timing = node.timing;
+    if let Some(clip) = &node.audio {
+        if clip.enabled {
+            let (in_, out_f, start) = match timing {
+                Some(t) => (t.in_ as f64, t.out as f64, t.start as f64),
+                None => (0.0, f64::from(i32::MAX), 0.0),
+            };
+            let level = clip.level.resolve(ctx);
+            let pan = clip.pan.resolve(ctx);
+            out.push(crate::audio::AudioSource {
+                asset: clip.asset,
+                start: shift + to_sf(in_, fps, sample_rate),
+                end: shift + to_sf(out_f, fps, sample_rate),
+                // Where in the *source* the in-point lands: a layer trimmed at
+                // its head starts partway into its own sound, exactly as a
+                // trimmed video layer shows a later frame.
+                offset: to_sf(in_ - start, fps, sample_rate),
+                gain: crate::audio::gains(level, pan),
+            });
+        }
+    }
+
+    // A precomp instance carries its comp's sound, shifted by where the
+    // instance sits — the audio half of "a precomp is a layer".
+    if let Some(inner) = node.precomp {
+        let inner_shift = shift + to_sf(timing.map(|t| t.start as f64).unwrap_or(0.0), fps, sample_rate);
+        let inner_frame = at_frame - timing.map(|t| t.start as f64).unwrap_or(0.0);
+        collect_audio(project, inner, inner_frame, inner_shift, stack, sample_rate, out);
+    }
+
+    for child in &node.children {
+        collect_audio_node(child, project, ctx, fps, sample_rate, shift, at_frame, stack, out);
+    }
+}

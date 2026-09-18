@@ -33,6 +33,18 @@ pub struct AssetId(pub u64);
 pub enum AssetKind {
     Image,
     Video,
+    /// Sound with no picture. A video *with* sound is still [`AssetKind::Video`]
+    /// — the kind says what the file is for, and the audio metadata below is
+    /// populated for either, because a layer showing a clip should hear it too.
+    Audio,
+}
+
+impl AssetKind {
+    /// Whether this kind puts pixels on the screen. Audio does not, which is
+    /// the one thing every drawing path needs to know about it.
+    pub fn is_visual(self) -> bool {
+        matches!(self, AssetKind::Image | AssetKind::Video)
+    }
 }
 
 /// One piece of imported footage.
@@ -68,6 +80,22 @@ pub struct Asset {
     /// rate — checked rather than assumed, because dividing by it is how a
     /// source frame gets picked.
     pub fps: f64,
+    /// Audio: samples per second. `0` when the asset carries no sound.
+    ///
+    /// Separate fields rather than reusing `frames`/`fps` for a sample count and
+    /// a sample rate. The arithmetic would work and the confusion would not be
+    /// worth it: a video with sound needs *both* pairs at once, and a field
+    /// whose meaning depends on the kind is a field someone reads wrongly.
+    /// `#[serde(default)]` on all three, so a pre-audio `.pbc` still loads.
+    #[serde(default)]
+    pub sample_rate: u32,
+    /// Audio: channel count. `0` when the asset carries no sound.
+    #[serde(default)]
+    pub channels: u16,
+    /// Audio: length in **sample frames** (one per channel-set, not per sample),
+    /// which is the unit every position in the audio path is measured in.
+    #[serde(default)]
+    pub samples: u64,
 }
 
 impl Asset {
@@ -83,7 +111,56 @@ impl Asset {
             height,
             frames: 1,
             fps: 0.0,
+            sample_rate: 0,
+            channels: 0,
+            samples: 0,
         }
+    }
+
+    /// A sound asset.
+    ///
+    /// `width`/`height`/`frames`/`fps` stay at their empty values: sound has no
+    /// picture, and a zero size is what [`AssetKind::is_visual`] exists to keep
+    /// anything from trying to draw.
+    pub fn audio(
+        id: AssetId,
+        path: impl Into<PathBuf>,
+        sample_rate: u32,
+        channels: u16,
+        samples: u64,
+    ) -> Self {
+        let path = path.into();
+        Self {
+            id,
+            name: default_name(&path),
+            path,
+            kind: AssetKind::Audio,
+            width: 0.0,
+            height: 0.0,
+            frames: 0,
+            fps: 0.0,
+            sample_rate,
+            channels,
+            samples,
+        }
+    }
+
+    /// How long this asset's sound runs, in seconds. `0.0` when it has none.
+    ///
+    /// Guards the rate rather than assuming it, for the same reason [`Self::fps`]
+    /// is checked before dividing: a malformed file reporting a zero rate would
+    /// otherwise produce an infinite duration and a comp that never ends.
+    pub fn audio_seconds(&self) -> f64 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
+        self.samples as f64 / self.sample_rate as f64
+    }
+
+    /// Whether this asset carries sound — true for an audio file, and for a
+    /// video whose import found an audio stream.
+    pub fn has_audio(&self) -> bool {
+        self.sample_rate > 0 && self.channels > 0 && self.samples > 0
     }
 
     /// A video asset.
@@ -105,6 +182,9 @@ impl Asset {
             height,
             frames: frames.max(1),
             fps,
+            sample_rate: 0,
+            channels: 0,
+            samples: 0,
         }
     }
 
@@ -138,6 +218,9 @@ impl Asset {
             height: self.height,
             frames: self.frames,
             fps: self.fps,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            samples: self.samples,
         }
     }
 
@@ -317,13 +400,55 @@ pub trait FrameStream: Send {
 }
 
 /// What [`Decoder::open`] reports: everything [`Asset`] caches, minus identity.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// The audio fields default to zero via [`AssetMeta::visual`], so a decoder that
+/// only knows about pixels does not have to mention them — but a decoder that
+/// finds an audio stream in a video *can* report it, which is what lets one
+/// layer carry both picture and sound.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct AssetMeta {
     pub kind: AssetKind,
     pub width: f64,
     pub height: f64,
     pub frames: i64,
     pub fps: f64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub samples: u64,
+}
+
+impl Default for AssetKind {
+    fn default() -> Self {
+        AssetKind::Image
+    }
+}
+
+impl AssetMeta {
+    /// Picture-only metadata: the common case, and the one every existing
+    /// decoder reports.
+    pub fn visual(kind: AssetKind, width: f64, height: f64, frames: i64, fps: f64) -> Self {
+        AssetMeta { kind, width, height, frames, fps, ..Default::default() }
+    }
+
+    /// Sound-only metadata.
+    pub fn sound(sample_rate: u32, channels: u16, samples: u64) -> Self {
+        AssetMeta {
+            kind: AssetKind::Audio,
+            sample_rate,
+            channels,
+            samples,
+            ..Default::default()
+        }
+    }
+
+    /// The same metadata with an audio stream attached — how a video decoder
+    /// reports a clip that has sound.
+    pub fn with_audio(mut self, sample_rate: u32, channels: u16, samples: u64) -> Self {
+        self.sample_rate = sample_rate;
+        self.channels = channels;
+        self.samples = samples;
+        self
+    }
 }
 
 impl AssetMeta {
@@ -337,8 +462,13 @@ impl AssetMeta {
             kind: self.kind,
             width: self.width,
             height: self.height,
-            frames: self.frames.max(1),
+            // A sound has no frames, so the `max(1)` that keeps a still from
+            // claiming zero must not invent one for audio.
+            frames: if self.kind.is_visual() { self.frames.max(1) } else { self.frames },
             fps: self.fps,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            samples: self.samples,
         }
     }
 }

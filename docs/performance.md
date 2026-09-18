@@ -65,21 +65,70 @@ demo composition at 1920×1080, rendering to a PNG sequence:
 | 0.5 | 960×540 | 108.3 |
 | 0.25 | 480×270 | 439.0 |
 
+Re-measured 2026-09-08 on a **Windows 11 developer machine** (the same demo,
+same release profile, CPU rasterizer), which is roughly 3× the container:
+
+| Output | Encoder | Frames/sec | 300 frames in |
+| --- | --- | --- | --- |
+| 1920×1080 | PNG sequence | **76.4** | 3.9s |
+| 1920×1080 | ffmpeg, H.264 draft | 70.9 | 4.2s |
+| 1920×1080 | ffmpeg, H.264 master | 68.2 | 4.4s |
+| 1920×1080 | ffmpeg, ProRes HQ | 57.2 | 5.3s |
+
+**Frame-parallel rendering, measured 2026-09-08 on the same machine** (16
+logical cores, demo at 1920x1080, PNG sequence, `--threads n`):
+
+| Threads | Compression on the writer | Compression on the workers |
+| --- | --- | --- |
+| 1 | 68.5 | 72.8 |
+| 2 | 169.9 | 143.3 |
+| 4 | 267.5 | 225.8 |
+| 8 | 312.8 | 345.4 |
+| 16 (default) | 307.3 | **434.1** |
+
+The left column stopped scaling at about eight threads, and the reason was the
+writer: frames rendered in parallel but were *compressed* by the one thread that
+wrote them. Measured directly, `PngSequence::push` was **1.78 ms/frame** at
+1080p, against an Amdahl-implied serial fraction of ~2.9 ms/frame — so
+compression was most of the ceiling.
+
+Moving it to the workers ([`Preparer`], `encode.rs`) is the right column: **6.0x
+over sequential**, and it keeps scaling past eight where it used to flatten. The
+low-thread rows are slightly *worse*, which is the honest cost — `push` now
+copies the frame before compressing it, and with one worker there is nothing to
+win back. The crossover is around four threads.
+
+**The ffmpeg path is unaffected by that change and is capped lower** (~215 fps at
+8 threads): its `Preparer` is a passthrough because ffmpeg compresses in its own
+process, so the ceiling there is the sidecar and the pipe, not our writer.
+
+Note the 2-thread row in the left column is superlinear, which is measurement
+noise rather than magic: single-run timings on a loaded desktop carry a few
+percent, and 68.5 there against 76.4 in the table above is that spread.
+
+The encoder spread is the useful part: **master costs ~4% over draft**, and
+ProRes ~25% over H.264, at this resolution. Both are small next to the
+rasterizer, which is the other way round from what the two-button model assumes
+— it assumes encoding is what you save by choosing Draft. At 1080p on this
+content the honest saving is a few percent. Draft's value is that it asks no
+questions, not that it is dramatically faster, and the table above is why
+[0018](decisions/0018-two-render-buttons.md)'s rule that *draft renders every
+pixel* costs so little.
+
 Three things fall out of that, and all three are actionable:
 
 - **It is cleanly pixel-bound.** Four times faster per halving of each
   dimension, almost exactly. Evaluation is not the bottleneck at this
   complexity; filling pixels is.
-- **It is single-threaded.** Four cores were available and one was used. Frames
-  are independent and `evaluate` is pure — the render loop is embarrassingly
-  parallel, and this is the largest easy win available. It has not been taken
-  yet because correctness came first and the seam is trivial to add later.
+- ~~**It is single-threaded.**~~ Taken, 2026-09-08: the offline renderer runs
+  frames on all cores and writes them in order (`render/src/parallel.rs`). See
+  the scaling table above, and note where it stops.
 - **PNG encoding is inside that number.** A meaningful share of it, at 1080p.
   Splitting raster time from encode time is worth doing before optimising
   either.
 
 **A debug build is ~100× slower** (the same 300-frame render: 244s debug versus
-~12s release). Never quote, compare, or investigate a timing from `cargo run`
+~12s release on the container, 3.9s on the developer machine above). Never quote, compare, or investigate a timing from `cargo run`
 without `--release`. This is the single most common way to arrive at a wrong
 conclusion about this codebase's speed.
 

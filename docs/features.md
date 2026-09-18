@@ -49,6 +49,19 @@ produce a finished video.
   imported `Path` no size. **All of them are animatable**, on equal footing:
   every one gets a stopwatch, a dopesheet row, and the full selection /
   retime / copy-paste / easing treatment.
+- **Effects** — a per-layer stack of pixel operations, in the properties panel
+  beside blend and matte (a non-empty stack isolates the layer, exactly as a
+  blend mode does). **Gaussian blur, brightness/contrast, hue/saturation, tint,
+  levels** and **drop shadow**, applied top to bottom; each one can be muted, reordered or removed,
+  and a muted effect is dropped from the stack rather than run as an identity
+  pass.
+  - Every numeric parameter is animatable on the same footing as everything
+    else: a stopwatch on the row, a dopesheet row, a curve, retiming and
+    copy/paste. A blur radius keyframes exactly the way a position does.
+  - The stack renders **everywhere**: the preview (through a per-layer readback
+    for the blur), the editor's Draft and Master exports, and the offline CPU
+    rasterizer that `motion render` uses. The SVG backend cannot express one,
+    so it reports the layer rather than silently drawing it plain.
 - **Timeline / dopesheet** (bottom) — a **frame ruler** with adaptive ticks
   (1/2/5/10-frame steps plus whole-second multiples, so labels land on round
   timecodes when zoomed out; per-frame minor ticks once frames are ≥6px apart),
@@ -94,3 +107,78 @@ produce a finished video.
   `add` / `mul` / `neg` / **`script`** (a Rhai one-liner over `frame`/`time`,
   with its live result or error shown). Drag boxes to arrange them. A cycle or a
   bad script falls back to a neutral value instead of breaking the frame.
+
+- **Sound** — import a sound file as a layer with **Audio** in the layers panel.
+  It arrives trimmed to its own length, and its timing is the layer's, so
+  trimming a sound is trimming a layer. Level and pan are ordinary animatable
+  properties, so they keyframe and take expressions like anything else (no
+  controls for them yet — see the production plan).
+  - **Playback follows the sound, not the wall clock.** When a comp has audio
+    the device becomes the time source and the frame is derived from the samples
+    it has actually consumed, so the picture cannot drift off the music over a
+    long piece. With no sound, or no working audio device, playback runs on the
+    wall clock exactly as it always did.
+  - **The waveform draws on the layer strip.** In the timeline's *Strips* view
+    a sound layer's bar carries its own shape, so a beat is somewhere you can
+    aim at rather than a number to count towards. It is drawn from the layer's
+    local time, so trimming the head scrolls the sound inside the bar exactly
+    as it scrolls a trimmed video layer's picture, and a muted layer keeps a
+    dimmed waveform rather than losing it.
+  - A rendered **video carries the mix** — both `motion render` and the
+    editor's own Draft and Master buttons mux it. A PNG sequence has nowhere to
+    put sound, so it isn't mixed at all. If a layer's sound isn't loaded, the
+    render still succeeds and the result chip is marked with a warning naming
+    what went out silent.
+  - **Opening a project reloads its sounds**, so a reopened `.pbc` plays,
+    draws its waveforms and exports with its mix. A file that has moved is
+    named and leaves its layer silent rather than failing the load.
+  - A file whose rate is not the project's is converted with a
+    **windowed-sinc** resampler, which keeps the top octave intact going up and
+    filters out what will not fit going down. Matched rates are copied
+    untouched.
+  - Formats are whatever symphonia handles: wav, mp3, flac, ogg, m4a, aac, aiff.
+    A sound that will not decode leaves that layer silent and says so, rather
+    than failing the render.
+
+- **Export** — two buttons on the composition bar, and they are **different
+  verbs** rather than one button with a mode
+  ([0018](decisions/0018-two-render-buttons.md)).
+  - **Draft** asks nothing: the whole comp, **full resolution**, fast encoder
+    settings, written beside the project as `<name>_draft.mp4`. The save icon
+    beside it picks a different destination — Draft still never asks when
+    *pressed*, it just goes somewhere else known. It is cheaper to
+    *encode*, never cheaper to render — a preview that silently halved
+    resolution would be the quickest way to ship the wrong file. It also refuses
+    to write a path a saved preset claims, so a draft can never overwrite a
+    deliverable.
+  - **Master** renders the project's saved **render preset** — name, path,
+    quality, scale and extra ffmpeg flags, stored in the `.pbc` — so two people
+    on one project produce identical files. The first press opens the **system
+    Save dialog** to pick a destination and writes it into the project; every
+    press after that renders straight there. The save icon beside the buttons
+    changes it later, and its tooltip names where Master currently writes — an
+    export whose destination you cannot see is one you find out about by
+    rendering it. A destination inside the project's folder is stored
+    **relative**, so the project and its output folder travel together.
+  - The extension picks the container, exactly as on the command line: `.mp4`
+    is H.264, a `.mov` master is **ProRes**, and a path with no video extension
+    becomes a numbered **PNG sequence**.
+  - **The work area is the render range.** Set one in the timeline and both
+    buttons render exactly it; the bar shows the frame range whenever it is
+    restricted, so a partial render is never a surprise. Clear the work area to
+    go back to the whole comp. Headlessly this is `--start` / `--end`, the same
+    inclusive convention.
+  - A progress bar with **Cancel** replaces the buttons while a job runs. The
+    editor stays live — the job renders a few frames per redraw rather than
+    blocking ([0020](decisions/0020-the-render-job-is-stepped-not-threaded.md))
+    — though its frame rate drops, because the export is sharing the GPU.
+    Cancelling removes the partial video rather than leaving a complete-looking
+    file of the wrong length.
+  - The export renders through **the same vello renderer as the preview**, so
+    what you see is what is written, minus the editor's own furniture (frame
+    border, passepartout, selection, onion skins). Effects included: a blurred
+    layer exports blurred, through the same readback the preview uses.
+  - The same renders are available headlessly:
+    `motion render project.pbc --out film.mp4 --quality master`. The offline
+    renderer uses **every core** (`--threads n` to pin it, `--threads 1` for the
+    sequential path), which is roughly 4.6x at 1080p.

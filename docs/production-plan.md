@@ -8,8 +8,10 @@ close it.
 
 ## 1. Where the project actually is
 
-Measured, not remembered: 37k lines of Rust across four crates, `cargo test
---workspace` green (553 tests: 304 core, 239 live, 10 render).
+Measured, not remembered: ~40k lines of Rust across four crates, `cargo test
+--workspace` green (714 tests: 340 core, 305 live, 61 render, 8 CLI). The render
+and live counts include tests that need a real GPU or a real `ffmpeg`; both skip
+cleanly where those are absent, so a headless CI box sees fewer.
 
 | Area | State |
 | --- | --- |
@@ -19,16 +21,18 @@ Measured, not remembered: 37k lines of Rust across four crates, `cargo test
 | Editor (`live`) | Broad. Dockable panels, timeline + dopesheet + curves, gizmo, pen tool, snapping, guides, onion skins, motion path, layer strips, font picker, undo/redo. |
 | Compositing | Model only. Blend modes, masks, track mattes exist in `Scene` and both backends. No effect stack, no GPU effect passes. |
 | Footage | Import works: stills (incl. HEIC/RAW), video via an `ffmpeg` sidecar, threaded decode cache with a warm frame stream. |
-| **Export** | **Does not exist.** No encoder, no render queue, no PNG sequence. `motion` still writes the 9-frame SVG demo. |
-| **Audio** | **Does not exist.** No decode, no playback, no waveform, no master clock. |
+| Export | Works, from the CLI *and* the GUI. Encoder trait with PNG-sequence and ffmpeg-sidecar impls, a CPU rasterizer for headless renders, an offscreen vello target so the editor exports through its own preview renderer, and the two-button render queue. Gap: the GUI export is GPU-serial (the CLI is frame-parallel). |
+| Audio | Works. Sound layers with animatable level/pan, symphonia decode, a realtime output stream, and the master clock inverted so the picture follows the sound. The CLI muxes a mix into rendered video. Gaps: no waveform, no level/pan controls, no audio from the GUI render buttons. |
 | Effects | Does not exist. `NodeCategory::Effect` is a registry slot with nothing in it. |
 | Motion blur | Does not exist. |
 | Project robustness | No autosave, no crash recovery, no asset relink UI, no "collect files". |
 
 **The honest summary:** PBC is a strong *animation authoring engine* with a
-capable editor on top, and it is **not yet a video tool**, because nothing
-comes out of it. Everything on the roadmap past this point has been engine
-depth; the gap to production is delivery, sound, and the finishing pass.
+capable editor on top, and as of 2026-09-08 **things come out of it** — a `.pbc`
+becomes an mp4, a ProRes master or a PNG sequence, from a button or from the
+command line. The remaining gap to production is **sound**, the **finishing
+pass** (effects), and **not losing work**. Everything on the roadmap before this
+point was engine depth; delivery is no longer the blocker.
 
 ## 2. What "ready to make production videos" requires
 
@@ -82,7 +86,7 @@ The second fix matters more than it looks: the SVG backend is the headless way
 to verify compositing semantics without a GPU, which is what Phase 1's
 preview-equals-export tests will assert against.
 
-### Phase 1 — Export (the unblocker) — *in progress*
+### Phase 1 — Export (the unblocker) — ✅ **done**
 
 The single highest-value change in the project. Nothing else here matters if a
 piece cannot leave the app.
@@ -108,27 +112,163 @@ piece cannot leave the app.
   `--scale`, `--fps`, ffmpeg pass-through, and `--demo` for rendering the
   built-in document on a machine with no project to hand.
 
-**Still ahead in this phase:**
+**Landed 2026-09-08 — the GUI half:**
 
-- **An offscreen vello render target**, so the *editor's* export uses the same
-  rasterizer as its preview and per-pixel parity becomes provable. Belongs where
-  a GPU device already exists.
-- **A render queue in the GUI**, hosting **two buttons** rather than one dialog:
-  **Draft** (no questions, one keystroke) and **Master** (full settings, saved
-  with the project so a team renders identically). The `Quality` model behind
-  them is built and tested; the buttons are a thin call.
-  See [`decisions/0018-two-render-buttons.md`](decisions/0018-two-render-buttons.md).
-- **Named render presets saved in the `.pbc`**, so an export spec travels with
-  the piece instead of living in whoever last opened the dialog.
-- **Frame-parallel rendering.** The loop is single-threaded and cleanly
-  pixel-bound; frames are independent and `evaluate` is pure, so this is the
-  largest easy win available. See [`performance.md`](performance.md).
+- ✅ **An offscreen vello render target** (`live/src/offscreen.rs`). The editor's
+  export renders through **the same vello renderer as the preview**, into a
+  texture instead of a surface, and reads the pixels back. There is no second
+  rasterizer in this path and therefore no parity *question* — the export is the
+  preview, minus the editor's furniture. That last clause is now enforced rather
+  than hoped for: the onion skins, passepartout, frame border and selection
+  outline were four separate arguments to `to_vello` and are now one `Chrome`
+  parameter, of which export passes `Chrome::none()`. The frame border in
+  particular was drawn *unconditionally*, so before this every rendered frame
+  would have carried a 1.5px grey rectangle exactly on the crop.
+- ✅ **A render queue in the GUI** (`live/src/renderqueue.rs`), hosting the two
+  buttons under the composition bar. A job is **stepped from the redraw loop**
+  rather than threaded — the device, the vello renderer and the footage cache all
+  belong to the preview, and the alternatives cost either a second adapter or a
+  lock that freezes the editor anyway. See
+  [`decisions/0020`](decisions/0020-the-render-job-is-stepped-not-threaded.md).
+- ✅ **Named render presets saved in the `.pbc`** (`Project::render_presets`,
+  `#[serde(default)]`, so no migration). Master renders from the project's
+  preset, which is what makes two people on one project produce the same file.
+  The destination is chosen through the **system Save dialog once** and written
+  into the project — asking every time would be the output-module habit 0018
+  declines, and never asking would land a deliverable at a guessed path. A
+  destination under the project's own folder is stored relative so the preset
+  travels.
+- ✅ **Blurred layers export blurred.** The GUI export runs the preview's own
+  `rasterize_effect_layers` readback, because vello has no layer-filter
+  primitive and a blur can only be done by rendering the layer alone, reading it
+  back, filtering and drawing the result in. Skipping it would have dropped
+  every blur from a delivered file *silently* — the frame still renders, still
+  sizes right, and looks broadly correct. Pinned by a pixel test.
+- ✅ **`Encoder::abort`**, which the Cancel button forced into existence:
+  dropping a process-backed encoder closes ffmpeg's stdin, and that is precisely
+  the signal meaning *finalize the container* — so a cancelled render would have
+  produced a complete, playable, wrong-length video with nothing to mark it as
+  partial.
 
+- ✅ **Frame-parallel rendering** in the offline renderer
+  (`render/src/parallel.rs`, `--threads`). Frames render on every core and are
+  reassembled into order before anything is written — an ffmpeg pipe has no
+  notion of frame numbers, so an early frame is not late data, it is wrong data,
+  silently. **4.6x** at 1080p; it stops scaling around eight threads because the
+  writer is serial and PNG compression is a large share of a frame. Verified by
+  rendering the demo at 1 and 12 threads and diffing all 300 frames: byte
+  identical.
+
+- ✅ **The work area reaches the render.** Both buttons render it when one is
+  set — a work area is how you say "this bit", and having Draft respect it while
+  Master ignored it would mean the two buttons rendered different films. The
+  range is shown on the render bar whenever it is restricted, never merely
+  implied by the timeline: a master that is four seconds instead of forty is a
+  mistake nobody catches until they play it. The half-open playback bounds are
+  converted to the inclusive form the renderer and `--start/--end` share, once,
+  at the caller.
+
+- ✅ **Parallel encoding.** Compression moved off the writer thread. An encoder
+  hands out a `Preparer` — a small `Send + Sync` value holding no borrow of the
+  encoder — which does the half of the work that needs only the pixels, on any
+  thread; the encoder keeps only the writing, which is inherently serial because
+  an output file has one cursor. PNG went from 4.3x to **6.0x** and now scales
+  past eight threads. ffmpeg's preparer is a passthrough, since it compresses in
+  its own process.
+
+**Phase 1 is complete.**
 **Done when:** a `.pbc` becomes an `.mp4` and a PNG sequence, from the GUI *and*
 from the command line, and the exported frame equals the preview frame.
-*Half of that is true today: the command line half.*
+**Met.** The remaining known limit is that the *GUI* export is GPU-serial — there
+is one device, shared with the preview — which is a property of that path rather
+than a gap in it.
 
-### Phase 2 — Audio and the master clock
+**Next: Phase 2, audio and the master clock.**
+
+### Phase 2 — Audio and the master clock — *in progress*
+
+**Landed 2026-09-08:**
+
+- ✅ **The document model for sound.** `Node::audio` beside `matte`/`effects`,
+  not a `Shape` variant — a video with a soundtrack is one layer with picture
+  *and* sound, so audio cannot be the thing a layer draws. Level and pan are
+  ordinary `Value<f64>`, so they keyframe and take expressions for free; timing
+  rides the existing `LayerTiming`. Everything is measured in **sample frames**,
+  never samples. Panning is constant-power, so a centred sound sits at √½ and a
+  pan sweep holds its loudness.
+- ✅ **Decoding with symphonia** (`render/src/audio.rs`), in-process rather than
+  through the ffmpeg sidecar that decodes video: playback wants a few
+  milliseconds on a realtime callback and must seek the instant the playhead
+  moves, and spawning a process per seek would be audible. Sounds are decoded
+  whole and held at their native rate; conversion happens on read, with matched
+  rates taking a bit-exact copy path.
+- ✅ **The clock inversion** (`live/src/clock.rs`). A sound card does not run at
+  wall-clock speed — a "48000Hz" device is 48000 ± a few ppm — so a picture on
+  the wall clock drifts off the sound by about a frame every few minutes, and
+  differently on every machine. With sound, the device is now the time source
+  and the frame is derived from the samples it consumed; without it, the wall
+  clock, unchanged.
+- ✅ **The output stream** (`live/src/playback.rs`), allocation-free and
+  lock-free on the callback: an immutable mix snapshot swapped wholesale, read
+  through a `try_lock` held only long enough to clone an `Arc`.
+- ✅ **Export mixes and muxes.** A rendered video carries the comp's sound, as a
+  finished WAV handed to ffmpeg as a second input — two pipes into one process
+  is a deadlock waiting to happen.
+
+Playback was confirmed working on a real device on 2026-09-08 — the one part of
+this phase that could not be verified from a test.
+
+- ✅ **The waveform in the timeline** (`render::Peaks`, drawn by
+  `strips.rs::waveform`). A min/max reduction at a fixed 256-sample-frame
+  resolution, cached per asset in `App::peaks`: fixed rather than per-zoom
+  because a per-zoom reduction is thrown away on every scroll, which is the
+  cost caching exists to avoid. Drawn from the layer's *local* time, using the
+  same `start` conversion `collect_audio` makes, so what you see and what you
+  hear cannot disagree.
+
+- ✅ **Level and pan controls.** They join `PropKind`, which is the whole
+  change: ordinary `Value<f64>`s get a dopesheet row, a curve, a stopwatch and
+  retiming from one variant plus two match arms. The panel edits level linearly
+  with a dB read-out beside it — dB is how loudness is read, linear is what the
+  mixer multiplies by. Mix edits republish the mix; `PropEdits::touches_audio`
+  keeps every other drag from walking the comp for sound nobody changed.
+- ✅ **Audio in the GUI export path.** `renderqueue::mix_soundtrack` writes a
+  temp WAV owned by the `RenderJob`, because ffmpeg reads it for the whole
+  render and the job outlives the call that started it. It reuses the editor's
+  already-decoded `Arc<Sound>`s rather than decoding again — `mix_comp` is now
+  generic over `Borrow<Sound>` so both callers hold sounds the way that suits
+  them. A sound the editor doesn't hold is mixed as silence and **named** on
+  the result chip; the render succeeds, so it is a note, not an error.
+
+- ✅ **Opening a project reloads its sound.** Samples live outside the
+  document, so a loaded `.pbc` arrived with references and nothing to play;
+  `App::reload_sounds` decodes every asset that `has_audio()` and clears the
+  old ones, for the same reason the footage cache is cleared — asset ids are
+  per-project, so the previous project's samples are keyed to ids this one
+  reuses. Synchronous, as import is; a file that will not decode is named and
+  its layer is silent, never a failed load.
+
+- ✅ **Resampling quality.** `Sound::read_into` is a Blackman-windowed sinc
+  (16 taps a side) instead of linear interpolation. The half that is easy to
+  miss: when converting *down*, the cutoff has to follow the **output's**
+  Nyquist, or the resampler faithfully reconstructs frequencies the output grid
+  cannot hold and they fold back as alias tones nothing downstream can remove.
+  Matched rates still take the exact-copy path, so the common case costs
+  nothing. Tested against an analytic sine (upsampling) and an unrepresentable
+  15kHz tone (downsampling).
+
+**Phase 2 is complete as of 2026-09-08.**
+
+**Done when:** a cut can be edited to music and the exported file carries it.
+*Both are true: the waveform makes sync editable, level and pan make the mix
+editable, and Draft, Master and the CLI all carry the sound.*
+
+Left for later, deliberately: the mix is one stereo bus with no meters and no
+solo, and a very long sound is decoded whole into memory (written down in
+`render/src/audio.rs` rather than discovered). Neither blocks editing to
+music, which is what this phase was for.
+
+#### The original plan for this phase
 
 Playback is a wall clock today. Sound forces the correct model, and every timing
 bug is easier to see once something is audible.
@@ -145,10 +285,45 @@ bug is easier to see once something is audible.
 
 **Done when:** a cut can be edited to music and the exported file carries it.
 
-### Phase 3 — Finishing: the compositor stage and effects
+### Phase 3 — Finishing: the compositor stage and effects — *in progress*
 
 The subsystem the README already identifies as shared by effects, keying,
 masking and 2.5D placement. Build it once, now that its clients are real.
+
+**Landed 2026-09-08:**
+
+- ✅ **Effects render in every backend.** The pixel maths moved from
+  `live/src/fx.rs` to `render/src/fx.rs`, where both rasterizers reach it, and
+  the CPU backend applies a layer's stack in `draw_group` — after the mask,
+  before blend and opacity, the same order the editor's readback compositor
+  uses. Before this, `motion render` drew every effect layer plain, which is
+  the "same in the preview and the export" clause failing silently. The SVG
+  backend still cannot express an effect and now *reports* one.
+- ✅ **Effect parameters keyframe.** `PropKind::Effect { index, param }` —
+  indexed and discovered per node like `PathPoint` — gives every parameter a
+  stopwatch, a dopesheet row, a curve, retiming and copy/paste, with no
+  effect-specific keyframe machinery. The layout is stated once in
+  `effect_params`, read by the panel, the dopesheet and `prop_kinds_of`.
+- ✅ **Levels and drop shadow**, the first two additions from the list below.
+  The shadow is the interesting one: it *looks* like it breaks the
+  same-bounds seam, and does not, because a layer's isolated target is the
+  whole canvas in both rasterizers — the shadow has somewhere to fall for the
+  same reason a blur's halo does.
+
+**Still ahead in this phase — start here:**
+
+1. **The rest of the first effect set:** glow, colour balance, chroma key.
+   Chroma key is the odd one — it writes *alpha* rather than colour, so it is
+   the first effect the in-scene colour fast path cannot approximate at all.
+2. **Effects as registry descriptors.** `registry.rs` still has its
+   `NodeCategory::Effect` stub. Routing the built-ins through the same seam a
+   plugin would is the plugin-shaped-now decision being cashed in, and it is
+   the point at which the panel stops matching on `EffectKind` by hand.
+3. **Motion blur.** Sub-frame sampling of `evaluate`, accumulated in the
+   compositor; gated per comp and per layer like AE's.
+4. **Known compositor gaps** (from the readback work): a blur inside a blur
+   loses the inner one, and a colour effect on a group *containing* a blurred
+   layer does not reach the blurred image.
 
 - Each isolated layer renders to its own offscreen target; an ordered stack of
   wgpu passes processes it; the result composites into the parent with blend,
@@ -409,8 +584,9 @@ we intend to hand over.
 
 ## 6. The one-line version
 
-The engine is ready. The **frame-count and matte-parity** gaps are closed; next
-is **export**, then **audio**, the **compositor and effects**, and **autosave and relink**
-— and stop adding engine depth until a finished video can leave the
-application. Extensibility (§4) costs nothing today but discipline: keep every
-built-in going through the registry, and every edit through an op.
+The engine is ready, **export works from both the CLI and the GUI**, and
+**sound plays and exports**. What is left in Phase 2 is making a mix *editable*
+— a waveform and level controls — then the **compositor and effects**, then
+**autosave and relink**. Still no new engine depth until those land.
+Extensibility (§4) costs nothing today but discipline: keep every built-in going
+through the registry, and every edit through an op.

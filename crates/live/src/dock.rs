@@ -604,9 +604,29 @@ pub(crate) struct CameraBar {
     pub(crate) rot: (f64, f64, f64),
 }
 
+/// The render bar's inputs and its reported intent, bundled so the composition
+/// bar takes one more parameter rather than three.
+///
+/// It rides on `comp_ui` because the render controls must share the comp bar's
+/// **single row** — see [`crate::renderqueue::render_ui`] for why a second row
+/// is not available here.
+pub(crate) struct RenderBar<'a> {
+    pub(crate) active: Option<&'a crate::renderqueue::RenderProgress>,
+    pub(crate) last: Option<&'a crate::renderqueue::RenderSummary>,
+    /// Where Draft currently writes, for its output button's tooltip.
+    pub(crate) draft_out: &'a str,
+    /// Where Master currently writes, for its output button's tooltip.
+    pub(crate) master_out: Option<&'a str>,
+    /// The work area as an inclusive frame range, when one is set — what both
+    /// buttons will render.
+    pub(crate) range: Option<(i64, i64)>,
+    pub(crate) out: &'a mut crate::renderqueue::RenderEdits,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn comp_ui(
     ui: &mut egui::Ui,
+    render: RenderBar<'_>,
     width: f64,
     height: f64,
     fps: f64,
@@ -877,5 +897,18 @@ pub(crate) fn comp_ui(
                 }
             });
         });
+
+        // The render controls, on this same row. An export belongs to the comp
+        // you are looking at, and Draft has to be one click from it.
+        ui.separator();
+        crate::renderqueue::render_ui(
+            ui,
+            render.active,
+            render.last,
+            render.draft_out,
+            render.master_out,
+            render.range,
+            render.out,
+        );
     });
 }

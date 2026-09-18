@@ -133,6 +133,8 @@ pub(crate) struct TreeEdits {
     /// because the dialog is blocking and must not run during the UI pass —
     /// same discipline as save/load.
     pub(crate) import_footage: bool,
+    /// Import a sound file as a layer.
+    pub(crate) import_audio: bool,
     pub(crate) delete: Option<NodeId>,
     pub(crate) save: bool,
     pub(crate) load: bool,
@@ -180,6 +182,11 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
         if icon::button(ui, icon::IMPORT, "Import footage (image or video)").clicked() {
             out.import_footage = true;
+        }
+        // A word rather than an icon: the subset has no speaker glyph, and
+        // adding one needs a font regeneration. Same call the pen tool makes.
+        if ui.button("Audio").on_hover_text("Import a sound file as a layer").clicked() {
+            out.import_audio = true;
         }
     });
     ui.weak("Adds into the selected node, else the root.");

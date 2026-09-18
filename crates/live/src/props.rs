@@ -79,6 +79,8 @@ pub(crate) struct NodeInfo {
     pub(crate) radius_anim: bool,
     pub(crate) stroke_color_anim: bool,
     pub(crate) stroke_width_anim: bool,
+    /// The layer's sound, `Some` only when it carries one.
+    pub(crate) audio: Option<AudioInfo>,
     /// Text-layer fields, `Some` only for a `Shape::Text`.
     pub(crate) text: Option<TextInfo>,
     /// The **knobs** this layer exposes — named values a `param` node in the
@@ -107,10 +109,22 @@ pub(crate) struct NodeInfo {
     /// The layer's effect stack, top to bottom in application order — resolved
     /// for display and paired with which parameters to edit.
     pub(crate) effects: Vec<EffectInfo>,
-    /// The stack contains an effect the in-scene fast path can't show yet (a
-    /// blur), so the preview under-represents it. Surfaced as a note rather than
-    /// silently drawing the wrong thing.
-    pub(crate) effects_preview_gap: bool,
+}
+
+/// A sound layer's mix, resolved for this frame.
+///
+/// Level stays **linear** all the way to the panel, because linear is what the
+/// mixer multiplies by and what the keyframes interpolate — the dB figure is a
+/// read-out computed for the eye, never a value anything stores. Converting on
+/// the way in would make a fade between two keys curve differently from the
+/// same keys on any other property.
+pub(crate) struct AudioInfo {
+    pub(crate) level: f64,
+    pub(crate) pan: f64,
+    /// Muted layers keep their settings and contribute nothing.
+    pub(crate) enabled: bool,
+    pub(crate) level_anim: bool,
+    pub(crate) pan_anim: bool,
 }
 
 /// One row of the properties panel's effect stack: what the effect is, whether
@@ -120,14 +134,26 @@ pub(crate) struct EffectInfo {
     pub(crate) enabled: bool,
     /// Numeric parameters in editing order, each tagged with which parameter it
     /// is so an edit routes back to the right `Value`.
-    pub(crate) nums: Vec<(EffectParam, f64)>,
+    pub(crate) nums: Vec<EffectNum>,
     /// The tint colour, `Some` only for a `Tint` effect.
     pub(crate) color: Option<[f32; 3]>,
 }
 
+/// One numeric effect parameter as the panel shows it: which one, its value on
+/// this frame, and whether it is already a track (so the stopwatch can say so).
+pub(crate) struct EffectNum {
+    pub(crate) param: EffectParam,
+    pub(crate) value: f64,
+    pub(crate) anim: bool,
+}
+
 /// Names one editable numeric parameter of an effect, so a `DragValue` edit can
 /// say which `Value` it changed without the panel knowing the effect's layout.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered and hashable because it rides inside [`PropKind::Effect`], which is
+/// the key of a `BTreeSet` — declaration order there decides dopesheet row
+/// order, so it decides this enum's too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum EffectParam {
     BlurRadius,
     Brightness,
@@ -136,6 +162,15 @@ pub(crate) enum EffectParam {
     Saturation,
     Lightness,
     TintAmount,
+    InBlack,
+    InWhite,
+    Gamma,
+    OutBlack,
+    OutWhite,
+    ShadowX,
+    ShadowY,
+    ShadowRadius,
+    ShadowOpacity,
 }
 
 impl EffectParam {
@@ -148,6 +183,15 @@ impl EffectParam {
             EffectParam::Saturation => "Saturation",
             EffectParam::Lightness => "Lightness",
             EffectParam::TintAmount => "Amount",
+            EffectParam::InBlack => "In Black",
+            EffectParam::InWhite => "In White",
+            EffectParam::Gamma => "Gamma",
+            EffectParam::OutBlack => "Out Black",
+            EffectParam::OutWhite => "Out White",
+            EffectParam::ShadowX => "Offset X",
+            EffectParam::ShadowY => "Offset Y",
+            EffectParam::ShadowRadius => "Softness",
+            EffectParam::ShadowOpacity => "Opacity",
         }
     }
 }
@@ -158,21 +202,93 @@ impl EffectParam {
 pub(crate) fn effect_nums(
     kind: &motion_core::EffectKind,
     ctx: &mut EvalCtx,
-) -> Vec<(EffectParam, f64)> {
+) -> Vec<EffectNum> {
+    effect_params(kind)
+        .into_iter()
+        .filter_map(|param| {
+            let value = effect_value(kind, param)?;
+            Some(EffectNum { param, value: value.resolve(ctx), anim: value.is_animated() })
+        })
+        .collect()
+}
+
+/// Which numeric parameters an effect kind has, in editing order.
+///
+/// **The** layout, in one place: the panel's rows, the dopesheet's rows and
+/// `prop_kinds_of` all read it, so none of them can disagree about what an
+/// effect exposes. Adding a parameter to an effect is this list plus an arm in
+/// [`effect_value`] and [`effect_value_mut`].
+pub(crate) fn effect_params(kind: &motion_core::EffectKind) -> Vec<EffectParam> {
     use motion_core::EffectKind as K;
+    use EffectParam as P;
     match kind {
-        K::GaussianBlur { radius } => vec![(EffectParam::BlurRadius, radius.resolve(ctx))],
-        K::BrightnessContrast { brightness, contrast } => vec![
-            (EffectParam::Brightness, brightness.resolve(ctx)),
-            (EffectParam::Contrast, contrast.resolve(ctx)),
-        ],
-        K::HueSaturation { hue, saturation, lightness } => vec![
-            (EffectParam::Hue, hue.resolve(ctx)),
-            (EffectParam::Saturation, saturation.resolve(ctx)),
-            (EffectParam::Lightness, lightness.resolve(ctx)),
-        ],
-        K::Tint { amount, .. } => vec![(EffectParam::TintAmount, amount.resolve(ctx))],
+        K::GaussianBlur { .. } => vec![P::BlurRadius],
+        K::BrightnessContrast { .. } => vec![P::Brightness, P::Contrast],
+        K::HueSaturation { .. } => vec![P::Hue, P::Saturation, P::Lightness],
+        K::Tint { .. } => vec![P::TintAmount],
+        K::Levels { .. } => vec![P::InBlack, P::InWhite, P::Gamma, P::OutBlack, P::OutWhite],
+        K::DropShadow { .. } => {
+            vec![P::ShadowX, P::ShadowY, P::ShadowRadius, P::ShadowOpacity]
+        }
     }
+}
+
+/// One effect parameter of one kind, or `None` if that kind has no such
+/// parameter — a stale panel index asking a blur for its hue.
+pub(crate) fn effect_value<'a>(
+    kind: &'a motion_core::EffectKind,
+    param: EffectParam,
+) -> Option<&'a Value<f64>> {
+    use motion_core::EffectKind as K;
+    use EffectParam as P;
+    Some(match (kind, param) {
+        (K::GaussianBlur { radius }, P::BlurRadius) => radius,
+        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness,
+        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast,
+        (K::HueSaturation { hue, .. }, P::Hue) => hue,
+        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
+        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
+        (K::Tint { amount, .. }, P::TintAmount) => amount,
+        (K::Levels { in_black, .. }, P::InBlack) => in_black,
+        (K::Levels { in_white, .. }, P::InWhite) => in_white,
+        (K::Levels { gamma, .. }, P::Gamma) => gamma,
+        (K::Levels { out_black, .. }, P::OutBlack) => out_black,
+        (K::Levels { out_white, .. }, P::OutWhite) => out_white,
+        (K::DropShadow { offset_x, .. }, P::ShadowX) => offset_x,
+        (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
+        (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
+        (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
+        _ => return None,
+    })
+}
+
+/// Mutable twin of [`effect_value`]. Adjacent on purpose, like
+/// `prop_of`/`prop_of_mut`: the two are only correct read together.
+pub(crate) fn effect_value_mut<'a>(
+    kind: &'a mut motion_core::EffectKind,
+    param: EffectParam,
+) -> Option<&'a mut Value<f64>> {
+    use motion_core::EffectKind as K;
+    use EffectParam as P;
+    Some(match (kind, param) {
+        (K::GaussianBlur { radius }, P::BlurRadius) => radius,
+        (K::BrightnessContrast { brightness, .. }, P::Brightness) => brightness,
+        (K::BrightnessContrast { contrast, .. }, P::Contrast) => contrast,
+        (K::HueSaturation { hue, .. }, P::Hue) => hue,
+        (K::HueSaturation { saturation, .. }, P::Saturation) => saturation,
+        (K::HueSaturation { lightness, .. }, P::Lightness) => lightness,
+        (K::Tint { amount, .. }, P::TintAmount) => amount,
+        (K::Levels { in_black, .. }, P::InBlack) => in_black,
+        (K::Levels { in_white, .. }, P::InWhite) => in_white,
+        (K::Levels { gamma, .. }, P::Gamma) => gamma,
+        (K::Levels { out_black, .. }, P::OutBlack) => out_black,
+        (K::Levels { out_white, .. }, P::OutWhite) => out_white,
+        (K::DropShadow { offset_x, .. }, P::ShadowX) => offset_x,
+        (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
+        (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
+        (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
+        _ => return None,
+    })
 }
 
 /// The text-specific half of a selected node. `content` and `size` are `Value`s
@@ -335,6 +451,29 @@ pub(crate) fn is_anim(node: &MNode, kind: PropKind) -> bool {
     prop_of(node, kind).is_some_and(|p| p.is_animated())
 }
 
+/// A linear gain as decibels, for reading.
+///
+/// Silence is `-inf dB`, spelled out rather than shown as a very negative
+/// number: the fader is *off*, which is a different statement from "quiet".
+pub(crate) fn db_label(level: f64) -> String {
+    if level <= 0.0 {
+        return "-inf dB".into();
+    }
+    format!("{:+.1} dB", 20.0 * level.log10())
+}
+
+/// A pan position as a side and a percentage — "L40" reads faster than
+/// "-0.40", and centre is the one position worth naming outright.
+pub(crate) fn pan_label(pan: f64) -> String {
+    let p = pan.clamp(-1.0, 1.0);
+    let pct = (p.abs() * 100.0).round() as i64;
+    match pct {
+        0 => "centre".into(),
+        _ if p < 0.0 => format!("L{pct}"),
+        _ => format!("R{pct}"),
+    }
+}
+
 impl NodeInfo {
     /// Resolve against a comp with no footage registry — every image layer
     /// then reads as missing, which is honest for a bare comp.
@@ -427,6 +566,13 @@ impl NodeInfo {
             radius_anim: is_anim(node, PropKind::ShapeRadius),
             stroke_color_anim: is_anim(node, PropKind::StrokeColor),
             stroke_width_anim: is_anim(node, PropKind::StrokeWidth),
+            audio: node.audio.as_ref().map(|a| AudioInfo {
+                level: a.level.resolve(ctx),
+                pan: a.pan.resolve(ctx),
+                enabled: a.enabled,
+                level_anim: a.level.is_animated(),
+                pan_anim: a.pan.is_animated(),
+            }),
             text: match node.shape.as_ref() {
                 Some(MShape::Text { content, family, size, align, max_width }) => Some(TextInfo {
                     content: content.resolve(ctx),
@@ -459,7 +605,8 @@ impl NodeInfo {
                     enabled: ef.enabled,
                     nums: effect_nums(&ef.kind, ctx),
                     color: match &ef.kind {
-                        motion_core::EffectKind::Tint { color, .. } => {
+                        motion_core::EffectKind::Tint { color, .. }
+                        | motion_core::EffectKind::DropShadow { color, .. } => {
                             let c = color.resolve(ctx);
                             Some([c.r as f32, c.g as f32, c.b as f32])
                         }
@@ -467,11 +614,6 @@ impl NodeInfo {
                     },
                 })
                 .collect(),
-            effects_preview_gap: {
-                let resolved: Vec<_> =
-                    node.effects.iter().filter_map(|e| e.resolve(ctx)).collect();
-                crate::fx::needs_readback(&resolved)
-            },
         }
     }
 }
@@ -532,6 +674,10 @@ pub(crate) struct PropEdits {
     pub(crate) scale_z: Option<f64>,
     pub(crate) opacity: Option<f64>,
     pub(crate) blend: Option<MBlendMode>,
+    /// Mix edits, meaningful only on a layer that carries sound.
+    pub(crate) audio_level: Option<f64>,
+    pub(crate) audio_pan: Option<f64>,
+    pub(crate) audio_enabled: Option<bool>,
     /// Turn a group into a compound path, pick its boolean op, or (`Some(None)`)
     /// make it an ordinary group again.
     #[allow(clippy::option_option)]
@@ -587,6 +733,21 @@ pub(crate) struct PropEdits {
     /// controls are discrete (a click adds/removes/reorders, a drag edits one
     /// parameter), so a single slot is enough and mirrors `set_compound`.
     pub(crate) effect: Option<EffectOp>,
+}
+
+impl PropEdits {
+    /// Whether these edits change what should be *heard*.
+    ///
+    /// Includes a stopwatch click: keying a level writes the current value into
+    /// a track, which is a change to the mix even though the number is the same
+    /// this frame.
+    pub(crate) fn touches_audio(&self) -> bool {
+        self.audio_level.is_some()
+            || self.audio_pan.is_some()
+            || self.audio_enabled.is_some()
+            || self.key.contains(&PropKind::AudioLevel)
+            || self.key.contains(&PropKind::AudioPan)
+    }
 }
 
 /// A single change to a layer's effect stack, reported by the panel and applied
@@ -1199,6 +1360,49 @@ pub(crate) fn properties_ui(
             ui.end_row();
         }
 
+        // --- Sound. Only on a layer that carries some: a shape layer showing a
+        // greyed-out volume slider would advertise a mix it can never have.
+        // Level is edited linearly, with the dB figure alongside as a read-out
+        // — dB is how loudness is *read*, linear is what the mixer multiplies
+        // by and what the keyframes interpolate. ---
+        if let Some(a) = &n.audio {
+            ui.label("Audio");
+            let mut on = a.enabled;
+            if ui.checkbox(&mut on, "audible").changed() {
+                edits.audio_enabled = Some(on);
+            }
+            ui.end_row();
+
+            ui.label("Level");
+            ui.horizontal(|ui| {
+                let mut level = a.level;
+                // Up to +6dB, not just unity: a quiet source needs lifting as
+                // often as a loud one needs taming, and a slider that stops at
+                // 1.0 makes that a keyframe-only operation.
+                if ui.add(egui::Slider::new(&mut level, 0.0..=2.0).show_value(false)).changed() {
+                    edits.audio_level = Some(level);
+                }
+                ui.weak(db_label(a.level));
+            });
+            if key_button(ui, a.level_anim) {
+                edits.key.insert(PropKind::AudioLevel);
+            }
+            ui.end_row();
+
+            ui.label("Pan");
+            ui.horizontal(|ui| {
+                let mut pan = a.pan;
+                if ui.add(egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false)).changed() {
+                    edits.audio_pan = Some(pan);
+                }
+                ui.weak(pan_label(a.pan));
+            });
+            if key_button(ui, a.pan_anim) {
+                edits.key.insert(PropKind::AudioPan);
+            }
+            ui.end_row();
+        }
+
         // --- Effects. An ordered stack of pixel operations on the layer's
         // finished, isolated image. Sits with the compositing controls because
         // it is one: a non-empty stack isolates the layer exactly as a blend
@@ -1243,15 +1447,28 @@ pub(crate) fn properties_ui(
             });
             ui.end_row();
 
-            // Parameter rows, indented under the effect they belong to.
-            for &(param, value) in &ef.nums {
+            // Parameter rows, indented under the effect they belong to. Each
+            // gets a stopwatch, so an effect animates through the same gesture
+            // every other property uses.
+            for num in &ef.nums {
+                let param = num.param;
                 ui.label(format!("  {}", param.label()));
-                let mut v = value;
-                let speed = if param == EffectParam::BlurRadius { 0.5 } else { 0.01 };
+                let mut v = num.value;
+                // Pixel distances drag coarsely, `0..1` amounts finely — a
+                // 0.01/frame offset would take a minute to move a shadow.
+                let speed = match param {
+                    EffectParam::BlurRadius
+                    | EffectParam::ShadowRadius
+                    | EffectParam::ShadowX
+                    | EffectParam::ShadowY => 0.5,
+                    _ => 0.01,
+                };
                 if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {
                     edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
                 }
-                ui.label("");
+                if key_button(ui, num.anim) {
+                    edits.key.insert(PropKind::Effect { index: i, param });
+                }
                 ui.end_row();
             }
             if let Some(rgb) = ef.color {
@@ -1263,12 +1480,6 @@ pub(crate) fn properties_ui(
                 ui.label("");
                 ui.end_row();
             }
-        }
-        if n.effects_preview_gap {
-            ui.label("");
-            ui.colored_label(WARN_COLOR, "blur not shown in preview yet")
-                .on_hover_text("Colour effects preview live; blur needs the full-image compositor, still being built.");
-            ui.end_row();
         }
 
         // --- Footage. The source is a read-only fact about a file; the only
@@ -1467,6 +1678,21 @@ pub(crate) enum PropKind {
     TextContent,
     TimeRemap,
     MaskSize,
+    /// A sound layer's mix. Ordinary `Value<f64>`s, so putting them here is all
+    /// it takes to give them a dopesheet row, a curve, retiming, copy/paste and
+    /// a stopwatch — the machinery does not care that what they move is
+    /// loudness rather than geometry.
+    AudioLevel,
+    AudioPan,
+    /// One numeric parameter of one effect in the layer's stack. **Indexed**
+    /// like [`PropKind::PathPoint`], and discovered per node by
+    /// [`prop_kinds_of`], because a stack's shape is data rather than a fixed
+    /// set — a layer has as many as it has effects.
+    ///
+    /// This is what cashes in "every parameter is a `Value<T>`, so animation
+    /// comes along at no cost": with it, a blur radius keyframes, plots and
+    /// retimes through exactly the machinery a position does.
+    Effect { index: usize, param: EffectParam },
     /// One control point of a vector path anchor. **Indexed**, so unlike every
     /// variant above it is not a fixed member of `ALL` — a path has as many as it
     /// has anchors, discovered per node by [`prop_kinds_of`]. It sorts last (after
@@ -1478,7 +1704,7 @@ pub(crate) enum PropKind {
 impl PropKind {
     /// The **fixed** animatable properties, in row order. Path points are dynamic
     /// and are appended per node by [`prop_kinds_of`], never listed here.
-    pub(crate) const ALL: [PropKind; 14] = [
+    pub(crate) const ALL: [PropKind; 16] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -1493,6 +1719,8 @@ impl PropKind {
         PropKind::TextContent,
         PropKind::TimeRemap,
         PropKind::MaskSize,
+        PropKind::AudioLevel,
+        PropKind::AudioPan,
     ];
 
     /// Row label. A [`std::borrow::Cow`] because a path point's label carries its
@@ -1501,6 +1729,11 @@ impl PropKind {
         use std::borrow::Cow;
         if let PropKind::PathPoint { index, part } = self {
             return Cow::Owned(format!("P{}{}", index + 1, part.suffix()));
+        }
+        // The stack position is part of the name: two blurs on one layer have
+        // the same parameter names and are not the same row.
+        if let PropKind::Effect { index, param } = self {
+            return Cow::Owned(format!("FX{} {}", index + 1, param.label()));
         }
         Cow::Borrowed(self.fixed_label())
     }
@@ -1523,8 +1756,11 @@ impl PropKind {
             PropKind::TextContent => "Content",
             PropKind::TimeRemap => "Time Remap",
             PropKind::MaskSize => "Mask Size",
-            // Intercepted by `label` before this is reached.
+            PropKind::AudioLevel => "Level",
+            PropKind::AudioPan => "Pan",
+            // Intercepted by `label` before these are reached.
             PropKind::PathPoint { .. } => "Path Point",
+            PropKind::Effect { .. } => "Effect",
         }
     }
 
@@ -1847,6 +2083,11 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRef::Vec2(size),
             _ => return None,
         },
+        // Only a layer that carries sound has these — the same shape as
+        // `Fill`, and what keeps level and pan out of a shape layer's
+        // dopesheet.
+        PropKind::AudioLevel => PropRef::Num(&node.audio.as_ref()?.level),
+        PropKind::AudioPan => PropRef::Num(&node.audio.as_ref()?.pan),
         PropKind::ShapeRadius => match node.shape.as_ref()? {
             MShape::Rect { radius, .. } => PropRef::Num(radius),
             _ => return None,
@@ -1859,6 +2100,11 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { content, .. } => PropRef::Str(content),
             _ => return None,
         },
+        // An effect parameter. A plain `Value<f64>`, so it keyframes and plots
+        // like an opacity — the effect stack needs no machinery of its own.
+        PropKind::Effect { index, param } => {
+            PropRef::Num(effect_value(&node.effects.get(index)?.kind, param)?)
+        }
         // One control point of a vector path — a plain `Value<Vec2>`, so it
         // keyframes, retimes, and plots (as X/Y) exactly like a shape's size.
         PropKind::PathPoint { index, part } => match node.shape.as_ref()? {
@@ -1877,6 +2123,11 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
 /// for a dozen empty ones.
 pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
     let mut kinds: Vec<PropKind> = PropKind::ALL.to_vec();
+    for (index, effect) in node.effects.iter().enumerate() {
+        for param in effect_params(&effect.kind) {
+            kinds.push(PropKind::Effect { index, param });
+        }
+    }
     if let Some(MShape::Vector { path }) = &node.shape {
         for index in 0..path.anchors.len() {
             for part in PathPart::ALL {
@@ -1914,6 +2165,8 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             MShape::Rect { size, .. } | MShape::Ellipse { size } => PropRefMut::Vec2(size),
             _ => return None,
         },
+        PropKind::AudioLevel => PropRefMut::Num(&mut node.audio.as_mut()?.level),
+        PropKind::AudioPan => PropRefMut::Num(&mut node.audio.as_mut()?.pan),
         PropKind::ShapeRadius => match node.shape.as_mut()? {
             MShape::Rect { radius, .. } => PropRefMut::Num(radius),
             _ => return None,
@@ -1922,6 +2175,9 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             MShape::Text { size, .. } => PropRefMut::Num(size),
             _ => return None,
         },
+        PropKind::Effect { index, param } => {
+            PropRefMut::Num(effect_value_mut(&mut node.effects.get_mut(index)?.kind, param)?)
+        }
         PropKind::PathPoint { index, part } => match node.shape.as_mut()? {
             MShape::Vector { path } => PropRefMut::Vec2(path.value_mut(index, part)?),
             _ => return None,

@@ -26,8 +26,8 @@ use std::process::ExitCode;
 
 use motion_core::{demo::demo_document, evaluate_comp, Color, CompId, Project};
 use motion_render::{
-    output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder, OutputSpec,
-    PngSequence, Quality,
+    is_video_container, output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder,
+    OutputSpec, PngSequence, Quality,
 };
 
 const USAGE: &str = "\
@@ -58,6 +58,10 @@ RENDER OPTIONS:
   --demo             Render the built-in demo document instead of a file.
                      The way to check that rendering works on a machine with
                      no project to hand.
+  --threads <n>      Render this many frames at once. Default: one per core.
+                     Frames are independent and evaluation is pure, so this
+                     scales close to linearly; `--threads 1` is the sequential
+                     path, for comparing against or debugging.
   -q, --quiet        Only report errors.
 
   motion demo        Writes the built-in demo document as SVG frames to ./out,
@@ -102,6 +106,8 @@ struct Opts {
     fps: Option<f64>,
     ffmpeg_args: Vec<String>,
     quality: Quality,
+    /// Worker threads for the render loop. `None` means one per core.
+    threads: Option<usize>,
     quiet: bool,
     demo: bool,
 }
@@ -119,6 +125,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         fps: None,
         ffmpeg_args: Vec::new(),
         quality: Quality::default(),
+        threads: None,
         quiet: false,
         demo: false,
     };
@@ -150,6 +157,15 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                     .ok_or_else(|| format!("--quality wants draft or master, not '{v}'"))?;
             }
             "--demo" => o.demo = true,
+            "--threads" => {
+                let n: usize = value("--threads")?
+                    .parse()
+                    .map_err(|_| "--threads wants a count")?;
+                if n == 0 {
+                    return Err("--threads wants at least 1".to_string());
+                }
+                o.threads = Some(n);
+            }
             "-q" | "--quiet" => o.quiet = true,
             other if other.starts_with('-') => return Err(format!("unknown option '{other}'")),
             other => positional = Some(PathBuf::from(other)),
@@ -169,14 +185,94 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// Whether the output path names a video container. Extension-driven, because
-/// deciding for the user is how you end up owning a codec table.
-fn is_video(path: &Path) -> bool {
-    const VIDEO: [&str; 8] = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "mxf", "gif"];
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| VIDEO.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+/// A mixed soundtrack on disk, deleted when it drops.
+///
+/// The file only has to outlive the ffmpeg process reading it, and tying that
+/// to a value's lifetime is more reliable than remembering to unlink it on
+/// every exit path — including the error ones.
+struct TempAudio(PathBuf);
+
+impl TempAudio {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempAudio {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Whether this comp has anything to hear.
+fn project_has_audio(project: &Project, comp: CompId) -> bool {
+    !motion_core::evaluate_audio(project, comp, 0.0, 48_000).is_empty()
+}
+
+/// Decode the comp's sounds, mix the frame range, and write it as a WAV.
+///
+/// `None` when the comp is silent, which is the ordinary case and must not cost
+/// an empty audio stream in the output.
+fn mix_soundtrack(
+    project: &Project,
+    comp: CompId,
+    start: i64,
+    end: i64,
+    o: &Opts,
+) -> Result<Option<TempAudio>, String> {
+    if !project_has_audio(project, comp) {
+        return Ok(None);
+    }
+    // 48kHz regardless of what the sources are: the mix has to land on one
+    // grid, and picking the highest common broadcast rate means a 44.1kHz
+    // source is resampled up rather than everything else being dragged down.
+    const RATE: u32 = 48_000;
+
+    let mut sounds = std::collections::HashMap::new();
+    for asset in project.assets.values().filter(|a| a.has_audio()) {
+        match motion_render::decode_sound(&asset.path) {
+            Ok(sound) => {
+                sounds.insert(asset.id, sound);
+            }
+            // A sound that will not decode is reported and skipped, exactly as
+            // unrenderable footage is: a render that fails outright because one
+            // layer's file moved is worse than one that says so.
+            Err(e) => {
+                if !o.quiet {
+                    eprintln!("note: {}: {e}", asset.path.display());
+                }
+            }
+        }
+    }
+
+    // A layer that names a sound nobody could decode is reported, not silently
+    // mixed as silence. Without this an export whose asset had moved produced a
+    // perfectly valid file with an empty audio stream and nothing to say why —
+    // the same class of failure as footage being dropped from a render, and the
+    // same answer: say so.
+    if !o.quiet {
+        let sources = motion_core::evaluate_audio(project, comp, start as f64, RATE);
+        let mut missing: Vec<u64> =
+            sources.iter().filter(|s| !sounds.contains_key(&s.asset)).map(|s| s.asset.0).collect();
+        missing.sort_unstable();
+        missing.dedup();
+        for id in missing {
+            let name = project
+                .asset(motion_core::AssetId(id))
+                .map(|a| a.path.display().to_string())
+                .unwrap_or_else(|| format!("asset {id}"));
+            eprintln!("note: {name} could not be read; that layer is silent");
+        }
+    }
+
+    let mix = motion_render::mix_comp(project, comp, start, end, RATE, &sounds);
+    if mix.is_empty() {
+        return Ok(None);
+    }
+    let path = std::env::temp_dir().join(format!("pbc_mix_{}.wav", std::process::id()));
+    motion_render::write_wav(&path, &mix, RATE)
+        .map_err(|e| format!("writing the mixed soundtrack: {e}"))?;
+    Ok(Some(TempAudio(path)))
 }
 
 fn render(args: &[String]) -> Result<(), String> {
@@ -207,12 +303,33 @@ fn render(args: &[String]) -> Result<(), String> {
     let (w, h) = output_size(comp.width, comp.height, o.scale);
     let spec = OutputSpec { width: w, height: h, fps: o.fps.unwrap_or(comp.fps) };
 
-    let mut encoder: Box<dyn Encoder> = if is_video(&o.out) {
+    // The soundtrack, mixed and written before the first frame is rendered.
+    //
+    // Ahead of the video rather than alongside it because ffmpeg reads it as a
+    // file: two pipes into one process is a deadlock waiting to happen, since
+    // the writer must keep both fed. Kept alive in `_audio_temp` — a
+    // `TempAudio` deletes the file when it drops, and it must outlive the
+    // encoder that is reading it.
+    let audio_temp = if is_video_container(&o.out) {
+        mix_soundtrack(&project, comp_id, start, end, &o)?
+    } else {
+        // A PNG sequence has nowhere to put sound. Silently mixing it would
+        // waste the work; silently *not* mentioning it would be worse.
+        if project_has_audio(&project, comp_id) && !o.quiet {
+            eprintln!("note: a PNG sequence carries no audio; the comp's sound is not exported");
+        }
+        None
+    };
+
+    let mut encoder: Box<dyn Encoder> = if is_video_container(&o.out) {
         // The preset first, the user's own arguments after it, so `--arg` can
         // override anything the preset chose rather than fighting it.
         let mut args = o.quality.ffmpeg_args(&o.out);
         args.extend(o.ffmpeg_args.iter().cloned());
-        Box::new(FfmpegEncoder::new(&o.out, spec, &args).map_err(|e| e.to_string())?)
+        Box::new(
+            FfmpegEncoder::with_audio(&o.out, spec, &args, audio_temp.as_ref().map(|t| t.path()))
+                .map_err(|e| e.to_string())?,
+        )
     } else {
         let stem = o
             .project
@@ -242,27 +359,64 @@ fn render(args: &[String]) -> Result<(), String> {
     let mut notes: std::collections::BTreeMap<String, usize> = Default::default();
     let started = std::time::Instant::now();
 
-    for frame in start..=end {
+    let threads = o.threads.unwrap_or_else(motion_render::default_threads);
+
+    // Frames are rendered in parallel and written in order. The two halves are
+    // split precisely along what is pure: `evaluate` + `rasterize` take only
+    // the project and a frame number and are called from many threads, while
+    // the encoder — a pipe with no notion of frame numbers — stays on this one.
+    // The encoder's off-thread half, taken once. It borrows nothing from the
+    // encoder, which is what lets a worker compress a frame while the writer
+    // still holds the encoder mutably.
+    let preparer = encoder.preparer();
+
+    let render_frame = |frame: i64| {
         let scene = evaluate_comp(&project, comp_id, frame as f64);
-        for (id, msg) in &scene.warnings {
-            *notes.entry(format!("node {}: {msg}", id.0)).or_default() += 1;
-        }
+        // Warnings are collected per frame and merged by the writer rather than
+        // shared through a lock: the map would be contended on every frame to
+        // record something that is nearly always identical across all of them.
+        let warnings: Vec<String> =
+            scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)).collect();
         let (pixels, report) =
             rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)
                 .map_err(|e| e.to_string())?;
-        for note in report {
-            *notes.entry(note).or_default() += 1;
-        }
-        encoder.push(&pixels).map_err(|e| e.to_string())?;
-        if !o.quiet && (frame - start) % 25 == 0 {
-            eprint!("\r  frame {frame}/{end}");
-        }
+        // Compression happens here, on the worker, not on the writer. For a PNG
+        // sequence this is most of a frame's encoding cost and was the serial
+        // fraction that capped the whole render; for an ffmpeg sidecar it is a
+        // move and costs nothing.
+        let prepared = preparer.prepare(pixels).map_err(|e| e.to_string())?;
+        Ok((prepared, warnings, report))
+    };
+
+    let mut written = 0i64;
+    let result = motion_render::render_in_order(
+        start..=end,
+        threads,
+        render_frame,
+        |frame, (prepared, warnings, report)| {
+            for note in warnings.into_iter().chain(report) {
+                *notes.entry(note).or_default() += 1;
+            }
+            encoder.write_prepared(prepared).map_err(|e| e.to_string())?;
+            written += 1;
+            if !o.quiet && (frame - start) % 25 == 0 {
+                eprint!("\r  frame {frame}/{end}");
+            }
+            Ok(())
+        },
+    );
+    // A failed render still has to close its encoder, and `abort` rather than
+    // `finish`: half a video finalized into a playable container is the failure
+    // mode `Encoder::abort` exists for.
+    if let Err(e) = result {
+        encoder.abort();
+        return Err(e);
     }
     encoder.finish().map_err(|e| e.to_string())?;
 
     if !o.quiet {
         let secs = started.elapsed().as_secs_f64();
-        let frames = (end - start + 1) as f64;
+        let frames = written as f64;
         eprintln!(
             "\r  {} frames in {secs:.2}s ({:.1} fps) → {}",
             frames as i64,
@@ -320,10 +474,10 @@ mod tests {
     /// no guess — so a `.mp4` is a video and a bare directory is a sequence.
     #[test]
     fn the_extension_chooses_the_encoder() {
-        assert!(is_video(Path::new("film.mp4")));
-        assert!(is_video(Path::new("MASTER.MOV")), "case-insensitive");
-        assert!(!is_video(Path::new("frames")));
-        assert!(!is_video(Path::new("frames/shot_01")));
+        assert!(is_video_container(Path::new("film.mp4")));
+        assert!(is_video_container(Path::new("MASTER.MOV")), "case-insensitive");
+        assert!(!is_video_container(Path::new("frames")));
+        assert!(!is_video_container(Path::new("frames/shot_01")));
     }
 
     #[test]
