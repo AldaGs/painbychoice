@@ -229,6 +229,19 @@ pub(crate) struct TreeEdits {
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
 /// row selects that node; the ▲/▼ buttons restack it among its siblings.
 pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+    // The whole panel is a drop target for Assets-panel rows.
+    let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
+        ui.set_min_width(ui.available_width());
+        panel_ui(ui, rows, selected, out);
+        // Fill the rest of the panel, so a drop anywhere lands.
+        ui.allocate_space(egui::vec2(ui.available_width(), ui.available_height().max(40.0)));
+    });
+    if let Some(item) = dropped {
+        out.place = Some(*item);
+    }
+}
+
+fn panel_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.heading("Layers");
     ui.horizontal(|ui| {
@@ -269,16 +282,7 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
         }
     }
     ui.separator();
-    // The whole list is a drop target for Assets-panel rows.
-    let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
-        ui.set_min_width(ui.available_width());
-        rows_ui(ui, rows, selected, out);
-        // Room below the last row, so there is always somewhere to drop.
-        ui.allocate_space(egui::vec2(ui.available_width(), 40.0));
-    });
-    if let Some(item) = dropped {
-        out.place = Some(*item);
-    }
+    rows_ui(ui, rows, selected, out);
 }
 
 /// The rows left showing once folded layers hide everything inside them.
@@ -348,8 +352,39 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
     // Folded layers, by id. View state for the session, not saved.
     let fold_id = egui::Id::new("layer_folds");
     let mut folded: std::collections::HashSet<NodeId> = ui.data(|d| d.get_temp(fold_id)).unwrap_or_default();
-    for row in unfolded_rows(rows, &folded) {
-        let row_resp = ui.horizontal(|ui| {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    for (n, row) in unfolded_rows(rows, &folded).into_iter().enumerate() {
+        // The whole row is one click/drag target, allocated *before* its
+        // contents so the arrow, switches and rename box sit on top of it and
+        // keep their own clicks. (Wrapping just the name in `dnd_drag_source`
+        // put a drag sensor over the label that ate double- and right-clicks.)
+        let id = egui::Id::new(("layer_row", row.id));
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
+        let lifted = row.depth > 0 && r.dragged();
+        if lifted {
+            egui::DragAndDrop::set_payload(ui.ctx(), LayerDrag(row.id));
+        }
+        // A lifted row paints on a top layer that follows the pointer.
+        let layer = if lifted { egui::LayerId::new(egui::Order::Tooltip, id) } else { ui.layer_id() };
+        let fill = if selected == Some(row.id) {
+            ui.visuals().selection.bg_fill
+        } else if lifted || ui.rect_contains_pointer(rect) {
+            egui::Color32::from_gray(132)
+        } else if n % 2 == 0 {
+            egui::Color32::from_gray(50)
+        } else {
+            egui::Color32::from_gray(60)
+        };
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layer_id(layer)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        row_ui.painter().rect_filled(rect, 0.0, fill);
+        row_ui.style_mut().interaction.selectable_labels = false;
+        {
+            let ui = &mut row_ui;
             let indent = 6.0 + row.depth as f32 * 14.0;
             let (space, _) = ui.allocate_exact_size(egui::vec2(indent, 18.0), egui::Sense::hover());
             // Indent guides, one per ancestor level, like Blender's outliner.
@@ -391,24 +426,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
                     } else {
                         egui::RichText::new(&row.name)
                     };
-                    // The name is the drag handle; the root never moves.
-                    let resp = if row.depth > 0 {
-                        ui.dnd_drag_source(egui::Id::new(("layer_row", row.id)), LayerDrag(row.id), |ui| {
-                            ui.selectable_label(selected == Some(row.id), name)
-                        })
-                        .inner
-                    } else {
-                        ui.selectable_label(selected == Some(row.id), name)
-                    };
-                    if resp.clicked() {
-                        out.select = Some(row.id);
-                    }
-                    if resp.double_clicked() && row.depth > 0 {
-                        renaming = Some((row.id, row.name.clone()));
-                    }
-                    if context_menu(&resp, row, out) {
-                        renaming = Some((row.id, row.name.clone()));
-                    }
+                    ui.label(name);
                 }
             }
             if let Some(comp) = row.precomp {
@@ -429,9 +447,23 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
                     }
                 });
             }
-        });
+        }
+        if lifted {
+            if let Some(p) = ui.ctx().pointer_interact_pos() {
+                let lift = egui::emath::TSTransform::from_translation(egui::vec2(0.0, p.y - rect.center().y));
+                ui.ctx().transform_layer_shapes(layer, lift);
+            }
+        }
+        if r.clicked() {
+            out.select = Some(row.id);
+        }
+        if r.double_clicked() && row.depth > 0 {
+            renaming = Some((row.id, row.name.clone()));
+        }
+        if context_menu(&r, row, out) {
+            renaming = Some((row.id, row.name.clone()));
+        }
         // Dropping a dragged layer on this row: above, into, or below it.
-        let r = row_resp.response;
         let hover = r.dnd_hover_payload::<LayerDrag>().and_then(|_| ui.ctx().pointer_hover_pos());
         if let Some(pos) = hover {
             let zone = if row.depth == 0 { DropZone::Into } else { DropZone::at(pos.y - r.rect.top(), r.rect.height()) };

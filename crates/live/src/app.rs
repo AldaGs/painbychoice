@@ -560,9 +560,7 @@ pub(crate) fn footage_layer(
 /// by the same amount so the animation's shape survives. Depth is untouched,
 /// and an expression is left alone — there is no constant to shift.
 ///
-/// ponytail: translation only. A new parent that rotates or scales still
-/// turns/scales the layer; compensating those needs a full transform
-/// decomposition, add it if reparenting under rotated nulls is common.
+/// Rotation and scale compensation live in `move_layer` (see [`spin_and_scale`]).
 pub(crate) fn keep_position(pos: &mut Value<motion_core::Vec3>, target: Point, t: f64) {
     let now = match pos {
         Value::Const(v) => *v,
@@ -575,6 +573,25 @@ pub(crate) fn keep_position(pos: &mut Value<motion_core::Vec3>, target: Point, t
         Value::Keyframed(track) => *track = track.clone().map_value(|v| v + d),
         Value::Expr(_) => {}
     }
+}
+
+/// Apply `f` to a value's constant or to every key; an expression is left alone.
+pub(crate) fn remap(v: &mut Value<motion_core::Vec3>, f: impl Fn(motion_core::Vec3) -> motion_core::Vec3) {
+    match v {
+        Value::Const(c) => *c = f(*c),
+        Value::Keyframed(track) => *track = track.clone().map_value(&f),
+        Value::Expr(_) => {}
+    }
+}
+
+/// A 2D affine's in-plane spin (radians) and x/y scale.
+///
+/// ponytail: assumes no skew — a non-uniformly scaled parent that is also
+/// rotated can't be matched exactly by a child's own rotation + scale anyway.
+pub(crate) fn spin_and_scale(m: Affine) -> (f64, f64, f64) {
+    let [a, b, c, d, _, _] = m.as_coeffs();
+    let sx = a.hypot(b);
+    (b.atan2(a), sx, (a * d - b * c) / sx)
 }
 
 /// Whether placing `comp` inside `into` would make a comp contain itself:
@@ -2693,12 +2710,22 @@ impl App {
         let old_parent = self.doc().root.parent_of(id).map(|p| p.id);
         let pivot = scene.place(id).map(|p| p.pivot);
         let parent_world = scene.place(parent).map(|p| p.world);
+        let old_world = old_parent.and_then(|p| scene.place(p)).map(|p| p.world);
         if !self.doc_mut().root.move_node(id, parent, index) {
             return false;
         }
         if old_parent != Some(parent) {
             if let (Some(at), Some(world), Some(node)) = (pivot, parent_world, self.doc_mut().root.find_mut(id)) {
                 keep_position(&mut node.transform.position, world.inverse() * at, t);
+                if let Some(old) = old_world {
+                    let ((ra, sx0, sy0), (rb, sx1, sy1)) = (spin_and_scale(old), spin_and_scale(world));
+                    let turn = (ra - rb).to_degrees();
+                    remap(&mut node.transform.rotation, |v| v + motion_core::Vec3::new(0.0, 0.0, turn));
+                    let (kx, ky) = (sx0 / sx1, sy0 / sy1);
+                    if kx.is_finite() && ky.is_finite() {
+                        remap(&mut node.transform.scale, |v| motion_core::Vec3::new(v.x * kx, v.y * ky, v.z));
+                    }
+                }
             }
         }
         true

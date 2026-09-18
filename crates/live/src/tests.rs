@@ -4111,6 +4111,11 @@ fn reparenting_keeps_the_layer_where_it_is() {
     }
 }
 
+#[test]
+fn spin_and_scale_reads_a_parent_transform() {
+    let (r, sx, sy) = spin_and_scale(Affine::rotate(0.5) * Affine::scale_non_uniform(2.0, 3.0));
+    assert!((r - 0.5).abs() < 1e-9 && (sx - 2.0).abs() < 1e-9 && (sy - 3.0).abs() < 1e-9);
+}
 
 // --- Split shape from group --------------------------------------------
 
