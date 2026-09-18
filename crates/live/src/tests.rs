@@ -5681,3 +5681,21 @@ fn locked_layers_are_skipped_by_picking() {
     let root = &doc.root;
     assert_eq!(pick(&scene, fit, (300.0, 420.0), |id| is_locked(root, id)), None);
 }
+
+#[test]
+fn folding_a_layer_hides_everything_inside_it() {
+    let group = MNode::group(1, "g")
+        .with_child(MNode::group(2, "inner").with_child(MNode::group(3, "deep")))
+        .with_child(MNode::group(4, "sib"));
+    let root = MNode::group(0, "root").with_child(group).with_child(MNode::group(5, "after"));
+    let mut rows = Vec::new();
+    tree_rows(&root, 0, &mut rows);
+    let shown = |folded: &[u64]| {
+        let f = folded.iter().map(|i| NodeId(*i)).collect();
+        unfolded_rows(&rows, &f).iter().map(|r| r.name.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(shown(&[]), ["root", "after", "g", "sib", "inner", "deep"]);
+    assert_eq!(shown(&[2]), ["root", "after", "g", "sib", "inner"]);
+    assert_eq!(shown(&[1]), ["root", "after", "g"], "the fold's own row stays");
+    assert_eq!(shown(&[0]), ["root"]);
+}

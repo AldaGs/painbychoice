@@ -260,6 +260,24 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
     }
 }
 
+/// The rows left showing once folded layers hide everything inside them.
+pub(crate) fn unfolded_rows<'a>(rows: &'a [TreeRow], folded: &std::collections::HashSet<NodeId>) -> Vec<&'a TreeRow> {
+    // While inside a folded layer, the depth of that layer.
+    let mut hide_below: Option<usize> = None;
+    let mut out = Vec::new();
+    for row in rows {
+        match hide_below {
+            Some(d) if row.depth > d => continue,
+            _ => hide_below = None,
+        }
+        if folded.contains(&row.id) {
+            hide_below = Some(row.depth);
+        }
+        out.push(row);
+    }
+    out
+}
+
 /// A painted eye (open, or struck through) or padlock (shut, or open). Painted
 /// because the icon font subset has neither glyph.
 fn switch(ui: &mut egui::Ui, eye: bool, on: bool, tip: &str) -> bool {
@@ -306,7 +324,10 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
     let rename_id = egui::Id::new("layer_rename");
     let mut renaming: Option<(NodeId, String)> = ui.data(|d| d.get_temp(rename_id));
     let guide = ui.visuals().widgets.noninteractive.bg_stroke;
-    for row in rows {
+    // Folded layers, by id. View state for the session, not saved.
+    let fold_id = egui::Id::new("layer_folds");
+    let mut folded: std::collections::HashSet<NodeId> = ui.data(|d| d.get_temp(fold_id)).unwrap_or_default();
+    for row in unfolded_rows(rows, &folded) {
         let row_resp = ui.horizontal(|ui| {
             let indent = 6.0 + row.depth as f32 * 14.0;
             let (space, _) = ui.allocate_exact_size(egui::vec2(indent, 18.0), egui::Sense::hover());
@@ -314,6 +335,22 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
             for d in 1..=row.depth {
                 let x = space.left() + 6.0 + (d as f32 - 0.5) * 14.0;
                 ui.painter().vline(x, space.y_range(), guide);
+            }
+            // The fold arrow, or its width in blank so names stay aligned.
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::click());
+            if row.children > 0 {
+                let open = !folded.contains(&row.id);
+                let c = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+                let m = rect.center();
+                let pts = if open {
+                    vec![m + egui::vec2(-4.0, -2.0), m + egui::vec2(4.0, -2.0), m + egui::vec2(0.0, 3.0)]
+                } else {
+                    vec![m + egui::vec2(-2.0, -4.0), m + egui::vec2(3.0, 0.0), m + egui::vec2(-2.0, 4.0)]
+                };
+                ui.painter().add(egui::Shape::convex_polygon(pts, c, egui::Stroke::NONE));
+                if resp.on_hover_text(if open { "Collapse" } else { "Expand" }).clicked() && !folded.remove(&row.id) {
+                    folded.insert(row.id);
+                }
             }
             ui.label(icon::text(row_glyph(row)));
             match renaming.as_mut().filter(|(id, _)| *id == row.id) {
@@ -390,6 +427,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
             }
         }
     }
+    ui.data_mut(|d| d.insert_temp(fold_id, folded));
     ui.data_mut(|d| match renaming {
         Some(v) => {
             d.insert_temp(rename_id, v);
