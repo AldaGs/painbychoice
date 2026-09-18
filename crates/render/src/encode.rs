@@ -454,6 +454,12 @@ impl FfmpegEncoder {
         // every player and browser handles, and the default for H.264 from
         // RGBA input is not it.
         cmd.args(["-pix_fmt", "yuv420p"]);
+        // RGB→YUV with the BT.709 matrix, and say so in the file. Left alone,
+        // swscale converts with BT.601 and tags nothing; players then decode
+        // HD as BT.709 and saturated reds drift orange.
+        cmd.args(["-vf", "scale=out_color_matrix=bt709:out_range=tv"])
+            .args(["-colorspace", "bt709", "-color_primaries", "bt709"])
+            .args(["-color_trc", "bt709", "-color_range", "tv"]);
         if audio.is_some() {
             cmd.args(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
         }
