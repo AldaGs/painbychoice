@@ -312,9 +312,9 @@ masking and 2.5D placement. Build it once, now that its clients are real.
 
 **Still ahead in this phase — start here:**
 
-1. **The rest of the first effect set:** glow, colour balance, chroma key.
-   Chroma key is the odd one — it writes *alpha* rather than colour, so it is
-   the first effect the in-scene colour fast path cannot approximate at all.
+1. ✅ **The rest of the first effect set** (2026-09-18): glow, colour
+   balance, chroma key. Glow and key are readback-only; key writes alpha and
+   does no spill suppression yet.
 2. **Effects as registry descriptors.** `registry.rs` still has its
    `NodeCategory::Effect` stub. Routing the built-ins through the same seam a
    plugin would is the plugin-shaped-now decision being cashed in, and it is

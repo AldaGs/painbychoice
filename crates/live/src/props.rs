@@ -171,6 +171,14 @@ pub(crate) enum EffectParam {
     ShadowY,
     ShadowRadius,
     ShadowOpacity,
+    GlowThreshold,
+    GlowRadius,
+    GlowIntensity,
+    BalanceRed,
+    BalanceGreen,
+    BalanceBlue,
+    KeyTolerance,
+    KeySoftness,
 }
 
 impl EffectParam {
@@ -192,6 +200,14 @@ impl EffectParam {
             EffectParam::ShadowY => "Offset Y",
             EffectParam::ShadowRadius => "Softness",
             EffectParam::ShadowOpacity => "Opacity",
+            EffectParam::GlowThreshold => "Threshold",
+            EffectParam::GlowRadius => "Radius",
+            EffectParam::GlowIntensity => "Intensity",
+            EffectParam::BalanceRed => "Red",
+            EffectParam::BalanceGreen => "Green",
+            EffectParam::BalanceBlue => "Blue",
+            EffectParam::KeyTolerance => "Tolerance",
+            EffectParam::KeySoftness => "Softness",
         }
     }
 }
@@ -230,6 +246,9 @@ pub(crate) fn effect_params(kind: &motion_core::EffectKind) -> Vec<EffectParam> 
         K::DropShadow { .. } => {
             vec![P::ShadowX, P::ShadowY, P::ShadowRadius, P::ShadowOpacity]
         }
+        K::Glow { .. } => vec![P::GlowThreshold, P::GlowRadius, P::GlowIntensity],
+        K::ColorBalance { .. } => vec![P::BalanceRed, P::BalanceGreen, P::BalanceBlue],
+        K::ChromaKey { .. } => vec![P::KeyTolerance, P::KeySoftness],
     }
 }
 
@@ -258,6 +277,14 @@ pub(crate) fn effect_value<'a>(
         (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
         (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
         (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
+        (K::Glow { threshold, .. }, P::GlowThreshold) => threshold,
+        (K::Glow { radius, .. }, P::GlowRadius) => radius,
+        (K::Glow { intensity, .. }, P::GlowIntensity) => intensity,
+        (K::ColorBalance { red, .. }, P::BalanceRed) => red,
+        (K::ColorBalance { green, .. }, P::BalanceGreen) => green,
+        (K::ColorBalance { blue, .. }, P::BalanceBlue) => blue,
+        (K::ChromaKey { tolerance, .. }, P::KeyTolerance) => tolerance,
+        (K::ChromaKey { softness, .. }, P::KeySoftness) => softness,
         _ => return None,
     })
 }
@@ -287,6 +314,14 @@ pub(crate) fn effect_value_mut<'a>(
         (K::DropShadow { offset_y, .. }, P::ShadowY) => offset_y,
         (K::DropShadow { radius, .. }, P::ShadowRadius) => radius,
         (K::DropShadow { opacity, .. }, P::ShadowOpacity) => opacity,
+        (K::Glow { threshold, .. }, P::GlowThreshold) => threshold,
+        (K::Glow { radius, .. }, P::GlowRadius) => radius,
+        (K::Glow { intensity, .. }, P::GlowIntensity) => intensity,
+        (K::ColorBalance { red, .. }, P::BalanceRed) => red,
+        (K::ColorBalance { green, .. }, P::BalanceGreen) => green,
+        (K::ColorBalance { blue, .. }, P::BalanceBlue) => blue,
+        (K::ChromaKey { tolerance, .. }, P::KeyTolerance) => tolerance,
+        (K::ChromaKey { softness, .. }, P::KeySoftness) => softness,
         _ => return None,
     })
 }
@@ -606,7 +641,8 @@ impl NodeInfo {
                     nums: effect_nums(&ef.kind, ctx),
                     color: match &ef.kind {
                         motion_core::EffectKind::Tint { color, .. }
-                        | motion_core::EffectKind::DropShadow { color, .. } => {
+                        | motion_core::EffectKind::DropShadow { color, .. }
+                        | motion_core::EffectKind::ChromaKey { color, .. } => {
                             let c = color.resolve(ctx);
                             Some([c.r as f32, c.g as f32, c.b as f32])
                         }
@@ -1460,7 +1496,8 @@ pub(crate) fn properties_ui(
                     EffectParam::BlurRadius
                     | EffectParam::ShadowRadius
                     | EffectParam::ShadowX
-                    | EffectParam::ShadowY => 0.5,
+                    | EffectParam::ShadowY
+                    | EffectParam::GlowRadius => 0.5,
                     _ => 0.01,
                 };
                 if ui.add(egui::DragValue::new(&mut v).speed(speed)).changed() {

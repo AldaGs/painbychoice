@@ -617,7 +617,7 @@ pub(crate) fn apply_effect_op(node: &mut MNode, frame: i64, op: &EffectOp) -> bo
         EffectOp::SetColor { index, rgb } => match node.effects.get_mut(index) {
             Some(ef) => {
                 match &mut ef.kind {
-                    K::Tint { color, .. } | K::DropShadow { color, .. } => {
+                    K::Tint { color, .. } | K::DropShadow { color, .. } | K::ChromaKey { color, .. } => {
                         color.set_at(frame, rgb_color(rgb));
                         true
                     }

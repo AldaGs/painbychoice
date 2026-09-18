@@ -59,6 +59,10 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             // A shadow is made of the layer's *alpha*, offset — there is no
             // such thing as one pixel's shadow. The readback path draws it.
             ResolvedEffect::DropShadow { .. } => rgb,
+            ResolvedEffect::ColorBalance { red, green, blue } => color_balance(rgb, red, green, blue),
+            // A glow spreads to neighbours and a key writes alpha; neither is
+            // one pixel's colour. Both are the readback path's.
+            ResolvedEffect::Glow { .. } | ResolvedEffect::ChromaKey { .. } => rgb,
         };
     }
     MColor::rgba(
@@ -74,7 +78,13 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
 /// lands, the panel can warn that the effect won't show in the preview.
 pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
     effects.iter().any(|e| {
-        matches!(e, ResolvedEffect::GaussianBlur { .. } | ResolvedEffect::DropShadow { .. })
+        matches!(
+            e,
+            ResolvedEffect::GaussianBlur { .. }
+                | ResolvedEffect::DropShadow { .. }
+                | ResolvedEffect::Glow { .. }
+                | ResolvedEffect::ChromaKey { .. }
+        )
     })
 }
 
@@ -115,6 +125,68 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::DropShadow { color, offset_x, offset_y, radius, opacity } => {
             drop_shadow(px, width, height, color, offset_x, offset_y, radius, opacity)
         }
+        ResolvedEffect::Glow { threshold, radius, intensity } => {
+            glow(px, width, height, threshold, radius, intensity)
+        }
+        ResolvedEffect::ColorBalance { red, green, blue } => {
+            map_rgb(px, |c| color_balance(c, red, green, blue))
+        }
+        ResolvedEffect::ChromaKey { color, tolerance, softness } => {
+            chroma_key(px, color, tolerance, softness)
+        }
+    }
+}
+
+fn color_balance(c: [f32; 3], red: f64, green: f64, blue: f64) -> [f32; 3] {
+    [c[0] + red as f32, c[1] + green as f32, c[2] + blue as f32].map(|v| v.clamp(0.0, 1.0))
+}
+
+/// Blur the pixels brighter than `threshold` and add them back over the image.
+///
+/// The add happens in premultiplied terms, so the halo spilling onto
+/// transparent canvas carries its own alpha rather than tinting nothing.
+fn glow(px: &mut [u8], width: usize, height: usize, threshold: f64, radius: f64, intensity: f64) {
+    let t = threshold as f32;
+    let mut bright = px.to_vec();
+    for p in bright.chunks_exact_mut(4) {
+        let luma = (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32) / 255.0;
+        if luma < t {
+            p[3] = 0;
+        }
+    }
+    gaussian_blur(&mut bright, width, height, radius);
+    let k = intensity as f32;
+    for (out, g) in px.chunks_exact_mut(4).zip(bright.chunks_exact(4)) {
+        let ga = g[3] as f32 / 255.0 * k;
+        if ga <= 0.0 {
+            continue;
+        }
+        let oa = out[3] as f32 / 255.0;
+        let a = (oa + ga).min(1.0);
+        for ch in 0..3 {
+            let sum = out[ch] as f32 / 255.0 * oa + g[ch] as f32 / 255.0 * ga;
+            out[ch] = to_u8((sum / a).min(1.0));
+        }
+        out[3] = to_u8(a);
+    }
+}
+
+/// Zero the alpha of pixels within `tolerance` (RGB distance) of `key`, ramping
+/// back to untouched over `softness`. Colour is left alone — spill suppression
+/// is a separate job.
+fn chroma_key(px: &mut [u8], key: MColor, tolerance: f64, softness: f64) {
+    let k = [key.r as f32, key.g as f32, key.b as f32];
+    let (tol, soft) = (tolerance as f32, softness as f32);
+    for p in px.chunks_exact_mut(4) {
+        let d = (0..3).map(|i| (p[i] as f32 / 255.0 - k[i]).powi(2)).sum::<f32>().sqrt();
+        let keep = if d <= tol {
+            0.0
+        } else if soft > 0.0 {
+            ((d - tol) / soft).min(1.0)
+        } else {
+            1.0
+        };
+        p[3] = (p[3] as f32 * keep).round() as u8;
     }
 }
 
@@ -671,5 +743,55 @@ mod tests {
         apply_stack(&mut a, 1, 1, &stack_a);
         apply_stack(&mut b, 1, 1, &stack_b);
         assert_ne!(a, b, "effect order should matter");
+    }
+
+    /// Chroma key clears the key colour, keeps what is far from it, and
+    /// partially keeps what lands in the softness ramp.
+    #[test]
+    fn chroma_key_clears_the_key_and_keeps_the_rest() {
+        // green, red, and a green 0.35 away (inside tolerance+softness).
+        let mut px = vec![0, 255, 0, 255, 255, 0, 0, 255, 0, 166, 0, 255];
+        apply_stack(
+            &mut px,
+            3,
+            1,
+            &[ResolvedEffect::ChromaKey {
+                color: Color::rgb(0.0, 1.0, 0.0),
+                tolerance: 0.3,
+                softness: 0.1,
+            }],
+        );
+        assert_eq!(px[3], 0, "the key goes transparent");
+        assert_eq!(&px[4..8], &[255, 0, 0, 255], "far colours are untouched");
+        assert!(px[11] > 0 && px[11] < 255, "the ramp is partial, got {}", px[11]);
+    }
+
+    /// Glow only brightens, spills onto empty canvas, and ignores anything
+    /// below its threshold.
+    #[test]
+    fn glow_spills_bright_pixels_only() {
+        let (w, h) = (9usize, 1usize);
+        let mut px = vec![0u8; w * h * 4];
+        px[16..20].copy_from_slice(&[255, 255, 255, 255]);
+        let mut dim = px.clone();
+        dim[16..20].copy_from_slice(&[40, 40, 40, 255]);
+        let glow = [ResolvedEffect::Glow { threshold: 0.5, radius: 2.0, intensity: 1.0 }];
+        apply_stack(&mut px, w, h, &glow);
+        assert!(px[5 * 4 + 3] > 0, "the halo spills beside a bright pixel");
+        assert_eq!(&px[16..20], &[255, 255, 255, 255], "and the source stays");
+        let before = dim.clone();
+        apply_stack(&mut dim, w, h, &glow);
+        assert_eq!(dim, before, "a dim pixel doesn't glow");
+    }
+
+    /// Zero balance is the identity; a red push moves only red.
+    #[test]
+    fn color_balance_shifts_one_channel() {
+        let mut px = solid([100, 100, 100, 255], 1);
+        let before = px.clone();
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::ColorBalance { red: 0.0, green: 0.0, blue: 0.0 }]);
+        assert_eq!(px, before);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::ColorBalance { red: 0.2, green: 0.0, blue: 0.0 }]);
+        assert!(px[0] > 140 && px[1] == 100 && px[2] == 100, "got {:?}", &px[..3]);
     }
 }

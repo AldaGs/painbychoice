@@ -102,6 +102,19 @@ pub enum EffectKind {
         radius: Value<f64>,
         opacity: Value<f64>,
     },
+    /// The layer's bright parts, blurred and added back on top: everything
+    /// above `threshold` (luma, `0..1`) bleeds out by `radius` pixels at
+    /// `intensity` strength. Additive, so a glow can only brighten.
+    Glow { threshold: Value<f64>, radius: Value<f64>, intensity: Value<f64> },
+    /// Signed per-channel shifts in `[-1, 1]`, added to red, green and blue —
+    /// pushing a cast in or out without the all-channels-at-once of Levels.
+    ColorBalance { red: Value<f64>, green: Value<f64>, blue: Value<f64> },
+    /// Knock out pixels near `color`: within `tolerance` (RGB distance) they go
+    /// fully transparent, then alpha ramps back over `softness`.
+    ///
+    /// The first effect that writes *alpha* rather than colour, and so the
+    /// first the in-scene colour fast path cannot approximate at all.
+    ChromaKey { color: Value<Color>, tolerance: Value<f64>, softness: Value<f64> },
 }
 
 impl Effect {
@@ -150,6 +163,23 @@ impl Effect {
                 radius: Value::constant(6.0),
                 opacity: Value::constant(0.5),
             },
+            // Like the shadow, a glow is the thing it adds: seeded visible.
+            EffectType::Glow => EffectKind::Glow {
+                threshold: Value::constant(0.6),
+                radius: Value::constant(12.0),
+                intensity: Value::constant(1.0),
+            },
+            EffectType::ColorBalance => EffectKind::ColorBalance {
+                red: Value::constant(0.0),
+                green: Value::constant(0.0),
+                blue: Value::constant(0.0),
+            },
+            // Green screen: the key everyone adds this for first.
+            EffectType::ChromaKey => EffectKind::ChromaKey {
+                color: Value::constant(Color::rgb(0.0, 1.0, 0.0)),
+                tolerance: Value::constant(0.3),
+                softness: Value::constant(0.1),
+            },
         };
         Self::new(kind)
     }
@@ -164,6 +194,9 @@ impl Effect {
             EffectKind::Tint { .. } => EffectType::Tint,
             EffectKind::Levels { .. } => EffectType::Levels,
             EffectKind::DropShadow { .. } => EffectType::DropShadow,
+            EffectKind::Glow { .. } => EffectType::Glow,
+            EffectKind::ColorBalance { .. } => EffectType::ColorBalance,
+            EffectKind::ChromaKey { .. } => EffectType::ChromaKey,
         }
     }
 
@@ -215,6 +248,21 @@ impl Effect {
                     opacity: opacity.resolve(ctx).clamp(0.0, 1.0),
                 }
             }
+            EffectKind::Glow { threshold, radius, intensity } => ResolvedEffect::Glow {
+                threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
+                radius: radius.resolve(ctx).max(0.0),
+                intensity: intensity.resolve(ctx).max(0.0),
+            },
+            EffectKind::ColorBalance { red, green, blue } => ResolvedEffect::ColorBalance {
+                red: red.resolve(ctx).clamp(-1.0, 1.0),
+                green: green.resolve(ctx).clamp(-1.0, 1.0),
+                blue: blue.resolve(ctx).clamp(-1.0, 1.0),
+            },
+            EffectKind::ChromaKey { color, tolerance, softness } => ResolvedEffect::ChromaKey {
+                color: color.resolve(ctx),
+                tolerance: tolerance.resolve(ctx).max(0.0),
+                softness: softness.resolve(ctx).max(0.0),
+            },
         })
     }
 
@@ -263,6 +311,21 @@ impl Effect {
                 num(radius);
                 num(opacity);
             }
+            EffectKind::Glow { threshold, radius, intensity } => {
+                num(threshold);
+                num(radius);
+                num(intensity);
+            }
+            EffectKind::ColorBalance { red, green, blue } => {
+                num(red);
+                num(green);
+                num(blue);
+            }
+            EffectKind::ChromaKey { color, tolerance, softness } => {
+                col(color);
+                num(tolerance);
+                num(softness);
+            }
         }
     }
 }
@@ -278,17 +341,23 @@ pub enum EffectType {
     Tint,
     Levels,
     DropShadow,
+    Glow,
+    ColorBalance,
+    ChromaKey,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 6] = [
+    pub const ALL: [EffectType; 9] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
         EffectType::Tint,
         EffectType::Levels,
         EffectType::DropShadow,
+        EffectType::Glow,
+        EffectType::ColorBalance,
+        EffectType::ChromaKey,
     ];
 
     pub fn label(self) -> &'static str {
@@ -299,6 +368,9 @@ impl EffectType {
             EffectType::Tint => "Tint",
             EffectType::Levels => "Levels",
             EffectType::DropShadow => "Drop Shadow",
+            EffectType::Glow => "Glow",
+            EffectType::ColorBalance => "Color Balance",
+            EffectType::ChromaKey => "Chroma Key",
         }
     }
 }
@@ -319,6 +391,9 @@ pub enum ResolvedEffect {
     Tint { color: Color, amount: f64 },
     Levels { in_black: f64, in_white: f64, gamma: f64, out_black: f64, out_white: f64 },
     DropShadow { color: Color, offset_x: f64, offset_y: f64, radius: f64, opacity: f64 },
+    Glow { threshold: f64, radius: f64, intensity: f64 },
+    ColorBalance { red: f64, green: f64, blue: f64 },
+    ChromaKey { color: Color, tolerance: f64, softness: f64 },
 }
 
 #[cfg(test)]
