@@ -625,6 +625,44 @@ pub fn average_frames(frames: &[Vec<u8>]) -> Vec<u8> {
 mod average_tests {
     use super::average_frames;
 
+    /// End to end: a box sliding 40px per frame, rendered with motion blur,
+    /// leaves partial coverage behind it that a sharp render does not.
+    #[test]
+    fn a_moving_box_smears_with_motion_blur() {
+        use motion_core::{Comp, Keyframe, Node, Project, Shape, Track, Value, Vec3};
+        let mut n = Node::group(1, "box");
+        n.shape = Some(Shape::Rect {
+            size: Value::constant(kurbo::Vec2::new(20.0, 20.0)),
+            radius: Value::constant(0.0),
+        });
+        n.fill = Some(Value::constant(motion_core::Color::rgb(1.0, 1.0, 1.0)));
+        n.transform.position = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, Vec3::flat(0.0, 50.0)),
+            Keyframe::linear(10, Vec3::flat(400.0, 50.0)),
+        ]));
+        let mut root = Node::group(0, "root");
+        root.children = vec![n];
+        let mut comp = Comp::new(500.0, 100.0, root);
+        comp.motion_blur.enabled = true;
+        let project = Project::single(comp.clone());
+        let render = |offsets: Vec<f64>| {
+            let frames: Vec<Vec<u8>> = offsets
+                .into_iter()
+                .map(|s| {
+                    let scene = motion_core::evaluate_comp_sample(
+                        &project, project.root, 5.0, s, motion_core::mat4::Mat4::IDENTITY,
+                    );
+                    super::rasterize(&scene, 500, 100, motion_core::Color::rgb(0.0, 0.0, 0.0), 1.0).unwrap().0
+                })
+                .collect();
+            average_frames(&frames)
+        };
+        let partial = |px: &[u8]| px.chunks_exact(4).filter(|p| p[0] > 10 && p[0] < 245).count();
+        let sharp = render(vec![0.0]);
+        let blurred = render(comp.motion_blur.offsets());
+        assert!(partial(&blurred) > partial(&sharp) + 100, "{} vs {}", partial(&blurred), partial(&sharp));
+    }
+
     #[test]
     fn averaging_blends_coverage_and_keeps_colour() {
         let red = vec![255, 0, 0, 255];

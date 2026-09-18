@@ -17,3 +17,8 @@ rhai = "1"
 
 motion-core = { path = "crates/core" }
 motion-render = { path = "crates/render" }
+
+# The pixel effects run per preview frame on the CPU; unoptimized, a glow
+# takes seconds a frame. Optimize just that crate even in dev builds.
+[profile.dev.package.motion-render]
+opt-level = 3

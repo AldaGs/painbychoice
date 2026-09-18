@@ -387,87 +387,155 @@ fn gaussian_blur(px: &mut [u8], width: usize, height: usize, radius: f64) {
     if radius < 0.5 || width == 0 || height == 0 {
         return;
     }
-    let kernel = gaussian_kernel(radius as f32);
-    let r = kernel.len() / 2;
+
+    // Only the layer's visible pixels plus the blur's reach can change: a
+    // small shape on a big canvas blurs a small box, not the whole frame.
+    let Some((x0, y0, x1, y1)) = alpha_bounds(px, width, height) else { return };
+    let m = (radius * 3.0).ceil() as usize + 1;
+    let (x0, y0) = (x0.saturating_sub(m), y0.saturating_sub(m));
+    let (x1, y1) = ((x1 + m).min(width), (y1 + m).min(height));
+    let (w, h) = (x1 - x0, y1 - y0);
 
     // Work in premultiplied f32 so alpha weighting is correct across edges.
-    let mut buf: Vec<[f32; 4]> = px
-        .chunks_exact(4)
-        .map(|c| {
+    let mut buf: Vec<[f32; 4]> = Vec::with_capacity(w * h);
+    for y in y0..y1 {
+        for c in px[(y * width + x0) * 4..(y * width + x1) * 4].chunks_exact(4) {
             let a = c[3] as f32 / 255.0;
-            [
+            buf.push([
                 (c[0] as f32 / 255.0) * a,
                 (c[1] as f32 / 255.0) * a,
                 (c[2] as f32 / 255.0) * a,
                 a,
-            ]
-        })
-        .collect();
-
-    let mut tmp = vec![[0.0f32; 4]; buf.len()];
-    // Horizontal pass: buf -> tmp.
-    blur_axis(&buf, &mut tmp, width, height, &kernel, r, true);
-    // Vertical pass: tmp -> buf.
-    blur_axis(&tmp, &mut buf, width, height, &kernel, r, false);
-
-    for (out, p) in px.chunks_exact_mut(4).zip(buf.iter()) {
-        let a = p[3];
-        let inv = if a > 1e-6 { 1.0 / a } else { 0.0 };
-        out[0] = to_u8(p[0] * inv);
-        out[1] = to_u8(p[1] * inv);
-        out[2] = to_u8(p[2] * inv);
-        out[3] = to_u8(a);
+            ]);
+        }
     }
-}
 
-/// One separable pass. `horizontal` picks the axis; samples clamp at the edges
-/// (extend the border) so the frame doesn't darken toward its edges.
-fn blur_axis(
-    src: &[[f32; 4]],
-    dst: &mut [[f32; 4]],
-    width: usize,
-    height: usize,
-    kernel: &[f32],
-    r: usize,
-    horizontal: bool,
-) {
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = [0.0f32; 4];
-            for (k, &w) in kernel.iter().enumerate() {
-                let offset = k as isize - r as isize;
-                let (sx, sy) = if horizontal {
-                    ((x as isize + offset).clamp(0, width as isize - 1) as usize, y)
-                } else {
-                    (x, (y as isize + offset).clamp(0, height as isize - 1) as usize)
-                };
-                let s = src[sy * width + sx];
-                acc[0] += s[0] * w;
-                acc[1] += s[1] * w;
-                acc[2] += s[2] * w;
-                acc[3] += s[3] * w;
-            }
-            dst[y * width + x] = acc;
+    // Three box blurs approximate the Gaussian (central limit), and a box is
+    // a running sum: cost per pixel no longer grows with the radius, which is
+    // what made a large glow or soft shadow stall the preview.
+    let mut tmp = vec![[0.0f32; 4]; buf.len()];
+    for r in box_radii(radius as f32) {
+        box_axis(&buf, &mut tmp, w, h, r, true);
+        box_axis(&tmp, &mut buf, w, h, r, false);
+    }
+
+    for (y, row) in (y0..y1).zip(buf.chunks_exact(w)) {
+        let dst = &mut px[(y * width + x0) * 4..(y * width + x1) * 4];
+        for (out, p) in dst.chunks_exact_mut(4).zip(row) {
+            let a = p[3];
+            let inv = if a > 1e-6 { 1.0 / a } else { 0.0 };
+            out[0] = to_u8(p[0] * inv);
+            out[1] = to_u8(p[1] * inv);
+            out[2] = to_u8(p[2] * inv);
+            out[3] = to_u8(a);
         }
     }
 }
 
-/// A normalized 1D Gaussian kernel for standard deviation `sigma`, truncated at
-/// 3σ (where the tail is negligible) and re-normalized so the weights sum to 1.
-fn gaussian_kernel(sigma: f32) -> Vec<f32> {
-    let sigma = sigma.max(1e-3);
-    let r = (sigma * 3.0).ceil() as usize;
-    let mut k: Vec<f32> = (0..=2 * r)
-        .map(|i| {
-            let x = i as f32 - r as f32;
-            (-(x * x) / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let sum: f32 = k.iter().sum();
-    for w in &mut k {
-        *w /= sum;
+/// Radii of the three box blurs whose sequence matches a Gaussian of `sigma`
+/// (the standard "boxes for Gauss" sizing: widths `wl`/`wl + 2` chosen so
+/// the variances sum to `sigma²`).
+fn box_radii(sigma: f32) -> [usize; 3] {
+    let n = 3.0;
+    let ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut wl = ideal.floor() as i32;
+    if wl % 2 == 0 {
+        wl -= 1;
     }
-    k
+    let wl = wl.max(1);
+    let wu = wl + 2;
+    let m = ((12.0 * sigma * sigma - n * (wl * wl) as f32 - 4.0 * n * wl as f32 - 3.0 * n)
+        / (-4.0 * wl as f32 - 4.0))
+        .round() as i32;
+    let r = |i: i32| (((if i < m { wl } else { wu }) - 1) / 2) as usize;
+    [r(0), r(1), r(2)]
+}
+
+/// The half-open box `(x0, y0, x1, y1)` holding every pixel with any alpha,
+/// or `None` for a fully transparent image.
+fn alpha_bounds(px: &[u8], width: usize, height: usize) -> Option<(usize, usize, usize, usize)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (width, height, 0, 0);
+    for y in 0..height {
+        let row = &px[y * width * 4..(y + 1) * width * 4];
+        let Some(first) = row.chunks_exact(4).position(|p| p[3] != 0) else { continue };
+        let last = row.chunks_exact(4).rposition(|p| p[3] != 0).unwrap_or(first);
+        (x0, x1) = (x0.min(first), x1.max(last + 1));
+        (y0, y1) = (y0.min(y), y + 1);
+    }
+    (x1 > x0).then_some((x0, y0, x1, y1))
+}
+
+/// One box-blur pass of radius `r` along an axis, as a running sum. Samples
+/// clamp at the edges (extend the border) so the frame doesn't darken toward
+/// its edges.
+///
+/// Split into bands of output rows across threads. A vertical pass works per
+/// band too: each band primes its column sums at its first row and slides.
+fn box_axis(
+    src: &[[f32; 4]],
+    dst: &mut [[f32; 4]],
+    width: usize,
+    height: usize,
+    r: usize,
+    horizontal: bool,
+) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(height.max(1));
+    let band = height.div_ceil(threads).max(1);
+    let inv = 1.0 / (2 * r + 1) as f32;
+    let ri = r as isize;
+    std::thread::scope(|scope| {
+        for (b, out) in dst.chunks_mut(band * width).enumerate() {
+            let y0 = b * band;
+            let rows = out.len() / width;
+            scope.spawn(move || {
+                if horizontal {
+                    for row in 0..rows {
+                        let line = &src[(y0 + row) * width..(y0 + row + 1) * width];
+                        let px = |i: isize| line[i.clamp(0, width as isize - 1) as usize];
+                        let mut acc = [0.0f32; 4];
+                        for i in -ri..=ri {
+                            let s = px(i);
+                            for c in 0..4 {
+                                acc[c] += s[c];
+                            }
+                        }
+                        for x in 0..width {
+                            out[row * width + x] = acc.map(|v| v * inv);
+                            let (add, sub) = (px(x as isize + ri + 1), px(x as isize - ri));
+                            for c in 0..4 {
+                                acc[c] += add[c] - sub[c];
+                            }
+                        }
+                    }
+                } else {
+                    let row_of = |y: isize| {
+                        let y = y.clamp(0, height as isize - 1) as usize;
+                        &src[y * width..(y + 1) * width]
+                    };
+                    let mut acc = vec![[0.0f32; 4]; width];
+                    for y in (y0 as isize - ri)..=(y0 as isize + ri) {
+                        for (a, s) in acc.iter_mut().zip(row_of(y)) {
+                            for c in 0..4 {
+                                a[c] += s[c];
+                            }
+                        }
+                    }
+                    for row in 0..rows {
+                        let y = (y0 + row) as isize;
+                        for (o, a) in out[row * width..(row + 1) * width].iter_mut().zip(&acc) {
+                            *o = a.map(|v| v * inv);
+                        }
+                        let (add, sub) = (row_of(y + ri + 1), row_of(y - ri));
+                        for ((a, p), m) in acc.iter_mut().zip(add).zip(sub) {
+                            for c in 0..4 {
+                                a[c] += p[c] - m[c];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -793,5 +861,27 @@ mod tests {
         assert_eq!(px, before);
         apply_stack(&mut px, 1, 1, &[ResolvedEffect::ColorBalance { red: 0.2, green: 0.0, blue: 0.0 }]);
         assert!(px[0] > 140 && px[1] == 100 && px[2] == 100, "got {:?}", &px[..3]);
+    }
+}
+
+#[cfg(test)]
+/// `cargo test -p motion-render time_glow -- --ignored --nocapture`
+mod bench {
+    #[test]
+    #[ignore]
+    fn time_glow() {
+        let (w, h) = (1920usize, 1080usize);
+        let mut px = vec![0u8; w * h * 4];
+        for y in 500..600 {
+            for x in 900..1000 {
+                px[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[255, 200, 200, 255]);
+            }
+        }
+        let t = std::time::Instant::now();
+        super::apply_stack(&mut px, w, h, &[motion_core::ResolvedEffect::Glow { threshold: 0.6, radius: 12.0, intensity: 1.0 }]);
+        eprintln!("glow 1080p: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        super::gaussian_blur(&mut px, w, h, 12.0);
+        eprintln!("blur 1080p: {:?}", t.elapsed());
     }
 }
