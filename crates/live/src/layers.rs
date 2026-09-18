@@ -132,6 +132,8 @@ pub(crate) struct TreeEdits {
     /// Open the import dialog. A bare flag rather than a path because the
     /// dialog is blocking and must not run during the UI pass.
     pub(crate) import: bool,
+    /// The same dialog, but files only join the library.
+    pub(crate) import_to_library: bool,
     /// Add this library item to the open comp — an Assets-panel drop or
     /// double-click.
     pub(crate) place: Option<AssetDrag>,

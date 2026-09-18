@@ -87,9 +87,10 @@ fn kind_icon(ui: &mut egui::Ui, kind: AssetKind) {
 }
 
 /// One draggable row: icon, name, info line.
-fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), name: &str, info: impl FnOnce(&mut egui::Ui), hover: String) {
+/// Returns whether the row was double-clicked.
+fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), name: &str, info: impl FnOnce(&mut egui::Ui), hover: String) -> bool {
     let id = egui::Id::new(("asset_row", payload));
-    ui.dnd_drag_source(id, payload, |ui| {
+    let resp = ui.dnd_drag_source(id, payload, |ui| {
         ui.horizontal(|ui| {
             icon(ui);
             ui.vertical(|ui| {
@@ -100,22 +101,25 @@ fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), 
     })
     .response
     .on_hover_text(hover);
+    // The drag source senses drags only, so the double-click is read off the
+    // pointer rather than the response.
+    resp.hovered() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
 }
 
 pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.heading("Assets");
-        if icon::button(ui, icon::IMPORT, "Import images, video or audio (Ctrl+I)").clicked() {
-            out.import = true;
+        if icon::button(ui, icon::IMPORT, "Import images, video or audio into the project").clicked() {
+            out.import_to_library = true;
         }
     });
-    ui.weak("Drag onto Layers to add to the open comp.");
+    ui.weak("Drag onto Layers to add · double-click a comp to open it");
     ui.separator();
     // Compositions first: they are what the project is made of.
     for (id, c) in &project.comps {
         let open = *id == current;
-        row(
+        let dbl = row(
             ui,
             AssetDrag::Comp(*id),
             |ui| {
@@ -127,9 +131,12 @@ pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, 
             },
             if open { "The open composition".into() } else { "Composition".into() },
         );
+        if dbl && !open {
+            out.open_comp = Some(*id);
+        }
     }
     for a in project.assets.values() {
-        row(
+        let _ = row(
             ui,
             AssetDrag::File(a.id),
             |ui| kind_icon(ui, a.kind),

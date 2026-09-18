@@ -2629,7 +2629,9 @@ impl App {
     /// File > Import: one dialog for every supported file, several at once,
     /// each routed by extension to the footage or the sound path. Returns
     /// whether anything landed.
-    pub(crate) fn import_files(&mut self) -> bool {
+    /// `place` also adds each file to the open comp; the Assets panel's
+    /// import passes false, since it is only filling the library.
+    pub(crate) fn import_files(&mut self, place: bool) -> bool {
         let all: Vec<&str> = FOOTAGE_EXTS.iter().chain(AUDIO_EXTS).copied().collect();
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("All supported", &all)
@@ -2641,29 +2643,29 @@ impl App {
         };
         let mut any = false;
         for path in paths {
-            any |= if is_audio_path(&path) {
-                self.import_audio(path)
-            } else {
-                self.import_footage(path)
-            };
+            let asset = if is_audio_path(&path) { self.import_audio(path) } else { self.import_footage(path) };
+            if let Some(asset) = asset {
+                any = true;
+                if place {
+                    self.place_asset(AssetDrag::File(asset));
+                }
+            }
         }
         any
     }
 
-    pub(crate) fn import_footage(&mut self, path: std::path::PathBuf) -> bool {
+    /// Add a picture file to the library. Library only: placing it in a comp
+    /// is [`Self::place_asset`]'s job.
+    pub(crate) fn import_footage(&mut self, path: std::path::PathBuf) -> Option<motion_core::AssetId> {
         let meta = match self.footage.probe(&path) {
             Ok(m) => m,
             Err(e) => {
                 self.ng_status = Some(format!("Couldn't import {}: {e}", path.display()));
-                return false;
+                return None;
             }
         };
-        let (id, at_center, fill) = self.new_layer_look();
-        let seed = LayerSeed { id, transform: at_center, fill };
-        let node = import_footage(&mut self.project, meta, path, seed, self.current);
-        self.push_layer(node, self.selected);
         self.ng_status = None;
-        true
+        Some(self.project.add_asset(meta.into_asset(motion_core::AssetId(0), path)))
     }
 
     /// Put a library item into the open comp as a new layer: footage, a sound,
@@ -2709,40 +2711,22 @@ impl App {
     /// samples live outside it, in `sounds`. The layer is placed at frame 0 and
     /// trimmed to the sound's own length, because an import is a source
     /// arriving — where it sits is an editing decision.
-    pub(crate) fn import_audio(&mut self, path: std::path::PathBuf) -> bool {
-        // Decoded here rather than lazily, because the length is what decides
-        // the layer's duration and a layer that resized itself once the file
-        // finished loading would be worse than a moment's wait.
+    /// Add a sound file to the library, decoded now so its waveform and
+    /// length are ready the moment it is placed.
+    pub(crate) fn import_audio(&mut self, path: std::path::PathBuf) -> Option<motion_core::AssetId> {
         let sound = match motion_render::decode_sound(&path) {
             Ok(s) => std::sync::Arc::new(s),
             Err(e) => {
                 self.ng_status = Some(format!("Couldn't import {}: {e}", path.display()));
-                return false;
+                return None;
             }
         };
-        let meta = motion_core::AssetMeta::sound(
-            sound.sample_rate,
-            2,
-            sound.frames() as u64,
-        );
-        let fps = self.doc().fps;
-        let asset = self
-            .project
-            .add_asset(meta.into_asset(motion_core::AssetId(0), path));
-        let name = self.project.asset(asset).map(|a| a.name.clone()).unwrap_or_default();
-        // The sound's own length, in this comp's frames.
-        let frames = ((sound.seconds() * fps).round() as i64).max(1);
-
-        let mut node = MNode::group(self.next_id, name);
-        node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
-        node.audio = Some(motion_core::AudioClip::new(asset));
-
+        let meta = motion_core::AssetMeta::sound(sound.sample_rate, 2, sound.frames() as u64);
+        let asset = self.project.add_asset(meta.into_asset(motion_core::AssetId(0), path));
         self.sounds.insert(asset, sound);
         self.refresh_peaks();
-        self.push_layer(node, self.selected);
-        self.publish_mix();
         self.ng_status = None;
-        true
+        Some(asset)
     }
 
     /// Decode every sound this project references, replacing whatever the last
@@ -4665,7 +4649,10 @@ impl App {
             dirty |= self.place_asset(item);
         }
         if tree_edits.import || comp.file == Some(FileCmd::Import) || shortcut == Some(FileCmd::Import) {
-            dirty |= self.import_files();
+            dirty |= self.import_files(true);
+        }
+        if tree_edits.import_to_library {
+            dirty |= self.import_files(false);
         }
         // --- Undo: close the phase opened by `before`. ---------------------
         // One comparison covers every edit above. `PartialEq` on the document

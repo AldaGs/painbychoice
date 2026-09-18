@@ -95,7 +95,7 @@ pub(crate) fn edit_label(
     if tree.ungroup.is_some() {
         return "Ungroup";
     }
-    if tree.import || comp.file == Some(crate::dock::FileCmd::Import) {
+    if tree.import || tree.import_to_library || comp.file == Some(crate::dock::FileCmd::Import) {
         return "Import";
     }
     if let Some(op) = &ng.op {
