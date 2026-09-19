@@ -3398,29 +3398,51 @@ impl App {
         let path = autosave_path(self.project_path.as_deref());
         let tmp = path.with_extension("autosave-tmp");
         match std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path)) {
-            Ok(()) => self.autosaved = json,
+            Ok(()) => {
+                self.autosaved = json;
+                // Leave a trail to this sidecar: at launch it is the only way
+                // back to a saved project's unsaved changes.
+                if let Some(p) = self.project_path.as_ref().and_then(|p| p.to_str()) {
+                    let _ = std::fs::write(last_session_path(), p);
+                }
+            }
             Err(e) => eprintln!("autosave failed: {e}"),
         }
     }
 
-    /// At launch: an untitled project's sidecar means the last session ended
-    /// with unsaved work. Offer it back; declined, it's deleted.
-    pub(crate) fn recover_untitled(&mut self) {
+    /// At launch: pick up whatever the last session left unsaved, so a crash
+    /// costs nothing even when the user never reaches File > Open.
+    ///
+    /// Two cases, because a sidecar's name follows its project: a never-saved
+    /// project's sits in the temp dir under a fixed name, while a saved one's
+    /// sits beside a file this session has no other way to know about — hence
+    /// [`last_session_path`], written whenever a titled project autosaves.
+    pub(crate) fn recover_last_session(&mut self) {
         let side = autosave_path(None);
-        let Ok(text) = std::fs::read_to_string(&side) else {
-            // Nothing to recover: the startup project is the baseline, so an
-            // untouched session never writes a sidecar.
-            self.autosaved = self.save_json().unwrap_or_default();
-            return;
-        };
-        if ask_recover("The last session left unsaved work. Recover it?") && self.open_text(&text, None) {
-            // Recovered work is unsaved until the user saves it: keep the
-            // sidecar until then, and don't rewrite an identical one.
-            self.autosaved = text;
-        } else {
+        if let Ok(text) = std::fs::read_to_string(&side) {
+            if ask_recover("The last session left unsaved work in an unsaved project. Recover it?")
+                && self.open_text(&text, None)
+            {
+                // Recovered work is unsaved until the user saves it: keep the
+                // sidecar until then, and don't rewrite an identical one.
+                self.autosaved = text;
+                return;
+            }
             let _ = std::fs::remove_file(side);
-            self.autosaved = self.save_json().unwrap_or_default();
+        } else if let Some(path) = std::fs::read_to_string(last_session_path())
+            .ok()
+            .map(|p| std::path::PathBuf::from(p.trim()))
+            .filter(|p| is_newer(&autosave_path(Some(p)), p))
+        {
+            // The project *and* its unsaved changes: `open_project_path` asks,
+            // and opens the saved file if the answer is no.
+            if self.open_project_path(path) {
+                return;
+            }
         }
+        // Nothing recovered: the startup project is the baseline, so an
+        // untouched session never writes a sidecar.
+        self.autosaved = self.save_json().unwrap_or_default();
     }
 
     /// File > New: an empty comp with the open comp's size, rate and length,
@@ -3498,13 +3520,21 @@ impl App {
             return false;
         };
         self.autosave();
+        self.open_project_path(path)
+    }
+
+    /// Open a `.pbc` by path, offering its sidecar first when that sidecar holds
+    /// newer work. Shared by File > Open and the launch recovery, so both ask
+    /// the same question and leave the same state behind.
+    pub(crate) fn open_project_path(&mut self, path: std::path::PathBuf) -> bool {
         // A sidecar newer than the file is work that never got saved — a crash,
         // or a close without saving. Offer it; declined, it's deleted.
         let side = autosave_path(Some(&path));
-        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        let recover = side.exists()
-            && mtime(&side) > mtime(&path)
-            && ask_recover("This project has autosaved changes newer than the file. Recover them?");
+        let recover = is_newer(&side, &path)
+            && ask_recover(&format!(
+                "{} has autosaved changes newer than the file. Recover them?",
+                path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+            ));
         if side.exists() && !recover {
             let _ = std::fs::remove_file(&side);
         }
@@ -5192,6 +5222,22 @@ pub(crate) fn autosave_path(project: Option<&std::path::Path>) -> std::path::Pat
             s.into()
         }
         None => std::env::temp_dir().join("pbc-untitled.pbc.autosave"),
+    }
+}
+
+/// Where the last saved project's path is remembered, for launch recovery.
+fn last_session_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("pbc-last-session.txt")
+}
+
+/// Whether `side` exists and is newer than `file` — an autosave holding work the
+/// saved file doesn't have. A missing `file` counts as older, so a sidecar whose
+/// project was moved or deleted is still offered.
+pub(crate) fn is_newer(side: &std::path::Path, file: &std::path::Path) -> bool {
+    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    match mtime(side) {
+        Some(s) => mtime(file).is_none_or(|f| s > f),
+        None => false,
     }
 }
 

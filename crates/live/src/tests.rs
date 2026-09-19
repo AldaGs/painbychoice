@@ -5832,3 +5832,34 @@ fn unparent_moves_out_one_level_or_all_the_way() {
     let ids: Vec<u64> = moved.children.iter().map(|c| c.id.0).collect();
     assert_eq!(ids, [1, 2, 5]);
 }
+
+/// Recovery hinges on one comparison: a sidecar is offered only when it holds
+/// work the saved file doesn't. Getting it backwards would either lose the
+/// unsaved changes or nag on every open of a cleanly saved project.
+#[test]
+fn an_autosave_is_offered_only_when_it_is_newer_than_the_project() {
+    let dir = std::env::temp_dir().join(format!("pbc-recover-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("shot.pbc");
+    let side = crate::app::autosave_path(Some(&file));
+
+    // No sidecar: nothing to offer.
+    std::fs::write(&file, "{}").unwrap();
+    assert!(!crate::app::is_newer(&side, &file));
+
+    // A sidecar written after the file is unsaved work.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&side, "{}").unwrap();
+    assert!(crate::app::is_newer(&side, &file));
+
+    // Saving again makes the file the newer of the two — a stale sidecar (one
+    // a failed removal left behind) must not be offered.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&file, "{}").unwrap();
+    assert!(!crate::app::is_newer(&side, &file));
+
+    // A project that moved away leaves its sidecar the only copy.
+    std::fs::remove_file(&file).unwrap();
+    assert!(crate::app::is_newer(&side, &file));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

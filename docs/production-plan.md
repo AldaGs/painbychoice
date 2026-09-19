@@ -358,8 +358,9 @@ Small, unglamorous, and the difference between a demo and a tool.
 
 - ✅ **Autosave** (2026-09-18): every 60 s (only when changed) and before
   Open/New, to `shot.pbc.autosave` beside the file or a temp-dir file for an
-  untitled project; written via rename, removed by a save. **Recovery**: opening
-  a file whose sidecar is newer offers it, and launch offers an untitled one.
+  untitled project; written via rename, removed by a save. **Recovery**: launch
+  offers the last session's unsaved work (its project path is remembered in the
+  temp dir), and opening a file whose sidecar is newer offers it too.
   Not yet runtime-checked; no dirty flag or save-on-quit prompt.
 - **Asset relink** UI and a "collect files" action — `core` already treats a
   relink as recoverable; expose it.
