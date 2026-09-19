@@ -92,6 +92,7 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(demo_document());
+    app.recover_untitled();
     println!("Pain By Choice — live. Space=play/pause  ←/→=step  R=restart  Esc=quit");
     event_loop.run_app(&mut app).unwrap();
 }

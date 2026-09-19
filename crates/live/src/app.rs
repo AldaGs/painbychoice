@@ -204,6 +204,11 @@ pub(crate) struct App {
     /// cannot supply: a Draft destination the user can guess, and the anchor a
     /// preset's relative path resolves against.
     pub(crate) project_path: Option<std::path::PathBuf>,
+    /// The JSON last written to disk — by a save, an autosave or an open — so
+    /// the autosave timer only writes when the project actually changed.
+    autosaved: String,
+    /// When the autosave timer last fired.
+    autosave_at: Instant,
     /// Exports in progress and finished. See [`crate::renderqueue`].
     pub(crate) queue: crate::renderqueue::RenderQueue,
     /// Playback time, from the audio device when there is one. See
@@ -1180,6 +1185,8 @@ impl App {
             ng_status: None,
             footage: FootageCache::new(motion_render::default_registry()),
             project_path: None,
+            autosaved: String::new(),
+            autosave_at: Instant::now(),
             queue: crate::renderqueue::RenderQueue::default(),
             clock: crate::clock::MasterClock::new(),
             audio_out: None,
@@ -2023,6 +2030,10 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 self.render(&window);
+                // ponytail: fixed 60 s interval, make it a setting if anyone asks.
+                if self.autosave_at.elapsed() >= std::time::Duration::from_secs(60) {
+                    self.autosave();
+                }
                 // Keep animating while playing; when paused, egui still asks
                 // for repaints while the pointer interacts with the UI.
                 //
@@ -3340,7 +3351,8 @@ impl App {
         self.write_project(path);
     }
 
-    fn write_project(&mut self, path: std::path::PathBuf) {
+    /// The project and layout as a `.pbc` file's text.
+    fn save_json(&self) -> serde_json::Result<String> {
         let project = SaveFile {
             project: Some(self.project.clone()),
             document: None,
@@ -3349,18 +3361,65 @@ impl App {
                 user_presets: self.presets.iter().filter(|p| !p.builtin).cloned().collect(),
             },
         };
-        match serde_json::to_string_pretty(&project) {
+        serde_json::to_string_pretty(&project)
+    }
+
+    fn write_project(&mut self, path: std::path::PathBuf) {
+        match self.save_json() {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = std::fs::write(&path, &json) {
                     eprintln!("save failed: {e}");
                 } else {
+                    // The sidecar is now older than the file it shadows: gone,
+                    // along with the untitled one if this was its first save.
+                    let _ = std::fs::remove_file(autosave_path(self.project_path.as_deref()));
+                    let _ = std::fs::remove_file(autosave_path(Some(&path)));
                     // Only on success: a failed save leaves the project where
                     // it was, and a Draft must not aim at a file that isn't
                     // there.
                     self.project_path = Some(path);
+                    self.autosaved = json;
                 }
             }
             Err(e) => eprintln!("serialize failed: {e}"),
+        }
+    }
+
+    /// Write the project to its sidecar if it changed since anything last hit
+    /// disk. Called on a timer and before an open or New replaces the project.
+    /// Written to a temp name and renamed, so a crash mid-write can't leave a
+    /// half sidecar where a whole one was.
+    pub(crate) fn autosave(&mut self) {
+        self.autosave_at = Instant::now();
+        let Ok(json) = self.save_json() else { return };
+        if json == self.autosaved {
+            return;
+        }
+        let path = autosave_path(self.project_path.as_deref());
+        let tmp = path.with_extension("autosave-tmp");
+        match std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path)) {
+            Ok(()) => self.autosaved = json,
+            Err(e) => eprintln!("autosave failed: {e}"),
+        }
+    }
+
+    /// At launch: an untitled project's sidecar means the last session ended
+    /// with unsaved work. Offer it back; declined, it's deleted.
+    pub(crate) fn recover_untitled(&mut self) {
+        let side = autosave_path(None);
+        let Ok(text) = std::fs::read_to_string(&side) else {
+            // Nothing to recover: the startup project is the baseline, so an
+            // untouched session never writes a sidecar.
+            self.autosaved = self.save_json().unwrap_or_default();
+            return;
+        };
+        if ask_recover("The last session left unsaved work. Recover it?") && self.open_text(&text, None) {
+            // Recovered work is unsaved until the user saves it: keep the
+            // sidecar until then, and don't rewrite an identical one.
+            self.autosaved = text;
+        } else {
+            let _ = std::fs::remove_file(side);
+            self.autosaved = self.save_json().unwrap_or_default();
         }
     }
 
@@ -3369,6 +3428,7 @@ impl App {
     /// cleared by a replace, so without asking this would be one misclick from
     /// losing the session. The layout is kept: it is the user's, not the file's.
     pub(crate) fn new_project(&mut self) -> bool {
+        self.autosave();
         let sure = rfd::MessageDialog::new()
             .set_title("New project")
             .set_description("Discard the current project and start an empty one?")
@@ -3383,6 +3443,7 @@ impl App {
         comp.duration_frames = old.duration_frames;
         comp.bg = old.bg;
         self.replace_project(MProject::single(comp), None);
+        self.autosaved = self.save_json().unwrap_or_default();
         true
     }
 
@@ -3436,17 +3497,38 @@ impl App {
         else {
             return false;
         };
-        let text = match std::fs::read_to_string(&path) {
+        self.autosave();
+        // A sidecar newer than the file is work that never got saved — a crash,
+        // or a close without saving. Offer it; declined, it's deleted.
+        let side = autosave_path(Some(&path));
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let recover = side.exists()
+            && mtime(&side) > mtime(&path)
+            && ask_recover("This project has autosaved changes newer than the file. Recover them?");
+        if side.exists() && !recover {
+            let _ = std::fs::remove_file(&side);
+        }
+        let text = match std::fs::read_to_string(if recover { &side } else { &path }) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("read failed: {e}");
                 return false;
             }
         };
+        if !self.open_text(&text, Some(path)) {
+            return false;
+        }
+        // Recovered changes stay unsaved (and their sidecar stays) until a save.
+        self.autosaved = if recover { text } else { self.save_json().unwrap_or_default() };
+        true
+    }
+
+    /// Replace the project and layout with a `.pbc` file's text.
+    fn open_text(&mut self, text: &str, path: Option<std::path::PathBuf>) -> bool {
         // Three formats, newest first: a project, a pre-comps wrapper holding a
         // single document, and a bare document from before the wrapper existed.
         // Each older one loads as a one-comp project, so nothing is stranded.
-        let (project, layout) = match serde_json::from_str::<SaveFile>(&text) {
+        let (project, layout) = match serde_json::from_str::<SaveFile>(text) {
             Ok(f) => {
                 let layout = Some(f.layout);
                 match (f.project, f.document) {
@@ -3454,7 +3536,7 @@ impl App {
                     (None, Some(d)) => (MProject::single(d), layout),
                     // A `SaveFile` with neither is not one of our files: it
                     // parsed only because every field defaults.
-                    (None, None) => match serde_json::from_str::<Document>(&text) {
+                    (None, None) => match serde_json::from_str::<Document>(text) {
                         Ok(d) => (MProject::single(d), None),
                         Err(e) => {
                             eprintln!("parse failed: {e}");
@@ -3468,7 +3550,7 @@ impl App {
                 return false;
             }
         };
-        self.replace_project(project, Some(path));
+        self.replace_project(project, path);
 
         // Restore the layout. Built-ins are always rebuilt from code; loaded user
         // presets (and the active dock) are validated, so a corrupt or edited
@@ -5098,4 +5180,26 @@ fn move_layers(graph: &mut NodeGraph, from: CompId, to: CompId, ids: &[NodeId]) 
             c.ref_comp = Some(to);
         }
     }
+}
+
+/// Where a project's autosave lives: beside the file (`shot.pbc.autosave`), or
+/// for a never-saved project, one fixed file in the temp dir.
+pub(crate) fn autosave_path(project: Option<&std::path::Path>) -> std::path::PathBuf {
+    match project {
+        Some(p) => {
+            let mut s = p.as_os_str().to_owned();
+            s.push(".autosave");
+            s.into()
+        }
+        None => std::env::temp_dir().join("pbc-untitled.pbc.autosave"),
+    }
+}
+
+fn ask_recover(msg: &str) -> bool {
+    rfd::MessageDialog::new()
+        .set_title("Recover autosave")
+        .set_description(msg)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }
