@@ -1,5 +1,6 @@
 out/
 target/
+.claude/
 
 # Render output. The CLI writes wherever `--out` points, and the demo
 # invocations in docs/performance.md land these in the repo root.
