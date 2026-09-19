@@ -246,6 +246,25 @@ pub(crate) fn knob_info(p: &motion_core::node::Param) -> KnobInfo {
     KnobInfo { name: p.name.clone(), kind: p.value.kind_name(), value: p.value.as_const() }
 }
 
+/// Every comp's layer names by `(comp, layer id)` — the current comp's bare,
+/// the others' suffixed with their comp, so a node title can say where it points.
+pub(crate) type LayerNames = std::collections::HashMap<(CompId, u64), String>;
+
+pub(crate) fn collect_layer_names(project: &MProject, current: CompId) -> LayerNames {
+    fn walk(n: &MNode, c: CompId, suffix: &str, out: &mut LayerNames) {
+        out.insert((c, n.id.0), format!("{}{suffix}", n.name));
+        for ch in &n.children {
+            walk(ch, c, suffix, out);
+        }
+    }
+    let mut out = LayerNames::new();
+    for (&c, comp) in &project.comps {
+        let suffix = if c == current { String::new() } else { format!(" ({})", comp.name) };
+        walk(&comp.root, c, &suffix, &mut out);
+    }
+    out
+}
+
 pub(crate) fn collect_layer_info(node: &MNode, out: &mut Vec<LayerInfo>) {
     out.push(LayerInfo {
         id: node.id.0,
@@ -394,6 +413,7 @@ pub(crate) fn nodegraph_ui(
     ctx: &GraphCtx,
     scope: NgScope,
     layers: &[LayerInfo],
+    layer_names: &LayerNames,
     modules: &[(ModuleId, String)],
     knobs: &[KnobInfo],
     module_output: Option<&Endpoint>,
@@ -459,7 +479,7 @@ pub(crate) fn nodegraph_ui(
     if graph.nodes.is_empty() {
         ui.weak("Empty. Add a node from the palette above, then drag between sockets to wire.");
     }
-    canvas(ui, graph, ctx, scope, layers, modules, script_preview, out);
+    canvas(ui, graph, ctx, scope, layers, layer_names, modules, script_preview, out);
 }
 
 /// Which graph node is selected for the inspector — ephemeral view state, so it
@@ -1336,6 +1356,7 @@ fn canvas(
     ctx: &GraphCtx,
     scope: NgScope,
     layers: &[LayerInfo],
+    layer_names: &LayerNames,
     modules: &[(ModuleId, String)],
     script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     out: &mut NgEdits,
@@ -1381,7 +1402,7 @@ fn canvas(
     let builder = egui::UiBuilder::new().max_rect(area).id_salt(("ng_canvas", scope_salt(scope)));
     ui.scope_builder(builder, |ui| {
         ui.set_clip_rect(area.intersect(ui.clip_rect()));
-        draw_graph(ui, graph, ctx, &view, layers, modules, script_preview, &mut selset, out);
+        draw_graph(ui, graph, ctx, &view, layers, layer_names, modules, script_preview, &mut selset, out);
     });
 
     marquee(ui, &bg, &view, graph, ctx, &mut selset);
@@ -1491,6 +1512,7 @@ fn draw_graph(
     ctx: &GraphCtx,
     view: &View,
     layers: &[LayerInfo],
+    layer_names: &LayerNames,
     modules: &[(ModuleId, String)],
     script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     selset: &mut std::collections::HashSet<GraphNodeId>,
@@ -1598,7 +1620,7 @@ fn draw_graph(
         let rect = egui::Rect::from_min_size(top, egui::vec2(view.s(NODE_W), h));
         let is_sel = selset.contains(&n.id);
         draw_node(
-            ui, &painter, view, n, desc.as_deref(), rect, is_sel, graph, layers, modules,
+            ui, &painter, view, n, desc.as_deref(), rect, is_sel, graph, layers, layer_names, modules,
             script_preview, out, &mut pending, &in_pos, &out_pos,
         );
     }
@@ -1644,6 +1666,7 @@ fn draw_node(
     selected: bool,
     graph: &NodeGraph,
     layers: &[LayerInfo],
+    layer_names: &LayerNames,
     modules: &[(ModuleId, String)],
     script_preview: Option<&(GraphNodeId, Result<String, String>)>,
     out: &mut NgEdits,
@@ -1686,7 +1709,7 @@ fn draw_node(
     };
 
     // Title, and a delete button at the header's right.
-    let title = node_title(node, desc, layers);
+    let title = node_title(node, desc, layers, layer_names);
     painter.text(
         egui::pos2(header.min.x + view.s(8.0), header.center().y),
         egui::Align2::LEFT_CENTER,
@@ -1993,17 +2016,24 @@ fn shape_out_editor(
 /// it — except for a **sink**, which says what it drives instead of what it is.
 /// "Rotation → Star" on the canvas is the whole reason a driver is worth being a
 /// node: the binding is legible without selecting anything.
-fn node_title(node: &GraphNode, desc: Option<&NodeDescriptor>, layers: &[LayerInfo]) -> String {
+/// Layer ids are per-comp, so the name comes from the comp the node recorded
+/// (`layer_names`), not whichever comp is open; `layers` only covers a node
+/// with no recorded comp.
+fn node_title(
+    node: &GraphNode,
+    desc: Option<&NodeDescriptor>,
+    layers: &[LayerInfo],
+    layer_names: &LayerNames,
+) -> String {
     if let Some(t) = &node.title {
         return t.clone();
     }
-    let layer_name = |t: NodeId| {
-        layers
-            .iter()
-            .find(|l| l.id == t.0)
-            .map(|l| l.name.clone())
-            .unwrap_or_else(|| format!("#{}", t.0))
-    };
+    let comp = if node.kind == "ref" { node.config.ref_comp } else { node.config.out_comp };
+    let layer_name = |t: NodeId| match comp {
+        Some(c) => layer_names.get(&(c, t.0)).cloned(),
+        None => layers.iter().find(|l| l.id == t.0).map(|l| l.name.clone()),
+    }
+    .unwrap_or_else(|| format!("#{}", t.0));
     // A configured ref reads as the mirror of its sink: `boxA → Position`
     // against the out node's `Position → boxA`, arrow pointing the way the
     // value travels in both cases.

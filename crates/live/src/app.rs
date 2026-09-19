@@ -4058,6 +4058,7 @@ impl App {
             }
             v
         };
+        let ng_layer_names = crate::nodegraph::collect_layer_names(&self.project, self.current);
         // Modules for a `use` node's picker: id + display name.
         let ng_modules: Vec<(ModuleId, String)> =
             self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
@@ -4178,6 +4179,7 @@ impl App {
                         &node_ctx,
                         ng_scope,
                         &ng_layers,
+                        &ng_layer_names,
                         &ng_modules,
                         &ng_knobs,
                         ng_module_output.as_ref(),

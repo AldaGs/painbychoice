@@ -3709,6 +3709,7 @@ fn the_panel_lays_out_every_node_kind_without_an_id_clash() {
             &ctx,
             NgScope::Project,
             &layers,
+            &Default::default(),
             &[],
             &[],
             None,
