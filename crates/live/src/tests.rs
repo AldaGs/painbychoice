@@ -1129,6 +1129,28 @@ fn three_layer_comp() -> MProject {
     ))
 }
 
+/// Precomposing moves a layer into a new comp with its id intact, so the
+/// drivers and refs naming it have to follow it there. The ones naming layers
+/// that stayed behind stay put, and the moved id isn't reused in the old comp.
+#[test]
+fn precomposing_carries_a_layers_drivers_and_refs_into_the_new_comp() {
+    let mut project = three_layer_comp();
+    let current = project.root;
+    let v = project.graph.add_node("value", Vec2::ZERO);
+    let moved_sink = project.graph.bind_output(Endpoint::new(v, "value"), current, NodeId(2), PropPath::Rotation);
+    let kept_sink = project.graph.bind_output(Endpoint::new(v, "value"), current, NodeId(1), PropPath::Rotation);
+    let r = project.graph.add_node("ref", Vec2::ZERO);
+    retarget_ref(&mut project.graph, r, current, Some((NodeId(2), PropPath::Opacity, 0.0)));
+
+    let (comp_id, _) = precompose_into(&mut project, current, NodeId(2), 99).unwrap();
+
+    let comp_of = |id| project.graph.node(id).unwrap().config.out_comp;
+    assert_eq!(comp_of(moved_sink), Some(comp_id), "the driver stayed behind");
+    assert_eq!(comp_of(kept_sink), Some(current), "a driver on a layer that didn't move followed");
+    assert_eq!(project.graph.node(r).unwrap().config.ref_comp, Some(comp_id), "the ref stayed behind");
+    assert!(project.comp(current).unwrap().removed_id_floor > 2, "the moved id could come back in the old comp");
+}
+
 #[test]
 fn precomposing_replaces_the_layer_in_place_with_an_instance() {
     let mut project = three_layer_comp();
@@ -2804,7 +2826,7 @@ fn a_geometry_driver_authors_a_layers_shape() {
         .graph
         .connect(&GraphCtx::bare(&reg), Endpoint::new(ramp, "value"), Endpoint::new(rect, "radius"))
         .unwrap();
-    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), target);
+    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), project.root, target);
 
     compile_drivers(&mut project, &reg, comp);
 
@@ -2837,8 +2859,8 @@ fn a_property_driver_overrides_one_param_of_a_graph_authored_shape() {
     let rect = project.graph.add_node("rect", Vec2::new(0.0, 0.0));
     let v = project.graph.add_node("value", Vec2::new(-200.0, 0.0));
     project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Vec3(motion_core::Vec3::flat(50.0, 50.0)));
-    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), target);
-    project.graph.bind_output(Endpoint::new(v, "value"), target, PropPath::ShapeSize);
+    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), project.root, target);
+    project.graph.bind_output(Endpoint::new(v, "value"), project.root, target, PropPath::ShapeSize);
 
     compile_drivers(&mut project, &reg, comp);
 
@@ -2859,12 +2881,57 @@ fn a_stale_geometry_driver_leaves_the_shape_untouched() {
     project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().shape =
         Some(MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
     let add = project.graph.add_node("math", Vec2::new(0.0, 0.0));
-    project.graph.bind_geometry(Endpoint::new(add, "geometry"), target);
+    project.graph.bind_geometry(Endpoint::new(add, "geometry"), project.root, target);
 
     compile_drivers(&mut project, &reg, comp);
 
     let node = project.comp(comp).unwrap().root.find(target).unwrap();
     assert!(matches!(node.shape, Some(MShape::Ellipse { .. })), "{:?}", node.shape);
+}
+
+/// The read side of the same rule: a `ref` picked in comp A names A's layer, so
+/// feeding a driver in comp B must not read B's layer that shares the id.
+#[test]
+fn a_ref_does_not_read_another_comps_layer_with_the_same_id() {
+    let (mut project, comp_a, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    // Comp B: its own layer 1 (what a leaky ref would read) and layer 2 (driven).
+    let mut b_one = MNode::group(1, "b one");
+    b_one.transform.opacity = Value::constant(0.25);
+    let b_root = MNode::group(0, "root").with_child(b_one).with_child(MNode::group(2, "b two"));
+    let comp_b = project.insert(Comp::new(200.0, 200.0, b_root));
+    let r = project.graph.add_node("ref", Vec2::ZERO);
+    retarget_ref(&mut project.graph, r, comp_a, Some((target, PropPath::Opacity, 0.0)));
+    project.graph.bind_output(Endpoint::new(r, "value"), comp_b, NodeId(2), PropPath::Opacity);
+
+    compile_drivers(&mut project, &reg, comp_b);
+
+    let b = project.comp(comp_b).unwrap();
+    let got = b.root.find(NodeId(2)).unwrap().transform.opacity.resolve(&mut EvalCtx::new(b, 0.0));
+    assert_ne!(got, 0.25, "the ref read comp B's layer 1 instead of comp A's");
+}
+
+/// Layer ids are per-comp but the graph is per-project, so a driver has to
+/// know *which* comp its target lives in. Recompiling while another comp is
+/// open must not reach into that comp's layer that happens to share the id.
+#[test]
+fn a_driver_does_not_leak_into_another_comp_with_the_same_layer_id() {
+    let (mut project, comp_a, target) = shape_driver_project();
+    let reg = NodeRegistry::with_builtins();
+    // Comp B has its own layer 1 — a hand-made ellipse, driven by nothing.
+    let mut other = MNode::group(1, "unrelated");
+    other.shape = Some(MShape::Ellipse { size: Value::constant(Vec2::new(10.0, 10.0)) });
+    let comp_b = project.insert(Comp::new(200.0, 200.0, MNode::group(0, "root").with_child(other)));
+    // The driver is authored for comp A's layer 1.
+    let rect = project.graph.add_node("rect", Vec2::new(0.0, 0.0));
+    project.graph.bind_geometry(Endpoint::new(rect, "geometry"), project.root, target);
+    compile_drivers(&mut project, &reg, comp_a);
+
+    // A graph edit while comp B is open recompiles against B.
+    compile_drivers(&mut project, &reg, comp_b);
+
+    let node = project.comp(comp_b).unwrap().root.find(target).unwrap();
+    assert!(matches!(node.shape, Some(MShape::Ellipse { .. })), "comp A's driver reshaped comp B's layer: {:?}", node.shape);
 }
 
 // ── Module scope: the canvas authoring a shared module's body. ───────────────
@@ -2948,7 +3015,7 @@ fn one_param_recipe_drives_two_layers_at_their_own_knob_values() {
     let p = project.graph.add_node("param", Vec2::ZERO);
     project.graph.node_mut(p).unwrap().config.param = "gain".into();
     for target in [NodeId(1), NodeId(2)] {
-        project.graph.bind_output(Endpoint::new(p, "value"), target, PropPath::Rotation);
+        project.graph.bind_output(Endpoint::new(p, "value"), project.root, target, PropPath::Rotation);
     }
     compile_drivers(&mut project, &reg, comp_id);
 
@@ -2977,7 +3044,7 @@ fn removing_a_knob_a_param_still_reads_falls_back_instead_of_failing() {
 
     let p = project.graph.add_node("param", Vec2::ZERO);
     project.graph.node_mut(p).unwrap().config.param = "gain".into();
-    project.graph.bind_output(Endpoint::new(p, "value"), NodeId(1), PropPath::Rotation);
+    project.graph.bind_output(Endpoint::new(p, "value"), project.root, NodeId(1), PropPath::Rotation);
     compile_drivers(&mut project, &reg, comp_id);
 
     let scene = evaluate_comp(&project, comp_id, 0.0);
@@ -3020,7 +3087,7 @@ fn linked_module_project() -> (MProject, NodeRegistry, ModuleId, GraphNodeId) {
 
     let u = project.graph.add_node("use", Vec2::ZERO);
     project.graph.node_mut(u).unwrap().config.module = Some(id);
-    project.graph.bind_output(Endpoint::new(u, "value"), NodeId(1), PropPath::Rotation);
+    project.graph.bind_output(Endpoint::new(u, "value"), project.root, NodeId(1), PropPath::Rotation);
     let comp_id = project.root;
     compile_drivers(&mut project, &reg, comp_id);
     (project, reg, id, u)
@@ -3062,7 +3129,7 @@ fn editing_a_module_body_drives_every_link() {
     project.comp_mut(project.root).unwrap().root.children.push(MNode::group(2, "b"));
     let u2 = project.graph.add_node("use", Vec2::new(0.0, 200.0));
     project.graph.node_mut(u2).unwrap().config.module = Some(id);
-    project.graph.bind_output(Endpoint::new(u2, "value"), NodeId(2), PropPath::Rotation);
+    project.graph.bind_output(Endpoint::new(u2, "value"), project.root, NodeId(2), PropPath::Rotation);
     let comp_id = project.root;
     compile_drivers(&mut project, &reg, comp_id);
 
@@ -3138,6 +3205,7 @@ fn a_geometry_node_can_create_the_layer_it_drives() {
     let node = create_layer_from_geometry(
         &mut project,
         &reg,
+        comp,
         Endpoint::new(rect, "geometry"),
         seed,
     )
@@ -3160,12 +3228,12 @@ fn a_geometry_node_can_create_the_layer_it_drives() {
 /// outputs, so this is the guard behind that, not a reachable path.
 #[test]
 fn a_value_output_cannot_create_a_layer() {
-    let (mut project, _, _) = shape_driver_project();
+    let (mut project, comp, _) = shape_driver_project();
     let reg = NodeRegistry::with_builtins();
     let v = project.graph.add_node("value", Vec2::ZERO);
     let seed =
         LayerSeed { id: 9, transform: Transform::default(), fill: MColor::rgb(0.0, 0.0, 0.0) };
-    assert!(create_layer_from_geometry(&mut project, &reg, Endpoint::new(v, "value"), seed)
+    assert!(create_layer_from_geometry(&mut project, &reg, comp, Endpoint::new(v, "value"), seed)
         .is_none());
     assert!(project.graph.shape_bindings().is_empty(), "a refused create left a binding behind");
 }
@@ -3180,6 +3248,7 @@ fn a_value_output_cannot_create_a_layer() {
 fn shape_sink_for(project: &mut MProject, target: NodeId) -> GraphNodeId {
     let sink = project.graph.add_node("shapeOut", Vec2::new(360.0, 40.0));
     project.graph.node_mut(sink).unwrap().config.out_shape = Some(target);
+    project.graph.node_mut(sink).unwrap().config.out_comp = Some(project.root);
     sink
 }
 
@@ -3277,7 +3346,7 @@ fn out_node_project() -> (MProject, CompId, NodeRegistry, GraphNodeId) {
     // the same at every frame and a bake can be checked without picking one.
     project.graph.node_mut(osc).unwrap().set_value("amp", ExprValue::Num(0.0));
     project.graph.node_mut(osc).unwrap().set_value("offset", ExprValue::Num(30.0));
-    let sink = project.graph.bind_output(Endpoint::new(osc, "value"), target, PropPath::Rotation);
+    let sink = project.graph.bind_output(Endpoint::new(osc, "value"), project.root, target, PropPath::Rotation);
     compile_drivers(&mut project, &reg, comp);
     (project, comp, reg, sink)
 }
@@ -3294,6 +3363,39 @@ fn an_out_node_drives_the_property_it_targets() {
 
 /// Deleting the sink node unbinds the property — and **bakes** it, so the layer
 /// stays where it was instead of being stranded on an expression no node feeds.
+/// Deleting a layer cuts the drivers and refs that named it, so no node is
+/// left holding an id that could be handed to a newcomer.
+#[test]
+fn deleting_a_layer_untargets_the_nodes_that_named_it() {
+    let (mut project, comp, _reg, sink) = out_node_project();
+    let target = NodeId(1);
+    let r = project.graph.add_node("ref", Vec2::ZERO);
+    retarget_ref(&mut project.graph, r, comp, Some((target, PropPath::Opacity, 0.0)));
+    assert_eq!(project.graph.bindings().len(), 1);
+
+    assert!(delete_layer(&mut project, comp, target));
+
+    assert!(project.graph.bindings().is_empty(), "the driver outlived its layer");
+    let config = &project.graph.node(sink).unwrap().config;
+    assert_eq!((config.out_target, config.out_comp), (None, None));
+    assert_eq!(project.graph.node(r).unwrap().config.ref_target, None, "the ref outlived its layer");
+}
+
+/// A deleted layer's id never comes back, even when it was the highest one —
+/// the case a plain `max + 1` gets wrong — and the floor survives a save.
+#[test]
+fn a_deleted_layers_id_is_never_handed_out_again() {
+    let (mut project, comp, target) = shape_driver_project();
+    assert_eq!(fresh_id(project.comp(comp).unwrap()), 2);
+
+    delete_layer(&mut project, comp, target);
+    assert_eq!(fresh_id(project.comp(comp).unwrap()), 2, "id 1 came back");
+
+    let json = serde_json::to_string(&project).unwrap();
+    let back: MProject = serde_json::from_str(&json).unwrap();
+    assert_eq!(fresh_id(back.comp(comp).unwrap()), 2, "a reload forgot the floor");
+}
+
 /// This is the route the old Drivers list's "×" was the only way to take.
 #[test]
 fn deleting_a_sink_node_bakes_the_property_it_was_driving() {
@@ -3362,7 +3464,7 @@ fn a_property_another_driver_still_writes_is_left_alone() {
     // A second sink on the same property, from a second source.
     let v = project.graph.add_node("value", Vec2::new(0.0, 200.0));
     project.graph.node_mut(v).unwrap().set_value("value", ExprValue::Num(5.0));
-    let second = project.graph.bind_output(Endpoint::new(v, "value"), NodeId(1), PropPath::Rotation);
+    let second = project.graph.bind_output(Endpoint::new(v, "value"), project.root, NodeId(1), PropPath::Rotation);
     let before = project.graph.bindings();
     assert_eq!(before.len(), 2);
 
@@ -3384,18 +3486,18 @@ fn repointing_a_ref_across_types_sweeps_its_stale_wires() {
     let ctx = GraphCtx::bare(&reg);
     let r = project.graph.add_node("ref", Vec2::new(0.0, 300.0));
     let osc = project.graph.add_node("osc", Vec2::new(200.0, 300.0));
-    retarget_ref(&mut project.graph, r, Some((NodeId(1), PropPath::Rotation, 0.0)));
+    retarget_ref(&mut project.graph, r, project.root, Some((NodeId(1), PropPath::Rotation, 0.0)));
     project
         .graph
         .connect(&ctx, Endpoint::new(r, "value"), Endpoint::new(osc, "freq"))
         .expect("a scalar read feeds a scalar knob");
 
     // Rotation → Opacity: both Numbers, so the wire is untouched.
-    retarget_ref(&mut project.graph, r, Some((NodeId(1), PropPath::Opacity, 0.0)));
+    retarget_ref(&mut project.graph, r, project.root, Some((NodeId(1), PropPath::Opacity, 0.0)));
     assert_eq!(project.graph.edges_from(r).count(), 1, "a same-type move keeps the wire");
 
     // Opacity → Position: Number becomes Vector, and the wire goes with it.
-    retarget_ref(&mut project.graph, r, Some((NodeId(1), PropPath::Position, 0.0)));
+    retarget_ref(&mut project.graph, r, project.root, Some((NodeId(1), PropPath::Position, 0.0)));
     assert_eq!(project.graph.edges_from(r).count(), 0, "the stale wire was swept");
     assert!(
         project.graph.validate(&ctx).is_empty(),
@@ -3430,7 +3532,9 @@ fn a_property_expression_imports_into_the_sink_that_drives_it() {
     project.comp_mut(comp).unwrap().root.find_mut(target).unwrap().transform.rotation =
         Value::expr(Expr::bin(BinOp::Add,Expr::Lit(ExprValue::Num(2.0)),Expr::Lit(ExprValue::Num(3.0))));
     let sink = project.graph.add_node("out", Vec2::new(360.0, 40.0));
-    project.graph.node_mut(sink).unwrap().config.out_target = Some((target, PropPath::Rotation));
+    let config = &mut project.graph.node_mut(sink).unwrap().config;
+    config.out_target = Some((target, PropPath::Rotation));
+    config.out_comp = Some(comp);
     assert!(project.graph.bindings().is_empty(), "an unwired sink drives nothing yet");
 
     import_property(&mut project, &reg, comp, sink).expect("a const expression should import");
@@ -4193,7 +4297,7 @@ fn splitting_repoints_a_driver_at_the_moved_property() {
     let mut project = project_with_hybrid_layer();
     let root_id = project.root;
     let value = project.graph.add_node("value", Vec2::ZERO);
-    project.graph.bind_output(Endpoint::new(value, "value"), NodeId(1), PropPath::ShapeSize);
+    project.graph.bind_output(Endpoint::new(value, "value"), project.root, NodeId(1), PropPath::ShapeSize);
     let child = split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
     let bindings = project.graph.bindings();
     assert_eq!(bindings.len(), 1);
@@ -4207,7 +4311,7 @@ fn splitting_leaves_a_transform_driver_on_the_parent() {
     let mut project = project_with_hybrid_layer();
     let root_id = project.root;
     let value = project.graph.add_node("value", Vec2::ZERO);
-    project.graph.bind_output(Endpoint::new(value, "value"), NodeId(1), PropPath::Position);
+    project.graph.bind_output(Endpoint::new(value, "value"), project.root, NodeId(1), PropPath::Position);
     split_shape(&mut project, root_id, NodeId(1), 9).unwrap();
     assert_eq!(project.graph.bindings()[0].target, NodeId(1));
 }

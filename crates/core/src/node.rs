@@ -1000,6 +1000,12 @@ pub struct Comp {
     /// [`Comp::migrate`] and never written back out.
     #[serde(default, rename = "duration", skip_serializing)]
     legacy_duration: Option<f64>,
+    /// One past the highest layer id this comp has ever **removed**. Ids are
+    /// handed out from the live tree's max, so without this a deleted top layer's
+    /// id comes straight back — and a driver still naming it would seize the
+    /// newcomer. Saved, so a reload can't forget it either.
+    #[serde(default)]
+    pub removed_id_floor: u64,
     /// The colour painted inside the comp bounds, behind every layer. A user
     /// setting, not a constant — `#[serde(default)]` so pre-bg `.pbc` files
     /// load with [`Comp::DEFAULT_BG`] rather than transparent.
@@ -1290,6 +1296,7 @@ impl Comp {
             fps: 60.0,
             duration_frames: Comp::DEFAULT_DURATION_FRAMES,
             legacy_duration: None,
+            removed_id_floor: 0,
             bg: Self::DEFAULT_BG,
             passepartout: Self::DEFAULT_PASSEPARTOUT,
             motion_path_range: Self::DEFAULT_MOTION_PATH_RANGE,
@@ -1750,10 +1757,10 @@ impl Project {
             m.graph.migrate_kinds();
         }
         for b in std::mem::take(&mut self.legacy_bindings) {
-            self.graph.bind_output(b.output, b.target, b.prop);
+            self.graph.bind_output(b.output, self.root, b.target, b.prop);
         }
         for b in std::mem::take(&mut self.legacy_shape_bindings) {
-            self.graph.bind_geometry(b.output, b.target);
+            self.graph.bind_geometry(b.output, self.root, b.target);
         }
     }
 }

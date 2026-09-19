@@ -317,11 +317,13 @@ pub(crate) fn apply_fps_edit(
 pub(crate) fn retarget_ref(
     graph: &mut motion_core::NodeGraph,
     id: GraphNodeId,
+    comp: CompId,
     target: Option<(NodeId, PropPath, f64)>,
 ) {
     let Some(n) = graph.node_mut(id) else { return };
     let before = n.config.ref_target.map(|(_, p, _)| p);
     n.config.ref_target = target;
+    n.config.ref_comp = target.map(|_| comp);
     let kind_of = |p: Option<PropPath>| p.map(|p| p.socket_type());
     if kind_of(before) != kind_of(target.map(|(_, p, _)| p)) {
         graph.disconnect_output(&Endpoint::new(id, "value"));
@@ -340,8 +342,9 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
         .graph
         .bindings()
         .iter()
+        .filter(|b| b.comp == id)
         .map(|b| {
-            let expr = lower_output(&project.graph, &ctx, &b.output);
+            let expr = lower_output(&project.graph, &ctx.in_comp(id), &b.output);
             // The wire's type is the socket's; the property's may be wider.
             (b.target, PropKind::from_path(b.prop), b.prop.adapt_driver(expr))
         })
@@ -350,7 +353,8 @@ pub(crate) fn compile_drivers(project: &mut MProject, reg: &NodeRegistry, id: Co
         .graph
         .shape_bindings()
         .iter()
-        .filter_map(|b| Some((b.target, lower_geometry(&project.graph, &ctx, &b.output)?)))
+        .filter(|b| b.comp == id)
+        .filter_map(|b| Some((b.target, lower_geometry(&project.graph, &ctx.in_comp(id), &b.output)?)))
         .collect();
     let Some(comp) = project.comp_mut(id) else { return };
     // Shapes first, properties second: a geometry driver decides the shape
@@ -406,8 +410,8 @@ pub(crate) fn bake_unbound(
     let mut ctx = EvalCtx::new(&snapshot, frame as f64);
     let Some(open) = project.comps.get_mut(&comp) else { return false };
     let mut baked = false;
-    for b in before {
-        if after.contains(b) || after.iter().any(|a| a.target == b.target && a.prop == b.prop) {
+    for b in before.iter().filter(|b| b.comp == comp) {
+        if after.contains(b) || after.iter().any(|a| a.comp == b.comp && a.target == b.target && a.prop == b.prop) {
             continue;
         }
         if let Some(node) = open.root.find_mut(b.target) {
@@ -417,8 +421,8 @@ pub(crate) fn bake_unbound(
             }
         }
     }
-    for b in before_shapes {
-        if after_shapes.contains(b) || after_shapes.iter().any(|a| a.target == b.target) {
+    for b in before_shapes.iter().filter(|b| b.comp == comp) {
+        if after_shapes.contains(b) || after_shapes.iter().any(|a| a.comp == b.comp && a.target == b.target) {
             continue;
         }
         // A graph-authored shape keeps its *kind* and freezes its params, so the
@@ -473,6 +477,7 @@ pub(crate) struct LayerSeed {
 pub(crate) fn create_layer_from_geometry(
     project: &mut MProject,
     reg: &NodeRegistry,
+    comp: CompId,
     output: Endpoint,
     seed: LayerSeed,
 ) -> Option<MNode> {
@@ -492,7 +497,7 @@ pub(crate) fn create_layer_from_geometry(
     let node = MNode::shape(seed.id, format!("{name} {}", seed.id), shape)
         .with_fill(seed.fill)
         .with_transform(seed.transform);
-    project.graph.bind_geometry(output, NodeId(seed.id));
+    project.graph.bind_geometry(output, comp, NodeId(seed.id));
     Some(node)
 }
 
@@ -787,6 +792,9 @@ pub(crate) fn split_shape(
     // Re-point drivers. A `PropPath` names a property *on a node*, and the
     // artwork properties now live on a different node.
     for n in &mut project.graph.nodes {
+        if n.config.out_comp != Some(comp) {
+            continue;
+        }
         if let Some((target, prop)) = n.config.out_target {
             if target == id && ARTWORK_PROPS.contains(&prop) {
                 n.config.out_target = Some((child_id, prop));
@@ -870,6 +878,9 @@ pub(crate) fn ungroup_layer(project: &mut MProject, comp: CompId, id: NodeId) ->
     for (k, child) in group.children.into_iter().enumerate() {
         parent.children.insert(i + k, child);
     }
+    // The group's own id is gone like any deleted layer's.
+    c.removed_id_floor = c.removed_id_floor.max(id.0 + 1);
+    forget_layers(&mut project.graph, comp, &[id]);
     Ok(())
 }
 
@@ -897,7 +908,7 @@ pub(crate) fn import_shape(
         .and_then(|n| n.shape.clone())
         .ok_or_else(|| "that layer has no shape (a group has none).".to_string())?;
     let at = raise_spot(&project.graph, sink);
-    let ctx = GraphCtx::new(reg, &project.modules);
+    let ctx = GraphCtx::new(reg, &project.modules).in_comp(comp);
     let output = motion_core::raise_geometry(&mut project.graph, &ctx, &shape, at)
         .map_err(|e| e.to_string())?;
     wire_into_sink(&mut project.graph, reg, output, sink, "geometry")
@@ -937,7 +948,7 @@ pub(crate) fn import_property(
     // Raise (mutates the graph) reading the registry — disjoint fields, so both
     // borrows coexist.
     let at = raise_spot(&project.graph, sink);
-    let ctx = GraphCtx::new(reg, &project.modules);
+    let ctx = GraphCtx::new(reg, &project.modules).in_comp(comp);
     let output = motion_core::raise(&mut project.graph, &ctx, &expr, at);
     wire_into_sink(&mut project.graph, reg, output, sink, "value")
 }
@@ -1032,6 +1043,64 @@ pub(crate) fn max_id(node: &MNode) -> u64 {
     node.children.iter().fold(node.id.0, |m, c| m.max(max_id(c)))
 }
 
+/// The next layer id `comp` can hand out: past every live layer *and* every one
+/// it has removed, so a stale reference can never land on a newcomer.
+pub(crate) fn fresh_id(comp: &Comp) -> u64 {
+    (max_id(&comp.root) + 1).max(comp.removed_id_floor)
+}
+
+/// Take layer `id` (and its subtree) out of `comp`, and cut every graph node
+/// that named one of them: an `out`/`shapeOut` sink loses its target, a `ref`
+/// its source. The layer is gone, so there's nothing to bake — the point is that
+/// no node goes on naming an id that could be handed to something else. The
+/// comp's id floor rises past the removed ids for the same reason.
+///
+/// Returns whether anything was removed. A free fn, like [`split_shape`], so
+/// it's testable without a window.
+pub(crate) fn delete_layer(project: &mut MProject, comp: CompId, id: NodeId) -> bool {
+    let Some(c) = project.comps.get_mut(&comp) else { return false };
+    let Some(gone) = c.root.remove(id) else { return false };
+    c.removed_id_floor = c.removed_id_floor.max(max_id(&gone) + 1);
+    let mut ids = Vec::new();
+    crate::gizmo::collect_ids(&gone, &mut ids);
+    forget_layers(&mut project.graph, comp, &ids);
+    true
+}
+
+/// Untarget every sink and ref in `graph` that names one of `ids` in `comp`.
+/// Untargeting goes the same way the pickers do it, wires included: an `out`
+/// sink's socket is typed by its property, so its input wire is dropped, and a
+/// ref goes through [`retarget_ref`].
+fn forget_layers(graph: &mut NodeGraph, comp: CompId, ids: &[NodeId]) {
+    let named = |t: NodeId| ids.contains(&t);
+    let mut outs = Vec::new();
+    let mut refs = Vec::new();
+    for n in &mut graph.nodes {
+        let c = &mut n.config;
+        if c.out_comp == Some(comp) {
+            if c.out_target.is_some_and(|(t, _)| named(t)) {
+                c.out_target = None;
+                outs.push(n.id);
+            }
+            if c.out_shape.is_some_and(named) {
+                c.out_shape = None;
+            }
+            if c.out_target.is_none() && c.out_shape.is_none() {
+                c.out_comp = None;
+            }
+        }
+        if c.ref_comp == Some(comp) && c.ref_target.is_some_and(|(t, _, _)| named(t)) {
+            refs.push(n.id);
+        }
+    }
+    for id in outs {
+        graph.disconnect_input(&Endpoint::new(id, "value"));
+    }
+    for id in refs {
+        retarget_ref(graph, id, comp, None);
+    }
+}
+
 impl App {
     /// The composition being edited. Every panel reads through this, so opening
     /// a different comp (stage 4) is a one-field change rather than a rewrite.
@@ -1045,7 +1114,7 @@ impl App {
     }
 
     pub(crate) fn new(doc: Document) -> Self {
-        let next_id = max_id(&doc.root) + 1;
+        let next_id = fresh_id(&doc);
         let view = TimelineView::full(doc.duration_frames);
         let project = MProject::single(doc);
         let current = project.root;
@@ -1157,7 +1226,7 @@ impl App {
             self.current = self.project.root;
         }
         let comp = self.doc();
-        let (next_id, frames) = (max_id(&comp.root) + 1, comp.duration_frames);
+        let (next_id, frames) = (fresh_id(comp), comp.duration_frames);
         // Never *lower* the counter: a redo can bring back nodes that were
         // deleted, and reusing an id they still hold would alias two layers.
         self.next_id = self.next_id.max(next_id);
@@ -1201,6 +1270,9 @@ impl App {
         // per rendered frame, since `apply_ng_op` runs only when an op fired.
         let modules = self.project.modules.clone();
         let ctx = GraphCtx::new(&self.node_registry, &modules);
+        // The layer pickers list the open comp's layers, so that's the comp a
+        // picked target lives in.
+        let current = self.current;
         let Some(graph) = scoped_graph_mut(&mut self.project, self.ng_scope) else { return };
         match op {
             NgOp::Add { kind, pos } => {
@@ -1232,7 +1304,7 @@ impl App {
                     n.set_value(socket, value);
                 }
             }
-            NgOp::SetRef { id, target } => retarget_ref(graph, id, target),
+            NgOp::SetRef { id, target } => retarget_ref(graph, id, current, target),
             NgOp::SetParam { id, name } => {
                 if let Some(n) = graph.node_mut(id) {
                     n.config.param = name;
@@ -1267,6 +1339,7 @@ impl App {
                 let Some(n) = graph.node_mut(id) else { return };
                 let before = n.config.out_target.map(|(_, p)| p);
                 n.config.out_target = target;
+                n.config.out_comp = target.map(|_| current);
                 // The socket is typed by the property, so a change of *kind*
                 // invalidates whatever was wired in. Drop that wire here rather
                 // than leave an edge the descriptor now says can't exist —
@@ -1293,6 +1366,7 @@ impl App {
             NgOp::SetOutShape { id, target } => {
                 if let Some(n) = graph.node_mut(id) {
                     n.config.out_shape = target;
+                    n.config.out_comp = target.map(|_| current);
                 }
             }
         }
@@ -2899,7 +2973,7 @@ impl App {
     pub(crate) fn create_layer_from_geometry(&mut self, output: Endpoint) {
         let (id, at_center, fill) = self.new_layer_look();
         let seed = LayerSeed { id, transform: at_center, fill };
-        match create_layer_from_geometry(&mut self.project, &self.node_registry, output, seed) {
+        match create_layer_from_geometry(&mut self.project, &self.node_registry, self.current, output, seed) {
             Some(node) => {
                 self.push_layer(node, None);
                 self.ng_status = None;
@@ -2941,7 +3015,7 @@ impl App {
         // all of `self`, so the reads can't straddle an assignment.
         let comp = self.doc();
         let (next_id, frames, name) =
-            (max_id(&comp.root) + 1, comp.duration_frames, comp.name.clone());
+            (fresh_id(comp), comp.duration_frames, comp.name.clone());
         self.next_id = next_id;
         self.view = TimelineView::full(frames);
         // The work area is per-comp view state; a fresh open starts with none.
@@ -3319,7 +3393,7 @@ impl App {
         // them using each comp's own fps. No-op on new files.
         project.migrate();
         let open = project.root_comp();
-        self.next_id = max_id(&open.root) + 1;
+        self.next_id = fresh_id(open);
         self.view = TimelineView::full(open.duration_frames);
         // The work area is view state, not saved with the document.
         self.work_area = None;
@@ -4716,7 +4790,7 @@ impl App {
             dirty |= self.add_node(kind);
         }
         if let Some(id) = tree_edits.delete {
-            self.doc_mut().root.remove(id);
+            delete_layer(&mut self.project, self.current, id);
             if self.selected == Some(id) {
                 self.selected = None;
                 self.selected_keys.clear();
@@ -4986,6 +5060,8 @@ pub(crate) fn precompose_into(
         return None;
     }
     let layer = open.root.find(id)?.clone();
+    let mut moved = Vec::new();
+    crate::gizmo::collect_ids(&layer, &mut moved);
     let (w, h, fps, frames) = (open.width, open.height, open.fps, open.duration_frames);
     let name = if layer.name.trim().is_empty() { "Precomp".to_string() } else { layer.name.clone() };
 
@@ -4997,6 +5073,27 @@ pub(crate) fn precompose_into(
 
     let instance = MNode::group(next_id, name).with_precomp(comp_id);
     let instance_id = instance.id;
-    project.comp_mut(current)?.root.replace(id, instance);
+    let open = project.comp_mut(current)?;
+    open.root.replace(id, instance);
+    // The moved layers keep their ids, but in the new comp: follow them there,
+    // and never hand their old ids out again in this one.
+    let top = moved.iter().map(|m| m.0).max().unwrap_or(0);
+    open.removed_id_floor = open.removed_id_floor.max(top + 1);
+    move_layers(&mut project.graph, current, comp_id, &moved);
     Some((comp_id, instance_id))
+}
+
+/// Re-point every sink and ref naming one of `ids` in `from` at `to`, for
+/// layers that moved comps with their ids intact.
+fn move_layers(graph: &mut NodeGraph, from: CompId, to: CompId, ids: &[NodeId]) {
+    for n in &mut graph.nodes {
+        let c = &mut n.config;
+        let out = c.out_target.map(|(t, _)| t).or(c.out_shape);
+        if c.out_comp == Some(from) && out.is_some_and(|t| ids.contains(&t)) {
+            c.out_comp = Some(to);
+        }
+        if c.ref_comp == Some(from) && c.ref_target.is_some_and(|(t, _, _)| ids.contains(&t)) {
+            c.ref_comp = Some(to);
+        }
+    }
 }

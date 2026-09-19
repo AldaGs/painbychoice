@@ -129,6 +129,7 @@ fn lower_out(
         // A reference to another layer's property, at a frame offset. Neutral
         // until a target is picked, so an unconfigured `ref` never breaks a frame.
         "ref" => match node.config.ref_target {
+            Some(_) if ctx.comp.is_some() && ctx.comp != node.config.ref_comp => neutral(),
             Some((n, prop, time_offset)) => Expr::Ref { node: n, prop, time_offset },
             None => neutral(),
         },

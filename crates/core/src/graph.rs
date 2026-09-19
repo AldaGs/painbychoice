@@ -21,7 +21,7 @@ use kurbo::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::expr::{BinOp, MathOp, PropPath, UnOp, Waveform};
-use crate::node::{ModuleId, NodeId};
+use crate::node::{CompId, ModuleId, NodeId};
 use crate::registry::{NodeDescriptor, NodeRegistry};
 use crate::socket::Socket;
 use crate::text::TextAlign;
@@ -43,6 +43,12 @@ use crate::text::TextAlign;
 pub struct GraphCtx<'a> {
     pub reg: &'a NodeRegistry,
     pub modules: &'a std::collections::BTreeMap<ModuleId, crate::node::Module>,
+    /// The comp the lowered expression will run in, when known. A `ref` names a
+    /// layer by per-comp id and `evaluate` can only read the comp it's running,
+    /// so a ref aimed at another comp lowers to neutral rather than reading
+    /// whichever layer shares the id. `None` (module bodies, previews) skips
+    /// the check.
+    pub comp: Option<CompId>,
 }
 
 /// A module map with nothing in it — for the tests and callers that have no
@@ -55,13 +61,18 @@ impl<'a> GraphCtx<'a> {
         reg: &'a NodeRegistry,
         modules: &'a std::collections::BTreeMap<ModuleId, crate::node::Module>,
     ) -> Self {
-        Self { reg, modules }
+        Self { reg, modules, comp: None }
+    }
+
+    /// This context, lowering for `comp`.
+    pub fn in_comp(self, comp: CompId) -> Self {
+        Self { comp: Some(comp), ..self }
     }
 
     /// A context over `reg` with no modules — for a graph that links none, and
     /// for tests of the kinds that don't care.
     pub fn bare(reg: &'a NodeRegistry) -> Self {
-        Self { reg, modules: &NO_MODULES }
+        Self { reg, modules: &NO_MODULES, comp: None }
     }
 
     /// The descriptor for one **placed** node: its kind's static descriptor,
@@ -214,6 +225,9 @@ pub struct NodeConfig {
     /// meanwhile, so an unconfigured `ref` never breaks the frame.
     #[serde(default)]
     pub ref_target: Option<(NodeId, PropPath, f64)>,
+    /// The comp a `ref_target`'s layer lives in — see [`GraphCtx::comp`].
+    #[serde(default)]
+    pub ref_comp: Option<CompId>,
     /// A `param` node's knob name. Empty until set. Lowered as
     /// `Expr::Param { node: None, .. }`, so it reads whichever layer a driver
     /// points the graph at — the layer's *own* exposed knob.
@@ -254,6 +268,11 @@ pub struct NodeConfig {
     /// [`ShapeBinding`] doesn't: the shape *is* what's bound.
     #[serde(default)]
     pub out_shape: Option<NodeId>,
+    /// The comp an `out`/`shapeOut` target's layer lives in. Layer ids are
+    /// per-comp but the graph is per-project, so a bare `NodeId` would name
+    /// "layer 3" in whichever comp happens to be open. `None` drives nothing.
+    #[serde(default)]
+    pub out_comp: Option<CompId>,
     /// A `math` node's operator. Not a socket: it selects *which* function the
     /// node is, not a value fed into one — the same reason an `osc`'s waveform
     /// is config. Defaults to Add, so a node placed before this field existed
@@ -299,7 +318,15 @@ impl Default for TextConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShapeBinding {
     pub output: Endpoint,
+    #[serde(default = "legacy_comp")]
+    pub comp: CompId,
     pub target: NodeId,
+}
+
+/// Pre-graph driver lists predate multiple comps; `Project::migrate` rebinds
+/// them to the project's root comp, so this placeholder is never read.
+fn legacy_comp() -> CompId {
+    CompId(0)
 }
 
 impl GraphNode {
@@ -385,6 +412,8 @@ pub enum GraphError {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     pub output: Endpoint,
+    #[serde(default = "legacy_comp")]
+    pub comp: CompId,
     pub target: NodeId,
     pub prop: PropPath,
 }
@@ -527,8 +556,9 @@ impl NodeGraph {
             .filter(|n| n.kind == "out")
             .filter_map(|n| {
                 let (target, prop) = n.config.out_target?;
+                let comp = n.config.out_comp?;
                 let edge = self.incoming(&Endpoint::new(n.id, "value"))?;
-                Some(Binding { output: edge.from.clone(), target, prop })
+                Some(Binding { output: edge.from.clone(), comp, target, prop })
             })
             .collect()
     }
@@ -541,8 +571,9 @@ impl NodeGraph {
             .filter(|n| n.kind == "shapeOut")
             .filter_map(|n| {
                 let target = n.config.out_shape?;
+                let comp = n.config.out_comp?;
                 let edge = self.incoming(&Endpoint::new(n.id, "geometry"))?;
-                Some(ShapeBinding { output: edge.from.clone(), target })
+                Some(ShapeBinding { output: edge.from.clone(), comp, target })
             })
             .collect()
     }
@@ -557,18 +588,22 @@ impl NodeGraph {
     /// Types line up by construction — the socket is retyped from `prop` — and a
     /// caller passing a mismatched output would rather see it drive nothing than
     /// have the binding silently dropped on the floor.
-    pub fn bind_output(&mut self, output: Endpoint, target: NodeId, prop: PropPath) -> GraphNodeId {
+    pub fn bind_output(&mut self, output: Endpoint, comp: CompId, target: NodeId, prop: PropPath) -> GraphNodeId {
         let id = self.add_node("out", self.sink_pos(&output));
-        self.node_mut(id).expect("just added").config.out_target = Some((target, prop));
+        let config = &mut self.node_mut(id).expect("just added").config;
+        config.out_target = Some((target, prop));
+        config.out_comp = Some(comp);
         self.edges.push(Edge { from: output, to: Endpoint::new(id, "value") });
         id
     }
 
     /// [`Self::bind_output`] for geometry: a `shapeOut` node driving `target`'s
     /// shape.
-    pub fn bind_geometry(&mut self, output: Endpoint, target: NodeId) -> GraphNodeId {
+    pub fn bind_geometry(&mut self, output: Endpoint, comp: CompId, target: NodeId) -> GraphNodeId {
         let id = self.add_node("shapeOut", self.sink_pos(&output));
-        self.node_mut(id).expect("just added").config.out_shape = Some(target);
+        let config = &mut self.node_mut(id).expect("just added").config;
+        config.out_shape = Some(target);
+        config.out_comp = Some(comp);
         self.edges.push(Edge { from: output, to: Endpoint::new(id, "geometry") });
         id
     }
@@ -864,7 +899,8 @@ mod tests {
 
         let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
         let osc = project.graph.add_node("osc", Vec2::new(20.0, 20.0));
-        project.graph.bind_output(Endpoint::new(osc, "value"), NodeId(0), PropPath::Rotation);
+        let root = project.root;
+        project.graph.bind_output(Endpoint::new(osc, "value"), root, NodeId(0), PropPath::Rotation);
         // A geometry driver, a text node's typography config, and a string
         // socket literal ride along too — all three are document data, so all
         // three must survive the trip.
@@ -872,7 +908,7 @@ mod tests {
         let tn = project.graph.node_mut(text).unwrap();
         tn.config.text.family = "Georgia".into();
         tn.set_value("content", crate::expr::ExprValue::Str("hello".into()));
-        project.graph.bind_geometry(Endpoint::new(text, "geometry"), NodeId(0));
+        project.graph.bind_geometry(Endpoint::new(text, "geometry"), root, NodeId(0));
 
         let json = serde_json::to_string(&project).unwrap();
         let back: Project = serde_json::from_str(&json).unwrap();
@@ -932,13 +968,14 @@ mod tests {
             loaded.graph.bindings(),
             [Binding {
                 output: Endpoint::new(osc, "value"),
+                comp: loaded.root,
                 target: NodeId(0),
                 prop: PropPath::Rotation,
             }],
         );
         assert_eq!(
             loaded.graph.shape_bindings(),
-            [ShapeBinding { output: Endpoint::new(rect, "geometry"), target: NodeId(0) }],
+            [ShapeBinding { output: Endpoint::new(rect, "geometry"), comp: loaded.root, target: NodeId(0) }],
         );
         // And they're real, visible, editable nodes — not a hidden list.
         assert_eq!(loaded.graph.nodes.iter().filter(|n| n.kind == "out").count(), 1);
@@ -1029,6 +1066,8 @@ mod tests {
 
         // Targeted and wired.
         g.node_mut(out).unwrap().config.out_target = Some((NodeId(7), PropPath::Rotation));
+        assert!(g.bindings().is_empty(), "a layer id means nothing without its comp");
+        g.node_mut(out).unwrap().config.out_comp = Some(crate::node::CompId(0));
         assert_eq!(g.bindings().len(), 1);
 
         // Pulling the wire retires the driver — no stale row left behind.

@@ -69,7 +69,9 @@ fn raise_rec(
         }
         Expr::Ref { node, prop, time_offset } => {
             let (id, y) = leaf(graph, "ref");
-            graph.node_mut(id).unwrap().config.ref_target = Some((*node, *prop, *time_offset));
+            let config = &mut graph.node_mut(id).unwrap().config;
+            config.ref_target = Some((*node, *prop, *time_offset));
+            config.ref_comp = ctx.comp;
             (Endpoint::new(id, "value"), y)
         }
         Expr::Param { name, .. } => {

@@ -1115,7 +1115,7 @@ pub(crate) fn snap_excluded(root: &MNode, target: NodeId) -> Vec<NodeId> {
     out
 }
 
-fn collect_ids(node: &MNode, out: &mut Vec<NodeId>) {
+pub(crate) fn collect_ids(node: &MNode, out: &mut Vec<NodeId>) {
     out.push(node.id);
     for c in &node.children {
         collect_ids(c, out);
