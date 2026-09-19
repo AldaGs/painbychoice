@@ -327,9 +327,12 @@ masking and 2.5D placement. Build it once, now that its clients are real.
    properties sample the shutter only when its switch is on (default on).
    Motion inherited from a parent still blurs a switched-off child — AE holds
    the parent chain too. Still open: that, and blur in the live preview.
-4. **Known compositor gaps** (from the readback work): a blur inside a blur
-   loses the inner one, and a colour effect on a group *containing* a blurred
-   layer does not reach the blurred image.
+4. ✅ **Compositor gaps closed** (2026-09-18): the readback path now renders
+   an effect layer's contents through the same loop as the frame, innermost
+   first, so a blur inside a blur keeps the inner one; and a colour-only layer
+   containing a processed one (a precomp) takes the readback path itself, so
+   its colour reaches the blurred image. Only the GPU path had either gap — the
+   CPU rasterizer was already recursive.
 
 - Each isolated layer renders to its own offscreen target; an ordered stack of
   wgpu passes processes it; the result composites into the parent with blend,

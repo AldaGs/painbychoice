@@ -503,6 +503,56 @@ mod tests {
         );
     }
 
+    /// **A layer's colour effect reaches a blurred layer inside it** — and that
+    /// layer stays blurred. A colour-only layer used to ride the in-scene path,
+    /// which tints raw items but never an inner layer's processed image. The
+    /// same nesting is what keeps a blur inside a blur. A precomp is how one
+    /// layer contains another; a parented child sits outside its parent's group.
+    #[test]
+    fn a_colour_effect_reaches_a_blurred_layer_inside_it() {
+        let Some(mut gpu) = Headless::new() else {
+            eprintln!("no usable GPU adapter; skipping the nested effect test");
+            return;
+        };
+        let mut project = centred_square_project();
+        let main = project.root;
+        let mut square = project.comp_mut(main).unwrap().root.children.remove(0);
+        square.effects.push(motion_core::effect::Effect {
+            enabled: true,
+            kind: motion_core::effect::EffectKind::GaussianBlur { radius: Value::constant(6.0) },
+        });
+        let mut inner = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(square));
+        inner.duration_frames = 1;
+        let inner = project.insert(inner);
+        let mut wrap = MNode::group(2, "wrap").with_precomp(inner);
+        wrap.effects.push(motion_core::effect::Effect {
+            enabled: true,
+            kind: motion_core::effect::EffectKind::Tint {
+                color: Value::constant(MColor::rgb(0.0, 0.0, 1.0)),
+                amount: Value::constant(1.0),
+            },
+        });
+        project.comp_mut(main).unwrap().root.children.push(wrap);
+
+        let target = OffscreenTarget::new(&gpu.device, 100, 100).expect("allocate");
+        let mut cache = crate::footage::FootageCache::new(motion_render::default_registry());
+        let rgba = FrameRenderer {
+            device: &gpu.device,
+            queue: &gpu.queue,
+            renderer: &mut gpu.renderer,
+            target: &target,
+            footage: &mut cache,
+        }
+        .frame(&project, main, 0.0)
+        .expect("render one frame");
+
+        let (r, _, b, _) = px(&rgba, 100, 50, 50);
+        assert!(b > r, "the outer tint must reach the blurred layer: centre is {r} red, {b} blue");
+        // Still blurred: just outside the square's edge is neither ground nor fill.
+        let (r2, g2, b2, _) = px(&rgba, 100, 66, 50);
+        assert!(!(r2 > 240 && g2 > 240 && b2 > 240), "the inner blur was lost: ({r2}, {g2}, {b2})");
+    }
+
     /// Chrome is editor furniture and must not reach a rendered frame.
     ///
     /// The frame border is the one that would actually ship: it is drawn

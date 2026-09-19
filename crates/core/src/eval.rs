@@ -86,9 +86,11 @@ impl Scene {
     /// the same answer. An unbalanced or interleaved sequence would corrupt
     /// everything drawn after it, so there is one definition to get right.
     pub fn nesting_order(&self) -> Vec<&LayerGroup> {
-        let mut groups: Vec<&LayerGroup> = self.groups.iter().collect();
-        groups.sort_by_key(|g| (g.start, std::cmp::Reverse(g.end)));
-        groups
+        // `groups` is post-order, so for two identical ranges the later one is
+        // the parent: it has to come first to be the outer layer.
+        let mut groups: Vec<(usize, &LayerGroup)> = self.groups.iter().enumerate().collect();
+        groups.sort_by_key(|&(i, g)| (g.start, std::cmp::Reverse(g.end), std::cmp::Reverse(i)));
+        groups.into_iter().map(|(_, g)| g).collect()
     }
 }
 

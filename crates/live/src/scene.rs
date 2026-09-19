@@ -353,115 +353,7 @@ pub(crate) fn to_vello(
     // until its subtree is walked), so they have to be re-sorted before they
     // can be opened as nested layers: by where they start, and for a shared
     // start the longer range is the outer one.
-    let groups = scene.nesting_order();
-    let mut next_group = 0usize;
-    // The layers currently open, innermost last. Holds the groups themselves
-    // (not just their end index) so the item loop can reach each open layer's
-    // effect stack while it draws inside it.
-    let mut open: Vec<&LayerGroup> = Vec::new();
-    // While `Some(end)`, the current layer's raw content has been replaced by a
-    // processed image (a blurred layer); its own items and any nested groups are
-    // skipped until `end`, since they are already baked into that image.
-    let mut replaced_until: Option<usize> = None;
-
-    for (i, item) in scene.items.iter().enumerate() {
-        let inside_replaced = replaced_until.is_some_and(|e| i < e);
-        // Open every layer that begins here. `push_layer` gives vello an
-        // offscreen target: everything drawn until the matching `pop_layer`
-        // composites as one image, which is what a blend mode needs and what a
-        // mask and the colour effects hang off. An item inside a replaced region
-        // opens nothing — its groups were consumed when the replacement drew.
-        if !inside_replaced {
-            while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
-                let replacement = effect_images.get(&g.source);
-                // A masked layer clips to its mask; an unmasked one clips to its
-                // own extent — bounded rather than "everything", because vello
-                // rasterizes the clip shape and an unbounded one would cost the
-                // whole frame per group. A *replaced* (blurred) layer is the
-                // exception: the blur spreads past the raw bounds, so an
-                // unmasked one clips to the whole comp instead of shaving off the
-                // halo.
-                match &g.clip {
-                    Some(mask) => vs.push_layer(
-                        if mask.even_odd { Fill::EvenOdd } else { Fill::NonZero },
-                        to_peniko_blend(g.blend, g.compose),
-                        g.alpha.clamp(0.0, 1.0) as f32,
-                        fit * mask.transform,
-                        &mask.path,
-                    ),
-                    None => {
-                        let bounds =
-                            if replacement.is_some() { comp_rect } else { group_bounds(scene, g) };
-                        vs.push_layer(
-                            Fill::NonZero,
-                            to_peniko_blend(g.blend, g.compose),
-                            g.alpha.clamp(0.0, 1.0) as f32,
-                            fit,
-                            &bounds,
-                        );
-                    }
-                }
-                open.push(g);
-                next_group += 1;
-
-                if let Some(img) = replacement {
-                    // The processed image is already in device space (rasterized
-                    // through the same `fit`), so it draws at identity, inside
-                    // this layer's push_layer so the blend and alpha still apply.
-                    vs.draw_image(&vello::peniko::ImageBrush::new(img.clone()), Affine::IDENTITY);
-                    replaced_until = Some(g.end);
-                    // Skip every group nested inside this one: its effects are
-                    // baked into the image, and leaving them for the loop would
-                    // strand `next_group` on a range that can't match a later
-                    // start.
-                    while groups.get(next_group).is_some_and(|g2| g2.start < g.end) {
-                        next_group += 1;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !inside_replaced {
-            let xf = fit * item.transform;
-            // Footage draws *instead of* the fill: the fill colour is what a
-            // rectangle would paint, and a clip covers it entirely. A stroke
-            // still applies, so a bordered video layer works like a bordered rect.
-            let drew_footage = match item.image {
-                Some(paint) => draw_footage(&mut vs, item, xf, paint, footage, assets),
-                None => false,
-            };
-            if let Some(fill) = item.fill {
-                if !drew_footage {
-                    let c = with_effects(fill, &open);
-                    vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity), None, &item.path);
-                }
-            }
-            if let Some((color, width)) = item.stroke {
-                vs.stroke(
-                    &KurboStroke::new(width),
-                    xf,
-                    to_peniko(with_effects(color, &open), item.opacity),
-                    None,
-                    &item.path,
-                );
-            }
-        }
-
-        // Close every layer that ended with this item, innermost first.
-        while open.last().map(|g| g.end) == Some(i + 1) {
-            vs.pop_layer();
-            if replaced_until == Some(i + 1) {
-                replaced_until = None;
-            }
-            open.pop();
-        }
-    }
-    // Belt and braces: an unbalanced push would corrupt everything drawn after
-    // it, and the ranges come from data that a future edit could get wrong.
-    for _ in 0..open.len() {
-        vs.pop_layer();
-    }
+    draw_range(&mut vs, scene, 0..scene.items.len(), &scene.nesting_order(), fit, comp_rect, footage, assets, effect_images);
     // Passepartout: dim everything outside the comp bounds, so the frame reads
     // as the shot and whatever is parked off-stage recedes without vanishing.
     if chrome.passepartout > 0.0 {
@@ -726,6 +618,134 @@ fn to_peniko_blend(mode: MBlendMode, compose: MComposeMode) -> vello::peniko::Bl
     B::new(mix, compose)
 }
 
+/// Draw `scene.items[range]` with the layers in `groups` (nesting order, only
+/// those inside `range`) opened around them — the body of [`to_vello`], split
+/// out so [`rasterize_effect_layers`] renders an effect layer's contents the
+/// same way: nested blends, masks, colour effects and already-processed inner
+/// effect images included, rather than as raw items.
+#[allow(clippy::too_many_arguments)]
+fn draw_range(
+    vs: &mut VScene,
+    scene: &MScene,
+    range: std::ops::Range<usize>,
+    groups: &[&LayerGroup],
+    fit: Affine,
+    comp_rect: kurbo::Rect,
+    footage: &mut FootageCache,
+    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+    effect_images: &std::collections::HashMap<NodeId, vello::peniko::ImageData>,
+) {
+    let mut next_group = 0usize;
+    // The layers currently open, innermost last. Holds the groups themselves
+    // (not just their end index) so the item loop can reach each open layer's
+    // effect stack while it draws inside it.
+    let mut open: Vec<&LayerGroup> = Vec::new();
+    // While `Some(end)`, the current layer's raw content has been replaced by a
+    // processed image (a blurred layer); its own items and any nested groups are
+    // skipped until `end`, since they are already baked into that image.
+    let mut replaced_until: Option<usize> = None;
+
+    for i in range {
+        let item = &scene.items[i];
+        let inside_replaced = replaced_until.is_some_and(|e| i < e);
+        // Open every layer that begins here. `push_layer` gives vello an
+        // offscreen target: everything drawn until the matching `pop_layer`
+        // composites as one image, which is what a blend mode needs and what a
+        // mask and the colour effects hang off. An item inside a replaced region
+        // opens nothing — its groups were consumed when the replacement drew.
+        if !inside_replaced {
+            while let Some(g) = groups.get(next_group).filter(|g| g.start == i) {
+                let replacement = effect_images.get(&g.source);
+                // A masked layer clips to its mask; an unmasked one clips to its
+                // own extent — bounded rather than "everything", because vello
+                // rasterizes the clip shape and an unbounded one would cost the
+                // whole frame per group. A *replaced* (blurred) layer is the
+                // exception: the blur spreads past the raw bounds, so an
+                // unmasked one clips to the whole comp instead of shaving off the
+                // halo.
+                match &g.clip {
+                    Some(mask) => vs.push_layer(
+                        if mask.even_odd { Fill::EvenOdd } else { Fill::NonZero },
+                        to_peniko_blend(g.blend, g.compose),
+                        g.alpha.clamp(0.0, 1.0) as f32,
+                        fit * mask.transform,
+                        &mask.path,
+                    ),
+                    None => {
+                        let bounds =
+                            if replacement.is_some() { comp_rect } else { group_bounds(scene, g) };
+                        vs.push_layer(
+                            Fill::NonZero,
+                            to_peniko_blend(g.blend, g.compose),
+                            g.alpha.clamp(0.0, 1.0) as f32,
+                            fit,
+                            &bounds,
+                        );
+                    }
+                }
+                open.push(g);
+                next_group += 1;
+
+                if let Some(img) = replacement {
+                    // The processed image is already in device space (rasterized
+                    // through the same `fit`), so it draws at identity, inside
+                    // this layer's push_layer so the blend and alpha still apply.
+                    vs.draw_image(&vello::peniko::ImageBrush::new(img.clone()), Affine::IDENTITY);
+                    replaced_until = Some(g.end);
+                    // Skip every group nested inside this one: its effects are
+                    // baked into the image, and leaving them for the loop would
+                    // strand `next_group` on a range that can't match a later
+                    // start.
+                    while groups.get(next_group).is_some_and(|g2| g2.start < g.end) {
+                        next_group += 1;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !inside_replaced {
+            let xf = fit * item.transform;
+            // Footage draws *instead of* the fill: the fill colour is what a
+            // rectangle would paint, and a clip covers it entirely. A stroke
+            // still applies, so a bordered video layer works like a bordered rect.
+            let drew_footage = match item.image {
+                Some(paint) => draw_footage(vs, item, xf, paint, footage, assets),
+                None => false,
+            };
+            if let Some(fill) = item.fill {
+                if !drew_footage {
+                    let c = with_effects(fill, &open);
+                    vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity), None, &item.path);
+                }
+            }
+            if let Some((color, width)) = item.stroke {
+                vs.stroke(
+                    &KurboStroke::new(width),
+                    xf,
+                    to_peniko(with_effects(color, &open), item.opacity),
+                    None,
+                    &item.path,
+                );
+            }
+        }
+
+        // Close every layer that ended with this item, innermost first.
+        while open.last().map(|g| g.end) == Some(i + 1) {
+            vs.pop_layer();
+            if replaced_until == Some(i + 1) {
+                replaced_until = None;
+            }
+            open.pop();
+        }
+    }
+    // Belt and braces: an unbalanced push would corrupt everything drawn after
+    // it, and the ranges come from data that a future edit could get wrong.
+    for _ in 0..open.len() {
+        vs.pop_layer();
+    }
+}
+
 /// Apply the colour-adjustment effects of every open layer to one item colour,
 /// innermost outward — the in-scene fast path for the effect stack (see
 /// [`crate::fx`]). A blur in the stack is skipped here; it needs the whole
@@ -739,32 +759,6 @@ fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {
         }
     }
     c
-}
-
-/// Draw one item's raw fill/stroke/footage into a scene at `fit`, with **no**
-/// effects applied. Used to build the sub-scene a full-image effect layer is
-/// rasterized from — [`motion_render::fx::apply_stack`] applies the whole stack (colour
-/// *and* blur) to the readback, so the sub-scene must be the untouched pixels.
-fn draw_item_raw(
-    vs: &mut VScene,
-    item: &motion_core::RenderItem,
-    fit: Affine,
-    footage: &mut FootageCache,
-    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
-) {
-    let xf = fit * item.transform;
-    let drew_footage = match item.image {
-        Some(paint) => draw_footage(vs, item, xf, paint, footage, assets),
-        None => false,
-    };
-    if let Some(fill) = item.fill {
-        if !drew_footage {
-            vs.fill(Fill::NonZero, xf, to_peniko(fill, item.opacity), None, &item.path);
-        }
-    }
-    if let Some((color, width)) = item.stroke {
-        vs.stroke(&KurboStroke::new(width), xf, to_peniko(color, item.opacity), None, &item.path);
-    }
 }
 
 /// Rasterize and process every layer whose effect stack needs the full image (a
@@ -804,16 +798,28 @@ pub(crate) fn rasterize_effect_layers(
     if width == 0 || height == 0 {
         return out;
     }
-    for g in &scene.groups {
-        if !motion_render::fx::needs_readback(&g.effects) {
+    // A processed inner layer clips to this instead of its raw bounds so its
+    // halo survives: the whole target, in the space `fit` maps from.
+    let comp_rect = fit.inverse().transform_rect_bbox(kurbo::Rect::new(0.0, 0.0, width as f64, height as f64));
+    let order = scene.nesting_order();
+    // Innermost first, so a layer's contents are drawn with its nested effect
+    // layers already processed — a blur inside a blur keeps the inner one.
+    for k in (0..order.len()).rev() {
+        let g = order[k];
+        let inner_len = order[k + 1..].iter().take_while(|g2| g2.start < g.end).count();
+        let inner = &order[k + 1..k + 1 + inner_len];
+        // A layer with only colour effects normally rides the in-scene path,
+        // which can't reach a processed inner image; so it takes the readback
+        // path too whenever it contains one.
+        let wraps_image = !g.effects.is_empty() && inner.iter().any(|g2| out.contains_key(&g2.source));
+        if !motion_render::fx::needs_readback(&g.effects) && !wraps_image {
             continue;
         }
-        // The layer's raw pixels, rasterized through the same `fit` as the main
-        // frame so the result lands on the identical device pixels.
+        // The layer's own contents (not its own blend/alpha/effects), rasterized
+        // through the same `fit` as the main frame so the result lands on the
+        // identical device pixels.
         let mut sub = VScene::new();
-        for item in &scene.items[g.start..g.end] {
-            draw_item_raw(&mut sub, item, fit, footage, assets);
-        }
+        draw_range(&mut sub, scene, g.start..g.end, inner, fit, comp_rect, footage, assets, &out);
 
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("effect-layer"),
