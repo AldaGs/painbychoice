@@ -3413,13 +3413,33 @@ impl App {
     /// At launch: pick up whatever the last session left unsaved, so a crash
     /// costs nothing even when the user never reaches File > Open.
     ///
-    /// Two cases, because a sidecar's name follows its project: a never-saved
-    /// project's sits in the temp dir under a fixed name, while a saved one's
-    /// sits beside a file this session has no other way to know about — hence
-    /// [`last_session_path`], written whenever a titled project autosaves.
+    /// Two candidates, because a sidecar's name follows its project: a
+    /// never-saved project's sits in the temp dir under a fixed name, while a
+    /// saved one's sits beside a file this session has no other way to know
+    /// about — hence [`last_session_path`], written whenever a titled project
+    /// autosaves. **The newer wins**, and the loser is deleted: opening a
+    /// project autosaves the untitled scene on the way out of it, so the temp
+    /// file routinely outlives its session and would otherwise be offered ahead
+    /// of the real work, and then again at every launch after that.
     pub(crate) fn recover_last_session(&mut self) {
-        let side = autosave_path(None);
-        if let Ok(text) = std::fs::read_to_string(&side) {
+        let untitled = autosave_path(None);
+        let titled = std::fs::read_to_string(last_session_path())
+            .ok()
+            .map(|p| std::path::PathBuf::from(p.trim()))
+            .filter(|p| is_newer(&autosave_path(Some(p)), p));
+        // Only one of the two is offered, so the other is stale by definition.
+        let take_titled = match &titled {
+            Some(p) => !is_newer(&untitled, &autosave_path(Some(p))),
+            None => false,
+        };
+        if take_titled {
+            let _ = std::fs::remove_file(&untitled);
+            // The project *and* its unsaved changes: `open_project_path` asks,
+            // and opens the saved file if the answer is no.
+            if self.open_project_path(titled.expect("checked above")) {
+                return;
+            }
+        } else if let Ok(text) = std::fs::read_to_string(&untitled) {
             if ask_recover("The last session left unsaved work in an unsaved project. Recover it?")
                 && self.open_text(&text, None)
             {
@@ -3428,17 +3448,7 @@ impl App {
                 self.autosaved = text;
                 return;
             }
-            let _ = std::fs::remove_file(side);
-        } else if let Some(path) = std::fs::read_to_string(last_session_path())
-            .ok()
-            .map(|p| std::path::PathBuf::from(p.trim()))
-            .filter(|p| is_newer(&autosave_path(Some(p)), p))
-        {
-            // The project *and* its unsaved changes: `open_project_path` asks,
-            // and opens the saved file if the answer is no.
-            if self.open_project_path(path) {
-                return;
-            }
+            let _ = std::fs::remove_file(&untitled);
         }
         // Nothing recovered: the startup project is the baseline, so an
         // untouched session never writes a sidecar.
