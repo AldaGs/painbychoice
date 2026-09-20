@@ -46,6 +46,15 @@ const BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// frames around the playhead to make room for frames nobody asked for.
 const PREFETCH_AHEAD: i64 = 48;
 
+/// How many footage streams the worker keeps open at once.
+///
+/// One per video layer on screen, near enough. With a single stream, two video
+/// layers alternate requests and every one of them is a different asset from
+/// the last — so each costs a re-open (~229ms) and playback collapses to a
+/// slideshow. Each open stream holds a decoder process and its buffers, so the
+/// pool is small and evicts least-recently-served.
+const MAX_STREAMS: usize = 4;
+
 /// How far the worker will walk a stream forward to reach a wanted frame
 /// before giving up and re-opening it.
 ///
@@ -101,7 +110,6 @@ enum Response {
 /// as a backwards seek and restarts the decoder — the exact ~229ms cost this
 /// module exists to avoid.
 struct Promised {
-    asset: AssetId,
     /// The request that started this run. The prefetch only ever moves
     /// *forward*, so nothing before this is promised — a backwards seek has to
     /// be asked for, and pays for a fresh stream.
@@ -123,8 +131,9 @@ pub(crate) struct FootageCache {
     /// Requested and not yet answered, so the same frame isn't queued once per
     /// redraw while the worker is busy with it.
     inflight: HashSet<Key>,
-    /// What the running prefetch has already promised. See [`Promised`].
-    promised: Option<Promised>,
+    /// What the running prefetches have already promised, per footage — one
+    /// entry per open stream, since the worker runs several. See [`Promised`].
+    promised: HashMap<AssetId, Promised>,
     bytes: usize,
     clock: u64,
     epoch: Epoch,
@@ -145,7 +154,7 @@ impl FootageCache {
             frames: HashMap::new(),
             failed: HashMap::new(),
             inflight: HashSet::new(),
-            promised: None,
+            promised: HashMap::new(),
             bytes: 0,
             clock: 0,
             epoch: 0,
@@ -181,7 +190,7 @@ impl FootageCache {
             // content under the new one's layers.
             Response::Frame { epoch, .. } | Response::PrefetchEnded { epoch }
                 if epoch != self.epoch => {}
-            Response::PrefetchEnded { .. } => self.promised = None,
+            Response::PrefetchEnded { .. } => self.promised.clear(),
             Response::Frame { key, result, .. } => {
                 self.inflight.remove(&key);
                 match result {
@@ -196,10 +205,8 @@ impl FootageCache {
 
     /// Whether the running prefetch has already promised this frame.
     fn promised(&self, paint: ImagePaint) -> bool {
-        self.promised.as_ref().is_some_and(|p| {
-            p.asset == paint.asset
-                && paint.source_frame >= p.from
-                && paint.source_frame <= p.until
+        self.promised.get(&paint.asset).is_some_and(|p| {
+            paint.source_frame >= p.from && paint.source_frame <= p.until
         })
     }
 
@@ -210,7 +217,7 @@ impl FootageCache {
     /// re-requested, so if the UI stopped redrawing it would sit on a stale
     /// picture with nothing scheduled to replace it.
     pub(crate) fn is_busy(&self) -> bool {
-        !self.inflight.is_empty() || self.promised.is_some()
+        !self.inflight.is_empty() || !self.promised.is_empty()
     }
 
     /// Pixels to draw for one paint, and whether they are the frame actually
@@ -244,11 +251,13 @@ impl FootageCache {
                 path: asset.path.clone(),
                 meta: asset.meta(),
             });
-            self.promised = Some(Promised {
-                asset: paint.asset,
-                from: paint.source_frame,
-                until: paint.source_frame + PREFETCH_AHEAD,
-            });
+            self.promised.insert(
+                paint.asset,
+                Promised {
+                    from: paint.source_frame,
+                    until: paint.source_frame + PREFETCH_AHEAD,
+                },
+            );
         }
 
         let hit = if exact { Some(key) } else { self.nearest(paint.asset, paint.source_frame) };
@@ -285,7 +294,7 @@ impl FootageCache {
         // means what it did, so they must not be written in as this project's
         // frames. Bumping the epoch makes `collect` drop them.
         self.inflight.clear();
-        self.promised = None;
+        self.promised.clear();
         self.epoch += 1;
         self.bytes = 0;
         let _ = self.to_worker.send(Request::Reset);
@@ -367,16 +376,22 @@ struct Session {
     asset: AssetId,
     meta: AssetMeta,
     stream: Box<dyn FrameStream>,
+    /// The furthest frame this stream should run ahead to, from the last
+    /// request served off it. Per stream, because two videos playing together
+    /// are at different frames of their own footage.
+    until: i64,
 }
 
 /// The worker: serve requested frames, and run ahead when there is nothing to
 /// serve.
 fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Response>) {
-    let mut session: Option<Session> = None;
-    // The furthest frame worth running ahead to, and which project generation
-    // asked for it — both set by the last real request, so prefetched frames
-    // are attributed exactly like the request that motivated them.
-    let mut prefetch_until = 0i64;
+    // Most-recently-served first; at most `MAX_STREAMS`.
+    let mut sessions: Vec<Session> = Vec::new();
+    // Which stream prefetches next, so several playing videos share the run-ahead
+    // instead of the newest one starving the rest.
+    let mut cursor = 0usize;
+    // Which project generation asked, so prefetched frames are attributed
+    // exactly like the request that motivated them.
     let mut epoch: Epoch = 0;
     // Whether there is an outstanding promise to retract. Mirrors the cache's
     // `promised`, and exists so the worker cannot announce the end of a
@@ -399,7 +414,7 @@ fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Resp
             // frame at a time so a request arriving mid-prefetch waits
             // microseconds rather than for a whole batch.
             None => {
-                if prefetch_one(&mut session, prefetch_until, epoch, &tx) {
+                if prefetch_one(&mut sessions, &mut cursor, epoch, &tx) {
                     continue;
                 }
                 // Fully caught up. Say so before blocking — the UI holds off
@@ -422,12 +437,11 @@ fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Resp
         match req {
             Some(Request::Stop) | None => return,
             Some(Request::Reset) => {
-                session = None;
+                sessions.clear();
                 promise_open = false;
             }
             Some(Request::Frame { epoch: e, key, path, meta }) => {
-                let result = serve(&decoders, &mut session, key, &path, &meta);
-                prefetch_until = key.1 + PREFETCH_AHEAD;
+                let result = serve(&decoders, &mut sessions, key, &path, &meta);
                 epoch = e;
                 promise_open = true;
                 if tx.send(Response::Frame { epoch: e, key, result }).is_err() {
@@ -441,72 +455,93 @@ fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Resp
 /// Produce one requested frame, reusing the open stream when it can reach it.
 fn serve(
     decoders: &DecoderRegistry,
-    session: &mut Option<Session>,
+    sessions: &mut Vec<Session>,
     key: Key,
     path: &Path,
     meta: &AssetMeta,
 ) -> Result<Frame, String> {
     let (asset, want) = key;
 
-    // The fast path, and the whole point of the module: the stream is already
-    // sitting on this frame, or close enough in front of it that walking there
-    // is cheaper than re-opening.
-    if let Some(s) = session.as_mut() {
+    // The fast path, and the whole point of the module: this footage's stream is
+    // already sitting on the frame, or close enough in front of it that walking
+    // there is cheaper than re-opening. Served streams move to the front, so the
+    // pool evicts whichever footage went longest without being asked for.
+    if let Some(i) = sessions.iter().position(|s| s.asset == asset) {
+        let s = &mut sessions[i];
+        s.until = want + PREFETCH_AHEAD;
         let at = s.stream.next_index();
-        if s.asset == asset && want >= at && want - at <= MAX_WALK {
-            loop {
+        if want >= at && want - at <= MAX_WALK {
+            let walked = loop {
                 let at = s.stream.next_index();
                 match s.stream.next_frame() {
-                    Ok(Some(frame)) if at == want => return Ok(frame),
+                    Ok(Some(frame)) if at == want => break Some(Ok(frame)),
                     // Walking over the frames in between.
                     Ok(Some(_)) => continue,
                     // Ran off the end; fall through and re-open, which reports
                     // honestly rather than guessing.
-                    Ok(None) => break,
-                    Err(e) => return Err(e.to_string()),
+                    Ok(None) => break None,
+                    Err(e) => break Some(Err(e.to_string())),
                 }
+            };
+            if let Some(result) = walked {
+                let s = sessions.remove(i);
+                sessions.insert(0, s);
+                return result;
             }
         }
+        // A jump backwards, too far ahead to walk, or off the end: this stream
+        // is no use for the request, and a fresh one replaces it below.
+        sessions.remove(i);
     }
 
-    // Either different footage, a jump backwards, or too far ahead to walk.
-    // Open a fresh stream *at* the wanted frame, which both answers this
-    // request and leaves the worker positioned for the ones that follow it.
-    *session = decoders
+    // Open a fresh stream *at* the wanted frame, which both answers this request
+    // and leaves the worker positioned for the ones that follow it.
+    let opened = decoders
         .stream(path, want, meta)
-        .map(|stream| Session { asset, meta: *meta, stream });
-    match session.as_mut() {
-        Some(s) => match s.stream.next_frame() {
-            Ok(Some(frame)) => Ok(frame),
-            Ok(None) => Err(format!("frame {want} is past the end of {}", path.display())),
-            Err(e) => Err(e.to_string()),
-        },
+        .map(|stream| Session { asset, meta: *meta, stream, until: want + PREFETCH_AHEAD });
+    let Some(mut s) = opened else {
         // No sequential mode — a still, where one frame is already in order.
-        None => decoders.frame(path, want, meta).map_err(|e| e.to_string()),
-    }
+        return decoders.frame(path, want, meta).map_err(|e| e.to_string());
+    };
+    let result = match s.stream.next_frame() {
+        Ok(Some(frame)) => Ok(frame),
+        Ok(None) => Err(format!("frame {want} is past the end of {}", path.display())),
+        Err(e) => Err(e.to_string()),
+    };
+    sessions.insert(0, s);
+    sessions.truncate(MAX_STREAMS);
+    result
 }
 
-/// Decode the next frame of the open stream, unasked. Returns whether it did.
+/// Decode the next frame of one open stream, unasked, taking the streams in
+/// turn. Returns whether it did.
 fn prefetch_one(
-    session: &mut Option<Session>,
-    until: i64,
+    sessions: &mut Vec<Session>,
+    cursor: &mut usize,
     epoch: Epoch,
     tx: &Sender<Response>,
 ) -> bool {
-    let Some(s) = session.as_mut() else { return false };
-    let at = s.stream.next_index();
-    if at > until || at > s.meta.frames - 1 {
-        return false;
-    }
-    match s.stream.next_frame() {
-        Ok(Some(frame)) => {
-            tx.send(Response::Frame { epoch, key: (s.asset, at), result: Ok(frame) }).is_ok()
+    for _ in 0..sessions.len() {
+        let i = *cursor % sessions.len();
+        *cursor = i + 1;
+        let s = &mut sessions[i];
+        let at = s.stream.next_index();
+        if at > s.until || at > s.meta.frames - 1 {
+            continue;
         }
-        // A prefetch failure is silent on purpose: nobody asked for this frame,
-        // and if they ever do, the real request will surface the error then.
-        Ok(None) | Err(_) => {
-            *session = None;
-            false
-        }
+        let asset = s.asset;
+        return match s.stream.next_frame() {
+            Ok(Some(frame)) => {
+                tx.send(Response::Frame { epoch, key: (asset, at), result: Ok(frame) }).is_ok()
+            }
+            // A prefetch failure is silent on purpose: nobody asked for this
+            // frame, and if they ever do, the real request will surface the
+            // error then.
+            Ok(None) | Err(_) => {
+                sessions.remove(i);
+                false
+            }
+        };
     }
+    false
 }

@@ -4554,6 +4554,30 @@ fn sequential_playback_starts_the_decoder_only_once() {
     assert_eq!(started(&starts), 1, "one stream served the whole run");
 }
 
+/// **Two video layers play as cheaply as one.** The worker used to keep a
+/// single stream, so alternating assets — which is just two videos on screen —
+/// made every request a different asset from the last, and every one of them
+/// paid the ~229ms re-open. Adding a second video dropped the preview to a
+/// slideshow.
+#[test]
+fn two_footage_layers_each_keep_their_own_stream() {
+    let (mut cache, starts) = fake_cache(4);
+    let a = motion_core::Asset::video(
+        motion_core::AssetId(1), fake_file("pbc_two_a.bin"), 4.0, 4.0, 1000, 24.0);
+    let b = motion_core::Asset::video(
+        motion_core::AssetId(2), fake_file("pbc_two_b.bin"), 4.0, 4.0, 1000, 24.0);
+
+    for frame in 0..12 {
+        for asset in [&a, &b] {
+            cache.image(asset, at(asset, frame));
+            cache.wait_for(at(asset, frame));
+            let (_, exact) = cache.image(asset, at(asset, frame)).expect("decoded");
+            assert!(exact, "frame {frame} of {:?} is the frame asked for", asset.id);
+        }
+    }
+    assert_eq!(started(&starts), 2, "one stream per layer, not one per request");
+}
+
 /// Jumping backwards can't be served by a forward-only stream, so it restarts
 /// the decoder — the expensive path, taken only when it must be.
 #[test]
