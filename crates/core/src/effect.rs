@@ -92,6 +92,14 @@ macro_rules! effect_fields {
             EffectKind::Exposure { exposure, offset, gamma } => {
                 (None, vec![exposure, offset, gamma])
             }
+            EffectKind::FastBoxBlur { radius, iterations } => (None, vec![radius, iterations]),
+            EffectKind::DirectionalBlur { angle, length } => (None, vec![angle, length]),
+            EffectKind::Sharpen { amount } => (None, vec![amount]),
+            EffectKind::UnsharpMask { amount, radius, threshold } => (None, vec![amount, radius, threshold]),
+            EffectKind::CrossBlur { radius_x, radius_y } => (None, vec![radius_x, radius_y]),
+            EffectKind::ChannelBlur { red, green, blue, alpha } => (None, vec![red, green, blue, alpha]),
+            EffectKind::BilateralBlur { radius, threshold } => (None, vec![radius, threshold]),
+            EffectKind::SmartBlur { radius, threshold } => (None, vec![radius, threshold]),
         }
     };
 }
@@ -255,6 +263,22 @@ pub enum EffectKind {
         tolerance: Value<f64>,
         softness: Value<f64>,
     },
+    /// Box blur, `iterations` passes of a `radius`-pixel box (EffectCraft Fast Box Blur; both axes, edges not repeated).
+    FastBoxBlur { radius: Value<f64>, iterations: Value<f64> },
+    /// Motion blur of `length` pixels along `angle` degrees clockwise from up (EffectCraft Directional Blur).
+    DirectionalBlur { angle: Value<f64>, length: Value<f64> },
+    /// Sharpen as an unsharp mask with a 1px sigma; `amount` 1.0 is AE's 50 (EffectCraft Sharpen).
+    Sharpen { amount: Value<f64> },
+    /// Add back `amount` (fraction, 0.5 = 50%) of the difference from a `radius`-sigma blur where it exceeds `threshold` (fraction of full scale) (EffectCraft Unsharp Mask).
+    UnsharpMask { amount: Value<f64>, radius: Value<f64>, threshold: Value<f64> },
+    /// Average of a horizontal-only and a vertical-only box blur (EffectCraft CC Cross Blur, Blend transfer mode).
+    CrossBlur { radius_x: Value<f64>, radius_y: Value<f64> },
+    /// Blurriness per channel (AE units, sigma = half) (EffectCraft Channel Blur; both axes, edges not repeated).
+    ChannelBlur { red: Value<f64>, green: Value<f64>, blue: Value<f64>, alpha: Value<f64> },
+    /// Edge-preserving blur: Gaussian spatial x colour-range weights; `threshold` is the range sigma as a fraction (EffectCraft Bilateral Blur, Colorize on).
+    BilateralBlur { radius: Value<f64>, threshold: Value<f64> },
+    /// Edge-preserving blur: box kernel averaging only neighbours within `threshold` (fraction) luminance of the centre (EffectCraft Smart Blur, Normal mode).
+    SmartBlur { radius: Value<f64>, threshold: Value<f64> },
 }
 
 impl Effect {
@@ -391,6 +415,23 @@ impl Effect {
                 tolerance: Value::constant(0.15),
                 softness: Value::constant(0.0),
             },
+            EffectType::FastBoxBlur => EffectKind::FastBoxBlur { radius: Value::constant(4.0), iterations: Value::constant(3.0) },
+            EffectType::DirectionalBlur => EffectKind::DirectionalBlur { angle: Value::constant(0.0), length: Value::constant(20.0) },
+            EffectType::Sharpen => EffectKind::Sharpen { amount: Value::constant(0.5) },
+            EffectType::UnsharpMask => EffectKind::UnsharpMask {
+                amount: Value::constant(0.5),
+                radius: Value::constant(1.0),
+                threshold: Value::constant(0.0),
+            },
+            EffectType::CrossBlur => EffectKind::CrossBlur { radius_x: Value::constant(10.0), radius_y: Value::constant(10.0) },
+            EffectType::ChannelBlur => EffectKind::ChannelBlur {
+                red: Value::constant(0.0),
+                green: Value::constant(0.0),
+                blue: Value::constant(0.0),
+                alpha: Value::constant(0.0),
+            },
+            EffectType::BilateralBlur => EffectKind::BilateralBlur { radius: Value::constant(5.0), threshold: Value::constant(0.1) },
+            EffectType::SmartBlur => EffectKind::SmartBlur { radius: Value::constant(3.0), threshold: Value::constant(0.25) },
         };
         Self::new(kind)
     }
@@ -418,6 +459,14 @@ impl Effect {
             EffectKind::ChannelMixer { .. } => EffectType::ChannelMixer,
             EffectKind::GammaPedestalGain { .. } => EffectType::GammaPedestalGain,
             EffectKind::LeaveColor { .. } => EffectType::LeaveColor,
+            EffectKind::FastBoxBlur { .. } => EffectType::FastBoxBlur,
+            EffectKind::DirectionalBlur { .. } => EffectType::DirectionalBlur,
+            EffectKind::Sharpen { .. } => EffectType::Sharpen,
+            EffectKind::UnsharpMask { .. } => EffectType::UnsharpMask,
+            EffectKind::CrossBlur { .. } => EffectType::CrossBlur,
+            EffectKind::ChannelBlur { .. } => EffectType::ChannelBlur,
+            EffectKind::BilateralBlur { .. } => EffectType::BilateralBlur,
+            EffectKind::SmartBlur { .. } => EffectType::SmartBlur,
         }
     }
 
@@ -547,6 +596,37 @@ impl Effect {
                 tolerance: tolerance.resolve(ctx).clamp(0.0, 1.0),
                 softness: softness.resolve(ctx).clamp(0.0, 1.0),
             },
+            EffectKind::FastBoxBlur { radius, iterations } => ResolvedEffect::FastBoxBlur {
+                radius: radius.resolve(ctx).max(0.0),
+                iterations: iterations.resolve(ctx).round().clamp(1.0, 50.0),
+            },
+            EffectKind::DirectionalBlur { angle, length } => {
+                ResolvedEffect::DirectionalBlur { angle: angle.resolve(ctx), length: length.resolve(ctx).max(0.0) }
+            }
+            EffectKind::Sharpen { amount } => ResolvedEffect::Sharpen { amount: amount.resolve(ctx).max(0.0) },
+            EffectKind::UnsharpMask { amount, radius, threshold } => ResolvedEffect::UnsharpMask {
+                amount: amount.resolve(ctx).max(0.0),
+                radius: radius.resolve(ctx).max(0.1),
+                threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
+            },
+            EffectKind::CrossBlur { radius_x, radius_y } => ResolvedEffect::CrossBlur {
+                radius_x: radius_x.resolve(ctx).max(0.0),
+                radius_y: radius_y.resolve(ctx).max(0.0),
+            },
+            EffectKind::ChannelBlur { red, green, blue, alpha } => ResolvedEffect::ChannelBlur {
+                red: red.resolve(ctx).max(0.0),
+                green: green.resolve(ctx).max(0.0),
+                blue: blue.resolve(ctx).max(0.0),
+                alpha: alpha.resolve(ctx).max(0.0),
+            },
+            EffectKind::BilateralBlur { radius, threshold } => ResolvedEffect::BilateralBlur {
+                radius: radius.resolve(ctx).max(0.0),
+                threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
+            },
+            EffectKind::SmartBlur { radius, threshold } => ResolvedEffect::SmartBlur {
+                radius: radius.resolve(ctx).max(0.0),
+                threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
+            },
         })
     }
 
@@ -636,11 +716,19 @@ pub enum EffectType {
     ChannelMixer,
     GammaPedestalGain,
     LeaveColor,
+    FastBoxBlur,
+    DirectionalBlur,
+    Sharpen,
+    UnsharpMask,
+    CrossBlur,
+    ChannelBlur,
+    BilateralBlur,
+    SmartBlur,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 19] = [
+    pub const ALL: [EffectType; 27] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
@@ -660,6 +748,14 @@ impl EffectType {
         EffectType::ChannelMixer,
         EffectType::GammaPedestalGain,
         EffectType::LeaveColor,
+        EffectType::FastBoxBlur,
+        EffectType::DirectionalBlur,
+        EffectType::Sharpen,
+        EffectType::UnsharpMask,
+        EffectType::CrossBlur,
+        EffectType::ChannelBlur,
+        EffectType::BilateralBlur,
+        EffectType::SmartBlur,
     ];
 
     pub fn label(self) -> &'static str {
@@ -683,6 +779,14 @@ impl EffectType {
             EffectType::ChannelMixer => "Channel Mixer",
             EffectType::GammaPedestalGain => "Gamma / Pedestal / Gain",
             EffectType::LeaveColor => "Leave Color",
+            EffectType::FastBoxBlur => "Fast Box Blur",
+            EffectType::DirectionalBlur => "Directional Blur",
+            EffectType::Sharpen => "Sharpen",
+            EffectType::UnsharpMask => "Unsharp Mask",
+            EffectType::CrossBlur => "Cross Blur",
+            EffectType::ChannelBlur => "Channel Blur",
+            EffectType::BilateralBlur => "Bilateral Blur",
+            EffectType::SmartBlur => "Smart Blur",
         }
     }
 
@@ -709,6 +813,14 @@ impl EffectType {
             EffectType::ChannelMixer => "fx.channel_mixer",
             EffectType::GammaPedestalGain => "fx.gamma_pedestal_gain",
             EffectType::LeaveColor => "fx.leave_color",
+            EffectType::FastBoxBlur => "fx.fast_box_blur",
+            EffectType::DirectionalBlur => "fx.directional_blur",
+            EffectType::Sharpen => "fx.sharpen",
+            EffectType::UnsharpMask => "fx.unsharp_mask",
+            EffectType::CrossBlur => "fx.cross_blur",
+            EffectType::ChannelBlur => "fx.channel_blur",
+            EffectType::BilateralBlur => "fx.bilateral_blur",
+            EffectType::SmartBlur => "fx.smart_blur",
         }
     }
 
@@ -816,6 +928,22 @@ impl EffectType {
                 p!("midtones", "Midtones (at 0.5)", 0.01),
                 p!("highlights", "Highlights (at 0.75)", 0.01),
             ],
+            EffectType::FastBoxBlur => &[p!("radius", "Radius", 0.5), p!("iterations", "Iterations", 0.1)],
+            EffectType::DirectionalBlur => &[p!("angle", "Angle", 1.0), p!("length", "Length", 0.5)],
+            EffectType::Sharpen => &[p!("amount", "Amount", 0.01)],
+            EffectType::UnsharpMask => {
+                &[p!("amount", "Amount", 0.01), p!("radius", "Radius", 0.1), p!("threshold", "Threshold", 0.005)]
+            }
+            EffectType::CrossBlur => &[p!("radius_x", "Radius X", 0.5), p!("radius_y", "Radius Y", 0.5)],
+            EffectType::ChannelBlur => &[
+                p!("red", "Red Blurriness", 0.5),
+                p!("green", "Green Blurriness", 0.5),
+                p!("blue", "Blue Blurriness", 0.5),
+                p!("alpha", "Alpha Blurriness", 0.5),
+            ],
+            EffectType::BilateralBlur | EffectType::SmartBlur => {
+                &[p!("radius", "Radius", 0.5), p!("threshold", "Threshold", 0.005)]
+            }
         }
     }
 
@@ -867,6 +995,14 @@ pub enum ResolvedEffect {
     ChannelMixer { rr: f64, rg: f64, rb: f64, rc: f64, gr: f64, gg: f64, gb: f64, gc: f64, br: f64, bg: f64, bb: f64, bc: f64 },
     GammaPedestalGain { gamma: f64, pedestal: f64, gain: f64, black_stretch: f64 },
     LeaveColor { color: Color, amount: f64, tolerance: f64, softness: f64 },
+    FastBoxBlur { radius: f64, iterations: f64 },
+    DirectionalBlur { angle: f64, length: f64 },
+    Sharpen { amount: f64 },
+    UnsharpMask { amount: f64, radius: f64, threshold: f64 },
+    CrossBlur { radius_x: f64, radius_y: f64 },
+    ChannelBlur { red: f64, green: f64, blue: f64, alpha: f64 },
+    BilateralBlur { radius: f64, threshold: f64 },
+    SmartBlur { radius: f64, threshold: f64 },
 }
 
 #[cfg(test)]
@@ -978,5 +1114,8 @@ mod tests {
         let reg = crate::registry::NodeRegistry::with_effects();
         assert_eq!(reg.len(), EffectType::ALL.len());
         assert!(reg.contains("fx.exposure") && reg.contains("fx.leave_color"));
+        assert!(["fast_box_blur", "directional_blur", "sharpen", "unsharp_mask", "cross_blur", "channel_blur", "bilateral_blur", "smart_blur"]
+            .iter()
+            .all(|n| reg.contains(&format!("fx.{n}"))));
     }
 }

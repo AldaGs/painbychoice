@@ -64,7 +64,15 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             // one pixel's colour. Both are the readback path's.
             ResolvedEffect::Glow { .. }
             | ResolvedEffect::ChromaKey { .. }
-            | ResolvedEffect::ColorKey { .. } => rgb,
+            | ResolvedEffect::ColorKey { .. }
+            | ResolvedEffect::FastBoxBlur { .. }
+            | ResolvedEffect::DirectionalBlur { .. }
+            | ResolvedEffect::Sharpen { .. }
+            | ResolvedEffect::UnsharpMask { .. }
+            | ResolvedEffect::CrossBlur { .. }
+            | ResolvedEffect::ChannelBlur { .. }
+            | ResolvedEffect::BilateralBlur { .. }
+            | ResolvedEffect::SmartBlur { .. } => rgb,
             ResolvedEffect::TonalBalance { sh, mid, hi } => tonal_balance(rgb, sh, mid, hi),
             ResolvedEffect::Curves { ys } => curves(rgb, ys),
             ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } => ported_rgb(rgb, e),
@@ -90,6 +98,14 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
                 | ResolvedEffect::Glow { .. }
                 | ResolvedEffect::ChromaKey { .. }
                 | ResolvedEffect::ColorKey { .. }
+                | ResolvedEffect::FastBoxBlur { .. }
+                | ResolvedEffect::DirectionalBlur { .. }
+                | ResolvedEffect::Sharpen { .. }
+                | ResolvedEffect::UnsharpMask { .. }
+                | ResolvedEffect::CrossBlur { .. }
+                | ResolvedEffect::ChannelBlur { .. }
+                | ResolvedEffect::BilateralBlur { .. }
+                | ResolvedEffect::SmartBlur { .. }
         )
     })
 }
@@ -146,6 +162,14 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::ColorKey { color, tolerance, softness } => {
             color_key(px, color, tolerance, softness)
         }
+        ResolvedEffect::FastBoxBlur { radius, iterations } => fast_box_blur(px, width, height, radius, iterations),
+        ResolvedEffect::DirectionalBlur { angle, length } => directional_blur(px, width, height, angle, length),
+        ResolvedEffect::Sharpen { amount } => unsharp(px, width, height, amount, 1.0, 0.0),
+        ResolvedEffect::UnsharpMask { amount, radius, threshold } => unsharp(px, width, height, amount, radius, threshold),
+        ResolvedEffect::CrossBlur { radius_x, radius_y } => cross_blur(px, width, height, radius_x, radius_y),
+        ResolvedEffect::ChannelBlur { red, green, blue, alpha } => channel_blur(px, width, height, [red, green, blue, alpha]),
+        ResolvedEffect::BilateralBlur { radius, threshold } => edge_preserving(px, width, height, radius, threshold as f32, false),
+        ResolvedEffect::SmartBlur { radius, threshold } => edge_preserving(px, width, height, radius, threshold as f32, true),
     }
 }
 
@@ -543,16 +567,30 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
 /// passes (horizontal then vertical) give the 2D Gaussian at O(n·r) instead of
 /// O(n·r²).
 fn gaussian_blur(px: &mut [u8], width: usize, height: usize, radius: f64) {
-    if radius < 0.5 || width == 0 || height == 0 {
+    if radius < 0.5 {
         return;
     }
-
-    // Only the layer's visible pixels plus the blur's reach can change: a
-    // small shape on a big canvas blurs a small box, not the whole frame.
-    let Some((x0, y0, x1, y1)) = alpha_bounds(px, width, height) else { return };
     let m = (radius * 3.0).ceil() as usize + 1;
-    let (x0, y0) = (x0.saturating_sub(m), y0.saturating_sub(m));
-    let (x1, y1) = ((x1 + m).min(width), (y1 + m).min(height));
+    with_premul(px, width, height, m, |buf, w, h| gauss_buf(buf, w, h, radius as f32));
+}
+
+/// Run `f` on a premultiplied f32 copy of the layer's visible pixels grown by
+/// `margin`, and write the result back as straight RGBA8. Only that box can
+/// change: a small shape on a big canvas blurs a small box, not the whole
+/// frame. The one place the spatial effects share their premultiply round-trip.
+fn with_premul(
+    px: &mut [u8],
+    width: usize,
+    height: usize,
+    margin: usize,
+    f: impl FnOnce(Vec<[f32; 4]>, usize, usize) -> Vec<[f32; 4]>,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let Some((x0, y0, x1, y1)) = alpha_bounds(px, width, height) else { return };
+    let (x0, y0) = (x0.saturating_sub(margin), y0.saturating_sub(margin));
+    let (x1, y1) = ((x1 + margin).min(width), (y1 + margin).min(height));
     let (w, h) = (x1 - x0, y1 - y0);
 
     // Work in premultiplied f32 so alpha weighting is correct across edges.
@@ -568,15 +606,7 @@ fn gaussian_blur(px: &mut [u8], width: usize, height: usize, radius: f64) {
             ]);
         }
     }
-
-    // Three box blurs approximate the Gaussian (central limit), and a box is
-    // a running sum: cost per pixel no longer grows with the radius, which is
-    // what made a large glow or soft shadow stall the preview.
-    let mut tmp = vec![[0.0f32; 4]; buf.len()];
-    for r in box_radii(radius as f32) {
-        box_axis(&buf, &mut tmp, w, h, r, true);
-        box_axis(&tmp, &mut buf, w, h, r, false);
-    }
+    let buf = f(buf, w, h);
 
     for (y, row) in (y0..y1).zip(buf.chunks_exact(w)) {
         let dst = &mut px[(y * width + x0) * 4..(y * width + x1) * 4];
@@ -589,6 +619,196 @@ fn gaussian_blur(px: &mut [u8], width: usize, height: usize, radius: f64) {
             out[3] = to_u8(a);
         }
     }
+}
+
+/// One box blur pass of radius `rx` along x and `ry` along y (0 skips that axis).
+fn box_pass(buf: Vec<[f32; 4]>, w: usize, h: usize, rx: usize, ry: usize) -> Vec<[f32; 4]> {
+    let mut a = buf;
+    let mut b = vec![[0.0f32; 4]; a.len()];
+    for (r, horizontal) in [(rx, true), (ry, false)] {
+        if r > 0 {
+            box_axis(&a, &mut b, w, h, r, horizontal);
+            std::mem::swap(&mut a, &mut b);
+        }
+    }
+    a
+}
+
+/// Gaussian of standard deviation `sigma` as three box passes (running sums).
+fn gauss_buf(mut buf: Vec<[f32; 4]>, w: usize, h: usize, sigma: f32) -> Vec<[f32; 4]> {
+    for r in box_radii(sigma) {
+        buf = box_pass(buf, w, h, r, r);
+    }
+    buf
+}
+
+/// Build a `w` x `h` buffer from `f(x, y)`, bands of rows on separate threads.
+fn par_pixels(w: usize, h: usize, f: impl Fn(usize, usize) -> [f32; 4] + Sync) -> Vec<[f32; 4]> {
+    let mut out = vec![[0.0f32; 4]; w * h];
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(h.max(1));
+    let band = h.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (b, chunk) in out.chunks_mut(band * w).enumerate() {
+            let f = &f;
+            scope.spawn(move || {
+                for (i, o) in chunk.iter_mut().enumerate() {
+                    *o = f(i % w, b * band + i / w);
+                }
+            });
+        }
+    });
+    out
+}
+
+// The blur-category effects below are ported from EffectCraft (MIT OR
+// Apache-2.0, Copyright (c) 2026 ArtCraft Team and the EffectCraft
+// contributors); see NOTICE. Each keeps the source's separable / running-sum
+// approach, so cost does not grow with the radius squared.
+
+fn fast_box_blur(px: &mut [u8], width: usize, height: usize, radius: f64, iterations: f64) {
+    let (r, it) = (radius.round() as usize, iterations as usize);
+    if r == 0 {
+        return;
+    }
+    with_premul(px, width, height, r * it + 1, |mut buf, w, h| {
+        for _ in 0..it {
+            buf = box_pass(buf, w, h, r, r);
+        }
+        buf
+    });
+}
+
+fn cross_blur(px: &mut [u8], width: usize, height: usize, radius_x: f64, radius_y: f64) {
+    let (rx, ry) = (radius_x.round() as usize, radius_y.round() as usize);
+    if rx == 0 && ry == 0 {
+        return;
+    }
+    with_premul(px, width, height, rx.max(ry) * 3 + 1, |buf, w, h| {
+        let (mut hz, mut vt) = (buf.clone(), buf);
+        for _ in 0..3 {
+            hz = box_pass(hz, w, h, rx, 0);
+            vt = box_pass(vt, w, h, 0, ry);
+        }
+        // Blend transfer mode: the mean of the two one-axis blurs.
+        hz.iter().zip(&vt).map(|(a, b)| std::array::from_fn(|c| (a[c] + b[c]) * 0.5)).collect()
+    });
+}
+
+/// Mean of bilinear samples along a line `length` pixels long through each
+/// pixel, `angle` degrees clockwise from up.
+fn directional_blur(px: &mut [u8], width: usize, height: usize, angle: f64, length: f64) {
+    if length < 0.5 {
+        return;
+    }
+    let (dx, dy) = (angle.to_radians().sin(), -angle.to_radians().cos());
+    let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
+    with_premul(px, width, height, length.ceil() as usize + 1, |buf, w, h| {
+        let at = |x: isize, y: isize| buf[y.clamp(0, h as isize - 1) as usize * w + x.clamp(0, w as isize - 1) as usize];
+        par_pixels(w, h, |x, y| {
+            let mut acc = [0.0f32; 4];
+            for i in 0..n {
+                let t = (i as f64 / (n - 1) as f64 - 0.5) * length;
+                let (sx, sy) = (x as f64 + dx * t, y as f64 + dy * t);
+                let (x0, y0) = (sx.floor(), sy.floor());
+                let (fx, fy) = ((sx - x0) as f32, (sy - y0) as f32);
+                let (x0, y0) = (x0 as isize, y0 as isize);
+                let (a, b, c, d) = (at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1));
+                for ch in 0..4 {
+                    acc[ch] += (a[ch] * (1.0 - fx) + b[ch] * fx) * (1.0 - fy) + (c[ch] * (1.0 - fx) + d[ch] * fx) * fy;
+                }
+            }
+            acc.map(|v| v / n as f32)
+        })
+    });
+}
+
+/// Add back `amount` of the difference between the image and a `sigma` blur of
+/// it, wherever that difference is at least `threshold` (fraction of full scale).
+fn unsharp(px: &mut [u8], width: usize, height: usize, amount: f64, sigma: f64, threshold: f64) {
+    with_premul(px, width, height, (sigma * 3.0).ceil() as usize + 1, |mut buf, w, h| {
+        let blurred = gauss_buf(buf.clone(), w, h, sigma as f32);
+        for (o, bl) in buf.iter_mut().zip(&blurred) {
+            for c in 0..3 {
+                let d = o[c] - bl[c];
+                if d.abs() >= threshold as f32 {
+                    o[c] = (o[c] + d * amount as f32).max(0.0);
+                }
+            }
+        }
+        buf
+    });
+}
+
+/// Per-channel Gaussian (sigma = half the blurriness). Each colour channel is
+/// blurred together with alpha at its own sigma and divided back to straight,
+/// then re-premultiplied by the alpha blurred at the alpha sigma.
+fn channel_blur(px: &mut [u8], width: usize, height: usize, blurriness: [f64; 4]) {
+    let sig = blurriness.map(|b| (b * 0.5) as f32);
+    let max = sig.iter().cloned().fold(0.0, f32::max);
+    if max < 0.05 {
+        return;
+    }
+    with_premul(px, width, height, (max * 3.0).ceil() as usize + 1, |buf, w, h| {
+        let planes: Vec<Vec<[f32; 4]>> =
+            sig.iter().map(|&s| if s < 0.05 { buf.clone() } else { gauss_buf(buf.clone(), w, h, s) }).collect();
+        let mut out = buf;
+        for (i, o) in out.iter_mut().enumerate() {
+            let a = planes[3][i][3].clamp(0.0, 1.0);
+            for c in 0..3 {
+                let q = planes[c][i];
+                o[c] = if q[3] > 1e-6 { q[c] / q[3] * a } else { 0.0 };
+            }
+            o[3] = a;
+        }
+        out
+    });
+}
+
+/// Edge-preserving neighbourhood average. `hard`: box kernel with a hard
+/// luminance range test (Smart Blur); otherwise Gaussian spatial x Gaussian
+/// colour-range weights (bilateral filter). Big radii sample on a stride.
+fn edge_preserving(px: &mut [u8], width: usize, height: usize, r: f64, range: f32, hard: bool) {
+    if r < 0.5 {
+        return;
+    }
+    let ri = r.ceil() as i64;
+    let stride = ((r / 6.0).ceil() as i64).max(1);
+    let sig_s2 = 2.0 * (r / 2.0).max(0.5).powi(2);
+    let sig_r2 = 2.0 * range.max(1e-3).powi(2);
+    with_premul(px, width, height, ri as usize, |buf, w, h| {
+        let at = |x: i64, y: i64| buf[y.clamp(0, h as i64 - 1) as usize * w + x.clamp(0, w as i64 - 1) as usize];
+        par_pixels(w, h, |x, y| {
+            let c = buf[y * w + x];
+            let cl = luma([c[0], c[1], c[2]]);
+            let mut acc = [0.0f32; 4];
+            let mut wsum = 0.0f32;
+            let mut dy = -ri;
+            while dy <= ri {
+                let mut dx = -ri;
+                while dx <= ri {
+                    let d2 = (dx * dx + dy * dy) as f64;
+                    if d2 <= r * r + 0.5 {
+                        let q = at(x as i64 + dx, y as i64 + dy);
+                        let wt = if hard {
+                            if (luma([q[0], q[1], q[2]]) - cl).abs() <= range { 1.0 } else { 0.0 }
+                        } else {
+                            let dc: f32 = (0..4).map(|k| (q[k] - c[k]).powi(2)).sum();
+                            ((-d2 / sig_s2) as f32 - dc / sig_r2).exp()
+                        };
+                        if wt > 0.0 {
+                            for k in 0..4 {
+                                acc[k] += q[k] * wt;
+                            }
+                            wsum += wt;
+                        }
+                    }
+                    dx += stride;
+                }
+                dy += stride;
+            }
+            if wsum > 0.0 { acc.map(|v| v / wsum) } else { c }
+        })
+    });
 }
 
 /// Radii of the three box blurs whose sequence matches a Gaussian of `sigma`
@@ -834,6 +1054,51 @@ mod tests {
         apply_stack(&mut px, 2, 1, &[ResolvedEffect::LeaveColor { color: Color::rgb(1.0, 0.0, 0.0), amount: 1.0, tolerance: 0.15, softness: 0.0 }]);
         assert_eq!(px[..3], [255, 0, 0]);
         assert!(px[4] == px[5] && px[5] == px[6]);
+    }
+
+    #[test]
+    fn ported_blur_pixel_math() {
+        // A lone opaque white pixel at (4,4) of a 9x9 field.
+        let dot = || {
+            let mut px = vec![0u8; 9 * 9 * 4];
+            px[(4 * 9 + 4) * 4..][..4].copy_from_slice(&[255; 4]);
+            px
+        };
+        let alpha = |px: &[u8], x: usize, y: usize| px[(y * 9 + x) * 4 + 3] as i32;
+        // Box blur, radius 1, one pass: the 3x3 neighbourhood gets 1/9 each, outside stays clear.
+        let mut px = dot();
+        apply_stack(&mut px, 9, 9, &[ResolvedEffect::FastBoxBlur { radius: 1.0, iterations: 1.0 }]);
+        assert!((alpha(&px, 3, 3) - 28).abs() <= 1 && alpha(&px, 2, 4) == 0);
+        // Cross blur: spreads along both axes but not the diagonal.
+        let mut px = dot();
+        apply_stack(&mut px, 9, 9, &[ResolvedEffect::CrossBlur { radius_x: 1.0, radius_y: 1.0 }]);
+        assert!(alpha(&px, 3, 4) > 0 && alpha(&px, 4, 3) > 0 && alpha(&px, 3, 3) == 0);
+        // Directional blur at 90 degrees (rightwards) smears horizontally only.
+        let mut px = dot();
+        apply_stack(&mut px, 9, 9, &[ResolvedEffect::DirectionalBlur { angle: 90.0, length: 4.0 }]);
+        assert!(alpha(&px, 6, 4) > 0 && alpha(&px, 4, 6) == 0);
+        // Channel blur on alpha only: the alpha spreads, the dot keeps its own colour.
+        let mut px = dot();
+        apply_stack(&mut px, 9, 9, &[ResolvedEffect::ChannelBlur { red: 0.0, green: 0.0, blue: 0.0, alpha: 4.0 }]);
+        assert!(alpha(&px, 3, 4) > 0 && alpha(&px, 4, 4) < 255 && px[(4 * 9 + 4) * 4] == 255);
+        // Sharpen: a step edge overshoots on the bright side and undershoots on the dark side.
+        let step = || -> Vec<u8> { (0..16).flat_map(|x| if x < 8 { [100, 100, 100, 255] } else { [200, 200, 200, 255] }).collect() };
+        let mut px = step();
+        apply_stack(&mut px, 16, 1, &[ResolvedEffect::Sharpen { amount: 1.0 }]);
+        assert!(px[8 * 4] > 200 && px[7 * 4] < 100);
+        // Unsharp threshold above the edge contrast leaves it untouched.
+        let mut px = step();
+        apply_stack(&mut px, 16, 1, &[ResolvedEffect::UnsharpMask { amount: 1.0, radius: 2.0, threshold: 0.9 }]);
+        assert_eq!(px, step());
+        // Bilateral / smart blur keep a hard edge (the range test rejects the other side).
+        for e in [
+            ResolvedEffect::BilateralBlur { radius: 3.0, threshold: 0.05 },
+            ResolvedEffect::SmartBlur { radius: 3.0, threshold: 0.1 },
+        ] {
+            let mut px = step();
+            apply_stack(&mut px, 16, 1, &[e]);
+            assert!(px[7 * 4] < 110 && px[8 * 4] > 190, "{:?}", &px[28..36]);
+        }
     }
 
     /// A drop shadow paints where the artwork is *not*, offset from it, and
