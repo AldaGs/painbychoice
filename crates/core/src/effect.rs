@@ -96,14 +96,15 @@ macro_rules! effect_fields {
             EffectKind::DirectionalBlur { angle, length } => (None, vec![angle, length]),
             EffectKind::Sharpen { amount } => (None, vec![amount]),
             EffectKind::UnsharpMask { amount, radius, threshold } => (None, vec![amount, radius, threshold]),
-            EffectKind::CrossBlur { radius_x, radius_y } => (None, vec![radius_x, radius_y]),
+            EffectKind::CrossBlur { radius_x, radius_y, mode } => (None, vec![radius_x, radius_y, mode]),
             EffectKind::ChannelBlur { red, green, blue, alpha } => (None, vec![red, green, blue, alpha]),
             EffectKind::BilateralBlur { radius, threshold } => (None, vec![radius, threshold]),
             EffectKind::SmartBlur { radius, threshold } => (None, vec![radius, threshold]),
             EffectKind::Posterize { level } => (None, vec![level]),
             EffectKind::Threshold { level } => (None, vec![level]),
             EffectKind::ThresholdRgb { red, green, blue, blend } => (None, vec![red, green, blue, blend]),
-            EffectKind::FindEdges { blend } => (None, vec![blend]),
+            EffectKind::FindEdges { blend, invert } => (None, vec![blend, invert]),
+            EffectKind::RadialBlur { amount, center_x, center_y, mode } => (None, vec![amount, center_x, center_y, mode]),
             EffectKind::Emboss { direction, relief, contrast, blend } => (None, vec![direction, relief, contrast, blend]),
             EffectKind::ColorEmboss { direction, relief, contrast, blend } => (None, vec![direction, relief, contrast, blend]),
             EffectKind::Mosaic { horizontal, vertical } => (None, vec![horizontal, vertical]),
@@ -130,6 +131,11 @@ pub struct Effect {
 
 fn yes() -> bool {
     true
+}
+
+/// Serde default for params added after projects were saved: the old fixed value, 0.
+fn zero() -> Value<f64> {
+    Value::constant(0.0)
 }
 
 /// The kinds of pixel effect, each carrying its own animatable parameters.
@@ -279,7 +285,13 @@ pub enum EffectKind {
     /// Add back `amount` (fraction, 0.5 = 50%) of the difference from a `radius`-sigma blur where it exceeds `threshold` (fraction of full scale) (EffectCraft Unsharp Mask).
     UnsharpMask { amount: Value<f64>, radius: Value<f64>, threshold: Value<f64> },
     /// Average of a horizontal-only and a vertical-only box blur (EffectCraft CC Cross Blur, Blend transfer mode).
-    CrossBlur { radius_x: Value<f64>, radius_y: Value<f64> },
+    CrossBlur {
+        radius_x: Value<f64>,
+        radius_y: Value<f64>,
+        /// Popup index: 0 Blend, 1 Add, 2 Screen, 3 Lighten. Absent in old projects = Blend.
+        #[serde(default = "zero")]
+        mode: Value<f64>,
+    },
     /// Blurriness per channel (AE units, sigma = half) (EffectCraft Channel Blur; both axes, edges not repeated).
     ChannelBlur { red: Value<f64>, green: Value<f64>, blue: Value<f64>, alpha: Value<f64> },
     /// Edge-preserving blur: Gaussian spatial x colour-range weights; `threshold` is the range sigma as a fraction (EffectCraft Bilateral Blur, Colorize on).
@@ -293,7 +305,14 @@ pub enum EffectKind {
     /// Per-channel black/white split, each at its own fraction; `blend` is the fraction of the original kept (EffectCraft CC Threshold RGB, no invert switches).
     ThresholdRgb { red: Value<f64>, green: Value<f64>, blue: Value<f64>, blend: Value<f64> },
     /// Sobel edges on luminance, dark on white (EffectCraft Find Edges, Invert off); `blend` is the fraction of the original kept.
-    FindEdges { blend: Value<f64> },
+    FindEdges {
+        blend: Value<f64>,
+        /// Checkbox (0/1). Absent in old projects = off.
+        #[serde(default = "zero")]
+        invert: Value<f64>,
+    },
+    /// Spin or zoom blur about a point (EffectCraft Radial Blur). `amount` is degrees for spin, percent for zoom; the centre is in canvas pixels, origin top-left (the layer's isolated target is the whole canvas). `mode` is a popup: 0 Spin, 1 Zoom.
+    RadialBlur { amount: Value<f64>, center_x: Value<f64>, center_y: Value<f64>, mode: Value<f64> },
     /// Grey relief from a luminance difference `relief` pixels either side along `direction` degrees (AE: 0 = right, counter-clockwise); `contrast` 1.0 = 100% (EffectCraft Emboss).
     Emboss { direction: Value<f64>, relief: Value<f64>, contrast: Value<f64>, blend: Value<f64> },
     /// Emboss that adds the relief to the layer's own colour (EffectCraft Color Emboss).
@@ -444,7 +463,7 @@ impl Effect {
                 radius: Value::constant(1.0),
                 threshold: Value::constant(0.0),
             },
-            EffectType::CrossBlur => EffectKind::CrossBlur { radius_x: Value::constant(10.0), radius_y: Value::constant(10.0) },
+            EffectType::CrossBlur => EffectKind::CrossBlur { radius_x: Value::constant(10.0), radius_y: Value::constant(10.0), mode: Value::constant(0.0) },
             EffectType::ChannelBlur => EffectKind::ChannelBlur {
                 red: Value::constant(0.0),
                 green: Value::constant(0.0),
@@ -461,7 +480,14 @@ impl Effect {
                 blue: Value::constant(0.5),
                 blend: Value::constant(0.0),
             },
-            EffectType::FindEdges => EffectKind::FindEdges { blend: Value::constant(0.0) },
+            EffectType::FindEdges => EffectKind::FindEdges { blend: Value::constant(0.0), invert: Value::constant(0.0) },
+            // Centre seeded at the middle of a 1920x1080 canvas; seed() has no comp size.
+            EffectType::RadialBlur => EffectKind::RadialBlur {
+                amount: Value::constant(10.0),
+                center_x: Value::constant(960.0),
+                center_y: Value::constant(540.0),
+                mode: Value::constant(0.0),
+            },
             EffectType::Emboss => EffectKind::Emboss {
                 direction: Value::constant(45.0),
                 relief: Value::constant(1.5),
@@ -517,6 +543,7 @@ impl Effect {
             EffectKind::Emboss { .. } => EffectType::Emboss,
             EffectKind::ColorEmboss { .. } => EffectType::ColorEmboss,
             EffectKind::Mosaic { .. } => EffectType::Mosaic,
+            EffectKind::RadialBlur { .. } => EffectType::RadialBlur,
         }
     }
 
@@ -659,9 +686,10 @@ impl Effect {
                 radius: radius.resolve(ctx).max(0.1),
                 threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
             },
-            EffectKind::CrossBlur { radius_x, radius_y } => ResolvedEffect::CrossBlur {
+            EffectKind::CrossBlur { radius_x, radius_y, mode } => ResolvedEffect::CrossBlur {
                 radius_x: radius_x.resolve(ctx).max(0.0),
                 radius_y: radius_y.resolve(ctx).max(0.0),
+                mode: popup_index(mode.resolve(ctx), 4),
             },
             EffectKind::ChannelBlur { red, green, blue, alpha } => ResolvedEffect::ChannelBlur {
                 red: red.resolve(ctx).max(0.0),
@@ -685,7 +713,15 @@ impl Effect {
                 blue: blue.resolve(ctx).clamp(0.0, 1.0),
                 blend: blend.resolve(ctx).clamp(0.0, 1.0),
             },
-            EffectKind::FindEdges { blend } => ResolvedEffect::FindEdges { blend: blend.resolve(ctx).clamp(0.0, 1.0) },
+            EffectKind::FindEdges { blend, invert } => ResolvedEffect::FindEdges {
+                blend: blend.resolve(ctx).clamp(0.0, 1.0),
+                invert: invert.resolve(ctx) >= 0.5,
+            },
+            EffectKind::RadialBlur { amount, center_x, center_y, mode } => ResolvedEffect::RadialBlur {
+                amount: amount.resolve(ctx),
+                center: (center_x.resolve(ctx), center_y.resolve(ctx)),
+                zoom: popup_index(mode.resolve(ctx), 2) == 1,
+            },
             EffectKind::Emboss { direction, relief, contrast, blend } => ResolvedEffect::Emboss {
                 direction: direction.resolve(ctx),
                 relief: relief.resolve(ctx).max(0.0),
@@ -752,6 +788,9 @@ impl Effect {
 /// effect's starting values are written.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EffectParamSpec {
+    /// How the panel draws it. Storage is always a `Value<f64>`, so keyframes, the registry and
+    /// serialization are unchanged; checkbox/popup values are rounded at resolve time (keys still interpolate, no Hold).
+    pub ui: ParamUi,
     /// Socket id on the effect's descriptor.
     pub id: &'static str,
     pub label: &'static str,
@@ -763,8 +802,29 @@ pub struct EffectParamSpec {
 /// which `&[...]` promotes to `'static`; a call would not be.
 macro_rules! p {
     ($id:expr, $label:expr, $step:expr) => {
-        EffectParamSpec { id: $id, label: $label, step: $step }
+        EffectParamSpec { id: $id, label: $label, step: $step, ui: ParamUi::Number }
     };
+    ($id:expr, $label:expr, $step:expr, $ui:expr) => {
+        EffectParamSpec { id: $id, label: $label, step: $step, ui: $ui }
+    };
+}
+
+/// How the panel presents a numeric effect parameter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParamUi {
+    Number,
+    /// 0 / 1.
+    Checkbox,
+    /// Index into the names.
+    Popup(&'static [&'static str]),
+    /// First half of a point; the *next* param must be `PointY`. The panel draws both on one row.
+    PointX,
+    PointY,
+}
+
+/// A popup value as an index: rounded, clamped to `0..n`.
+fn popup_index(v: f64, n: usize) -> usize {
+    v.round().clamp(0.0, (n - 1) as f64) as usize
 }
 
 /// The flat discriminant of [`EffectKind`] — one value per effect kind, with no
@@ -806,11 +866,12 @@ pub enum EffectType {
     Emboss,
     ColorEmboss,
     Mosaic,
+    RadialBlur,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 34] = [
+    pub const ALL: [EffectType; 35] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
@@ -845,6 +906,7 @@ impl EffectType {
         EffectType::Emboss,
         EffectType::ColorEmboss,
         EffectType::Mosaic,
+        EffectType::RadialBlur,
     ];
 
     pub fn label(self) -> &'static str {
@@ -883,6 +945,7 @@ impl EffectType {
             EffectType::Emboss => "Emboss",
             EffectType::ColorEmboss => "Color Emboss",
             EffectType::Mosaic => "Mosaic",
+            EffectType::RadialBlur => "Radial Blur",
         }
     }
 
@@ -924,6 +987,7 @@ impl EffectType {
             EffectType::Emboss => "fx.emboss",
             EffectType::ColorEmboss => "fx.color_emboss",
             EffectType::Mosaic => "fx.mosaic",
+            EffectType::RadialBlur => "fx.radial_blur",
         }
     }
 
@@ -1037,7 +1101,11 @@ impl EffectType {
             EffectType::UnsharpMask => {
                 &[p!("amount", "Amount", 0.01), p!("radius", "Radius", 0.1), p!("threshold", "Threshold", 0.005)]
             }
-            EffectType::CrossBlur => &[p!("radius_x", "Radius X", 0.5), p!("radius_y", "Radius Y", 0.5)],
+            EffectType::CrossBlur => &[
+                p!("radius_x", "Radius X", 0.5),
+                p!("radius_y", "Radius Y", 0.5),
+                p!("mode", "Transfer Mode", 1.0, ParamUi::Popup(&["Blend", "Add", "Screen", "Lighten"])),
+            ],
             EffectType::ChannelBlur => &[
                 p!("red", "Red Blurriness", 0.5),
                 p!("green", "Green Blurriness", 0.5),
@@ -1055,7 +1123,15 @@ impl EffectType {
                 p!("blue", "Blue Threshold", 0.005),
                 p!("blend", "Blend With Original", 0.01),
             ],
-            EffectType::FindEdges => &[p!("blend", "Blend With Original", 0.01)],
+            EffectType::FindEdges => {
+                &[p!("blend", "Blend With Original", 0.01), p!("invert", "Invert", 1.0, ParamUi::Checkbox)]
+            }
+            EffectType::RadialBlur => &[
+                p!("amount", "Amount", 0.5),
+                p!("center_x", "Center", 1.0, ParamUi::PointX),
+                p!("center_y", "Center Y", 1.0, ParamUi::PointY),
+                p!("mode", "Type", 1.0, ParamUi::Popup(&["Spin", "Zoom"])),
+            ],
             EffectType::Emboss | EffectType::ColorEmboss => &[
                 p!("direction", "Direction", 1.0),
                 p!("relief", "Relief", 0.1),
@@ -1118,17 +1194,18 @@ pub enum ResolvedEffect {
     DirectionalBlur { angle: f64, length: f64 },
     Sharpen { amount: f64 },
     UnsharpMask { amount: f64, radius: f64, threshold: f64 },
-    CrossBlur { radius_x: f64, radius_y: f64 },
+    CrossBlur { radius_x: f64, radius_y: f64, mode: usize },
     ChannelBlur { red: f64, green: f64, blue: f64, alpha: f64 },
     BilateralBlur { radius: f64, threshold: f64 },
     SmartBlur { radius: f64, threshold: f64 },
     Posterize { level: f64 },
     Threshold { level: f64 },
     ThresholdRgb { red: f64, green: f64, blue: f64, blend: f64 },
-    FindEdges { blend: f64 },
+    FindEdges { blend: f64, invert: bool },
     Emboss { direction: f64, relief: f64, contrast: f64, blend: f64 },
     ColorEmboss { direction: f64, relief: f64, contrast: f64, blend: f64 },
     Mosaic { horizontal: f64, vertical: f64 },
+    RadialBlur { amount: f64, center: (f64, f64), zoom: bool },
 }
 
 #[cfg(test)]
@@ -1240,8 +1317,34 @@ mod tests {
         let reg = crate::registry::NodeRegistry::with_effects();
         assert_eq!(reg.len(), EffectType::ALL.len());
         assert!(reg.contains("fx.exposure") && reg.contains("fx.leave_color"));
-        assert!(["fast_box_blur", "directional_blur", "sharpen", "unsharp_mask", "cross_blur", "channel_blur", "bilateral_blur", "smart_blur", "posterize", "threshold", "threshold_rgb", "find_edges", "emboss", "color_emboss", "mosaic"]
+        assert!(["fast_box_blur", "directional_blur", "sharpen", "unsharp_mask", "cross_blur", "channel_blur", "bilateral_blur", "smart_blur", "posterize", "threshold", "threshold_rgb", "find_edges", "emboss", "color_emboss", "mosaic", "radial_blur"]
             .iter()
             .all(|n| reg.contains(&format!("fx.{n}"))));
+    }
+
+    /// Projects saved before Invert / Transfer Mode existed deserialize to the old fixed
+    /// behaviour (off / Blend): the field is simply missing from the JSON.
+    #[test]
+    fn old_effect_json_gets_default_for_new_params() {
+        let mut ctx = EvalCtx::at(0.0);
+        let mut full = serde_json::to_value(Effect::seed(EffectType::FindEdges)).unwrap();
+        assert!(full["kind"]["FindEdges"].as_object_mut().unwrap().remove("invert").is_some());
+        let e: Effect = serde_json::from_value(full).unwrap();
+        assert_eq!(e.resolve(&mut ctx), Some(ResolvedEffect::FindEdges { blend: 0.0, invert: false }));
+        let mut full = serde_json::to_value(Effect::seed(EffectType::CrossBlur)).unwrap();
+        assert!(full["kind"]["CrossBlur"].as_object_mut().unwrap().remove("mode").is_some());
+        let e: Effect = serde_json::from_value(full).unwrap();
+        assert!(matches!(e.resolve(&mut ctx), Some(ResolvedEffect::CrossBlur { mode: 0, .. })));
+    }
+
+    #[test]
+    fn point_params_are_adjacent_x_then_y() {
+        for ty in EffectType::ALL {
+            for (i, p) in ty.params().iter().enumerate() {
+                if p.ui == ParamUi::PointX {
+                    assert_eq!(ty.params()[i + 1].ui, ParamUi::PointY, "{ty:?}");
+                }
+            }
+        }
     }
 }

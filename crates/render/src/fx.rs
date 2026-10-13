@@ -76,7 +76,8 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             | ResolvedEffect::FindEdges { .. }
             | ResolvedEffect::Emboss { .. }
             | ResolvedEffect::ColorEmboss { .. }
-            | ResolvedEffect::Mosaic { .. } => rgb,
+            | ResolvedEffect::Mosaic { .. }
+            | ResolvedEffect::RadialBlur { .. } => rgb,
             ResolvedEffect::TonalBalance { sh, mid, hi } => tonal_balance(rgb, sh, mid, hi),
             ResolvedEffect::Curves { ys } => curves(rgb, ys),
             ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } | ResolvedEffect::Posterize { .. } | ResolvedEffect::Threshold { .. } | ResolvedEffect::ThresholdRgb { .. } => ported_rgb(rgb, e),
@@ -114,6 +115,7 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
                 | ResolvedEffect::Emboss { .. }
                 | ResolvedEffect::ColorEmboss { .. }
                 | ResolvedEffect::Mosaic { .. }
+                | ResolvedEffect::RadialBlur { .. }
         )
     })
 }
@@ -174,14 +176,15 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::DirectionalBlur { angle, length } => directional_blur(px, width, height, angle, length),
         ResolvedEffect::Sharpen { amount } => unsharp(px, width, height, amount, 1.0, 0.0),
         ResolvedEffect::UnsharpMask { amount, radius, threshold } => unsharp(px, width, height, amount, radius, threshold),
-        ResolvedEffect::CrossBlur { radius_x, radius_y } => cross_blur(px, width, height, radius_x, radius_y),
+        ResolvedEffect::CrossBlur { radius_x, radius_y, mode } => cross_blur(px, width, height, radius_x, radius_y, mode),
         ResolvedEffect::ChannelBlur { red, green, blue, alpha } => channel_blur(px, width, height, [red, green, blue, alpha]),
         ResolvedEffect::BilateralBlur { radius, threshold } => edge_preserving(px, width, height, radius, threshold as f32, false),
         ResolvedEffect::SmartBlur { radius, threshold } => edge_preserving(px, width, height, radius, threshold as f32, true),
-        ResolvedEffect::FindEdges { blend } => find_edges(px, width, height, blend as f32),
+        ResolvedEffect::FindEdges { blend, invert } => find_edges(px, width, height, blend as f32, invert),
         ResolvedEffect::Emboss { direction, relief, contrast, blend } => emboss(px, width, height, direction, relief, contrast as f32, blend as f32, false),
         ResolvedEffect::ColorEmboss { direction, relief, contrast, blend } => emboss(px, width, height, direction, relief, contrast as f32, blend as f32, true),
         ResolvedEffect::Mosaic { horizontal, vertical } => mosaic(px, width, height, horizontal as usize, vertical as usize),
+        ResolvedEffect::RadialBlur { amount, center, zoom } => radial_blur(px, width, height, amount, center, zoom),
     }
 }
 
@@ -693,7 +696,7 @@ fn lerp4(fx: [f32; 4], orig: [f32; 4], k: f32) -> [f32; 4] {
     std::array::from_fn(|c| fx[c] + (orig[c] - fx[c]) * k)
 }
 
-fn find_edges(px: &mut [u8], width: usize, height: usize, blend: f32) {
+fn find_edges(px: &mut [u8], width: usize, height: usize, blend: f32, invert: bool) {
     with_premul(px, width, height, 1, |buf, w, h| {
         let l = |x: usize, y: usize, dx: i64, dy: i64| {
             let p = buf[(y as i64 + dy).clamp(0, h as i64 - 1) as usize * w + (x as i64 + dx).clamp(0, w as i64 - 1) as usize];
@@ -702,7 +705,8 @@ fn find_edges(px: &mut [u8], width: usize, height: usize, blend: f32) {
         par_pixels(w, h, |x, y| {
             let gx = l(x, y, 1, -1) + 2.0 * l(x, y, 1, 0) + l(x, y, 1, 1) - l(x, y, -1, -1) - 2.0 * l(x, y, -1, 0) - l(x, y, -1, 1);
             let gy = l(x, y, -1, 1) + 2.0 * l(x, y, 0, 1) + l(x, y, 1, 1) - l(x, y, -1, -1) - 2.0 * l(x, y, 0, -1) - l(x, y, 1, -1);
-            let v = 1.0 - (gx * gx + gy * gy).sqrt().min(1.0);
+            let m = (gx * gx + gy * gy).sqrt().min(1.0);
+            let v = if invert { m } else { 1.0 - m };
             let a = buf[y * w + x][3];
             lerp4([v * a, v * a, v * a, a], buf[y * w + x], blend)
         })
@@ -768,6 +772,46 @@ fn mosaic(px: &mut [u8], width: usize, height: usize, hb: usize, vb: usize) {
     });
 }
 
+/// Spin (`amount` degrees) or zoom (`amount` percent) blur: 32 bilinear samples along an arc /
+/// ray through each pixel about `center`. `center` is in buffer pixels, which are canvas pixels
+/// (the layer's isolated target is the whole canvas), origin top-left. Margin = whole canvas so
+/// the crop `with_premul` makes starts at (0,0) and `center` needs no offset.
+fn radial_blur(px: &mut [u8], width: usize, height: usize, amount: f64, center: (f64, f64), zoom: bool) {
+    let amount = if zoom { amount / 100.0 } else { amount };
+    if amount.abs() < 1e-6 {
+        return;
+    }
+    with_premul(px, width, height, width.max(height), |buf, w, h| {
+        let at = |x: i64, y: i64| {
+            if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 { [0.0; 4] } else { buf[y as usize * w + x as usize] }
+        };
+        par_pixels(w, h, |x, y| {
+            let (vx, vy) = (x as f64 + 0.5 - center.0, y as f64 + 0.5 - center.1);
+            let mut acc = [0.0f32; 4];
+            for i in 0..32 {
+                let t = i as f64 / 31.0 - 0.5;
+                let (sx, sy) = if zoom {
+                    let k = 1.0 + t * amount;
+                    (center.0 + vx * k, center.1 + vy * k)
+                } else {
+                    let (s, c) = (t * amount).to_radians().sin_cos();
+                    (center.0 + vx * c - vy * s, center.1 + vx * s + vy * c)
+                };
+                let (fx, fy) = (sx - 0.5, sy - 0.5);
+                let (x0, y0) = (fx.floor(), fy.floor());
+                let (tx, ty) = ((fx - x0) as f32, (fy - y0) as f32);
+                let (x0, y0) = (x0 as i64, y0 as i64);
+                let top = lerp4(at(x0, y0), at(x0 + 1, y0), tx);
+                let p = lerp4(top, lerp4(at(x0, y0 + 1), at(x0 + 1, y0 + 1), tx), ty);
+                for c in 0..4 {
+                    acc[c] += p[c];
+                }
+            }
+            acc.map(|v| v / 32.0)
+        })
+    });
+}
+
 fn fast_box_blur(px: &mut [u8], width: usize, height: usize, radius: f64, iterations: f64) {
     let (r, it) = (radius.round() as usize, iterations as usize);
     if r == 0 {
@@ -781,7 +825,7 @@ fn fast_box_blur(px: &mut [u8], width: usize, height: usize, radius: f64, iterat
     });
 }
 
-fn cross_blur(px: &mut [u8], width: usize, height: usize, radius_x: f64, radius_y: f64) {
+fn cross_blur(px: &mut [u8], width: usize, height: usize, radius_x: f64, radius_y: f64, mode: usize) {
     let (rx, ry) = (radius_x.round() as usize, radius_y.round() as usize);
     if rx == 0 && ry == 0 {
         return;
@@ -792,8 +836,21 @@ fn cross_blur(px: &mut [u8], width: usize, height: usize, radius_x: f64, radius_
             hz = box_pass(hz, w, h, rx, 0);
             vt = box_pass(vt, w, h, 0, ry);
         }
-        // Blend transfer mode: the mean of the two one-axis blurs.
-        hz.iter().zip(&vt).map(|(a, b)| std::array::from_fn(|c| (a[c] + b[c]) * 0.5)).collect()
+        // Transfer mode: 0 Blend (mean), 1 Add, 2 Screen, 3 Lighten; alpha clamped like colour.
+        hz.iter()
+            .zip(&vt)
+            .map(|(a, b)| {
+                std::array::from_fn(|c| {
+                    let v = match mode {
+                        1 => a[c] + b[c],
+                        2 => a[c] + b[c] - a[c] * b[c],
+                        3 => a[c].max(b[c]),
+                        _ => (a[c] + b[c]) * 0.5,
+                    };
+                    v.clamp(0.0, 1.0)
+                })
+            })
+            .collect()
     });
 }
 
@@ -1174,7 +1231,7 @@ mod tests {
         assert!((alpha(&px, 3, 3) - 28).abs() <= 1 && alpha(&px, 2, 4) == 0);
         // Cross blur: spreads along both axes but not the diagonal.
         let mut px = dot();
-        apply_stack(&mut px, 9, 9, &[ResolvedEffect::CrossBlur { radius_x: 1.0, radius_y: 1.0 }]);
+        apply_stack(&mut px, 9, 9, &[ResolvedEffect::CrossBlur { radius_x: 1.0, radius_y: 1.0, mode: 0 }]);
         assert!(alpha(&px, 3, 4) > 0 && alpha(&px, 4, 3) > 0 && alpha(&px, 3, 3) == 0);
         // Directional blur at 90 degrees (rightwards) smears horizontally only.
         let mut px = dot();
@@ -1218,7 +1275,7 @@ mod tests {
         // Find Edges: flat area is white, a step edge goes dark.
         let step: Vec<u8> = (0..8).flat_map(|x| if x < 4 { [0, 0, 0, 255] } else { [255, 255, 255, 255] }).collect();
         let mut px = step.clone();
-        apply_stack(&mut px, 8, 1, &[ResolvedEffect::FindEdges { blend: 0.0 }]);
+        apply_stack(&mut px, 8, 1, &[ResolvedEffect::FindEdges { blend: 0.0, invert: false }]);
         assert!(px[0] == 255 && px[3 * 4] < 30);
         // Emboss: flat is mid grey; a step lights one side.
         let mut px = step.clone();
@@ -1486,6 +1543,34 @@ mod tests {
         assert_eq!(px, before);
         apply_stack(&mut px, 1, 1, &[ResolvedEffect::ColorBalance { red: 0.2, green: 0.0, blue: 0.0 }]);
         assert!(px[0] > 140 && px[1] == 100 && px[2] == 100, "got {:?}", &px[..3]);
+    }
+
+    /// Spin blur about a chosen centre: a bright pixel to the right of the centre smears along
+    /// the arc (up/down), and with the centre moved onto the pixel nothing smears.
+    #[test]
+    fn radial_blur_follows_its_centre() {
+        let (w, h) = (21usize, 21usize);
+        let mk = || {
+            let mut px = vec![0u8; w * h * 4];
+            px[(10 * w + 15) * 4..][..4].copy_from_slice(&[255, 255, 255, 255]);
+            px
+        };
+        let a = |px: &[u8], x: usize, y: usize| px[(y * w + x) * 4 + 3];
+        let mut spun = mk();
+        apply_stack(&mut spun, w, h, &[ResolvedEffect::RadialBlur { amount: 60.0, center: (10.5, 10.5), zoom: false }]);
+        assert!(a(&spun, 15, 8) > 0 || a(&spun, 15, 12) > 0, "smears along the arc");
+        let mut still = mk();
+        apply_stack(&mut still, w, h, &[ResolvedEffect::RadialBlur { amount: 60.0, center: (15.5, 10.5), zoom: false }]);
+        assert_eq!(a(&still, 15, 8), 0);
+        assert_eq!(a(&still, 15, 10), 255);
+    }
+
+    #[test]
+    fn find_edges_invert_flips_flat_areas() {
+        let mut px = vec![200u8; 8 * 8 * 4];
+        px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+        apply_stack(&mut px, 8, 8, &[ResolvedEffect::FindEdges { blend: 0.0, invert: true }]);
+        assert_eq!(px[(4 * 8 + 4) * 4], 0);
     }
 }
 

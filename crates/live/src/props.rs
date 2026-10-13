@@ -1408,18 +1408,65 @@ pub(crate) fn properties_ui(
             // Parameter rows, indented under the effect they belong to. Each
             // gets a stopwatch, so an effect animates through the same gesture
             // every other property uses.
-            for num in &ef.nums {
+            for (k, num) in ef.nums.iter().enumerate() {
                 let param = num.param;
+                let ui_kind = param.spec().ui;
+                // The Y half of a point is drawn on its X half's row.
+                if ui_kind == motion_core::ParamUi::PointY {
+                    continue;
+                }
                 ui.label(format!("  {}", param.label()));
                 let mut v = num.value;
                 // Pixel distances drag coarsely, `0..1` amounts finely — a
                 // 0.01/frame offset would take a minute to move a shadow.
                 let speed = param.spec().step;
-                if ui.add(crate::calc::num(&mut v).speed(speed)).changed() {
-                    edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
+                let mut keys = vec![param];
+                match ui_kind {
+                    motion_core::ParamUi::Checkbox => {
+                        let mut on = v >= 0.5;
+                        if ui.checkbox(&mut on, "").changed() {
+                            edits.effect = Some(EffectOp::SetNum { index: i, param, value: on as u8 as f64 });
+                        }
+                    }
+                    motion_core::ParamUi::Popup(names) => {
+                        let cur = (v.round().max(0.0) as usize).min(names.len() - 1);
+                        egui::ComboBox::from_id_salt(("fx_popup", i, param.slot))
+                            .selected_text(names[cur])
+                            .show_ui(ui, |ui| {
+                                for (n, name) in names.iter().enumerate() {
+                                    if ui.selectable_label(n == cur, *name).clicked() {
+                                        edits.effect = Some(EffectOp::SetNum { index: i, param, value: n as f64 });
+                                    }
+                                }
+                            });
+                    }
+                    motion_core::ParamUi::PointX => {
+                        // Two fields side by side; the Y num is the next slot.
+                        let ynum = ef.nums.get(k + 1);
+                        ui.horizontal(|ui| {
+                            if ui.add(crate::calc::num(&mut v).speed(speed).prefix("x ")).changed() {
+                                edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
+                            }
+                            if let Some(yn) = ynum {
+                                let mut y = yn.value;
+                                if ui.add(crate::calc::num(&mut y).speed(speed).prefix("y ")).changed() {
+                                    edits.effect = Some(EffectOp::SetNum { index: i, param: yn.param, value: y });
+                                }
+                            }
+                        });
+                        keys.extend(ynum.map(|yn| yn.param));
+                    }
+                    _ => {
+                        if ui.add(crate::calc::num(&mut v).speed(speed)).changed() {
+                            edits.effect = Some(EffectOp::SetNum { index: i, param, value: v });
+                        }
+                    }
                 }
-                if key_button(ui, num.anim) {
-                    edits.key.insert(PropKind::Effect { index: i, param });
+                let anim = num.anim || (keys.len() > 1 && ef.nums.get(k + 1).is_some_and(|y| y.anim));
+                if key_button(ui, anim) {
+                    for p in keys {
+                        edits.key.insert(PropKind::Effect { index: i, param: p });
+                    }
                 }
                 ui.end_row();
             }
