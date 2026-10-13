@@ -100,6 +100,13 @@ macro_rules! effect_fields {
             EffectKind::ChannelBlur { red, green, blue, alpha } => (None, vec![red, green, blue, alpha]),
             EffectKind::BilateralBlur { radius, threshold } => (None, vec![radius, threshold]),
             EffectKind::SmartBlur { radius, threshold } => (None, vec![radius, threshold]),
+            EffectKind::Posterize { level } => (None, vec![level]),
+            EffectKind::Threshold { level } => (None, vec![level]),
+            EffectKind::ThresholdRgb { red, green, blue, blend } => (None, vec![red, green, blue, blend]),
+            EffectKind::FindEdges { blend } => (None, vec![blend]),
+            EffectKind::Emboss { direction, relief, contrast, blend } => (None, vec![direction, relief, contrast, blend]),
+            EffectKind::ColorEmboss { direction, relief, contrast, blend } => (None, vec![direction, relief, contrast, blend]),
+            EffectKind::Mosaic { horizontal, vertical } => (None, vec![horizontal, vertical]),
         }
     };
 }
@@ -279,6 +286,20 @@ pub enum EffectKind {
     BilateralBlur { radius: Value<f64>, threshold: Value<f64> },
     /// Edge-preserving blur: box kernel averaging only neighbours within `threshold` (fraction) luminance of the centre (EffectCraft Smart Blur, Normal mode).
     SmartBlur { radius: Value<f64>, threshold: Value<f64> },
+    /// Quantise each channel to `level` steps (EffectCraft Posterize).
+    Posterize { level: Value<f64> },
+    /// Black/white split on luminance at `level` (fraction of full scale) (EffectCraft Threshold).
+    Threshold { level: Value<f64> },
+    /// Per-channel black/white split, each at its own fraction; `blend` is the fraction of the original kept (EffectCraft CC Threshold RGB, no invert switches).
+    ThresholdRgb { red: Value<f64>, green: Value<f64>, blue: Value<f64>, blend: Value<f64> },
+    /// Sobel edges on luminance, dark on white (EffectCraft Find Edges, Invert off); `blend` is the fraction of the original kept.
+    FindEdges { blend: Value<f64> },
+    /// Grey relief from a luminance difference `relief` pixels either side along `direction` degrees (AE: 0 = right, counter-clockwise); `contrast` 1.0 = 100% (EffectCraft Emboss).
+    Emboss { direction: Value<f64>, relief: Value<f64>, contrast: Value<f64>, blend: Value<f64> },
+    /// Emboss that adds the relief to the layer's own colour (EffectCraft Color Emboss).
+    ColorEmboss { direction: Value<f64>, relief: Value<f64>, contrast: Value<f64>, blend: Value<f64> },
+    /// Tiles of `horizontal` x `vertical` blocks across the layer, each its average colour (EffectCraft Mosaic, Sharp Colors off).
+    Mosaic { horizontal: Value<f64>, vertical: Value<f64> },
 }
 
 impl Effect {
@@ -432,6 +453,28 @@ impl Effect {
             },
             EffectType::BilateralBlur => EffectKind::BilateralBlur { radius: Value::constant(5.0), threshold: Value::constant(0.1) },
             EffectType::SmartBlur => EffectKind::SmartBlur { radius: Value::constant(3.0), threshold: Value::constant(0.25) },
+            EffectType::Posterize => EffectKind::Posterize { level: Value::constant(6.0) },
+            EffectType::Threshold => EffectKind::Threshold { level: Value::constant(0.5) },
+            EffectType::ThresholdRgb => EffectKind::ThresholdRgb {
+                red: Value::constant(0.5),
+                green: Value::constant(0.5),
+                blue: Value::constant(0.5),
+                blend: Value::constant(0.0),
+            },
+            EffectType::FindEdges => EffectKind::FindEdges { blend: Value::constant(0.0) },
+            EffectType::Emboss => EffectKind::Emboss {
+                direction: Value::constant(45.0),
+                relief: Value::constant(1.5),
+                contrast: Value::constant(1.0),
+                blend: Value::constant(0.0),
+            },
+            EffectType::ColorEmboss => EffectKind::ColorEmboss {
+                direction: Value::constant(45.0),
+                relief: Value::constant(1.5),
+                contrast: Value::constant(1.0),
+                blend: Value::constant(0.0),
+            },
+            EffectType::Mosaic => EffectKind::Mosaic { horizontal: Value::constant(10.0), vertical: Value::constant(10.0) },
         };
         Self::new(kind)
     }
@@ -467,6 +510,13 @@ impl Effect {
             EffectKind::ChannelBlur { .. } => EffectType::ChannelBlur,
             EffectKind::BilateralBlur { .. } => EffectType::BilateralBlur,
             EffectKind::SmartBlur { .. } => EffectType::SmartBlur,
+            EffectKind::Posterize { .. } => EffectType::Posterize,
+            EffectKind::Threshold { .. } => EffectType::Threshold,
+            EffectKind::ThresholdRgb { .. } => EffectType::ThresholdRgb,
+            EffectKind::FindEdges { .. } => EffectType::FindEdges,
+            EffectKind::Emboss { .. } => EffectType::Emboss,
+            EffectKind::ColorEmboss { .. } => EffectType::ColorEmboss,
+            EffectKind::Mosaic { .. } => EffectType::Mosaic,
         }
     }
 
@@ -627,6 +677,31 @@ impl Effect {
                 radius: radius.resolve(ctx).max(0.0),
                 threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
             },
+            EffectKind::Posterize { level } => ResolvedEffect::Posterize { level: level.resolve(ctx).round().clamp(2.0, 255.0) },
+            EffectKind::Threshold { level } => ResolvedEffect::Threshold { level: level.resolve(ctx).clamp(0.0, 1.0) },
+            EffectKind::ThresholdRgb { red, green, blue, blend } => ResolvedEffect::ThresholdRgb {
+                red: red.resolve(ctx).clamp(0.0, 1.0),
+                green: green.resolve(ctx).clamp(0.0, 1.0),
+                blue: blue.resolve(ctx).clamp(0.0, 1.0),
+                blend: blend.resolve(ctx).clamp(0.0, 1.0),
+            },
+            EffectKind::FindEdges { blend } => ResolvedEffect::FindEdges { blend: blend.resolve(ctx).clamp(0.0, 1.0) },
+            EffectKind::Emboss { direction, relief, contrast, blend } => ResolvedEffect::Emboss {
+                direction: direction.resolve(ctx),
+                relief: relief.resolve(ctx).max(0.0),
+                contrast: contrast.resolve(ctx).max(0.0),
+                blend: blend.resolve(ctx).clamp(0.0, 1.0),
+            },
+            EffectKind::ColorEmboss { direction, relief, contrast, blend } => ResolvedEffect::ColorEmboss {
+                direction: direction.resolve(ctx),
+                relief: relief.resolve(ctx).max(0.0),
+                contrast: contrast.resolve(ctx).max(0.0),
+                blend: blend.resolve(ctx).clamp(0.0, 1.0),
+            },
+            EffectKind::Mosaic { horizontal, vertical } => ResolvedEffect::Mosaic {
+                horizontal: horizontal.resolve(ctx).round().max(1.0),
+                vertical: vertical.resolve(ctx).round().max(1.0),
+            },
         })
     }
 
@@ -724,11 +799,18 @@ pub enum EffectType {
     ChannelBlur,
     BilateralBlur,
     SmartBlur,
+    Posterize,
+    Threshold,
+    ThresholdRgb,
+    FindEdges,
+    Emboss,
+    ColorEmboss,
+    Mosaic,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 27] = [
+    pub const ALL: [EffectType; 34] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
@@ -756,6 +838,13 @@ impl EffectType {
         EffectType::ChannelBlur,
         EffectType::BilateralBlur,
         EffectType::SmartBlur,
+        EffectType::Posterize,
+        EffectType::Threshold,
+        EffectType::ThresholdRgb,
+        EffectType::FindEdges,
+        EffectType::Emboss,
+        EffectType::ColorEmboss,
+        EffectType::Mosaic,
     ];
 
     pub fn label(self) -> &'static str {
@@ -787,6 +876,13 @@ impl EffectType {
             EffectType::ChannelBlur => "Channel Blur",
             EffectType::BilateralBlur => "Bilateral Blur",
             EffectType::SmartBlur => "Smart Blur",
+            EffectType::Posterize => "Posterize",
+            EffectType::Threshold => "Threshold",
+            EffectType::ThresholdRgb => "Threshold RGB",
+            EffectType::FindEdges => "Find Edges",
+            EffectType::Emboss => "Emboss",
+            EffectType::ColorEmboss => "Color Emboss",
+            EffectType::Mosaic => "Mosaic",
         }
     }
 
@@ -821,6 +917,13 @@ impl EffectType {
             EffectType::ChannelBlur => "fx.channel_blur",
             EffectType::BilateralBlur => "fx.bilateral_blur",
             EffectType::SmartBlur => "fx.smart_blur",
+            EffectType::Posterize => "fx.posterize",
+            EffectType::Threshold => "fx.threshold",
+            EffectType::ThresholdRgb => "fx.threshold_rgb",
+            EffectType::FindEdges => "fx.find_edges",
+            EffectType::Emboss => "fx.emboss",
+            EffectType::ColorEmboss => "fx.color_emboss",
+            EffectType::Mosaic => "fx.mosaic",
         }
     }
 
@@ -944,6 +1047,22 @@ impl EffectType {
             EffectType::BilateralBlur | EffectType::SmartBlur => {
                 &[p!("radius", "Radius", 0.5), p!("threshold", "Threshold", 0.005)]
             }
+            EffectType::Posterize => &[p!("level", "Level", 1.0)],
+            EffectType::Threshold => &[p!("level", "Level", 0.005)],
+            EffectType::ThresholdRgb => &[
+                p!("red", "Red Threshold", 0.005),
+                p!("green", "Green Threshold", 0.005),
+                p!("blue", "Blue Threshold", 0.005),
+                p!("blend", "Blend With Original", 0.01),
+            ],
+            EffectType::FindEdges => &[p!("blend", "Blend With Original", 0.01)],
+            EffectType::Emboss | EffectType::ColorEmboss => &[
+                p!("direction", "Direction", 1.0),
+                p!("relief", "Relief", 0.1),
+                p!("contrast", "Contrast", 0.01),
+                p!("blend", "Blend With Original", 0.01),
+            ],
+            EffectType::Mosaic => &[p!("horizontal", "Horizontal Blocks", 1.0), p!("vertical", "Vertical Blocks", 1.0)],
         }
     }
 
@@ -1003,6 +1122,13 @@ pub enum ResolvedEffect {
     ChannelBlur { red: f64, green: f64, blue: f64, alpha: f64 },
     BilateralBlur { radius: f64, threshold: f64 },
     SmartBlur { radius: f64, threshold: f64 },
+    Posterize { level: f64 },
+    Threshold { level: f64 },
+    ThresholdRgb { red: f64, green: f64, blue: f64, blend: f64 },
+    FindEdges { blend: f64 },
+    Emboss { direction: f64, relief: f64, contrast: f64, blend: f64 },
+    ColorEmboss { direction: f64, relief: f64, contrast: f64, blend: f64 },
+    Mosaic { horizontal: f64, vertical: f64 },
 }
 
 #[cfg(test)]
@@ -1114,7 +1240,7 @@ mod tests {
         let reg = crate::registry::NodeRegistry::with_effects();
         assert_eq!(reg.len(), EffectType::ALL.len());
         assert!(reg.contains("fx.exposure") && reg.contains("fx.leave_color"));
-        assert!(["fast_box_blur", "directional_blur", "sharpen", "unsharp_mask", "cross_blur", "channel_blur", "bilateral_blur", "smart_blur"]
+        assert!(["fast_box_blur", "directional_blur", "sharpen", "unsharp_mask", "cross_blur", "channel_blur", "bilateral_blur", "smart_blur", "posterize", "threshold", "threshold_rgb", "find_edges", "emboss", "color_emboss", "mosaic"]
             .iter()
             .all(|n| reg.contains(&format!("fx.{n}"))));
     }

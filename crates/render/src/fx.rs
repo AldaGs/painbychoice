@@ -72,10 +72,14 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             | ResolvedEffect::CrossBlur { .. }
             | ResolvedEffect::ChannelBlur { .. }
             | ResolvedEffect::BilateralBlur { .. }
-            | ResolvedEffect::SmartBlur { .. } => rgb,
+            | ResolvedEffect::SmartBlur { .. }
+            | ResolvedEffect::FindEdges { .. }
+            | ResolvedEffect::Emboss { .. }
+            | ResolvedEffect::ColorEmboss { .. }
+            | ResolvedEffect::Mosaic { .. } => rgb,
             ResolvedEffect::TonalBalance { sh, mid, hi } => tonal_balance(rgb, sh, mid, hi),
             ResolvedEffect::Curves { ys } => curves(rgb, ys),
-            ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } => ported_rgb(rgb, e),
+            ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } | ResolvedEffect::Posterize { .. } | ResolvedEffect::Threshold { .. } | ResolvedEffect::ThresholdRgb { .. } => ported_rgb(rgb, e),
         };
     }
     MColor::rgba(
@@ -106,6 +110,10 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
                 | ResolvedEffect::ChannelBlur { .. }
                 | ResolvedEffect::BilateralBlur { .. }
                 | ResolvedEffect::SmartBlur { .. }
+                | ResolvedEffect::FindEdges { .. }
+                | ResolvedEffect::Emboss { .. }
+                | ResolvedEffect::ColorEmboss { .. }
+                | ResolvedEffect::Mosaic { .. }
         )
     })
 }
@@ -158,7 +166,7 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         }
         ResolvedEffect::TonalBalance { sh, mid, hi } => map_rgb(px, |c| tonal_balance(c, sh, mid, hi)),
         ResolvedEffect::Curves { ys } => map_rgb(px, |c| curves(c, ys)),
-        ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } => map_rgb(px, |c| ported_rgb(c, effect)),
+        ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } | ResolvedEffect::Posterize { .. } | ResolvedEffect::Threshold { .. } | ResolvedEffect::ThresholdRgb { .. } => map_rgb(px, |c| ported_rgb(c, effect)),
         ResolvedEffect::ColorKey { color, tolerance, softness } => {
             color_key(px, color, tolerance, softness)
         }
@@ -170,6 +178,10 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::ChannelBlur { red, green, blue, alpha } => channel_blur(px, width, height, [red, green, blue, alpha]),
         ResolvedEffect::BilateralBlur { radius, threshold } => edge_preserving(px, width, height, radius, threshold as f32, false),
         ResolvedEffect::SmartBlur { radius, threshold } => edge_preserving(px, width, height, radius, threshold as f32, true),
+        ResolvedEffect::FindEdges { blend } => find_edges(px, width, height, blend as f32),
+        ResolvedEffect::Emboss { direction, relief, contrast, blend } => emboss(px, width, height, direction, relief, contrast as f32, blend as f32, false),
+        ResolvedEffect::ColorEmboss { direction, relief, contrast, blend } => emboss(px, width, height, direction, relief, contrast as f32, blend as f32, true),
+        ResolvedEffect::Mosaic { horizontal, vertical } => mosaic(px, width, height, horizontal as usize, vertical as usize),
     }
 }
 
@@ -315,6 +327,18 @@ fn ported_rgb(c: [f32; 3], e: &ResolvedEffect) -> [f32; 3] {
             };
             let g = luma(c);
             c.map(|v| v + (g - v) * amount as f32 * (1.0 - keep))
+        }
+        ResolvedEffect::Posterize { level } => {
+            let lv = level as f32 - 1.0;
+            c.map(|v| (v.clamp(0.0, 1.0) * lv).round() / lv)
+        }
+        ResolvedEffect::Threshold { level } => [if luma(c) >= level as f32 { 1.0 } else { 0.0 }; 3],
+        ResolvedEffect::ThresholdRgb { red, green, blue, blend } => {
+            let t = [red, green, blue];
+            std::array::from_fn(|i| {
+                let o = if c[i] >= t[i] as f32 { 1.0 } else { 0.0 };
+                o + (c[i] - o) * blend as f32
+            })
         }
         _ => c,
     }
@@ -664,6 +688,85 @@ fn par_pixels(w: usize, h: usize, f: impl Fn(usize, usize) -> [f32; 4] + Sync) -
 // Apache-2.0, Copyright (c) 2026 ArtCraft Team and the EffectCraft
 // contributors); see NOTICE. Each keeps the source's separable / running-sum
 // approach, so cost does not grow with the radius squared.
+
+fn lerp4(fx: [f32; 4], orig: [f32; 4], k: f32) -> [f32; 4] {
+    std::array::from_fn(|c| fx[c] + (orig[c] - fx[c]) * k)
+}
+
+fn find_edges(px: &mut [u8], width: usize, height: usize, blend: f32) {
+    with_premul(px, width, height, 1, |buf, w, h| {
+        let l = |x: usize, y: usize, dx: i64, dy: i64| {
+            let p = buf[(y as i64 + dy).clamp(0, h as i64 - 1) as usize * w + (x as i64 + dx).clamp(0, w as i64 - 1) as usize];
+            luma([p[0], p[1], p[2]])
+        };
+        par_pixels(w, h, |x, y| {
+            let gx = l(x, y, 1, -1) + 2.0 * l(x, y, 1, 0) + l(x, y, 1, 1) - l(x, y, -1, -1) - 2.0 * l(x, y, -1, 0) - l(x, y, -1, 1);
+            let gy = l(x, y, -1, 1) + 2.0 * l(x, y, 0, 1) + l(x, y, 1, 1) - l(x, y, -1, -1) - 2.0 * l(x, y, 0, -1) - l(x, y, 1, -1);
+            let v = 1.0 - (gx * gx + gy * gy).sqrt().min(1.0);
+            let a = buf[y * w + x][3];
+            lerp4([v * a, v * a, v * a, a], buf[y * w + x], blend)
+        })
+    });
+}
+
+/// Relief from the difference of two bilinear samples `relief` px either side
+/// along `direction`; `colour` adds it to the pixel's own colour instead of grey.
+fn emboss(px: &mut [u8], width: usize, height: usize, direction: f64, relief: f64, contrast: f32, blend: f32, colour: bool) {
+    let (dx, dy) = (direction.to_radians().cos() * relief, -direction.to_radians().sin() * relief);
+    with_premul(px, width, height, relief.ceil() as usize + 1, |buf, w, h| {
+        let at = |x: i64, y: i64| buf[y.clamp(0, h as i64 - 1) as usize * w + x.clamp(0, w as i64 - 1) as usize];
+        // Bilinear sample at pixel-centre coordinates (sx, sy).
+        let sample = |sx: f64, sy: f64| {
+            let (fx, fy) = (sx - 0.5, sy - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = ((fx - x0) as f32, (fy - y0) as f32);
+            let (x0, y0) = (x0 as i64, y0 as i64);
+            let top = lerp4(at(x0, y0), at(x0 + 1, y0), tx);
+            lerp4(top, lerp4(at(x0, y0 + 1), at(x0 + 1, y0 + 1), tx), ty)
+        };
+        let unpre = |p: [f32; 4]| if p[3] > 1e-6 { [p[0] / p[3], p[1] / p[3], p[2] / p[3]] } else { [0.0; 3] };
+        par_pixels(w, h, |x, y| {
+            let o = buf[y * w + x];
+            let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let (a, b) = (sample(cx + dx, cy + dy), sample(cx - dx, cy - dy));
+            let fx = if colour {
+                if o[3] <= 0.0 {
+                    return o;
+                }
+                let (c, pa, pb) = (unpre(o), unpre(a), unpre(b));
+                let e: [f32; 3] = std::array::from_fn(|i| (c[i] + (pa[i] - pb[i]) * contrast).max(0.0));
+                [e[0] * o[3], e[1] * o[3], e[2] * o[3], o[3]]
+            } else {
+                let v = (0.5 + (luma([a[0], a[1], a[2]]) - luma([b[0], b[1], b[2]])) * contrast).clamp(0.0, 1.0);
+                [v * o[3], v * o[3], v * o[3], o[3]]
+            };
+            lerp4(fx, o, blend)
+        })
+    });
+}
+
+/// `hb` x `vb` blocks across the layer's visible bounds, each the mean of its pixels.
+fn mosaic(px: &mut [u8], width: usize, height: usize, hb: usize, vb: usize) {
+    // Margin 0: tiles follow the visible bounds, not the whole canvas.
+    with_premul(px, width, height, 0, |mut buf, w, h| {
+        let (cw, ch) = ((w as f64 / hb as f64).max(1.0), (h as f64 / vb as f64).max(1.0));
+        let (nx, ny) = ((w as f64 / cw).ceil() as usize, (h as f64 / ch).ceil() as usize);
+        let tile = |x: usize, y: usize| ((y as f64 / ch) as usize).min(ny - 1) * nx + ((x as f64 / cw) as usize).min(nx - 1);
+        let mut sums = vec![([0.0f64; 4], 0.0f64); nx * ny];
+        for (i, p) in buf.iter().enumerate() {
+            let s = &mut sums[tile(i % w, i / w)];
+            for c in 0..4 {
+                s.0[c] += p[c] as f64;
+            }
+            s.1 += 1.0;
+        }
+        for (i, p) in buf.iter_mut().enumerate() {
+            let (s, n) = sums[tile(i % w, i / w)];
+            *p = std::array::from_fn(|c| (s[c] / n.max(1.0)) as f32);
+        }
+        buf
+    });
+}
 
 fn fast_box_blur(px: &mut [u8], width: usize, height: usize, radius: f64, iterations: f64) {
     let (r, it) = (radius.round() as usize, iterations as usize);
@@ -1099,6 +1202,49 @@ mod tests {
             apply_stack(&mut px, 16, 1, &[e]);
             assert!(px[7 * 4] < 110 && px[8 * 4] > 190, "{:?}", &px[28..36]);
         }
+    }
+
+    #[test]
+    fn ported_stylize_pixel_math() {
+        let one = |e: ResolvedEffect, px: [u8; 4]| {
+            let mut v = px.to_vec();
+            apply_stack(&mut v, 1, 1, &[e]);
+            v
+        };
+        // Posterize to 2 levels snaps to black / white; threshold splits on luminance.
+        assert_eq!(one(ResolvedEffect::Posterize { level: 2.0 }, [200, 50, 130, 255])[..3], [255, 0, 255]);
+        assert_eq!(one(ResolvedEffect::Threshold { level: 0.5 }, [200, 200, 200, 255])[..3], [255; 3]);
+        assert_eq!(one(ResolvedEffect::ThresholdRgb { red: 0.5, green: 0.5, blue: 0.5, blend: 0.0 }, [200, 50, 130, 255])[..3], [255, 0, 255]);
+        // Find Edges: flat area is white, a step edge goes dark.
+        let step: Vec<u8> = (0..8).flat_map(|x| if x < 4 { [0, 0, 0, 255] } else { [255, 255, 255, 255] }).collect();
+        let mut px = step.clone();
+        apply_stack(&mut px, 8, 1, &[ResolvedEffect::FindEdges { blend: 0.0 }]);
+        assert!(px[0] == 255 && px[3 * 4] < 30);
+        // Emboss: flat is mid grey; a step lights one side.
+        let mut px = step.clone();
+        apply_stack(&mut px, 8, 1, &[ResolvedEffect::Emboss { direction: 0.0, relief: 1.0, contrast: 1.0, blend: 0.0 }]);
+        assert!((px[0] as i32 - 128).abs() <= 1 && px[3 * 4] != 128);
+        // Mosaic with 2 blocks across averages each half to one colour.
+        let mut px = step;
+        apply_stack(&mut px, 8, 1, &[ResolvedEffect::Mosaic { horizontal: 2.0, vertical: 1.0 }]);
+        assert!(px[..16].iter().step_by(4).all(|&v| v == 0) && px[16..].iter().step_by(4).all(|&v| v == 255));
+    }
+
+    #[test]
+    fn mosaic_tiles_follow_the_visible_bounds() {
+        // 8x8 canvas, transparent except a 4x4 block at (2,2) of four distinct quadrants.
+        let mut px = vec![0u8; 8 * 8 * 4];
+        for y in 2..6 {
+            for x in 2..6 {
+                let v = [40u8, 120, 200, 250][(y - 2) / 2 * 2 + (x - 2) / 2];
+                px[(y * 8 + x) * 4..][..4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        apply_stack(&mut px, 8, 8, &[ResolvedEffect::Mosaic { horizontal: 2.0, vertical: 2.0 }]);
+        let at = |x: usize, y: usize| px[(y * 8 + x) * 4];
+        assert_eq!([at(2, 2), at(5, 2), at(2, 5), at(5, 5)], [40, 120, 200, 250]);
+        assert_eq!(px[3], 0);
+        assert_eq!(px[(7 * 8 + 7) * 4 + 3], 0);
     }
 
     /// A drop shadow paints where the artwork is *not*, offset from it, and
