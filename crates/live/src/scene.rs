@@ -704,7 +704,9 @@ fn draw_range(
             }
         }
 
-        if !inside_replaced {
+        // Re-read: the item that *opens* a replaced layer was outside the
+        // replacement a moment ago, and drawing it raw would cover the image.
+        if !replaced_until.is_some_and(|e| i < e) {
             let xf = fit * item.transform;
             // Footage draws *instead of* the fill: the fill colour is what a
             // rectangle would paint, and a clip covers it entirely. A stroke
@@ -751,6 +753,14 @@ fn draw_range(
 /// [`crate::fx`]). A blur in the stack is skipped here; it needs the whole
 /// rasterized layer, which the readback compositor will supply. Most items sit
 /// inside no effect layer, so the common case is a single `is_empty` check.
+/// Whether a layer's effects must run on its rasterized pixels. Spatial effects
+/// always do; colour ones too when the layer holds footage, because the in-scene
+/// path ([`with_effects`]) recolours fills and a clip draws instead of its fill.
+pub(crate) fn needs_readback(scene: &MScene, g: &LayerGroup) -> bool {
+    motion_render::fx::needs_readback(&g.effects)
+        || (!g.effects.is_empty() && scene.items[g.start..g.end].iter().any(|it| it.image.is_some()))
+}
+
 fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {
     let mut c = color;
     for g in open.iter().rev() {
@@ -812,7 +822,7 @@ pub(crate) fn rasterize_effect_layers(
         // which can't reach a processed inner image; so it takes the readback
         // path too whenever it contains one.
         let wraps_image = !g.effects.is_empty() && inner.iter().any(|g2| out.contains_key(&g2.source));
-        if !motion_render::fx::needs_readback(&g.effects) && !wraps_image {
+        if !needs_readback(scene, g) && !wraps_image {
             continue;
         }
         // The layer's own contents (not its own blend/alpha/effects), rasterized
