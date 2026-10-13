@@ -62,6 +62,36 @@ macro_rules! effect_fields {
             EffectKind::ChromaKey { color, tolerance, softness } => {
                 (Some(color), vec![tolerance, softness])
             }
+            EffectKind::TonalBalance { sh_r, sh_g, sh_b, mid_r, mid_g, mid_b, hi_r, hi_g, hi_b } => {
+                (None, vec![sh_r, sh_g, sh_b, mid_r, mid_g, mid_b, hi_r, hi_g, hi_b])
+            }
+            EffectKind::Curves { shadows, midtones, highlights } => {
+                (None, vec![shadows, midtones, highlights])
+            }
+            EffectKind::ColorKey { color, tolerance, softness } => {
+                (Some(color), vec![tolerance, softness])
+            }
+            EffectKind::LeaveColor { color, amount, tolerance, softness } => {
+                (Some(color), vec![amount, tolerance, softness])
+            }
+            EffectKind::GammaPedestalGain { gamma, pedestal, gain, black_stretch } => {
+                (None, vec![gamma, pedestal, gain, black_stretch])
+            }
+            EffectKind::ChannelMixer { rr, rg, rb, rc, gr, gg, gb, gc, br, bg, bb, bc } => {
+                (None, vec![rr, rg, rb, rc, gr, gg, gb, gc, br, bg, bb, bc])
+            }
+            EffectKind::PhotoFilter { color, density } => {
+                (Some(color), vec![density])
+            }
+            EffectKind::Vibrance { vibrance, saturation } => {
+                (None, vec![vibrance, saturation])
+            }
+            EffectKind::BlackWhite { reds, yellows, greens, cyans, blues, magentas } => {
+                (None, vec![reds, yellows, greens, cyans, blues, magentas])
+            }
+            EffectKind::Exposure { exposure, offset, gamma } => {
+                (None, vec![exposure, offset, gamma])
+            }
         }
     };
 }
@@ -149,6 +179,82 @@ pub enum EffectKind {
     /// The first effect that writes *alpha* rather than colour, and so the
     /// first the in-scene colour fast path cannot approximate at all.
     ChromaKey { color: Value<Color>, tolerance: Value<f64>, softness: Value<f64> },
+    /// Shadows / midtones / highlights colour balance, each a signed RGB shift
+    /// in `[-1, 1]` weighted by the pixel's luma. (Port of EffectCraft's Color
+    /// Balance; distinct from the flat [`EffectKind::ColorBalance`].)
+    TonalBalance {
+        sh_r: Value<f64>,
+        sh_g: Value<f64>,
+        sh_b: Value<f64>,
+        mid_r: Value<f64>,
+        mid_g: Value<f64>,
+        mid_b: Value<f64>,
+        hi_r: Value<f64>,
+        hi_g: Value<f64>,
+        hi_b: Value<f64>,
+    },
+    /// A master tone curve through `(0,0) (.25,shadows) (.5,midtones)
+    /// (.75,highlights) (1,1)` - the output at three fixed inputs, so each
+    /// point keyframes like any number. Identity is `0.25 / 0.5 / 0.75`.
+    Curves { shadows: Value<f64>, midtones: Value<f64>, highlights: Value<f64> },
+    /// Knock out pixels whose every channel is within `tolerance` of `color`
+    /// (Chebyshev distance, EffectCraft's Color Key); alpha ramps back over
+    /// `softness`. Unlike [`EffectKind::ChromaKey`] (Euclidean) it keys a box.
+    ColorKey { color: Value<Color>, tolerance: Value<f64>, softness: Value<f64> },
+    /// Exposure in stops (gain `2^exposure`), a linear-light `offset`, and `gamma` (EffectCraft Exposure, master group).
+    Exposure {
+        exposure: Value<f64>,
+        offset: Value<f64>,
+        gamma: Value<f64>,
+    },
+    /// Greyscale with per-hue brightness weights as fractions (0.4 = AE's 40%) (EffectCraft Black & White; the optional tint is not ported).
+    BlackWhite {
+        reds: Value<f64>,
+        yellows: Value<f64>,
+        greens: Value<f64>,
+        cyans: Value<f64>,
+        blues: Value<f64>,
+        magentas: Value<f64>,
+    },
+    /// Boost the less-saturated colours more than the already-saturated ones; `saturation` is a flat signed amount (EffectCraft Vibrance).
+    Vibrance {
+        vibrance: Value<f64>,
+        saturation: Value<f64>,
+    },
+    /// Multiply by `color`, mixed in by `density`, keeping the pixel luminance (EffectCraft Photo Filter with Preserve Luminosity on; no preset menu).
+    PhotoFilter {
+        color: Value<Color>,
+        density: Value<f64>,
+    },
+    /// Each output channel as a weighted sum of R, G, B plus a constant (EffectCraft Channel Mixer, monochrome off). Params are row-major: rr rg rb rc / gr gg gb gc / br bg bb bc.
+    ChannelMixer {
+        rr: Value<f64>,
+        rg: Value<f64>,
+        rb: Value<f64>,
+        rc: Value<f64>,
+        gr: Value<f64>,
+        gg: Value<f64>,
+        gb: Value<f64>,
+        gc: Value<f64>,
+        br: Value<f64>,
+        bg: Value<f64>,
+        bb: Value<f64>,
+        bc: Value<f64>,
+    },
+    /// `pedestal + (gain - pedestal) * v^gamma` on every channel, with a black-stretch toe (EffectCraft Gamma/Pedestal/Gain, one master set instead of per channel).
+    GammaPedestalGain {
+        gamma: Value<f64>,
+        pedestal: Value<f64>,
+        gain: Value<f64>,
+        black_stretch: Value<f64>,
+    },
+    /// Desaturate everything farther than `tolerance` (RGB distance / sqrt 3) from `color`, by `amount`; `softness` feathers the edge (EffectCraft Leave Color, RGB matching).
+    LeaveColor {
+        color: Value<Color>,
+        amount: Value<f64>,
+        tolerance: Value<f64>,
+        softness: Value<f64>,
+    },
 }
 
 impl Effect {
@@ -214,6 +320,77 @@ impl Effect {
                 tolerance: Value::constant(0.3),
                 softness: Value::constant(0.1),
             },
+            EffectType::TonalBalance => {
+                let z = || Value::constant(0.0);
+                EffectKind::TonalBalance {
+                    sh_r: z(),
+                    sh_g: z(),
+                    sh_b: z(),
+                    mid_r: z(),
+                    mid_g: z(),
+                    mid_b: z(),
+                    hi_r: z(),
+                    hi_g: z(),
+                    hi_b: z(),
+                }
+            }
+            EffectType::Curves => EffectKind::Curves {
+                shadows: Value::constant(0.25),
+                midtones: Value::constant(0.5),
+                highlights: Value::constant(0.75),
+            },
+            EffectType::ColorKey => EffectKind::ColorKey {
+                color: Value::constant(Color::rgb(0.0, 0.0, 1.0)),
+                tolerance: Value::constant(0.1),
+                softness: Value::constant(0.0),
+            },
+            EffectType::Exposure => EffectKind::Exposure {
+                exposure: Value::constant(0.0),
+                offset: Value::constant(0.0),
+                gamma: Value::constant(1.0),
+            },
+            EffectType::BlackWhite => EffectKind::BlackWhite {
+                reds: Value::constant(0.4),
+                yellows: Value::constant(0.6),
+                greens: Value::constant(0.4),
+                cyans: Value::constant(0.6),
+                blues: Value::constant(0.2),
+                magentas: Value::constant(0.8),
+            },
+            EffectType::Vibrance => EffectKind::Vibrance {
+                vibrance: Value::constant(0.0),
+                saturation: Value::constant(0.0),
+            },
+            EffectType::PhotoFilter => EffectKind::PhotoFilter {
+                color: Value::constant(Color::rgb(0.93, 0.54, 0.09)),
+                density: Value::constant(0.25),
+            },
+            EffectType::ChannelMixer => EffectKind::ChannelMixer {
+                rr: Value::constant(1.0),
+                rg: Value::constant(0.0),
+                rb: Value::constant(0.0),
+                rc: Value::constant(0.0),
+                gr: Value::constant(0.0),
+                gg: Value::constant(1.0),
+                gb: Value::constant(0.0),
+                gc: Value::constant(0.0),
+                br: Value::constant(0.0),
+                bg: Value::constant(0.0),
+                bb: Value::constant(1.0),
+                bc: Value::constant(0.0),
+            },
+            EffectType::GammaPedestalGain => EffectKind::GammaPedestalGain {
+                gamma: Value::constant(1.0),
+                pedestal: Value::constant(0.0),
+                gain: Value::constant(1.0),
+                black_stretch: Value::constant(0.0),
+            },
+            EffectType::LeaveColor => EffectKind::LeaveColor {
+                color: Value::constant(Color::rgb(1.0, 0.0, 0.0)),
+                amount: Value::constant(1.0),
+                tolerance: Value::constant(0.15),
+                softness: Value::constant(0.0),
+            },
         };
         Self::new(kind)
     }
@@ -231,6 +408,16 @@ impl Effect {
             EffectKind::Glow { .. } => EffectType::Glow,
             EffectKind::ColorBalance { .. } => EffectType::ColorBalance,
             EffectKind::ChromaKey { .. } => EffectType::ChromaKey,
+            EffectKind::TonalBalance { .. } => EffectType::TonalBalance,
+            EffectKind::Curves { .. } => EffectType::Curves,
+            EffectKind::ColorKey { .. } => EffectType::ColorKey,
+            EffectKind::Exposure { .. } => EffectType::Exposure,
+            EffectKind::BlackWhite { .. } => EffectType::BlackWhite,
+            EffectKind::Vibrance { .. } => EffectType::Vibrance,
+            EffectKind::PhotoFilter { .. } => EffectType::PhotoFilter,
+            EffectKind::ChannelMixer { .. } => EffectType::ChannelMixer,
+            EffectKind::GammaPedestalGain { .. } => EffectType::GammaPedestalGain,
+            EffectKind::LeaveColor { .. } => EffectType::LeaveColor,
         }
     }
 
@@ -296,6 +483,69 @@ impl Effect {
                 color: color.resolve(ctx),
                 tolerance: tolerance.resolve(ctx).max(0.0),
                 softness: softness.resolve(ctx).max(0.0),
+            },
+            EffectKind::TonalBalance { sh_r, sh_g, sh_b, mid_r, mid_g, mid_b, hi_r, hi_g, hi_b } => {
+                let mut c = |v: &Value<f64>| v.resolve(ctx).clamp(-1.0, 1.0);
+                ResolvedEffect::TonalBalance {
+                    sh: [c(sh_r), c(sh_g), c(sh_b)],
+                    mid: [c(mid_r), c(mid_g), c(mid_b)],
+                    hi: [c(hi_r), c(hi_g), c(hi_b)],
+                }
+            }
+            EffectKind::Curves { shadows, midtones, highlights } => ResolvedEffect::Curves {
+                ys: [shadows.resolve(ctx), midtones.resolve(ctx), highlights.resolve(ctx)],
+            },
+            EffectKind::ColorKey { color, tolerance, softness } => ResolvedEffect::ColorKey {
+                color: color.resolve(ctx),
+                tolerance: tolerance.resolve(ctx).max(0.0),
+                softness: softness.resolve(ctx).max(0.0),
+            },
+            EffectKind::Exposure { exposure, offset, gamma } => ResolvedEffect::Exposure {
+                exposure: exposure.resolve(ctx),
+                offset: offset.resolve(ctx),
+                gamma: gamma.resolve(ctx).max(0.01),
+            },
+            EffectKind::BlackWhite { reds, yellows, greens, cyans, blues, magentas } => ResolvedEffect::BlackWhite {
+                reds: reds.resolve(ctx),
+                yellows: yellows.resolve(ctx),
+                greens: greens.resolve(ctx),
+                cyans: cyans.resolve(ctx),
+                blues: blues.resolve(ctx),
+                magentas: magentas.resolve(ctx),
+            },
+            EffectKind::Vibrance { vibrance, saturation } => ResolvedEffect::Vibrance {
+                vibrance: vibrance.resolve(ctx).clamp(-1.0, 1.0),
+                saturation: saturation.resolve(ctx).clamp(-1.0, 1.0),
+            },
+            EffectKind::PhotoFilter { color, density } => ResolvedEffect::PhotoFilter {
+                color: color.resolve(ctx),
+                density: density.resolve(ctx).clamp(0.0, 1.0),
+            },
+            EffectKind::ChannelMixer { rr, rg, rb, rc, gr, gg, gb, gc, br, bg, bb, bc } => ResolvedEffect::ChannelMixer {
+                rr: rr.resolve(ctx),
+                rg: rg.resolve(ctx),
+                rb: rb.resolve(ctx),
+                rc: rc.resolve(ctx),
+                gr: gr.resolve(ctx),
+                gg: gg.resolve(ctx),
+                gb: gb.resolve(ctx),
+                gc: gc.resolve(ctx),
+                br: br.resolve(ctx),
+                bg: bg.resolve(ctx),
+                bb: bb.resolve(ctx),
+                bc: bc.resolve(ctx),
+            },
+            EffectKind::GammaPedestalGain { gamma, pedestal, gain, black_stretch } => ResolvedEffect::GammaPedestalGain {
+                gamma: gamma.resolve(ctx).max(0.01),
+                pedestal: pedestal.resolve(ctx),
+                gain: gain.resolve(ctx),
+                black_stretch: black_stretch.resolve(ctx).max(0.0),
+            },
+            EffectKind::LeaveColor { color, amount, tolerance, softness } => ResolvedEffect::LeaveColor {
+                color: color.resolve(ctx),
+                amount: amount.resolve(ctx).clamp(0.0, 1.0),
+                tolerance: tolerance.resolve(ctx).clamp(0.0, 1.0),
+                softness: softness.resolve(ctx).clamp(0.0, 1.0),
             },
         })
     }
@@ -376,11 +626,21 @@ pub enum EffectType {
     Glow,
     ColorBalance,
     ChromaKey,
+    TonalBalance,
+    Curves,
+    ColorKey,
+    Exposure,
+    BlackWhite,
+    Vibrance,
+    PhotoFilter,
+    ChannelMixer,
+    GammaPedestalGain,
+    LeaveColor,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 9] = [
+    pub const ALL: [EffectType; 19] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
@@ -390,6 +650,16 @@ impl EffectType {
         EffectType::Glow,
         EffectType::ColorBalance,
         EffectType::ChromaKey,
+        EffectType::TonalBalance,
+        EffectType::Curves,
+        EffectType::ColorKey,
+        EffectType::Exposure,
+        EffectType::BlackWhite,
+        EffectType::Vibrance,
+        EffectType::PhotoFilter,
+        EffectType::ChannelMixer,
+        EffectType::GammaPedestalGain,
+        EffectType::LeaveColor,
     ];
 
     pub fn label(self) -> &'static str {
@@ -403,6 +673,16 @@ impl EffectType {
             EffectType::Glow => "Glow",
             EffectType::ColorBalance => "Color Balance",
             EffectType::ChromaKey => "Chroma Key",
+            EffectType::TonalBalance => "Color Balance (S/M/H)",
+            EffectType::Curves => "Curves",
+            EffectType::ColorKey => "Color Key",
+            EffectType::Exposure => "Exposure",
+            EffectType::BlackWhite => "Black & White",
+            EffectType::Vibrance => "Vibrance",
+            EffectType::PhotoFilter => "Photo Filter",
+            EffectType::ChannelMixer => "Channel Mixer",
+            EffectType::GammaPedestalGain => "Gamma / Pedestal / Gain",
+            EffectType::LeaveColor => "Leave Color",
         }
     }
 
@@ -419,6 +699,16 @@ impl EffectType {
             EffectType::Glow => "fx.glow",
             EffectType::ColorBalance => "fx.color_balance",
             EffectType::ChromaKey => "fx.chroma_key",
+            EffectType::TonalBalance => "fx.tonal_balance",
+            EffectType::Curves => "fx.curves",
+            EffectType::ColorKey => "fx.color_key",
+            EffectType::Exposure => "fx.exposure",
+            EffectType::BlackWhite => "fx.black_white",
+            EffectType::Vibrance => "fx.vibrance",
+            EffectType::PhotoFilter => "fx.photo_filter",
+            EffectType::ChannelMixer => "fx.channel_mixer",
+            EffectType::GammaPedestalGain => "fx.gamma_pedestal_gain",
+            EffectType::LeaveColor => "fx.leave_color",
         }
     }
 
@@ -462,9 +752,70 @@ impl EffectType {
             EffectType::ColorBalance => {
                 &[p!("red", "Red", 0.01), p!("green", "Green", 0.01), p!("blue", "Blue", 0.01)]
             }
-            EffectType::ChromaKey => {
+            EffectType::ChromaKey | EffectType::ColorKey => {
                 &[p!("tolerance", "Tolerance", 0.01), p!("softness", "Softness", 0.01)]
             }
+            EffectType::TonalBalance => &[
+                p!("sh_r", "Shadow Red", 0.01),
+                p!("sh_g", "Shadow Green", 0.01),
+                p!("sh_b", "Shadow Blue", 0.01),
+                p!("mid_r", "Midtone Red", 0.01),
+                p!("mid_g", "Midtone Green", 0.01),
+                p!("mid_b", "Midtone Blue", 0.01),
+                p!("hi_r", "Highlight Red", 0.01),
+                p!("hi_g", "Highlight Green", 0.01),
+                p!("hi_b", "Highlight Blue", 0.01),
+            ],
+            EffectType::Exposure => &[
+                p!("exposure", "Exposure", 0.05),
+                p!("offset", "Offset", 0.005),
+                p!("gamma", "Gamma Correction", 0.01),
+            ],
+            EffectType::BlackWhite => &[
+                p!("reds", "Reds", 0.01),
+                p!("yellows", "Yellows", 0.01),
+                p!("greens", "Greens", 0.01),
+                p!("cyans", "Cyans", 0.01),
+                p!("blues", "Blues", 0.01),
+                p!("magentas", "Magentas", 0.01),
+            ],
+            EffectType::Vibrance => &[
+                p!("vibrance", "Vibrance", 0.01),
+                p!("saturation", "Saturation", 0.01),
+            ],
+            EffectType::PhotoFilter => &[
+                p!("density", "Density", 0.01),
+            ],
+            EffectType::ChannelMixer => &[
+                p!("rr", "Red-Red", 0.01),
+                p!("rg", "Red-Green", 0.01),
+                p!("rb", "Red-Blue", 0.01),
+                p!("rc", "Red-Const", 0.01),
+                p!("gr", "Green-Red", 0.01),
+                p!("gg", "Green-Green", 0.01),
+                p!("gb", "Green-Blue", 0.01),
+                p!("gc", "Green-Const", 0.01),
+                p!("br", "Blue-Red", 0.01),
+                p!("bg", "Blue-Green", 0.01),
+                p!("bb", "Blue-Blue", 0.01),
+                p!("bc", "Blue-Const", 0.01),
+            ],
+            EffectType::GammaPedestalGain => &[
+                p!("gamma", "Gamma", 0.01),
+                p!("pedestal", "Pedestal", 0.01),
+                p!("gain", "Gain", 0.01),
+                p!("black_stretch", "Black Stretch", 0.01),
+            ],
+            EffectType::LeaveColor => &[
+                p!("amount", "Amount to Decolor", 0.01),
+                p!("tolerance", "Tolerance", 0.01),
+                p!("softness", "Edge Softness", 0.01),
+            ],
+            EffectType::Curves => &[
+                p!("shadows", "Shadows (at 0.25)", 0.01),
+                p!("midtones", "Midtones (at 0.5)", 0.01),
+                p!("highlights", "Highlights (at 0.75)", 0.01),
+            ],
         }
     }
 
@@ -506,6 +857,16 @@ pub enum ResolvedEffect {
     Glow { threshold: f64, radius: f64, intensity: f64 },
     ColorBalance { red: f64, green: f64, blue: f64 },
     ChromaKey { color: Color, tolerance: f64, softness: f64 },
+    TonalBalance { sh: [f64; 3], mid: [f64; 3], hi: [f64; 3] },
+    Curves { ys: [f64; 3] },
+    ColorKey { color: Color, tolerance: f64, softness: f64 },
+    Exposure { exposure: f64, offset: f64, gamma: f64 },
+    BlackWhite { reds: f64, yellows: f64, greens: f64, cyans: f64, blues: f64, magentas: f64 },
+    Vibrance { vibrance: f64, saturation: f64 },
+    PhotoFilter { color: Color, density: f64 },
+    ChannelMixer { rr: f64, rg: f64, rb: f64, rc: f64, gr: f64, gg: f64, gb: f64, gc: f64, br: f64, bg: f64, bb: f64, bc: f64 },
+    GammaPedestalGain { gamma: f64, pedestal: f64, gain: f64, black_stretch: f64 },
+    LeaveColor { color: Color, amount: f64, tolerance: f64, softness: f64 },
 }
 
 #[cfg(test)]
@@ -616,5 +977,6 @@ mod tests {
         }
         let reg = crate::registry::NodeRegistry::with_effects();
         assert_eq!(reg.len(), EffectType::ALL.len());
+        assert!(reg.contains("fx.exposure") && reg.contains("fx.leave_color"));
     }
 }

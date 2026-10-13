@@ -62,7 +62,12 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             ResolvedEffect::ColorBalance { red, green, blue } => color_balance(rgb, red, green, blue),
             // A glow spreads to neighbours and a key writes alpha; neither is
             // one pixel's colour. Both are the readback path's.
-            ResolvedEffect::Glow { .. } | ResolvedEffect::ChromaKey { .. } => rgb,
+            ResolvedEffect::Glow { .. }
+            | ResolvedEffect::ChromaKey { .. }
+            | ResolvedEffect::ColorKey { .. } => rgb,
+            ResolvedEffect::TonalBalance { sh, mid, hi } => tonal_balance(rgb, sh, mid, hi),
+            ResolvedEffect::Curves { ys } => curves(rgb, ys),
+            ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } => ported_rgb(rgb, e),
         };
     }
     MColor::rgba(
@@ -84,6 +89,7 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
                 | ResolvedEffect::DropShadow { .. }
                 | ResolvedEffect::Glow { .. }
                 | ResolvedEffect::ChromaKey { .. }
+                | ResolvedEffect::ColorKey { .. }
         )
     })
 }
@@ -134,6 +140,159 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::ChromaKey { color, tolerance, softness } => {
             chroma_key(px, color, tolerance, softness)
         }
+        ResolvedEffect::TonalBalance { sh, mid, hi } => map_rgb(px, |c| tonal_balance(c, sh, mid, hi)),
+        ResolvedEffect::Curves { ys } => map_rgb(px, |c| curves(c, ys)),
+        ResolvedEffect::Exposure { .. } | ResolvedEffect::BlackWhite { .. } | ResolvedEffect::Vibrance { .. } | ResolvedEffect::PhotoFilter { .. } | ResolvedEffect::ChannelMixer { .. } | ResolvedEffect::GammaPedestalGain { .. } | ResolvedEffect::LeaveColor { .. } => map_rgb(px, |c| ported_rgb(c, effect)),
+        ResolvedEffect::ColorKey { color, tolerance, softness } => {
+            color_key(px, color, tolerance, softness)
+        }
+    }
+}
+
+// The three effects below are ported from EffectCraft (MIT OR Apache-2.0,
+// Copyright (c) 2026 ArtCraft Team and the EffectCraft contributors); see NOTICE.
+
+/// Luma-weighted shadow / midtone / highlight RGB shifts (EffectCraft's
+/// `color_balance`, minus its Preserve Luminosity option).
+fn tonal_balance(c: [f32; 3], sh: [f64; 3], mid: [f64; 3], hi: [f64; 3]) -> [f32; 3] {
+    let l = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).clamp(0.0, 1.0);
+    let ws = (1.0 - l * 2.0).clamp(0.0, 1.0);
+    let wh = (l * 2.0 - 1.0).clamp(0.0, 1.0);
+    let wm = 1.0 - ws - wh;
+    std::array::from_fn(|i| {
+        (c[i] + (sh[i] as f32 * ws + mid[i] as f32 * wm + hi[i] as f32 * wh) * 0.5).clamp(0.0, 1.0)
+    })
+}
+
+/// Master tone curve through `(0,0) (.25,y0) (.5,y1) (.75,y2) (1,1)`, monotone
+/// cubic Hermite (Fritsch-Carlson) as in EffectCraft's `Curve`.
+fn curves(c: [f32; 3], ys: [f64; 3]) -> [f32; 3] {
+    let xs = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+    let y = [0.0f32, ys[0] as f32, ys[1] as f32, ys[2] as f32, 1.0];
+    let d: [f32; 4] = std::array::from_fn(|k| (y[k + 1] - y[k]) / (xs[k + 1] - xs[k]));
+    let mut m = [d[0], 0.0, 0.0, 0.0, d[3]];
+    for k in 1..4 {
+        m[k] = if d[k - 1] * d[k] <= 0.0 { 0.0 } else { (d[k - 1] + d[k]) * 0.5 };
+    }
+    for k in 0..4 {
+        if d[k].abs() < 1e-12 {
+            m[k] = 0.0;
+            m[k + 1] = 0.0;
+        } else {
+            let (a, b) = (m[k] / d[k], m[k + 1] / d[k]);
+            let s = a * a + b * b;
+            if s > 9.0 {
+                let t = 3.0 / s.sqrt();
+                m[k] = t * a * d[k];
+                m[k + 1] = t * b * d[k];
+            }
+        }
+    }
+    c.map(|v| {
+        let v = v.clamp(0.0, 1.0);
+        let k = ((v * 4.0) as usize).min(3);
+        let t = (v - xs[k]) / 0.25;
+        let (t2, t3) = (t * t, t * t * t);
+        (2.0 * t3 - 3.0 * t2 + 1.0) * y[k]
+            + (t3 - 2.0 * t2 + t) * 0.25 * m[k]
+            + (-2.0 * t3 + 3.0 * t2) * y[k + 1]
+            + (t3 - t2) * 0.25 * m[k + 1]
+    })
+}
+
+/// Zero alpha where every channel is within `tolerance` of the key colour
+/// (Chebyshev, EffectCraft's Color Key); `softness` ramps it back. Edge
+/// thin/feather (spatial matte ops) are not ported.
+fn color_key(px: &mut [u8], key: MColor, tolerance: f64, softness: f64) {
+    let k = [key.r as f32, key.g as f32, key.b as f32];
+    let (tol, soft) = (tolerance as f32, softness as f32);
+    for p in px.chunks_exact_mut(4) {
+        let d = (0..3).map(|i| (p[i] as f32 / 255.0 - k[i]).abs()).fold(0.0, f32::max);
+        let keep = if d <= tol {
+            0.0
+        } else if soft > 0.0 {
+            ((d - tol) / soft).min(1.0)
+        } else {
+            1.0
+        };
+        p[3] = (p[3] as f32 * keep).round() as u8;
+    }
+}
+
+fn luma(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+fn linear_to_srgb(v: f32) -> f32 {
+    if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// `|v|^p` keeping `v`'s sign, as EffectCraft's Exposure does.
+fn mirror_pow(v: f32, p: f32) -> f32 {
+    v.abs().powf(p).copysign(v)
+}
+
+/// The per-pixel effects ported from EffectCraft's `ec.color.*` set, in one
+/// match so the in-scene colour path and the image path share every formula.
+/// Straight RGB in, straight RGB out; other variants pass through.
+fn ported_rgb(c: [f32; 3], e: &ResolvedEffect) -> [f32; 3] {
+    match *e {
+        ResolvedEffect::Exposure { exposure, offset, gamma } => c.map(|v| {
+            let o = mirror_pow(srgb_to_linear(v.max(0.0)) * 2f32.powf(exposure as f32) + offset as f32, 1.0 / gamma as f32);
+            linear_to_srgb(o.abs()).copysign(o)
+        }),
+        ResolvedEffect::BlackWhite { reds, yellows, greens, cyans, blues, magentas } => {
+            let w = [reds, yellows, greens, cyans, blues, magentas].map(|v| v as f32);
+            let (h, s, _) = rgb_to_hsl(c);
+            // Interpolate the six hue weights around the colour wheel.
+            let hp = h * 6.0;
+            let i = hp.floor() as usize % 6;
+            let wt = w[i] + (w[(i + 1) % 6] - w[i]) * (hp - hp.floor());
+            [(luma(c) + (wt - 0.5) * s * 0.6).max(0.0); 3]
+        }
+        ResolvedEffect::Vibrance { vibrance, saturation } => {
+            let (h, s, l) = rgb_to_hsl(c);
+            let s = (s * (1.0 + saturation as f32) + vibrance as f32 * (1.0 - s) * s.min(0.5)).clamp(0.0, 1.0);
+            hsl_to_rgb(h, s, l)
+        }
+        ResolvedEffect::PhotoFilter { color, density } => {
+            let k = [color.r as f32, color.g as f32, color.b as f32];
+            let o: [f32; 3] = std::array::from_fn(|i| c[i] + (c[i] * k[i] - c[i]) * density as f32);
+            let r = luma(c) / luma(o).max(1e-6);
+            o.map(|v| v * r)
+        }
+        ResolvedEffect::ChannelMixer { rr, rg, rb, rc, gr, gg, gb, gc, br, bg, bb, bc } => {
+            let row = |a: f64, b: f64, d: f64, k: f64| (c[0] as f64 * a + c[1] as f64 * b + c[2] as f64 * d + k).max(0.0) as f32;
+            [row(rr, rg, rb, rc), row(gr, gg, gb, gc), row(br, bg, bb, bc)]
+        }
+        ResolvedEffect::GammaPedestalGain { gamma, pedestal, gain, black_stretch } => c.map(|v| {
+            // Black stretch lifts the low values (a toe that fades out by mid grey).
+            let v = if black_stretch > 0.0 && v > 0.0 && v < 1.0 {
+                v + black_stretch as f32 * 0.25 * v * (1.0 - v).powi(4)
+            } else {
+                v
+            };
+            (pedestal as f32 + (gain - pedestal) as f32 * v.max(0.0).powf(gamma as f32)).max(0.0)
+        }),
+        ResolvedEffect::LeaveColor { color, amount, tolerance, softness } => {
+            let k = [color.r as f32, color.g as f32, color.b as f32];
+            let d = (0..3).map(|i| (c[i] - k[i]).powi(2)).sum::<f32>().sqrt() / 3f32.sqrt();
+            let (tol, soft) = (tolerance as f32, softness as f32);
+            let keep = if tol >= 1.0 || d <= tol {
+                1.0
+            } else if soft <= 1e-6 {
+                0.0
+            } else {
+                (1.0 - (d - tol) / soft).clamp(0.0, 1.0)
+            };
+            let g = luma(c);
+            c.map(|v| v + (g - v) * amount as f32 * (1.0 - keep))
+        }
+        _ => c,
     }
 }
 
@@ -620,6 +779,61 @@ mod tests {
         assert_eq!(px[0], 0, "black stays black");
         assert_eq!(px[8], 255, "white stays white");
         assert!(px[4] > 140, "the midtone lifts, got {}", px[4]);
+    }
+
+    #[test]
+    fn ported_effects_pixel_math() {
+        // Curves: default seed is the identity; lifting the midpoint brightens.
+        let mut px = solid([10, 128, 240, 200], 1);
+        let before = px.clone();
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::Curves { ys: [0.25, 0.5, 0.75] }]);
+        assert_eq!(px, before);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::Curves { ys: [0.25, 0.75, 0.75] }]);
+        assert!(px[1] > 150);
+        // Balance: a blue shadow shift moves a dark pixel, not a white one.
+        let mut px = vec![20, 20, 20, 255, 255, 255, 255, 255];
+        apply_stack(&mut px, 2, 1, &[ResolvedEffect::TonalBalance { sh: [0.0, 0.0, 1.0], mid: [0.0; 3], hi: [0.0; 3] }]);
+        assert!(px[2] > px[0] + 40 && px[4..7] == [255, 255, 255]);
+        // Key: removes the key colour (within tolerance), keeps the rest.
+        let mut px = vec![0, 0, 255, 255, 255, 0, 0, 255];
+        let key = Color::rgb(0.0, 0.0, 1.0);
+        apply_stack(&mut px, 2, 1, &[ResolvedEffect::ColorKey { color: key, tolerance: 0.1, softness: 0.0 }]);
+        assert_eq!((px[3], px[7]), (0, 255));
+        // Exposure: +1 stop doubles linear light (128 -> ~176); 0 stops is identity.
+        let mut px = solid([128, 128, 128, 255], 1);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::Exposure { exposure: 0.0, offset: 0.0, gamma: 1.0 }]);
+        assert_eq!(px[0], 128);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::Exposure { exposure: 1.0, offset: 0.0, gamma: 1.0 }]);
+        assert!((174..=178).contains(&px[0]), "got {}", px[0]);
+        // Black & White: grey out, and the red weight steers how bright red lands.
+        let bw = |reds| {
+            let mut px = solid([255, 0, 0, 255], 1);
+            apply_stack(&mut px, 1, 1, &[ResolvedEffect::BlackWhite { reds, yellows: 0.6, greens: 0.4, cyans: 0.6, blues: 0.2, magentas: 0.8 }]);
+            px
+        };
+        assert!(bw(0.4)[0] == bw(0.4)[1] && bw(1.0)[0] > bw(0.4)[0]);
+        // Vibrance: boosts a muted colour, leaves grey and zero alone.
+        let mut px = solid([150, 100, 100, 255], 1);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::Vibrance { vibrance: 1.0, saturation: 0.0 }]);
+        assert!(px[0] - px[1] > 50);
+        // Photo filter: a blue filter keeps luminance but pulls red down relative to blue.
+        let mut px = solid([128, 128, 128, 255], 1);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::PhotoFilter { color: Color::rgb(0.0, 0.0, 1.0), density: 1.0 }]);
+        assert!(px[2] > 128 && px[0] == 0);
+        // Channel mixer: red <- blue swap; Gamma/Pedestal/Gain: gain halves, pedestal lifts.
+        let mut px = solid([200, 0, 50, 255], 1);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::ChannelMixer { rr: 0.0, rg: 0.0, rb: 1.0, rc: 0.0, gr: 0.0, gg: 1.0, gb: 0.0, gc: 0.0, br: 1.0, bg: 0.0, bb: 0.0, bc: 0.0 }]);
+        assert_eq!(px[..3], [50, 0, 200]);
+        let mut px = solid([128, 128, 128, 255], 1);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::GammaPedestalGain { gamma: 1.0, pedestal: 0.0, gain: 0.5, black_stretch: 0.0 }]);
+        assert_eq!(px[0], 64);
+        apply_stack(&mut px, 1, 1, &[ResolvedEffect::GammaPedestalGain { gamma: 1.0, pedestal: 0.5, gain: 1.0, black_stretch: 0.0 }]);
+        assert!(px[0] > 150);
+        // Leave colour: keeps the key colour, greys the rest.
+        let mut px = vec![255, 0, 0, 255, 0, 0, 255, 255];
+        apply_stack(&mut px, 2, 1, &[ResolvedEffect::LeaveColor { color: Color::rgb(1.0, 0.0, 0.0), amount: 1.0, tolerance: 0.15, softness: 0.0 }]);
+        assert_eq!(px[..3], [255, 0, 0]);
+        assert!(px[4] == px[5] && px[5] == px[6]);
     }
 
     /// A drop shadow paints where the artwork is *not*, offset from it, and
