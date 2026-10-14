@@ -1368,10 +1368,14 @@ pub(crate) fn properties_ui(
             .show_ui(ui, |ui| {
                 // Built from the effect registry, the seam a plugin effect
                 // registers through; ids with no built-in routine are skipped.
-                for desc in motion_core::NodeRegistry::with_effects().iter() {
-                    let Some(ty) = motion_core::EffectType::from_id(&desc.id) else { continue };
-                    if ui.selectable_label(false, &desc.label).clicked() {
-                        edits.effect = Some(EffectOp::Add(ty));
+                let reg = motion_core::NodeRegistry::with_effects();
+                for cat in motion_core::EffectType::CATEGORIES {
+                    ui.label(egui::RichText::new(cat).weak().small());
+                    for desc in reg.iter() {
+                        let Some(ty) = motion_core::EffectType::from_id(&desc.id) else { continue };
+                        if ty.category() == cat && ui.selectable_label(false, format!("   {}", desc.label)).clicked() {
+                            edits.effect = Some(EffectOp::Add(ty));
+                        }
                     }
                 }
             });

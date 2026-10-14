@@ -909,6 +909,26 @@ impl EffectType {
         EffectType::RadialBlur,
     ];
 
+    /// The Add menu's groups, in order; AE's Effects & Presets names.
+    pub const CATEGORIES: [&'static str; 5] =
+        ["Blur & Sharpen", "Color Correction", "Keying", "Perspective", "Stylize"];
+
+    /// Which of [`Self::CATEGORIES`] this kind is listed under.
+    pub fn category(self) -> &'static str {
+        use EffectType::*;
+        match self {
+            GaussianBlur | FastBoxBlur | DirectionalBlur | Sharpen | UnsharpMask | CrossBlur
+            | ChannelBlur | BilateralBlur | SmartBlur | RadialBlur => "Blur & Sharpen",
+            BrightnessContrast | HueSaturation | Tint | Levels | ColorBalance | TonalBalance
+            | Curves | Exposure | BlackWhite | Vibrance | PhotoFilter | ChannelMixer
+            | GammaPedestalGain | LeaveColor => "Color Correction",
+            ChromaKey | ColorKey => "Keying",
+            DropShadow => "Perspective",
+            Glow | Posterize | Threshold | ThresholdRgb | FindEdges | Emboss | ColorEmboss
+            | Mosaic => "Stylize",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             EffectType::GaussianBlur => "Gaussian Blur",
@@ -1297,6 +1317,14 @@ mod tests {
             assert!(seen.insert(ty.label()), "{} listed twice", ty.label());
         }
         assert_eq!(seen.len(), EffectType::ALL.len());
+    }
+
+    /// Every listed category is used, so the menu never shows an empty heading.
+    #[test]
+    fn every_category_has_an_effect() {
+        for cat in EffectType::CATEGORIES {
+            assert!(EffectType::ALL.iter().any(|t| t.category() == cat), "{cat}");
+        }
     }
 
     /// The parameter table and the stored fields agree for every kind: same
