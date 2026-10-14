@@ -4049,7 +4049,7 @@ fn root_with_nested_layers() -> MNode {
 fn strips_skip_the_comp_root() {
     // The root IS the composition, not a layer in it; trimming the thing that
     // defines the time axis has no coherent meaning.
-    let rows = strip_rows(&root_with_nested_layers());
+    let rows = strip_rows(&root_with_nested_layers(), &Default::default());
     assert_eq!(rows.len(), 2);
     assert!(!rows.iter().any(|r| r.name == "root"));
     assert_eq!(rows[0].name, "group");
@@ -4057,7 +4057,7 @@ fn strips_skip_the_comp_root() {
 
 #[test]
 fn strips_keep_the_tree_shape_as_depth() {
-    let rows = strip_rows(&root_with_nested_layers());
+    let rows = strip_rows(&root_with_nested_layers(), &Default::default());
     // A child of the first layer indents one step — a flat list of names would
     // lose which layer is inside which group.
     assert_eq!((rows[0].depth, rows[1].depth), (0, 1));
@@ -4065,7 +4065,7 @@ fn strips_keep_the_tree_shape_as_depth() {
 
 #[test]
 fn a_strip_carries_its_layers_window_and_keys() {
-    let rows = strip_rows(&root_with_nested_layers());
+    let rows = strip_rows(&root_with_nested_layers(), &Default::default());
     let child = &rows[1];
     assert_eq!(child.timing, Some(LayerTiming::new(4, 20)));
     assert_eq!(child.keys, vec![0, 8], "merged across the layer's properties");
@@ -4085,7 +4085,7 @@ fn a_strip_carries_its_sound_so_the_row_can_draw_a_waveform() {
     muted.audio = Some(clip);
     let silent = MNode::group(3, "shape");
     let rows =
-        strip_rows(&MNode::group(0, "root").with_child(sounding).with_child(muted).with_child(silent));
+        strip_rows(&MNode::group(0, "root").with_child(sounding).with_child(muted).with_child(silent), &Default::default());
     let by_name = |n: &str| rows.iter().find(|r| r.name == n).expect("row").audio;
     assert_eq!(by_name("music"), Some((motion_core::AssetId(7), true)));
     // Muted keeps its waveform, dimmed: muting is temporary, and hiding the
@@ -4106,7 +4106,7 @@ fn a_strips_keys_are_deduped_across_properties() {
     transform.opacity =
         Value::Keyframed(Track::new(vec![Keyframe::linear(0, 1.0), Keyframe::linear(5, 0.0)]));
     let layer = MNode::group(1, "layer").with_transform(transform);
-    let rows = strip_rows(&MNode::group(0, "root").with_child(layer));
+    let rows = strip_rows(&MNode::group(0, "root").with_child(layer), &Default::default());
     assert_eq!(rows[0].keys, vec![0, 5]);
 }
 
@@ -4154,7 +4154,7 @@ fn the_strips_view_agrees_with_the_layers_panel() {
     let mut tree = Vec::new();
     tree_rows(&root, 0, &mut tree);
     let panel: Vec<NodeId> = tree.iter().skip(1).map(|r| r.id).collect();
-    let strips: Vec<NodeId> = strip_rows(&root).iter().map(|r| r.id).collect();
+    let strips: Vec<NodeId> = strip_rows(&root, &Default::default()).iter().map(|r| r.id).collect();
     assert_eq!(panel, strips);
 }
 
@@ -4647,6 +4647,123 @@ fn loading_another_project_drops_the_cached_frames() {
     cache.clear();
     assert_eq!(cache.resident_bytes(), 0);
     assert!(cache.image(&asset, at(&asset, 0)).is_none(), "nothing survives the swap");
+}
+
+/// A strip knows whether its layer carries picture, and whether that picture's
+/// time is remapped — the two facts that decide whether a cache gutter can be
+/// drawn honestly.
+#[test]
+fn a_footage_strip_reports_its_asset_and_whether_it_is_remapped() {
+    let mut assets = std::collections::BTreeMap::new();
+    assets.insert(
+        motion_core::AssetId(3),
+        motion_core::Asset::video(motion_core::AssetId(3), fake_file("pbc_strip.bin"), 4.0, 4.0, 100, 24.0),
+    );
+
+    let mut plain = MNode::group(1, "plain");
+    plain.shape = Some(motion_core::Shape::Image {
+        asset: motion_core::AssetId(3),
+        size: Value::constant(Vec2::new(4.0, 4.0)),
+        time_remap: None,
+    });
+    let mut remapped = MNode::group(2, "remapped");
+    remapped.shape = Some(motion_core::Shape::Image {
+        asset: motion_core::AssetId(3),
+        size: Value::constant(Vec2::new(4.0, 4.0)),
+        time_remap: Some(Value::constant(0.0)),
+    });
+    let shape_only = MNode::group(3, "square");
+
+    let root = MNode::group(0, "root").with_child(plain).with_child(remapped).with_child(shape_only);
+    let rows = strip_rows(&root, &assets);
+    let by_name = |n: &str| {
+        rows.iter().find(|r| r.name == n).expect("the layer has a strip").footage.clone()
+    };
+
+    assert_eq!(by_name("plain").map(|(a, r)| (a.id, r)), Some((motion_core::AssetId(3), false)));
+    assert_eq!(by_name("remapped").map(|(a, r)| (a.id, r)), Some((motion_core::AssetId(3), true)),
+        "a remapped layer is still footage — the flag is what suppresses its gutter");
+    assert!(by_name("square").is_none(), "a shape layer has no footage to cache");
+}
+
+/// A cache-bar column is green only when *every* frame it covers is resident.
+///
+/// Zoomed out, one pixel column stands for many frames. Claiming it cached
+/// because one of them happened to be decoded would promise a smooth playback
+/// that isn't there, which is the one lie this bar must not tell.
+#[test]
+fn a_cache_column_is_only_green_when_all_its_frames_are_resident() {
+    let asset = motion_core::Asset::video(
+        motion_core::AssetId(3), fake_file("pbc_col.bin"), 4.0, 4.0, 100, 24.0);
+    let mut cached: std::collections::HashSet<crate::footage::Key> =
+        (0..10).map(|f| (motion_core::AssetId(3), f)).collect();
+
+    // A column covering frames 0..=5, entirely inside the resident run.
+    assert!(crate::strips::column_cached(&asset, &cached, 0.0, 5.0, 24.0));
+    // A column running past the end of it.
+    assert!(!crate::strips::column_cached(&asset, &cached, 0.0, 20.0, 24.0));
+
+    // One hole is enough to take the whole column out.
+    cached.remove(&(motion_core::AssetId(3), 4));
+    assert!(!crate::strips::column_cached(&asset, &cached, 0.0, 5.0, 24.0),
+        "a gap anywhere in the column is a stall the user would not have been warned about");
+}
+
+/// The run-ahead is a slice of the memory budget, not a fixed frame count.
+///
+/// This is the second-video cliff: at 1080x1920 a frame is 8.3MB, so two
+/// streams each running 48 frames ahead ask for ~800MB against a 512MB budget.
+/// The prefetches evicted each other, the playhead arrived at a frame that had
+/// been decoded and thrown away, and the re-request read as a backwards seek —
+/// a ~229ms decoder restart per frame per video.
+#[test]
+fn the_run_ahead_shrinks_as_more_videos_open() {
+    let file = fake_file("pbc_run_ahead.bin");
+    let hd = motion_core::Asset::video(motion_core::AssetId(1), file.clone(), 1080.0, 1920.0, 300, 24.0)
+        .meta();
+    let one = crate::footage::run_ahead(&hd, 1);
+    let two = crate::footage::run_ahead(&hd, 2);
+    assert!(two < one, "a second video must not get the same run-ahead as a lone one");
+
+    // What matters is the total, not the ratio: every open stream's run-ahead
+    // together has to still fit in the budget it is a share of.
+    let frame_bytes = 1080 * 1920 * 4;
+    assert!(two as usize * 2 * frame_bytes <= 512 * 1024 * 1024);
+
+    // Tiny footage is capped by the ceiling rather than the budget, which is
+    // what keeps a runaway prefetch bounded when frames cost nothing.
+    let icon = motion_core::Asset::video(motion_core::AssetId(2), file, 4.0, 4.0, 1000, 24.0).meta();
+    assert_eq!(crate::footage::run_ahead(&icon, 8), 48);
+}
+
+/// Eviction drops what the playhead has passed, not what was decoded longest
+/// ago.
+///
+/// Least-recently-used was the trap: a frame the prefetch just decoded has
+/// never been *drawn*, so it looked like the stalest entry in the cache and
+/// eviction threw out exactly the frames playback was about to reach.
+#[test]
+fn eviction_drops_the_frames_furthest_from_the_playhead() {
+    let (mut cache, _) = fake_cache(4);
+    let file = fake_file("pbc_evict_order.bin");
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), file, 4.0, 4.0, 1000, 24.0);
+    let other = motion_core::AssetId(9);
+
+    // Drawing is what records the playhead, so the cache learns it here.
+    cache.image(&asset, at(&asset, 100));
+
+    let id = motion_core::AssetId(1);
+    let ahead_near = cache.staleness((id, 105));
+    let ahead_far = cache.staleness((id, 140));
+    let behind_near = cache.staleness((id, 95));
+    let behind_far = cache.staleness((id, 10));
+    let undrawn = cache.staleness((other, 100));
+
+    // Highest goes first.
+    assert!(ahead_near < ahead_far, "the nearer run-ahead frame is the safer one");
+    assert!(ahead_far < behind_near, "anything already passed goes before the run-ahead");
+    assert!(behind_near < behind_far, "the furthest behind goes first of the passed frames");
+    assert!(behind_far < undrawn, "footage nobody is drawing is the most droppable of all");
 }
 
 // ---------------------------------------------------------------------------
@@ -5654,6 +5771,7 @@ fn the_composition_bar_fits_its_fixed_height() {
                     &mut preset_name_buf,
                     &mut layout,
                     &[],
+                    (0, crate::footage::BUDGET_BYTES),
                     &[CompEntry { id: CompId(0), label: "Comp 1".to_string() }],
                     CompId(0),
                     &mut comp_name_buf,
@@ -5715,6 +5833,7 @@ fn the_composition_bar_still_fits_while_a_render_runs() {
                     &mut preset_name_buf,
                     &mut layout,
                     &[],
+                    (0, crate::footage::BUDGET_BYTES),
                     &[CompEntry { id: CompId(0), label: "Comp 1".to_string() }],
                     CompId(0),
                     &mut comp_name_buf,

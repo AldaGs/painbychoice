@@ -37,14 +37,40 @@ use vello::peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 /// A budget rather than a frame count because frames differ in size by two
 /// orders of magnitude — a hundred 4K frames is 3GB, a hundred icons is
 /// nothing, and only one of those numbers is a sensible limit.
-const BUDGET_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// How far ahead of the last request the worker will decode unprompted.
 ///
 /// This is what makes playback smooth: by the time the playhead arrives, the
 /// frame is already here. Bounded because a runaway prefetch would evict the
-/// frames around the playhead to make room for frames nobody asked for.
+/// frames around the playhead to make room for frames nobody asked for — and
+/// the *ceiling* alone stops being enough bounding once there is more than one
+/// video, which is what [`run_ahead`] is for.
 const PREFETCH_AHEAD: i64 = 48;
+
+/// The share of [`BUDGET_BYTES`] the run-ahead is allowed to occupy.
+///
+/// The rest is what the playhead has already passed, which scrubbing backwards
+/// and the held frame during a miss both still want.
+const PREFETCH_SHARE: usize = 2;
+
+/// How far ahead *this* stream may run, given how many are open and how big a
+/// frame of it is.
+///
+/// Fixing the run-ahead at [`PREFETCH_AHEAD`] per stream is what made a second
+/// video fall off a cliff: at 1080x1920 a frame is 8.3MB, so two streams
+/// running 48 ahead ask for ~800MB against a 512MB budget. The prefetches then
+/// evict each other, the playhead arrives at a frame that was decoded and
+/// thrown away, and the re-request reads as a backwards seek — the ~229ms
+/// re-open this whole module exists to avoid, paid once per frame per video.
+///
+/// So the run-ahead is whatever actually fits, and the ceiling applies only
+/// when it is the smaller of the two.
+pub(crate) fn run_ahead(meta: &AssetMeta, streams: usize) -> i64 {
+    let frame_bytes = (meta.width as usize).max(1) * (meta.height as usize).max(1) * 4;
+    let share = BUDGET_BYTES / PREFETCH_SHARE / streams.max(1) / frame_bytes.max(1);
+    (share as i64).clamp(1, PREFETCH_AHEAD)
+}
 
 /// How many footage streams the worker keeps open at once.
 ///
@@ -63,16 +89,13 @@ const MAX_STREAMS: usize = 4;
 /// wins.
 const MAX_WALK: i64 = 120;
 
-/// One cached frame, with the clock reading that makes eviction possible.
+/// One cached frame.
 struct Cached {
     image: ImageData,
     bytes: usize,
-    /// When it was last drawn. A plain counter, not a timestamp: the only
-    /// question ever asked of it is which entry is oldest.
-    used: u64,
 }
 
-type Key = (AssetId, i64);
+pub(crate) type Key = (AssetId, i64);
 
 /// Which generation of the project a message belongs to.
 ///
@@ -134,8 +157,13 @@ pub(crate) struct FootageCache {
     /// What the running prefetches have already promised, per footage — one
     /// entry per open stream, since the worker runs several. See [`Promised`].
     promised: HashMap<AssetId, Promised>,
+    /// The frame each footage is currently being *drawn* at — recorded on every
+    /// [`FootageCache::image`] call, so it is the playhead as the scene sees it
+    /// rather than the last request, which a long prefetch run leaves stale.
+    ///
+    /// This is what eviction steers by. See [`FootageCache::evict_to_budget`].
+    wanted: HashMap<AssetId, i64>,
     bytes: usize,
-    clock: u64,
     epoch: Epoch,
 }
 
@@ -155,8 +183,8 @@ impl FootageCache {
             failed: HashMap::new(),
             inflight: HashSet::new(),
             promised: HashMap::new(),
+            wanted: HashMap::new(),
             bytes: 0,
-            clock: 0,
             epoch: 0,
         }
     }
@@ -232,7 +260,7 @@ impl FootageCache {
     /// footage has ever decoded.
     pub(crate) fn image(&mut self, asset: &Asset, paint: ImagePaint) -> Option<(&ImageData, bool)> {
         let key = (paint.asset, paint.source_frame);
-        self.clock += 1;
+        self.wanted.insert(paint.asset, paint.source_frame);
 
         let exact = self.frames.contains_key(&key);
         // Not asking for a frame the prefetch already promised is the whole
@@ -255,14 +283,19 @@ impl FootageCache {
                 paint.asset,
                 Promised {
                     from: paint.source_frame,
+                    // The ceiling, not the budgeted run-ahead: over-promising
+                    // here only delays a re-request, and the worker retracts
+                    // the excess with `PrefetchEnded` the moment it stops
+                    // short. Under-promising would re-ask for frames the
+                    // stream has already passed, which is the expensive
+                    // mistake.
                     until: paint.source_frame + PREFETCH_AHEAD,
                 },
             );
         }
 
         let hit = if exact { Some(key) } else { self.nearest(paint.asset, paint.source_frame) };
-        let entry = self.frames.get_mut(&hit?)?;
-        entry.used = self.clock;
+        let entry = self.frames.get(&hit?)?;
         Some((&entry.image, exact))
     }
 
@@ -295,6 +328,7 @@ impl FootageCache {
         // frames. Bumping the epoch makes `collect` drop them.
         self.inflight.clear();
         self.promised.clear();
+        self.wanted.clear();
         self.epoch += 1;
         self.bytes = 0;
         let _ = self.to_worker.send(Request::Reset);
@@ -312,33 +346,71 @@ impl FootageCache {
             width: frame.width,
             height: frame.height,
         };
-        if let Some(old) = self.frames.insert(key, Cached { image, bytes, used: self.clock }) {
+        if let Some(old) = self.frames.insert(key, Cached { image, bytes }) {
             self.bytes -= old.bytes;
         }
         self.bytes += bytes;
         self.evict_to_budget();
     }
 
-    /// Drop least-recently-drawn frames until the budget is met.
+    /// Drop the frames furthest from where each footage is being drawn, until
+    /// the budget is met.
     ///
-    /// Scrubbing a timeline touches frames in a sweep, so least-recently-used
-    /// is the right policy almost by definition: the frames furthest behind the
-    /// playhead are the ones least likely to be wanted next.
+    /// **Not** least-recently-used, which is the trap this replaced: a frame
+    /// the prefetch has just decoded has never been drawn, so under LRU it
+    /// looked like the stalest thing in the cache. Eviction therefore ran in
+    /// decode order and threw out precisely the frames the playhead was about
+    /// to reach — and the re-request that followed read as a backwards seek and
+    /// restarted the decoder.
+    ///
+    /// Distance from the playhead asks the question that actually matters, and
+    /// asks it asymmetrically: a frame *behind* the playhead has been shown and
+    /// play only moves away from it, so it goes before anything ahead of the
+    /// playhead, which is the run-ahead that playback is relying on.
     fn evict_to_budget(&mut self) {
         while self.bytes > BUDGET_BYTES && self.frames.len() > 1 {
-            let Some(oldest) = self.frames.iter().min_by_key(|(_, c)| c.used).map(|(k, _)| *k)
+            let Some(worst) = self.frames.keys().max_by_key(|k| self.staleness(**k)).copied()
             else {
                 break;
             };
-            if let Some(c) = self.frames.remove(&oldest) {
+            if let Some(c) = self.frames.remove(&worst) {
                 self.bytes -= c.bytes;
             }
         }
     }
 
-    #[cfg(test)]
+    /// How droppable a cached frame is; the highest goes first.
+    ///
+    /// Footage nobody is drawing has no playhead at all, and is the most
+    /// droppable thing there is — a layer that has scrolled out of the comp, or
+    /// an asset from before a relink.
+    pub(crate) fn staleness(&self, (asset, frame): Key) -> (u8, i64) {
+        let Some(&want) = self.wanted.get(&asset) else { return (2, 0) };
+        if frame < want {
+            (1, want - frame)
+        } else {
+            (0, frame - want)
+        }
+    }
+
+    /// How much decoded footage is resident, against [`BUDGET_BYTES`].
+    ///
+    /// Shown in the comp bar. A cache with a hard ceiling that nobody can see
+    /// is indistinguishable from a memory leak when it fills and from a broken
+    /// prefetch when it doesn't, so the number is part of the feature.
     pub(crate) fn resident_bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Every frame currently decoded, as a set the UI can keep and query
+    /// without holding a borrow on the cache.
+    ///
+    /// A snapshot rather than a borrow because the timeline draws inside a
+    /// closure that already needs `&mut self` — the same reason the strips
+    /// view takes a cloned handle to the audio peaks. Cheap: the budget caps
+    /// this at a few hundred keys.
+    pub(crate) fn resident_keys(&self) -> HashSet<Key> {
+        self.frames.keys().copied().collect()
     }
 
     /// Block until this frame is in hand (or known to have failed).
@@ -467,8 +539,9 @@ fn serve(
     // there is cheaper than re-opening. Served streams move to the front, so the
     // pool evicts whichever footage went longest without being asked for.
     if let Some(i) = sessions.iter().position(|s| s.asset == asset) {
+        let ahead = run_ahead(meta, sessions.len());
         let s = &mut sessions[i];
-        s.until = want + PREFETCH_AHEAD;
+        s.until = want + ahead;
         let at = s.stream.next_index();
         if want >= at && want - at <= MAX_WALK {
             let walked = loop {
@@ -496,9 +569,12 @@ fn serve(
 
     // Open a fresh stream *at* the wanted frame, which both answers this request
     // and leaves the worker positioned for the ones that follow it.
+    // `+ 1` counts the stream about to join the pool: its share has to be
+    // reserved before it starts spending it.
+    let ahead = run_ahead(meta, sessions.len() + 1);
     let opened = decoders
         .stream(path, want, meta)
-        .map(|stream| Session { asset, meta: *meta, stream, until: want + PREFETCH_AHEAD });
+        .map(|stream| Session { asset, meta: *meta, stream, until: want + ahead });
     let Some(mut s) = opened else {
         // No sequential mode — a still, where one frame is already in order.
         return decoders.frame(path, want, meta).map_err(|e| e.to_string());

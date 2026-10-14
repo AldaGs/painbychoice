@@ -661,6 +661,8 @@ pub(crate) fn comp_ui(
     name_buf: &mut String,
     layout: &mut LayoutEdits,
     warnings: &[(u64, String)],
+    // Decoded footage resident, and the budget it is held to.
+    cache: (usize, usize),
     comps: &[CompEntry],
     current: CompId,
     comp_name_buf: &mut String,
@@ -760,6 +762,34 @@ pub(crate) fn comp_ui(
             )
             .on_hover_text(summary);
         }
+
+        // Decoded footage resident. Beside the warnings because it answers the
+        // same kind of question — is the shell keeping up — and because a
+        // cache with a hard ceiling is otherwise invisible until it misbehaves:
+        // full reads as a memory leak, empty reads as a broken prefetch, and
+        // neither is distinguishable from the other without the number.
+        //
+        // Coloured only once it is actually full. A cache that has reached its
+        // budget is working exactly as designed, so this is a reading, not a
+        // warning — but it is also the moment frames start being evicted, which
+        // is worth being able to see.
+        let (used, budget) = cache;
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        let full = budget > 0 && used * 10 >= budget * 9;
+        ui.separator();
+        ui.colored_label(
+            if full {
+                egui::Color32::from_rgb(220, 160, 60)
+            } else {
+                egui::Color32::from_gray(150)
+            },
+            format!("{:.0}/{:.0} MB", mb(used), mb(budget)),
+        )
+        .on_hover_text(
+            "Decoded footage held in memory, against its budget.
+\
+             The green gutter on a layer's strip shows which of its frames these are.",
+        );
         ui.separator();
 
         ui.label("Size");

@@ -3989,10 +3989,14 @@ impl App {
         let curve_rows = sel_node.map(curve_rows).unwrap_or_default();
         // Strips are per *comp*, not per selection: the whole point is seeing
         // every layer's window at once.
-        let strip_rows = strip_rows(&self.doc().root);
+        let strip_rows = strip_rows(&self.doc().root, &self.project.assets);
         // Cloned handles rather than a borrow: the timeline draws inside a
         // closure that also needs `&mut self` for the edits it collects.
         let peaks = self.peaks.clone();
+        // Same reason, and the same shape: what the footage cache is holding,
+        // snapshotted for the strips' cache gutter and the comp bar's readout.
+        let cached = self.footage.resident_keys();
+        let cache_use = (self.footage.resident_bytes(), crate::footage::BUDGET_BYTES);
 
         // Every key on the selected node, flattened, for the transport's
         // key-stepping buttons. Duplicates across properties are fine —
@@ -4217,6 +4221,7 @@ impl App {
                         &mut preset_name_buf,
                         &mut layout,
                         &warnings,
+                        cache_use,
                         &comp_entries,
                         current_comp,
                         &mut comp_name_buf,
@@ -4260,6 +4265,7 @@ impl App {
                             work_area,
                             dope_label_w,
                             &peaks,
+                            &cached,
                             &mut dope,
                         ),
                         TimelineMode::Curves => curves_ui(

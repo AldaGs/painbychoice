@@ -37,6 +37,19 @@ pub(crate) struct StripRow {
     /// temporary state and hiding the shape would make the row you are about
     /// to unmute the one you cannot read.
     pub(crate) audio: Option<(motion_core::AssetId, bool)>,
+    /// The picture this layer carries, if any, and whether its time is
+    /// remapped.
+    ///
+    /// The whole [`Asset`](motion_core::Asset) rather than its id because
+    /// drawing the cache bar has to turn comp frames into source frames, and
+    /// `Asset::source_frame` is already that conversion — re-deriving it from
+    /// a couple of copied fields is how the strip and the renderer would
+    /// eventually disagree about which frame a layer is showing.
+    ///
+    /// The flag is what the bar can't answer: a remapped layer picks its
+    /// source frame from a curve resolved against the whole project, so the
+    /// honest bar for one is no bar at all.
+    pub(crate) footage: Option<(motion_core::Asset, bool)>,
 }
 
 /// Flatten a comp's layers into strip rows.
@@ -44,8 +57,16 @@ pub(crate) struct StripRow {
 /// The comp **root is skipped**: it is the composition itself, not a layer in
 /// it, and offering to trim the thing that defines the time axis would be a
 /// control with no coherent meaning.
-pub(crate) fn strip_rows(root: &MNode) -> Vec<StripRow> {
-    fn walk(node: &MNode, depth: usize, out: &mut Vec<StripRow>) {
+pub(crate) fn strip_rows(
+    root: &MNode,
+    assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+) -> Vec<StripRow> {
+    fn walk(
+        node: &MNode,
+        depth: usize,
+        assets: &std::collections::BTreeMap<motion_core::AssetId, motion_core::Asset>,
+        out: &mut Vec<StripRow>,
+    ) {
         let mut keys: Vec<i64> =
             dope_rows(node).into_iter().flat_map(|r| r.frames).collect();
         keys.sort_unstable();
@@ -58,16 +79,22 @@ pub(crate) fn strip_rows(root: &MNode) -> Vec<StripRow> {
             timing: node.timing,
             keys,
             audio: node.audio.as_ref().map(|a| (a.asset, a.enabled)),
+            footage: match &node.shape {
+                Some(motion_core::Shape::Image { asset, time_remap, .. }) => assets
+                    .get(asset)
+                    .map(|a| (a.clone(), time_remap.is_some())),
+                _ => None,
+            },
         });
         // Front-most first, matching the layers panel — the two are the same
         // list of layers and must not disagree about their order.
         for c in node.children.iter().rev() {
-            walk(c, depth + 1, out);
+            walk(c, depth + 1, assets, out);
         }
     }
     let mut out = Vec::new();
     for child in root.children.iter().rev() {
-        walk(child, 0, &mut out);
+        walk(child, 0, assets, &mut out);
     }
     out
 }
@@ -126,6 +153,73 @@ fn waveform(
     }
 }
 
+/// Draw which of a footage layer's frames are decoded and resident, as a thin
+/// band along the bottom of its bar.
+///
+/// The green bar every NLE has, and for the same reason: the cache is the
+/// difference between a scrub that is instant and one that restarts a decoder,
+/// and without this the user can only find out by trying it.
+///
+/// Read per pixel column rather than per frame so a zoomed-out comp costs the
+/// width of the bar instead of the length of the footage — and so a column
+/// standing for several frames is only claimed as cached when **all** of them
+/// are. Optimism here would be the one lie that matters: it would promise a
+/// smooth playback that isn't there.
+///
+/// `start` is the layer's local frame zero in comp frames, the same conversion
+/// [`waveform`] makes, so picture and sound cannot disagree about where in the
+/// source a comp frame lands.
+/// Whether one pixel column of a cache bar is cached: every source frame it
+/// covers is resident.
+///
+/// **All**, not any. Zoomed out, one column stands for many frames, and a
+/// column drawn green because one of thirty frames happened to be decoded
+/// would promise playback that isn't there — the single lie this bar exists to
+/// prevent, since its whole job is to say what will be smooth.
+pub(crate) fn column_cached(
+    asset: &motion_core::Asset,
+    cached: &std::collections::HashSet<crate::footage::Key>,
+    f0: f64,
+    f1: f64,
+    fps: f64,
+) -> bool {
+    let (a, b) = (asset.source_frame(f0, fps), asset.source_frame(f1, fps));
+    (a.min(b)..=a.max(b)).all(|sf| cached.contains(&(asset.id, sf)))
+}
+
+fn cache_bar(
+    painter: &egui::Painter,
+    bar: egui::Rect,
+    axis: &Axis,
+    fps: f64,
+    start: f64,
+    asset: &motion_core::Asset,
+    cached: &std::collections::HashSet<crate::footage::Key>,
+) {
+    if bar.width() < 1.0 {
+        return;
+    }
+    // Along the bottom edge, where it reads as a status gutter for the bar
+    // rather than as content in it — the waveform already owns the middle.
+    let band = egui::Rect::from_min_max(
+        egui::pos2(bar.left(), bar.bottom() - 3.0),
+        egui::pos2(bar.right(), bar.bottom() - 1.0),
+    );
+    let col = egui::Color32::from_rgb(96, 190, 120);
+    let mut x = band.left().floor();
+    while x < band.right() {
+        let f0 = axis.x_to_frame_exact(x) - start;
+        let f1 = axis.x_to_frame_exact(x + 1.0) - start;
+        if column_cached(asset, cached, f0, f1, fps) {
+            painter.line_segment(
+                [egui::pos2(x + 0.5, band.top()), egui::pos2(x + 0.5, band.bottom())],
+                egui::Stroke::new(1.0, col),
+            );
+        }
+        x += 1.0;
+    }
+}
+
 /// The layer-strips view.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn strips_ui(
@@ -142,6 +236,7 @@ pub(crate) fn strips_ui(
         motion_core::AssetId,
         std::sync::Arc<motion_render::Peaks>,
     >,
+    cached: &std::collections::HashSet<crate::footage::Key>,
     out: &mut DopeEdits,
 ) {
     let label_w = clamp_label_w(label_w, ui.max_rect().width());
@@ -298,6 +393,18 @@ pub(crate) fn strips_ui(
                 if let Some(pk) = peaks.get(&asset) {
                     let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
                     waveform(&painter, bar, &axis, tb.fps(), start, pk, on);
+                }
+            }
+
+            // Which of this layer's frames are decoded and ready. A remapped
+            // layer gets the empty gutter and nothing in it: its source frame
+            // comes from a curve resolved against the whole project, and a bar
+            // drawn from the natural mapping would be confidently wrong about
+            // every frame — worse than no bar, because it would be believed.
+            if let Some((asset, remapped)) = &row.footage {
+                let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
+                if !remapped {
+                    cache_bar(&painter, bar, &axis, tb.fps(), start, asset, cached);
                 }
             }
 
