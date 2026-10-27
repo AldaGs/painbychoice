@@ -202,6 +202,11 @@ pub fn text_origin(content: &str, family: &str, size: f64, align: TextAlign, max
     })
 }
 
+/// The laid-out block's width and height, as [`text_to_path`] centres it.
+pub fn text_size(content: &str, family: &str, size: f64, align: TextAlign, max_width: Option<f64>) -> Option<Vec2> {
+    with_layout(content, family, size, align, max_width, |l| Vec2::new(l.width() as f64, l.height() as f64))
+}
+
 /// Shape and lay out `content`, then hand the layout to `f`. `None` when there
 /// is nothing to lay out.
 fn with_layout<R>(

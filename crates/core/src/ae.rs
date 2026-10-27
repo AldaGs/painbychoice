@@ -434,11 +434,27 @@ impl Importer<'_> {
             self.report.drop("text leading");
         }
         let content = text.to_string();
-        if let Some(o) = crate::text::text_origin(&content, &family, size, align, None) {
+        // Paragraph text wraps inside a box given in layer space; PBC centres
+        // the wrapped block, so line its aligned edge and top up with the box.
+        let (bp, bs) = (nums(&style["boxPos"]), nums(&style["boxSize"]));
+        let boxed = (bp.len() == 2 && bs.len() == 2 && bs[0] > 0.0).then(|| (Vec2::new(bp[0], bp[1]), Vec2::new(bs[0], bs[1])));
+        let max_width = boxed.map(|(_, s)| s.x);
+        let origin = match boxed {
+            Some((p, s)) => crate::text::text_size(&content, &family, size, align, max_width).map(|b| {
+                let x = match align {
+                    TextAlign::Left => -b.x / 2.0 - p.x,
+                    TextAlign::Center => -(p.x + s.x / 2.0),
+                    TextAlign::Right => b.x / 2.0 - (p.x + s.x),
+                };
+                Vec2::new(x, -b.y / 2.0 - p.y)
+            }),
+            None => crate::text::text_origin(&content, &family, size, align, None),
+        };
+        if let Some(o) = origin {
             node.transform.anchor = shift(node.transform.anchor.clone(), o);
             self.centred.insert(node.id, -o);
         }
-        node.shape = Some(Shape::Text { content: Value::constant(content), family, size: Value::constant(size), align, max_width: None });
+        node.shape = Some(Shape::Text { content: Value::constant(content), family, size: Value::constant(size), align, max_width });
     }
 
     /// The installed family a PostScript font name belongs to: the longest
