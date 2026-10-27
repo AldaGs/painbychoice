@@ -401,11 +401,63 @@ impl Shape {
     }
 }
 
-/// A stroke: animatable color and width.
+/// A stroke: animatable color and width, and how its ends and corners look.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub color: Value<Color>,
     pub width: Value<f64>,
+    #[serde(default, skip_serializing_if = "StrokeStyle::is_default")]
+    pub style: StrokeStyle,
+}
+
+/// End caps and corner joins. Not animatable: they are switches, like AE's.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StrokeStyle {
+    pub cap: LineCap,
+    pub join: LineJoin,
+    /// A miter longer than this many stroke widths is beveled instead.
+    pub miter_limit: f64,
+}
+
+impl Default for StrokeStyle {
+    fn default() -> Self {
+        Self { cap: LineCap::Butt, join: LineJoin::Miter, miter_limit: 4.0 }
+    }
+}
+
+impl StrokeStyle {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The kurbo stroke of `width` in this style, for the vector backends.
+    pub fn kurbo(&self, width: f64) -> kurbo::Stroke {
+        let cap = match self.cap {
+            LineCap::Butt => kurbo::Cap::Butt,
+            LineCap::Round => kurbo::Cap::Round,
+            LineCap::Square => kurbo::Cap::Square,
+        };
+        let join = match self.join {
+            LineJoin::Miter => kurbo::Join::Miter,
+            LineJoin::Round => kurbo::Join::Round,
+            LineJoin::Bevel => kurbo::Join::Bevel,
+        };
+        kurbo::Stroke::new(width).with_caps(cap).with_join(join).with_miter_limit(self.miter_limit)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineCap {
+    Butt,
+    Round,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineJoin {
+    Miter,
+    Round,
+    Bevel,
 }
 
 /// A user-exposed control on a node: a named, animatable knob that expressions

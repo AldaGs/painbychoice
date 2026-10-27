@@ -20,7 +20,7 @@ use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::effect::{Effect, EffectKind};
 use crate::path::{Anchor, VectorPath};
 use crate::pathfinder::BoolOp;
-use crate::node::{Comp, CompId, LayerTiming, Node, NodeId, Project, Shape, Stroke, Transform};
+use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, StrokeStyle, Shape, Stroke, Transform};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
 use crate::vec3::Vec3;
@@ -447,6 +447,7 @@ impl Importer<'_> {
             node.stroke = Some(Stroke {
                 color: Value::constant(rgb("strokeColor").unwrap_or(Color::rgb(0.0, 0.0, 0.0))),
                 width: Value::constant(num(style, "strokeWidth", 1.0)),
+                style: Default::default(),
             });
         }
         if num(style, "tracking", 0.0) != 0.0 {
@@ -639,6 +640,7 @@ impl Importer<'_> {
             Stroke {
                 color: self.color(prop(&props, "ADBE Vector Stroke Color"), start, Color::rgb(1.0, 1.0, 1.0)),
                 width: self.scalar(prop(&props, "ADBE Vector Stroke Width"), start, 1.0, 2.0),
+                style: stroke_style(&props),
             }
         });
 
@@ -928,6 +930,26 @@ fn colorama_palette(hex: &str) -> Vec<(f64, Color)> {
         out.push((pos, Color { r: c(5), g: c(6), b: c(7), a: c(4) }));
     }
     out
+}
+
+/// A shape stroke's caps, joins and miter limit. AE stores 1/2/3 for butt,
+/// round, projecting caps and miter, round, bevel joins, and leaves the
+/// defaults (butt, miter, 4) out.
+fn stroke_style(props: &[J]) -> StrokeStyle {
+    let code = |m: &str| prop(props, m).and_then(|p| nums(&p["value"]).first().copied()).unwrap_or(1.0) as i64;
+    StrokeStyle {
+        cap: match code("ADBE Vector Stroke Line Cap") {
+            2 => LineCap::Round,
+            3 => LineCap::Square,
+            _ => LineCap::Butt,
+        },
+        join: match code("ADBE Vector Stroke Line Join") {
+            2 => LineJoin::Round,
+            3 => LineJoin::Bevel,
+            _ => LineJoin::Miter,
+        },
+        miter_limit: prop(props, "ADBE Vector Stroke Miter Limit").and_then(|p| nums(&p["value"]).first().copied()).unwrap_or(4.0),
+    }
 }
 
 /// A script result's components, the way the exporter writes values.

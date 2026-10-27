@@ -713,6 +713,7 @@ fn full_node() -> MNode {
     n.stroke = Some(motion_core::Stroke {
         color: Value::constant(MColor::rgb(0.0, 0.0, 1.0)),
         width: Value::constant(2.0),
+        style: Default::default(),
     });
     n
 }
@@ -4900,6 +4901,7 @@ fn a_groups_clip_bounds_include_the_stroke_width() {
     n.stroke = Some(motion_core::Stroke {
         color: Value::constant(MColor::rgb(0.0, 0.0, 0.0)),
         width: Value::constant(8.0),
+        style: Default::default(),
     });
     let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(n));
     let scene = motion_core::evaluate(&comp, 0.0);

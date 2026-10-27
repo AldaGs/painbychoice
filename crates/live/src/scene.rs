@@ -338,7 +338,7 @@ pub(crate) fn to_vello(
             if let Some((color, width)) = item.stroke {
                 let c = tinted(color, ghost.tint, TINT_AMOUNT);
                 vs.stroke(
-                    &KurboStroke::new(width),
+                    &item.stroke_style.kurbo(width),
                     xf,
                     to_peniko(c, item.opacity * ghost.opacity),
                     None,
@@ -723,7 +723,7 @@ fn draw_range(
             }
             if let Some((color, width)) = item.stroke {
                 vs.stroke(
-                    &KurboStroke::new(width),
+                    &item.stroke_style.kurbo(width),
                     xf,
                     to_peniko(with_effects(color, &open), item.opacity),
                     None,

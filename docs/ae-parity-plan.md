@@ -80,6 +80,12 @@ with a `Gradient` (linear/radial, stops) for both fill and stroke. Taper and
 wave are rare; later. Done when: the shape layers in the references match AE
 side-by-side.
 
+**Status (2026-10-27):** caps, joins and miter limit are in (`StrokeStyle` on
+`Stroke`, drawn by the vello, tiny-skia and SVG backends) and imported — most
+AE strokes in the references are round/round. No reference uses dashes, taper
+or wave, so those are skipped. Gradient fills/strokes (16 + 3 uses) are not
+done.
+
 ## Step 3 — Expressions and controls
 
 PBC already has `Param`s (= AE expression controls) and a Rhai bridge with

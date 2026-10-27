@@ -2545,6 +2545,7 @@ mod tests {
         .with_stroke(Stroke {
             color: Value::constant(Color::rgb(1.0, 0.0, 0.0)),
             width: Value::constant(4.0),
+            style: Default::default(),
         });
         let b = Node::group(2, "b").with_transform(Transform {
             opacity: Value::expr(Expr::Script(

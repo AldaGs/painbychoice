@@ -2244,6 +2244,7 @@ impl App {
             node.stroke = Some(motion_core::Stroke {
                 color: Value::constant(MColor::rgb(0.0, 0.0, 0.0)),
                 width: Value::constant(2.0),
+                style: Default::default(),
             });
             changed = true;
         }

@@ -246,7 +246,22 @@ fn draw_item(scene: &Scene, i: usize, target: &mut Pixmap, scale: f64, report: &
         paint.set_color(sk_color(with_alpha(color, alpha)));
         // The stroke is scaled with the geometry: a 2px outline at 2× output
         // is 4px, or the render would not be the same picture larger.
-        let stroke = Stroke { width: (width * scale) as f32, ..Default::default() };
+        let st = item.stroke_style;
+        let stroke = Stroke {
+            width: (width * scale) as f32,
+            miter_limit: st.miter_limit as f32,
+            line_cap: match st.cap {
+                motion_core::LineCap::Butt => tiny_skia::LineCap::Butt,
+                motion_core::LineCap::Round => tiny_skia::LineCap::Round,
+                motion_core::LineCap::Square => tiny_skia::LineCap::Square,
+            },
+            line_join: match st.join {
+                motion_core::LineJoin::Miter => tiny_skia::LineJoin::Miter,
+                motion_core::LineJoin::Round => tiny_skia::LineJoin::Round,
+                motion_core::LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
+            },
+            ..Default::default()
+        };
         target.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 }
@@ -375,6 +390,26 @@ mod tests {
         let (buf, report) =
             rasterize(&scene, comp.width as u32, comp.height as u32, BLACK, scale).unwrap();
         (buf, report, w)
+    }
+
+    /// A stroke's cap reaches the pixels: a round cap paints past the end of
+    /// an open line, a butt cap stops at it.
+    #[test]
+    fn stroke_caps_reach_the_pixels() {
+        let line = |cap| {
+            let mut n = Node::group(1, "line");
+            let pts = [kurbo::Vec2::new(10.0, 20.0), kurbo::Vec2::new(30.0, 20.0)];
+            n.shape = Some(Shape::Vector { path: motion_core::path::VectorPath::polyline(pts, false) });
+            n.stroke = Some(motion_core::Stroke {
+                color: Value::constant(Color::rgb(1.0, 1.0, 1.0)),
+                width: Value::constant(8.0),
+                style: motion_core::StrokeStyle { cap, ..Default::default() },
+            });
+            let (buf, _, w) = render(&Comp::new(40.0, 40.0, Node::group(0, "root").with_child(n)), 1.0);
+            px(&buf, w, 32, 20)[0]
+        };
+        assert_eq!(line(motion_core::LineCap::Butt), 0);
+        assert_eq!(line(motion_core::LineCap::Round), 255);
     }
 
     /// The floor: a shape reaches actual pixels, in the right place, over a

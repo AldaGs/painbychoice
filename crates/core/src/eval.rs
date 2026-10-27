@@ -24,6 +24,8 @@ pub struct RenderItem {
     pub path: BezPath,
     pub fill: Option<Color>,
     pub stroke: Option<(Color, f64)>,
+    /// How `stroke` ends and turns corners.
+    pub stroke_style: crate::node::StrokeStyle,
     /// The footage painted inside `path`, for a raster layer.
     ///
     /// `None` for every vector item, which is why adding footage cost the
@@ -509,6 +511,7 @@ fn walk(
                 .stroke
                 .as_ref()
                 .map(|s| (s.color.resolve(ctx), s.width.resolve(ctx)));
+            let stroke_style = node.stroke.as_ref().map(|s| s.style).unwrap_or_default();
             bounds = Some((flat * merged.clone()).bounding_box());
             scene.items.push(RenderItem {
                 source: node.id,
@@ -516,6 +519,7 @@ fn walk(
                 path: merged,
                 fill,
                 stroke,
+                stroke_style,
                 image: None,
                 opacity,
             });
@@ -536,6 +540,7 @@ fn walk(
             .stroke
             .as_ref()
             .map(|s| (s.color.resolve(ctx), s.width.resolve(ctx)));
+        let stroke_style = node.stroke.as_ref().map(|s| s.style).unwrap_or_default();
 
         // Provenance-tagged sanity check: surface non-finite geometry instead
         // of silently emitting a broken frame.
@@ -562,6 +567,7 @@ fn walk(
                         path: p,
                         fill,
                         stroke,
+                        stroke_style,
                         image,
                         opacity,
                     });
@@ -574,6 +580,7 @@ fn walk(
                         path,
                         fill,
                         stroke,
+                        stroke_style,
                         image,
                         opacity,
                     });

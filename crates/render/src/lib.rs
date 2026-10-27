@@ -222,8 +222,9 @@ pub fn scene_to_svg_reporting(
         };
         let stroke = match item.stroke {
             Some((color, w)) => format!(
-                " stroke=\"{}\" stroke-width=\"{w}\"",
-                css_rgba(with_alpha(color, item.opacity))
+                " stroke=\"{}\" stroke-width=\"{w}\"{}",
+                css_rgba(with_alpha(color, item.opacity)),
+                svg_stroke_style(item.stroke_style)
             ),
             None => String::new(),
         };
@@ -329,7 +330,7 @@ fn write_matte_mask(
             ));
         }
         let stroke = match item.stroke {
-            Some((_, w)) => format!(" stroke=\"{paint}\" stroke-width=\"{w}\""),
+            Some((_, w)) => format!(" stroke=\"{paint}\" stroke-width=\"{w}\"{}", svg_stroke_style(item.stroke_style)),
             None => String::new(),
         };
         m.push_str(&format!(
@@ -340,6 +341,26 @@ fn write_matte_mask(
     }
     m.push_str("  </mask>\n");
     m
+}
+
+/// Cap, join and miter attributes, empty for SVG's own defaults (which are
+/// PBC's: butt, miter, 4).
+fn svg_stroke_style(s: motion_core::StrokeStyle) -> String {
+    let mut out = String::new();
+    match s.cap {
+        motion_core::LineCap::Butt => {}
+        motion_core::LineCap::Round => out.push_str(" stroke-linecap=\"round\""),
+        motion_core::LineCap::Square => out.push_str(" stroke-linecap=\"square\""),
+    }
+    match s.join {
+        motion_core::LineJoin::Miter => {}
+        motion_core::LineJoin::Round => out.push_str(" stroke-linejoin=\"round\""),
+        motion_core::LineJoin::Bevel => out.push_str(" stroke-linejoin=\"bevel\""),
+    }
+    if s.miter_limit != 4.0 {
+        out.push_str(&format!(" stroke-miterlimit=\"{}\"", s.miter_limit));
+    }
+    out
 }
 
 /// The CSS keyword for a blend mode.
