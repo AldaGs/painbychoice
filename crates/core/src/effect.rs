@@ -108,6 +108,11 @@ macro_rules! effect_fields {
             EffectKind::Emboss { direction, relief, contrast, blend } => (None, vec![direction, relief, contrast, blend]),
             EffectKind::ColorEmboss { direction, relief, contrast, blend } => (None, vec![direction, relief, contrast, blend]),
             EffectKind::Mosaic { horizontal, vertical } => (None, vec![horizontal, vertical]),
+            EffectKind::FractalNoise { contrast, brightness, scale, complexity, evolution, seed } => {
+                (None, vec![contrast, brightness, scale, complexity, evolution, seed])
+            }
+            EffectKind::Colorama { phase, cycles, .. } => (None, vec![phase, cycles]),
+            EffectKind::Unmult => (None, vec![]),
         }
     };
 }
@@ -319,7 +324,30 @@ pub enum EffectKind {
     ColorEmboss { direction: Value<f64>, relief: Value<f64>, contrast: Value<f64>, blend: Value<f64> },
     /// Tiles of `horizontal` x `vertical` blocks across the layer, each its average colour (EffectCraft Mosaic, Sharp Colors off).
     Mosaic { horizontal: Value<f64>, vertical: Value<f64> },
+    /// Replace the layer's colour with grey value noise (AE Fractal Noise,
+    /// Basic type, Linear): `scale` px per cell, `complexity` octaves, `contrast`
+    /// and `brightness` in AE's units, `evolution` in degrees (a revolution
+    /// cycles the pattern), `seed` picks the pattern. Alpha is kept.
+    FractalNoise {
+        contrast: Value<f64>,
+        brightness: Value<f64>,
+        scale: Value<f64>,
+        complexity: Value<f64>,
+        evolution: Value<f64>,
+        seed: Value<f64>,
+    },
+    /// Map each pixel's intensity through a palette (AE Colorama): phase =
+    /// intensity x `cycles` + `phase`, wrapped to 0..1, picks the stop at or
+    /// before it — no interpolation, AE's "Interpolate Palette" off. Up to
+    /// [`COLORAMA_STOPS`] stops, sorted by position.
+    Colorama { phase: Value<f64>, cycles: Value<f64>, palette: Vec<(f64, Color)> },
+    /// Turn black into transparency (AE Unmult): alpha becomes the brightest
+    /// channel and colour is divided by it.
+    Unmult,
 }
+
+/// The most palette stops a [`EffectKind::Colorama`] keeps.
+pub const COLORAMA_STOPS: usize = 16;
 
 impl Effect {
     /// A new, enabled effect of the given kind, seeded with the neutral /
@@ -501,6 +529,20 @@ impl Effect {
                 blend: Value::constant(0.0),
             },
             EffectType::Mosaic => EffectKind::Mosaic { horizontal: Value::constant(10.0), vertical: Value::constant(10.0) },
+            EffectType::FractalNoise => EffectKind::FractalNoise {
+                contrast: Value::constant(100.0),
+                brightness: Value::constant(0.0),
+                scale: Value::constant(100.0),
+                complexity: Value::constant(6.0),
+                evolution: Value::constant(0.0),
+                seed: Value::constant(0.0),
+            },
+            EffectType::Colorama => EffectKind::Colorama {
+                phase: Value::constant(0.0),
+                cycles: Value::constant(1.0),
+                palette: vec![(0.0, Color::rgb(0.0, 0.0, 0.0)), (0.5, Color::rgb(1.0, 1.0, 1.0))],
+            },
+            EffectType::Unmult => EffectKind::Unmult,
         };
         Self::new(kind)
     }
@@ -543,6 +585,9 @@ impl Effect {
             EffectKind::Emboss { .. } => EffectType::Emboss,
             EffectKind::ColorEmboss { .. } => EffectType::ColorEmboss,
             EffectKind::Mosaic { .. } => EffectType::Mosaic,
+            EffectKind::FractalNoise { .. } => EffectType::FractalNoise,
+            EffectKind::Colorama { .. } => EffectType::Colorama,
+            EffectKind::Unmult => EffectType::Unmult,
             EffectKind::RadialBlur { .. } => EffectType::RadialBlur,
         }
     }
@@ -738,6 +783,26 @@ impl Effect {
                 horizontal: horizontal.resolve(ctx).round().max(1.0),
                 vertical: vertical.resolve(ctx).round().max(1.0),
             },
+            EffectKind::FractalNoise { contrast, brightness, scale, complexity, evolution, seed } => {
+                ResolvedEffect::FractalNoise {
+                    contrast: contrast.resolve(ctx),
+                    brightness: brightness.resolve(ctx),
+                    scale: scale.resolve(ctx).max(1.0),
+                    complexity: complexity.resolve(ctx).clamp(1.0, 20.0),
+                    evolution: evolution.resolve(ctx),
+                    seed: seed.resolve(ctx),
+                }
+            }
+            EffectKind::Colorama { phase, cycles, palette } => {
+                let mut stops = [(f64::INFINITY, [0.0; 4]); COLORAMA_STOPS];
+                let mut sorted = palette.clone();
+                sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (slot, (t, c)) in stops.iter_mut().zip(sorted) {
+                    *slot = (t, [c.r, c.g, c.b, c.a]);
+                }
+                ResolvedEffect::Colorama { phase: phase.resolve(ctx), cycles: cycles.resolve(ctx), stops }
+            }
+            EffectKind::Unmult => ResolvedEffect::Unmult,
         })
     }
 
@@ -867,11 +932,14 @@ pub enum EffectType {
     ColorEmboss,
     Mosaic,
     RadialBlur,
+    FractalNoise,
+    Colorama,
+    Unmult,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 35] = [
+    pub const ALL: [EffectType; 38] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
@@ -907,11 +975,14 @@ impl EffectType {
         EffectType::ColorEmboss,
         EffectType::Mosaic,
         EffectType::RadialBlur,
+        EffectType::FractalNoise,
+        EffectType::Colorama,
+        EffectType::Unmult,
     ];
 
     /// The Add menu's groups, in order; AE's Effects & Presets names.
-    pub const CATEGORIES: [&'static str; 5] =
-        ["Blur & Sharpen", "Color Correction", "Keying", "Perspective", "Stylize"];
+    pub const CATEGORIES: [&'static str; 7] =
+        ["Blur & Sharpen", "Channel", "Color Correction", "Keying", "Noise & Grain", "Perspective", "Stylize"];
 
     /// Which of [`Self::CATEGORIES`] this kind is listed under.
     pub fn category(self) -> &'static str {
@@ -925,7 +996,9 @@ impl EffectType {
             ChromaKey | ColorKey => "Keying",
             DropShadow => "Perspective",
             Glow | Posterize | Threshold | ThresholdRgb | FindEdges | Emboss | ColorEmboss
-            | Mosaic => "Stylize",
+            | Mosaic | Colorama => "Stylize",
+            FractalNoise => "Noise & Grain",
+            Unmult => "Channel",
         }
     }
 
@@ -965,6 +1038,9 @@ impl EffectType {
             EffectType::Emboss => "Emboss",
             EffectType::ColorEmboss => "Color Emboss",
             EffectType::Mosaic => "Mosaic",
+            EffectType::FractalNoise => "Fractal Noise",
+            EffectType::Colorama => "Colorama",
+            EffectType::Unmult => "Unmult",
             EffectType::RadialBlur => "Radial Blur",
         }
     }
@@ -1007,6 +1083,9 @@ impl EffectType {
             EffectType::Emboss => "fx.emboss",
             EffectType::ColorEmboss => "fx.color_emboss",
             EffectType::Mosaic => "fx.mosaic",
+            EffectType::FractalNoise => "fx.fractal_noise",
+            EffectType::Colorama => "fx.colorama",
+            EffectType::Unmult => "fx.unmult",
             EffectType::RadialBlur => "fx.radial_blur",
         }
     }
@@ -1159,6 +1238,16 @@ impl EffectType {
                 p!("blend", "Blend With Original", 0.01),
             ],
             EffectType::Mosaic => &[p!("horizontal", "Horizontal Blocks", 1.0), p!("vertical", "Vertical Blocks", 1.0)],
+            EffectType::FractalNoise => &[
+                p!("contrast", "Contrast", 1.0),
+                p!("brightness", "Brightness", 1.0),
+                p!("scale", "Scale", 1.0),
+                p!("complexity", "Complexity", 0.1),
+                p!("evolution", "Evolution", 1.0),
+                p!("seed", "Random Seed", 1.0),
+            ],
+            EffectType::Colorama => &[p!("phase", "Add Phase", 0.01), p!("cycles", "Cycle Repetitions", 0.1)],
+            EffectType::Unmult => &[],
         }
     }
 
@@ -1226,6 +1315,10 @@ pub enum ResolvedEffect {
     ColorEmboss { direction: f64, relief: f64, contrast: f64, blend: f64 },
     Mosaic { horizontal: f64, vertical: f64 },
     RadialBlur { amount: f64, center: (f64, f64), zoom: bool },
+    FractalNoise { contrast: f64, brightness: f64, scale: f64, complexity: f64, evolution: f64, seed: f64 },
+    /// `stops` past the palette's end sit at position infinity.
+    Colorama { phase: f64, cycles: f64, stops: [(f64, [f64; 4]); COLORAMA_STOPS] },
+    Unmult,
 }
 
 #[cfg(test)]
@@ -1335,7 +1428,7 @@ mod tests {
         for ty in EffectType::ALL {
             let e = Effect::seed(ty);
             let n = ty.params().len();
-            assert!(e.num(n - 1).is_some() && e.num(n).is_none(), "{ty:?}");
+            assert!((n == 0 || e.num(n - 1).is_some()) && e.num(n).is_none(), "{ty:?}");
             let d = ty.descriptor();
             for spec in ty.params() {
                 assert!(d.find_input(spec.id).is_some(), "{ty:?}.{}", spec.id);

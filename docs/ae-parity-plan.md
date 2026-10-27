@@ -98,7 +98,15 @@ lower them to native IR**, rather than embedding a JS engine.
 | `thisComp.layer("x").effect("y")("z")` links | ~200 | `Ref` to that layer's `Param` |
 
 Expressions that don't match go to Rhai unchanged when they parse, otherwise
-into the report. Revisit a JS engine (boa/quickjs) only if the report's long
+into the report.
+
+**Status (2026-10-27):** single-line rig expressions translate to Rhai
+(`Importer::script`): `thisComp.layer(..).effect(..)(..)` and bare `effect`
+links are inlined recursively (controllers are matched by their user label),
+plus `thisComp.width/height/frameDuration`, `time`, `value`, `Math.*` and one
+ternary. A clock-free result folds to a constant; a live one stays a script
+where PBC's units are AE's. Expression controls are consumed, not reported.
+The rest of the table is still open. Revisit a JS engine (boa/quickjs) only if the report's long
 tail blocks a real project.
 
 ## Step 4 — Text animators
@@ -118,3 +126,10 @@ Fractal Noise, Colorama, Bulge, Stroke, Simple Choker, Linear Color Key,
 Motion Tile, Spill Suppressor and the single-use tail. Third-party (Deep Glow,
 Shadow Studio) map to PBC's `Glow`/`DropShadow` approximations. Mocha, Bendio
 and loopFlow are out of scope.
+
+**Status (2026-10-27):** imported — Mosaic, Fractal Noise (value noise, not
+AE's exact pattern), Colorama (palette read from the `aRbp` bytes the parser
+now exports; intensity phase, no interpolation) and Unmult; default Offset and
+expression controls are no-ops. The user's own plugins (`aldai HardMosaic`,
+`aldai ColourBlocks`, sources at github.com/AldaGs) are not ported yet;
+ColourBlocks draws the WARM UP 6 break-comp blocks.

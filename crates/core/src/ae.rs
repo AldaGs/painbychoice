@@ -10,13 +10,14 @@
 //! comp's layers are reversed on the way in. Both put the origin at the comp's
 //! top-left with y down, so positions carry over unchanged.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kurbo::Vec2;
 use serde_json::Value as J;
 
 use crate::asset::{Asset, AssetId, AssetKind};
 use crate::composite::{BlendMode, Mask, MatteMode};
+use crate::effect::{Effect, EffectKind};
 use crate::path::{Anchor, VectorPath};
 use crate::pathfinder::BoolOp;
 use crate::node::{Comp, CompId, LayerTiming, Node, NodeId, Project, Shape, Stroke, Transform};
@@ -95,6 +96,9 @@ pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
             report: &mut report,
             next_id: 1,
             fps: num(c, "framerate", 30.0),
+            expr_layers: Vec::new(),
+            expr_layer: J::Null,
+            translated: HashSet::new(),
         }
         .comp(c);
         built.insert(comp_ids[&id(c)], comp);
@@ -194,6 +198,13 @@ struct Importer<'a> {
     report: &'a mut ImportReport,
     next_id: u64,
     fps: f64,
+    /// What an expression can name: the comp's layers (`thisComp.layer`) and
+    /// the layer it sits on (`effect`).
+    expr_layers: Vec<J>,
+    expr_layer: J,
+    /// Expressions on the current layer that became PBC values, so the report
+    /// counts only the rest.
+    translated: HashSet<String>,
 }
 
 impl Importer<'_> {
@@ -209,6 +220,7 @@ impl Importer<'_> {
     fn comp(&mut self, c: &J) -> Comp {
         let mut root = Node::group(1, "root");
         let mut layers = c["layers"].as_array().cloned().unwrap_or_default();
+        self.expr_layers = layers.clone();
         // AE >= 23 can take a matte from the layer *below*; PBC takes it from
         // the one above. The matte layer is consumed rather than drawn, so
         // swapping the pair changes nothing visible.
@@ -257,6 +269,8 @@ impl Importer<'_> {
     /// a source comp makes a precomp, text makes a text layer, shape contents a
     /// shape layer, and no source a null.
     fn layer(&mut self, l: &J, above: Option<u64>) -> Option<Node> {
+        self.expr_layer = l.clone();
+        self.translated.clear();
         let layer_kind = l["kind"].as_str().unwrap_or("");
         if matches!(layer_kind, "camera" | "light" | "model" | "mesh") {
             self.report.drop(format!("{layer_kind} layer"));
@@ -297,8 +311,9 @@ impl Importer<'_> {
         }
         let flags = &l["flags"];
         // A null draws nothing either way, and AE nulls are usually switched
-        // off; that must not hide what links to them.
-        node.hidden = layer_kind != "null" && flags["video"] == J::Bool(false) && flags["audio"] != J::Bool(true);
+        // off; that must not hide what links to them. The audio switch is on
+        // for every layer by default, so it says nothing about sound.
+        node.hidden = layer_kind != "null" && flags["video"] == J::Bool(false);
         if let Some(mode) = l["blendMode"].as_str() {
             match blend_mode(mode) {
                 Some(b) => node.blend = b,
@@ -374,7 +389,14 @@ impl Importer<'_> {
         }
 
         for e in l["effects"].as_array().into_iter().flatten() {
-            self.report.drop(format!("effect: {}", e["name"].as_str().unwrap_or("?")));
+            match self.effect(e, start) {
+                Some(fx) => node.effects.push(fx),
+                // Expression controls draw nothing; expressions read them inline.
+                None if e["matchName"].as_str().is_some_and(|m| m.ends_with(" Control")) => {}
+                // Offset at its defaults (no stored values) moves nothing.
+                None if e["matchName"] == "ADBE Offset" && e["properties"].as_array().is_none_or(|p| p.is_empty()) => {}
+                None => self.report.drop(format!("effect: {}", e["name"].as_str().unwrap_or("?"))),
+            }
         }
         // A mask in mode None does nothing to the layer's alpha in AE either;
         // it is there for effects (Stroke, Trace Path) to read.
@@ -486,12 +508,112 @@ impl Importer<'_> {
         }
     }
 
-    /// Count every expression under `j` into the report. Expressions are not
-    /// evaluated yet (step 3 of the plan), so the property keeps its value.
+    /// An AE expression on `p` rewritten as a PBC (Rhai) script, for the
+    /// patterns rigs are built from: controller and effect references
+    /// (inlined, recursively), `thisComp` size, `time`, `value`, `Math.*`, and
+    /// a ternary. `None` for anything else; the rewrite is only kept if it
+    /// runs.
+    /// `on` is the layer `p` belongs to, which a bare `effect(...)` names.
+    fn script(&self, p: &J, on: &J, depth: u32) -> Option<String> {
+        let src = p["expression"].as_str().map(str::trim).filter(|e| !e.is_empty())?;
+        if depth > 8 || src.contains('\n') && src.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
+            return None;
+        }
+        let mut s = src.trim_end_matches(';').to_string();
+        // References first, while their quoted names are intact.
+        let mut out = String::new();
+        let mut rest = s.as_str();
+        while let Some(i) = [rest.find("thisComp.layer(\""), rest.find("effect(\"")].into_iter().flatten().min() {
+            out.push_str(&rest[..i]);
+            let mut r = &rest[i..];
+            let layer = match r.strip_prefix("thisComp.layer(\"") {
+                Some(t) => {
+                    let (name, t) = quoted(t)?;
+                    r = t.strip_prefix('.')?;
+                    self.expr_layers.iter().find(|l| l["name"] == name)?
+                }
+                None => on,
+            };
+            let (fx, t) = quoted(r.strip_prefix("effect(\"")?)?;
+            let (param, t) = quoted(t.strip_prefix("(\"")?)?;
+            let e = layer["effects"].as_array()?.iter().find(|e| e["label"] == fx || e["name"] == fx)?;
+            let q = e["properties"].as_array()?.iter().find(|q| q["name"] == param)?;
+            let v = match self.script(q, layer, depth + 1) {
+                Some(inner) => inner,
+                None if q["matchName"].as_str().is_some_and(|m| m.contains("Checkbox")) => (nums(&q["value"]).first().is_some_and(|v| *v != 0.0)).to_string(),
+                None => literal(&nums(&q["value"]))?,
+            };
+            out.push_str(&format!("({v})"));
+            rest = t;
+        }
+        out.push_str(rest);
+        s = out;
+        for (from, to) in [
+            ("thisComp.width", format!("{:?}", self.comp_size.x)),
+            ("thisComp.height", format!("{:?}", self.comp_size.y)),
+            ("thisComp.frameDuration", format!("{:?}", 1.0 / self.fps)),
+            ("Math.PI", "PI()".into()),
+            ("Math.ceil", "ceiling".into()),
+            ("Math.", "".into()),
+        ] {
+            s = s.replace(from, &to);
+        }
+        s = floats(&s);
+        s = word(&s, "time", &format!("(frame / {:?})", self.fps));
+        s = word(&s, "value", &literal(&nums(&p["value"]))?);
+        // `c ? a : b` → `if c { a } else { b }`, one level deep.
+        if let (Some(q), Some(c)) = (s.find('?'), s.rfind(':')) {
+            if q < c {
+                s = format!("if {} {{ {} }} else {{ {} }}", &s[..q].trim(), s[q + 1..c].trim(), s[c + 1..].trim());
+            }
+        }
+        crate::expr::eval_script(&s, 0.0).ok()?;
+        Some(s)
+    }
+
+    /// The PBC effect for an AE one, where PBC has it. Parameters are read by
+    /// their AE match name, `<effect>-<4-digit index>`.
+    fn effect(&mut self, e: &J, start: f64) -> Option<Effect> {
+        let mn = e["matchName"].as_str()?;
+        let props = e["properties"].as_array().cloned().unwrap_or_default();
+        let mut f = |i: u32, or: f64| {
+            let p = prop(&props, &format!("{mn}-{i:04}"));
+            self.value(p, start, or, |v| v.first().copied(), |a, b| (a - b).abs())
+        };
+        let kind = match mn {
+            "ADBE Mosaic" => EffectKind::Mosaic { horizontal: f(1, 10.0), vertical: f(2, 10.0) },
+            "ADBE Fractal Noise" => EffectKind::FractalNoise {
+                contrast: f(4, 100.0),
+                brightness: f(5, 0.0),
+                scale: f(10, 100.0),
+                complexity: f(15, 6.0),
+                evolution: f(23, 0.0),
+                seed: f(27, 0.0),
+            },
+            "APC Colorama" => {
+                let (phase, cycles) = (f(4, 0.0), f(38, 1.0));
+                let arb = prop(&props, "APC Colorama-0012").and_then(|p| p["arb"].as_str()).unwrap_or("");
+                let palette = colorama_palette(arb);
+                if palette.is_empty() {
+                    return None;
+                }
+                EffectKind::Colorama { phase, cycles, palette }
+            }
+            "ADBE Unmult" => EffectKind::Unmult,
+            _ => return None,
+        };
+        Some(Effect::new(kind))
+    }
+
+    /// Count every expression under `j` that was not translated into the
+    /// report; those properties keep their static value.
     fn count_expressions(&mut self, j: &J) {
         match j {
+            // An expression control's own expression is inlined where it is read.
+            J::Object(o) if o.get("matchName").and_then(J::as_str).is_some_and(|m| m.ends_with(" Control")) => {}
             J::Object(o) => {
-                if o.get("expression").and_then(J::as_str).is_some_and(|e| !e.is_empty()) {
+                let e = o.get("expression").and_then(J::as_str).unwrap_or("");
+                if !e.is_empty() && !self.translated.contains(e) {
                     self.report.drop("expression");
                 }
                 for v in o.values() {
@@ -735,6 +857,23 @@ impl Importer<'_> {
         T: crate::expr::FromExpr + crate::expr::ToExpr,
     {
         let Some(p) = p else { return Value::constant(or) };
+        if let Some(src) = self.script(p, &self.expr_layer, 0) {
+            // A script that ignores the clock folds to a constant through the
+            // usual unit conversion. A live one is kept only where PBC's units
+            // are AE's, since nothing converts its output each frame.
+            let probe = crate::expr::eval_script(&src, 0.0).ok();
+            let via = probe.as_ref().map(expr_nums).and_then(|v| conv(&v));
+            let direct = probe.and_then(T::from_expr);
+            let kept = match (src.contains("frame"), via, direct) {
+                (false, Some(v), _) => Some(Value::constant(v)),
+                (true, Some(v), Some(d)) if dist(&v, &d) < 1e-9 => Some(Value::expr(crate::expr::Expr::Script(src))),
+                _ => None,
+            };
+            if let Some(v) = kept {
+                self.translated.insert(p["expression"].as_str().unwrap_or("").to_string());
+                return v;
+            }
+        }
         let Some(keys) = p["keyframes"].as_array().filter(|k| !k.is_empty()) else {
             return Value::constant(conv(&nums(&p["value"])).unwrap_or(or));
         };
@@ -772,6 +911,93 @@ impl Importer<'_> {
         }
         Value::Keyframed(Track::new(keys_out))
     }
+}
+
+/// Colorama's Output Cycle palette from its raw parameter bytes (hex): 8-byte
+/// stops, a big-endian u32 position out of 65535 then ARGB, ended by an empty
+/// stop. Positions become 0..1.
+fn colorama_palette(hex: &str) -> Vec<(f64, Color)> {
+    let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect();
+    let mut out = Vec::new();
+    for (i, st) in bytes.chunks_exact(8).enumerate() {
+        if i > 0 && st.iter().all(|&b| b == 0) || out.len() == crate::effect::COLORAMA_STOPS {
+            break;
+        }
+        let pos = u32::from_be_bytes([st[0], st[1], st[2], st[3]]) as f64 / 65535.0;
+        let c = |k: usize| st[k] as f64 / 255.0;
+        out.push((pos, Color { r: c(5), g: c(6), b: c(7), a: c(4) }));
+    }
+    out
+}
+
+/// A script result's components, the way the exporter writes values.
+fn expr_nums(v: &crate::expr::ExprValue) -> Vec<f64> {
+    use crate::expr::ExprValue as E;
+    match v {
+        E::Num(n) => vec![*n],
+        E::Vec3(p) => vec![p.x, p.y, p.z],
+        E::Color(c) => vec![c.r, c.g, c.b, c.a],
+        _ => Vec::new(),
+    }
+}
+
+/// The name in `name")rest` and what follows its closing `")`.
+fn quoted(s: &str) -> Option<(&str, &str)> {
+    let end = s.find("\")")?;
+    Some((&s[..end], &s[end + 2..]))
+}
+
+/// A property value as a script literal: a number, or an array.
+fn literal(v: &[f64]) -> Option<String> {
+    match v {
+        [] => None,
+        [x] => Some(format!("{x:?}")),
+        v => Some(format!("[{}]", v.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>().join(", "))),
+    }
+}
+
+/// Integer literals as floats: AE's numbers are all doubles, and Rhai would
+/// otherwise do integer division on `1/2`.
+fn floats(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i] as char;
+        let prev = if i == 0 { ' ' } else { b[i - 1] as char };
+        if c.is_ascii_digit() && !(prev.is_alphanumeric() || prev == '_' || prev == '.') {
+            let start = i;
+            while i < b.len() && (b[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            out.push_str(&s[start..i]);
+            let next = b.get(i).map(|&c| c as char);
+            if next != Some('.') && !next.is_some_and(|c| c.is_alphabetic()) {
+                out.push_str(".0");
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// `s` with every whole-word `w` (not a property access like `x.w`) replaced.
+fn word(s: &str, w: &str, with: &str) -> String {
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(j) = s[i..].find(w).map(|j| j + i) {
+        let before = s[..j].chars().next_back();
+        let after = s[j + w.len()..].chars().next();
+        out.push_str(&s[i..j]);
+        let after_ident = after.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        out.push_str(if ident(before) || after_ident { w } else { with });
+        i = j + w.len();
+    }
+    out.push_str(&s[i..]);
+    out
 }
 
 /// Move a position-like value by `d`, keyframes and all. An expression is
@@ -816,6 +1042,36 @@ fn prop<'a>(props: &'a [J], match_name: &str) -> Option<&'a J> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rig_expressions_and_grid_effects_import() {
+        // A controller layer drives a Mosaic through a nested, checkbox-gated
+        // expression, and a Colorama carries its palette as raw bytes.
+        let json = r##"{"root":{"id":0,"type":"Folder","children":[
+          {"id":1,"name":"Main","type":"Composition","width":900,"height":300,"framerate":24,"seconds":2,"layers":[
+            {"index":1,"name":"CTRL","kind":"null","sourceId":0,"flags":{"video":false},"effects":[
+              {"matchName":"ADBE Checkbox Control","label":"Link","properties":[{"name":"Checkbox","matchName":"ADBE Checkbox Control-0001","value":[1]}]},
+              {"matchName":"ADBE Slider Control","label":"W","properties":[{"name":"Slider","matchName":"ADBE Slider Control-0001","value":[150]}]},
+              {"matchName":"ADBE Slider Control","label":"H","properties":[{"name":"Slider","matchName":"ADBE Slider Control-0001","value":[7],
+                "expression":"(effect(\"Link\")(\"Checkbox\") == true) ? effect(\"W\")(\"Slider\") : value;"}]}]},
+            {"index":2,"name":"GRID","sourceId":0,"flags":{"video":false},"effects":[
+              {"matchName":"ADBE Mosaic","properties":[
+                {"matchName":"ADBE Mosaic-0002","value":[2],"expression":"Math.round(thisComp.height/thisComp.layer(\"CTRL\").effect(\"H\")(\"Slider\"))"}]},
+              {"matchName":"ADBE Fractal Noise","properties":[{"matchName":"ADBE Fractal Noise-0023","value":[0],"expression":"time * 10"}]},
+              {"matchName":"APC Colorama","properties":[{"matchName":"APC Colorama-0012","arb":"00000000ffff000000008000ff0000ff000000000000000000000000"}]}]}]}]}}"##;
+        let (p, report) = import(json).unwrap();
+        let grid = &p.root_comp().root.children[0];
+        assert!(grid.hidden, "video off hides a layer whatever its audio switch says");
+        let EffectKind::Mosaic { vertical, .. } = &grid.effects[0].kind else { panic!("{:?}", grid.effects) };
+        assert_eq!(vertical, &Value::constant(2.0), "300 / 150, through the gated H slider");
+        let EffectKind::FractalNoise { evolution, .. } = &grid.effects[1].kind else { panic!() };
+        assert!(evolution.is_expr(), "time-driven stays live");
+        let EffectKind::Colorama { palette, .. } = &grid.effects[2].kind else { panic!() };
+        assert_eq!(palette.len(), 2);
+        assert_eq!(palette[1].0, 32768.0 / 65535.0);
+        assert_eq!(palette[1].1, Color::rgb(0.0, 0.0, 1.0));
+        assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+    }
 
     #[test]
     fn ae_ease_becomes_matching_handles() {
@@ -883,6 +1139,9 @@ mod tests {
             report: &mut report,
             next_id: 1,
             fps: 10.0,
+            expr_layers: Vec::new(),
+            expr_layer: J::Null,
+            translated: HashSet::new(),
         };
         let path = im.path(&shape, 0.0, Vec2::new(1.0, 1.0), Vec2::ZERO);
         assert!(path.closed);
@@ -946,6 +1205,9 @@ mod tests {
             report: &mut report,
             next_id: 1,
             fps: 10.0,
+            expr_layers: Vec::new(),
+            expr_layer: J::Null,
+            translated: HashSet::new(),
         };
         let out = im.shape_items(&items, 0.0);
         assert_eq!(out.len(), 1);

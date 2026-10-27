@@ -77,6 +77,9 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             | ResolvedEffect::Emboss { .. }
             | ResolvedEffect::ColorEmboss { .. }
             | ResolvedEffect::Mosaic { .. }
+            | ResolvedEffect::FractalNoise { .. }
+            | ResolvedEffect::Colorama { .. }
+            | ResolvedEffect::Unmult
             | ResolvedEffect::RadialBlur { .. } => rgb,
             ResolvedEffect::TonalBalance { sh, mid, hi } => tonal_balance(rgb, sh, mid, hi),
             ResolvedEffect::Curves { ys } => curves(rgb, ys),
@@ -115,6 +118,9 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
                 | ResolvedEffect::Emboss { .. }
                 | ResolvedEffect::ColorEmboss { .. }
                 | ResolvedEffect::Mosaic { .. }
+                | ResolvedEffect::FractalNoise { .. }
+                | ResolvedEffect::Colorama { .. }
+                | ResolvedEffect::Unmult
                 | ResolvedEffect::RadialBlur { .. }
         )
     })
@@ -185,6 +191,100 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::ColorEmboss { direction, relief, contrast, blend } => emboss(px, width, height, direction, relief, contrast as f32, blend as f32, true),
         ResolvedEffect::Mosaic { horizontal, vertical } => mosaic(px, width, height, horizontal as usize, vertical as usize),
         ResolvedEffect::RadialBlur { amount, center, zoom } => radial_blur(px, width, height, amount, center, zoom),
+        ResolvedEffect::FractalNoise { contrast, brightness, scale, complexity, evolution, seed } => {
+            fractal_noise(px, width, contrast, brightness, scale, complexity, evolution, seed)
+        }
+        ResolvedEffect::Colorama { phase, cycles, ref stops } => colorama(px, phase, cycles, stops),
+        ResolvedEffect::Unmult => unmult(px),
+    }
+}
+
+/// Grey fractal value noise over every covered pixel, alpha kept. Octaves
+/// follow AE's defaults: each one 56% the size and 70% the weight of the
+/// last. Evolution moves through a third noise axis, one cell per revolution.
+#[allow(clippy::too_many_arguments)]
+fn fractal_noise(px: &mut [u8], width: usize, contrast: f64, brightness: f64, scale: f64, complexity: f64, evolution: f64, seed: f64) {
+    let z = evolution / 360.0;
+    let seed = seed as i64 as u32;
+    let octaves = complexity.ceil() as usize;
+    for (i, p) in px.chunks_exact_mut(4).enumerate() {
+        if p[3] == 0 {
+            continue;
+        }
+        let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+        let (mut sum, mut norm, mut amp, mut freq) = (0.0, 0.0, 1.0, 1.0 / scale);
+        for o in 0..octaves {
+            // A fractional last octave fades in, as AE's Complexity does.
+            let w = if o + 1 == octaves { complexity - o as f64 } else { 1.0 };
+            sum += value_noise(x * freq, y * freq, z, seed.wrapping_add(o as u32 * 101)) * amp * w;
+            norm += amp * w;
+            amp *= 0.7;
+            freq /= 0.56;
+        }
+        let v = ((sum / norm - 0.5) * contrast / 100.0 + 0.5 + brightness / 100.0).clamp(0.0, 1.0);
+        let g = (v * 255.0).round() as u8;
+        p[..3].fill(g);
+    }
+}
+
+/// Smoothly interpolated lattice noise in 0..1.
+fn value_noise(x: f64, y: f64, z: f64, seed: u32) -> f64 {
+    let hash = |x: i64, y: i64, z: i64| {
+        let mut h = (x as u32).wrapping_mul(0x8da6_b343) ^ (y as u32).wrapping_mul(0xd816_3841) ^ (z as u32).wrapping_mul(0xcb1a_b31f) ^ seed.wrapping_mul(0x27d4_eb2d);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        (h & 0xffff) as f64 / 65535.0
+    };
+    let (fx, fy, fz) = (x.floor(), y.floor(), z.floor());
+    let s = |t: f64| t * t * (3.0 - 2.0 * t);
+    let (tx, ty, tz) = (s(x - fx), s(y - fy), s(z - fz));
+    let (ix, iy, iz) = (fx as i64, fy as i64, fz as i64);
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let plane = |k: i64| {
+        lerp(
+            lerp(hash(ix, iy, k), hash(ix + 1, iy, k), tx),
+            lerp(hash(ix, iy + 1, k), hash(ix + 1, iy + 1, k), tx),
+            ty,
+        )
+    };
+    lerp(plane(iz), plane(iz + 1), tz)
+}
+
+/// AE Colorama with the input phase taken from intensity: each covered pixel
+/// becomes the palette stop at or before its phase.
+fn colorama(px: &mut [u8], phase: f64, cycles: f64, stops: &[(f64, [f64; 4])]) {
+    let n = stops.iter().take_while(|s| s.0.is_finite()).count();
+    if n == 0 {
+        return;
+    }
+    for p in px.chunks_exact_mut(4) {
+        if p[3] == 0 {
+            continue;
+        }
+        let i = (p[0] as f64 * 0.299 + p[1] as f64 * 0.587 + p[2] as f64 * 0.114) / 255.0;
+        let t = (i * cycles + phase).rem_euclid(1.0);
+        // Before the first stop the palette wraps round to the last.
+        let k = stops[..n].iter().rposition(|s| s.0 <= t).unwrap_or(n - 1);
+        let c = stops[k].1;
+        for ch in 0..3 {
+            p[ch] = (c[ch].clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+}
+
+/// AE Unmult: black becomes transparent, colour is divided back out.
+fn unmult(px: &mut [u8]) {
+    for p in px.chunks_exact_mut(4) {
+        let m = p[0].max(p[1]).max(p[2]);
+        if m == 0 {
+            p[3] = 0;
+            continue;
+        }
+        for ch in 0..3 {
+            p[ch] = ((p[ch] as u32 * 255) / m as u32) as u8;
+        }
+        p[3] = ((p[3] as u32 * m as u32) / 255) as u8;
     }
 }
 
@@ -1087,6 +1187,17 @@ mod tests {
     }
 
     /// A full tint replaces the colour outright and leaves alpha alone.
+    #[test]
+    fn colorama_steps_through_its_palette_and_unmult_drops_black() {
+        let mut stops = [(f64::INFINITY, [0.0; 4]); motion_core::effect::COLORAMA_STOPS];
+        stops[0] = (0.0, [0.0, 0.0, 0.0, 1.0]);
+        stops[1] = (0.5, [1.0, 0.0, 0.0, 1.0]);
+        // Dark grey sits before the second stop, light grey after it.
+        let mut px = vec![60, 60, 60, 255, 200, 200, 200, 255];
+        apply_stack(&mut px, 2, 1, &[ResolvedEffect::Colorama { phase: 0.0, cycles: 1.0, stops }, ResolvedEffect::Unmult]);
+        assert_eq!(px, vec![0, 0, 0, 0, 255, 0, 0, 255]);
+    }
+
     #[test]
     fn a_full_tint_replaces_the_colour() {
         let mut px = solid([10, 20, 30, 200], 4);
