@@ -123,6 +123,20 @@ by character/word/line, shape: square/ramp/smooth) + the expression selector.
 Per-glyph transforms are applied after shaping. Done when the Type Array
 layers animate like AE.
 
+**Status (2026-10-27):** in, on `Node::text_animators` rather than the shape.
+Position and Opacity animators; Range selectors (Square shape, percent) and
+the Type Array expression selector as a native `Stagger` (Influence curve,
+Delay/Shift frames, Reverse, marker delays). Units: chars, chars excluding
+spaces, words, lines. Eval emits each run of equally-moved glyphs as its own
+item. Not yet: other animator properties (fill colour, scale, rotation,
+tracking), animated animator values, other range shapes, index units.
+The parser now exports layer markers and falls back to a control's `pard`
+value when its value was never stored (Type Array's Delay default is 2).
+
+Found on the way: the importer subtracted the layer start from key times,
+which are already layer time — every keyed property on a late-starting
+layer ran early. Fixed.
+
 ## Step 5 — Effects
 
 Port in this order (count in the references): Fill (71), Offset (57),

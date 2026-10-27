@@ -20,7 +20,7 @@ use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::effect::{Effect, EffectKind};
 use crate::path::{Anchor, VectorPath};
 use crate::pathfinder::BoolOp;
-use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, StrokeStyle, Shape, Stroke, Transform};
+use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
 use crate::vec3::Vec3;
@@ -281,7 +281,7 @@ impl Importer<'_> {
         // Keyframe times are comp times; PBC keys are on the layer's local
         // clock, which starts at `startTime`.
         let props = l["transform"].as_array().cloned().unwrap_or_default();
-        node.transform = self.transform(&props, start, true);
+        node.transform = self.transform(&props, true);
         // The exporter leaves out properties at their default, and AE's
         // defaults are not zero: a layer sits at the comp centre, and a layer
         // with a sized source (footage, solid, precomp) turns about its centre.
@@ -348,16 +348,15 @@ impl Importer<'_> {
             node.precomp = Some(comp);
         } else if let Some(text) = l["text"].as_str() {
             self.text(&mut node, text, &l["textStyle"]);
-            if l["textProperties"]["properties"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|p| p["matchName"] == "ADBE Text Animators" && p["properties"].as_array().is_some_and(|a| !a.is_empty()))
-            {
-                self.report.drop("text animators");
+            let groups = l["textProperties"]["properties"].as_array().cloned().unwrap_or_default();
+            let animators = prop(&groups, "ADBE Text Animators").and_then(|a| a["properties"].as_array()).cloned().unwrap_or_default();
+            for a in &animators {
+                if let Some(t) = self.text_animator(a, l) {
+                    node.text_animators.push(t);
+                }
             }
         } else if let Some(contents) = l["contents"].as_array() {
-            node.children = self.shape_items(contents, start);
+            node.children = self.shape_items(contents);
         } else if let Some(item) = self.items.get(&source).filter(|i| kind(i) == "Footage") {
             let size = Vec2::new(num(item, "width", 0.0), num(item, "height", 0.0));
             mask_space = (size, Vec2::ZERO);
@@ -389,10 +388,11 @@ impl Importer<'_> {
         }
 
         for e in l["effects"].as_array().into_iter().flatten() {
-            match self.effect(e, start) {
+            match self.effect(e) {
                 Some(fx) => node.effects.push(fx),
                 // Expression controls draw nothing; expressions read them inline.
-                None if e["matchName"].as_str().is_some_and(|m| m.ends_with(" Control")) => {}
+                // Type Array's controls are read by its text animator.
+                None if e["matchName"].as_str().is_some_and(|m| m.ends_with(" Control") || m.starts_with("Pseudo/Type Array")) => {}
                 // Offset at its defaults (no stored values) moves nothing.
                 None if e["matchName"] == "ADBE Offset" && e["properties"].as_array().is_none_or(|p| p.is_empty()) => {}
                 None => self.report.drop(format!("effect: {}", e["name"].as_str().unwrap_or("?"))),
@@ -408,7 +408,7 @@ impl Importer<'_> {
             let inverted = (m["inverted"] == true) != (m["maskMode"] == "subtract");
             match (m["maskMode"].as_str(), prop(&props, "ADBE Mask Shape").filter(|p| p["path"].is_object())) {
                 (Some("add" | "subtract") | None, Some(p)) => {
-                    let path = self.path(p, start, mask_space.0, mask_space.1);
+                    let path = self.path(p, mask_space.0, mask_space.1);
                     node.mask = Some(Mask { inverted, ..Mask::new(Shape::Vector { path }) });
                 }
                 (_, None) => self.report.drop("mask without a path"),
@@ -572,14 +572,105 @@ impl Importer<'_> {
         Some(s)
     }
 
+    /// One AE text animator: its Position and Opacity, and its first selector
+    /// — a Range selector (Square shape), or the Type Array expression
+    /// selector, which becomes a stagger read from the layer's Type Array
+    /// effect. Anything else is reported.
+    fn text_animator(&mut self, a: &J, l: &J) -> Option<TextAnimator> {
+        let groups = a["properties"].as_array().cloned().unwrap_or_default();
+        let props = prop(&groups, "ADBE Text Animator Properties").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
+        let selectors = prop(&groups, "ADBE Text Selectors").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
+        let mut position = Vec2::ZERO;
+        let mut opacity = None;
+        for p in &props {
+            let v = nums(&p["value"]);
+            if p["keyframes"].as_array().is_some_and(|k| !k.is_empty()) || p["expression"].as_str().is_some_and(|e| !e.is_empty()) {
+                self.report.drop("text animator property: animated (static value kept)");
+            }
+            match p["matchName"].as_str().unwrap_or("") {
+                "ADBE Text Position 3D" if v.len() >= 2 => position = Vec2::new(v[0], v[1]),
+                "ADBE Text Opacity" if !v.is_empty() => opacity = Some(v[0] / 100.0),
+                m => self.report.drop(format!("text animator property: {m}")),
+            }
+        }
+        let Some(sel) = selectors.first() else { return None };
+        if selectors.len() > 1 {
+            self.report.drop("text animator: additional selector");
+        }
+        let sp = sel["properties"].as_array().cloned().unwrap_or_default();
+        let unit = |code: Option<f64>| match code.unwrap_or(1.0) as i64 {
+            2 => TextUnit::CharsExcludingSpaces,
+            3 => TextUnit::Words,
+            4 => TextUnit::Lines,
+            _ => TextUnit::Chars,
+        };
+        let code = |props: &[J], m: &str| prop(props, m).and_then(|p| nums(&p["value"]).first().copied());
+        let pct = |me: &mut Self, m: &str, or: f64| me.value(prop(&sp, m), or, |v| v.first().copied(), |a, b| (a - b).abs());
+        let (based_on, selector) = match sel["matchName"].as_str().unwrap_or("") {
+            "ADBE Text Selector" => {
+                let adv = prop(&sp, "ADBE Text Range Advanced").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
+                if code(&adv, "ADBE Text Range Shape").is_some_and(|s| s != 1.0) {
+                    self.report.drop("text range selector shape (Square used)");
+                }
+                if code(&adv, "ADBE Text Range Units").is_some_and(|u| u == 2.0) {
+                    self.report.drop("text range selector by index");
+                }
+                let sel = TextSelector::Range {
+                    start: pct(self, "ADBE Text Percent Start", 0.0),
+                    end: pct(self, "ADBE Text Percent End", 100.0),
+                    offset: pct(self, "ADBE Text Percent Offset", 0.0),
+                };
+                (unit(code(&adv, "ADBE Text Range Type2")), sel)
+            }
+            "ADBE Text Expressible Selector" => {
+                let amount = prop(&sp, "ADBE Text Expressible Amount")?;
+                let expr = amount["expression"].as_str().unwrap_or("");
+                if !expr.contains("Type Array") {
+                    return None;
+                }
+                self.translated.insert(expr.to_string());
+                // The selector's name picks the effect: "<Name> - Selector 1".
+                let label = sel["label"].as_str().unwrap_or("");
+                let name = label.split('<').nth(1).and_then(|r| r.split('>').next()).unwrap_or("Type Array");
+                let fx = l["effects"].as_array()?.iter().find(|e| {
+                    e["matchName"].as_str().is_some_and(|m| m.starts_with("Pseudo/Type Array")) && (e["label"] == name || e["name"] == name)
+                })?;
+                let fp = fx["properties"].as_array().cloned().unwrap_or_default();
+                let mn = fx["matchName"].as_str().unwrap_or("");
+                let ctl = |i: u32| prop(&fp, &format!("{mn}-{i:04}")).and_then(|p| nums(&p["value"]).first().copied()).unwrap_or(0.0);
+                let influence = prop(&fp, &format!("{mn}-0001")).cloned();
+                // With Use Markers on, a layer marker sets each unit's delay
+                // from the curve's first key.
+                let first_key = influence.as_ref().and_then(|p| p["keyframes"][0]["time"].as_f64()).unwrap_or(0.0);
+                let delays = match ctl(4) != 0.0 {
+                    true => nums(&l["markers"]).iter().map(|m| (m - first_key) * self.fps).collect(),
+                    false => Vec::new(),
+                };
+                let sel = TextSelector::Stagger {
+                    amount: self.value(influence.as_ref(), 100.0, |v| v.first().copied(), |a, b| (a - b).abs()),
+                    delays,
+                    step: ctl(2),
+                    shift: ctl(3),
+                    reverse: ctl(5) != 0.0,
+                };
+                (unit(code(&sp, "ADBE Text Range Type2")), sel)
+            }
+            m => {
+                self.report.drop(format!("text selector: {m}"));
+                return None;
+            }
+        };
+        Some(TextAnimator { based_on, selector, position, opacity })
+    }
+
     /// The PBC effect for an AE one, where PBC has it. Parameters are read by
     /// their AE match name, `<effect>-<4-digit index>`.
-    fn effect(&mut self, e: &J, start: f64) -> Option<Effect> {
+    fn effect(&mut self, e: &J) -> Option<Effect> {
         let mn = e["matchName"].as_str()?;
         let props = e["properties"].as_array().cloned().unwrap_or_default();
         let mut f = |i: u32, or: f64| {
             let p = prop(&props, &format!("{mn}-{i:04}"));
-            self.value(p, start, or, |v| v.first().copied(), |a, b| (a - b).abs())
+            self.value(p, or, |v| v.first().copied(), |a, b| (a - b).abs())
         };
         let kind = match mn {
             "ADBE Mosaic" => EffectKind::Mosaic { horizontal: f(1, 10.0), vertical: f(2, 10.0) },
@@ -629,17 +720,17 @@ impl Importer<'_> {
     /// A shape layer's contents, or a shape group's. Each AE group becomes a
     /// group node; its paths become leaves carrying the group's fill and
     /// stroke, which in AE paint every path above them in the same group.
-    fn shape_items(&mut self, items: &[J], start: f64) -> Vec<Node> {
+    fn shape_items(&mut self, items: &[J]) -> Vec<Node> {
         let find = |m: &str| items.iter().find(|i| i["matchName"] == m);
         let fill = find("ADBE Vector Graphic - Fill").map(|f| {
             let props = f["properties"].as_array().cloned().unwrap_or_default();
-            self.color(prop(&props, "ADBE Vector Fill Color"), start, Color::rgb(1.0, 0.0, 0.0))
+            self.color(prop(&props, "ADBE Vector Fill Color"), Color::rgb(1.0, 0.0, 0.0))
         });
         let stroke = find("ADBE Vector Graphic - Stroke").map(|s| {
             let props = s["properties"].as_array().cloned().unwrap_or_default();
             Stroke {
-                color: self.color(prop(&props, "ADBE Vector Stroke Color"), start, Color::rgb(1.0, 1.0, 1.0)),
-                width: self.scalar(prop(&props, "ADBE Vector Stroke Width"), start, 1.0, 2.0),
+                color: self.color(prop(&props, "ADBE Vector Stroke Color"), Color::rgb(1.0, 1.0, 1.0)),
+                width: self.scalar(prop(&props, "ADBE Vector Stroke Width"), 1.0, 2.0),
                 style: stroke_style(&props),
             }
         });
@@ -655,23 +746,23 @@ impl Importer<'_> {
                     let tf = prop(&props, "ADBE Vector Transform Group")
                         .and_then(|t| t["properties"].as_array().cloned())
                         .unwrap_or_default();
-                    g.transform = self.transform(&tf, start, false);
+                    g.transform = self.transform(&tf, false);
                     let contents = prop(&props, "ADBE Vectors Group")
                         .and_then(|c| c["properties"].as_array().cloned())
                         .unwrap_or_default();
-                    g.children = self.shape_items(&contents, start);
+                    g.children = self.shape_items(&contents);
                     out.push(g);
                     continue;
                 }
                 "ADBE Vector Shape - Rect" => Some(Shape::Rect {
-                    size: self.vec2(prop(&props, "ADBE Vector Rect Size"), start),
-                    radius: self.scalar(prop(&props, "ADBE Vector Rect Roundness"), start, 1.0, 0.0),
+                    size: self.vec2(prop(&props, "ADBE Vector Rect Size")),
+                    radius: self.scalar(prop(&props, "ADBE Vector Rect Roundness"), 1.0, 0.0),
                 }),
                 "ADBE Vector Shape - Ellipse" => {
-                    Some(Shape::Ellipse { size: self.vec2(prop(&props, "ADBE Vector Ellipse Size"), start) })
+                    Some(Shape::Ellipse { size: self.vec2(prop(&props, "ADBE Vector Ellipse Size")) })
                 }
                 "ADBE Vector Shape - Group" => match prop(&props, "ADBE Vector Shape") {
-                    Some(p) if p["path"].is_object() => Some(Shape::Vector { path: self.path(p, start, Vec2::new(1.0, 1.0), Vec2::ZERO) }),
+                    Some(p) if p["path"].is_object() => Some(Shape::Vector { path: self.path(p, Vec2::new(1.0, 1.0), Vec2::ZERO) }),
                     _ => {
                         self.report.drop("bezier path (no vertices in export)");
                         None
@@ -712,21 +803,21 @@ impl Importer<'_> {
     }
 
     /// A layer transform or a shape group's. AE scale and opacity are percent.
-    fn transform(&mut self, props: &[J], start: f64, layer: bool) -> Transform {
+    fn transform(&mut self, props: &[J], layer: bool) -> Transform {
         let (anchor, pos, scale, opacity) = if layer {
             ("ADBE Anchor Point", "ADBE Position", "ADBE Scale", "ADBE Opacity")
         } else {
             ("ADBE Vector Anchor", "ADBE Vector Position", "ADBE Vector Scale", "ADBE Vector Group Opacity")
         };
         let mut t = Transform::default();
-        t.anchor = self.vec3(prop(props, anchor), start, 1.0, Vec3::ZERO);
-        t.position = self.position(props, pos, start);
-        t.scale = self.vec3(prop(props, scale), start, 0.01, Vec3::ONE);
-        t.opacity = self.scalar(prop(props, opacity), start, 0.01, 1.0);
+        t.anchor = self.vec3(prop(props, anchor), 1.0, Vec3::ZERO);
+        t.position = self.position(props, pos);
+        t.scale = self.vec3(prop(props, scale), 0.01, Vec3::ONE);
+        t.opacity = self.scalar(prop(props, opacity), 0.01, 1.0);
         let rz = if layer { "ADBE Rotate Z" } else { "ADBE Vector Rotation" };
-        let z = self.scalar(prop(props, rz), start, 1.0, 0.0);
-        let x = layer.then(|| self.scalar(prop(props, "ADBE Rotate X"), start, 1.0, 0.0));
-        let y = layer.then(|| self.scalar(prop(props, "ADBE Rotate Y"), start, 1.0, 0.0));
+        let z = self.scalar(prop(props, rz), 1.0, 0.0);
+        let x = layer.then(|| self.scalar(prop(props, "ADBE Rotate X"), 1.0, 0.0));
+        let y = layer.then(|| self.scalar(prop(props, "ADBE Rotate Y"), 1.0, 0.0));
         let c = |v: &Option<Value<f64>>| match v {
             Some(Value::Const(v)) => *v,
             _ => 0.0,
@@ -750,13 +841,13 @@ impl Importer<'_> {
 
     /// Position, joined or separated. The export carries both forms; the
     /// separated X/Y win only when they are the ones animated.
-    fn position(&mut self, props: &[J], joined: &str, start: f64) -> Value<Vec3> {
+    fn position(&mut self, props: &[J], joined: &str) -> Value<Vec3> {
         let animated = |p: Option<&J>| p.is_some_and(|p| p.get("keyframes").is_some());
         let (px, py) = (prop(props, "ADBE Position_0"), prop(props, "ADBE Position_1"));
         if !animated(prop(props, joined)) && (animated(px) || animated(py)) {
             self.report.drop("separated position (X only kept)");
-            let x = self.scalar(px, start, 1.0, 0.0);
-            let y = match self.scalar(py, start, 1.0, 0.0) {
+            let x = self.scalar(px, 1.0, 0.0);
+            let y = match self.scalar(py, 1.0, 0.0) {
                 Value::Const(y) => y,
                 _ => 0.0,
             };
@@ -766,7 +857,7 @@ impl Importer<'_> {
                 Value::Expr(e) => Value::Expr(e),
             };
         }
-        self.vec3(prop(props, joined), start, 1.0, Vec3::ZERO)
+        self.vec3(prop(props, joined), 1.0, Vec3::ZERO)
     }
 
     /// A bezier path. Animated paths become one track per point and handle,
@@ -774,7 +865,7 @@ impl Importer<'_> {
     /// conversion is the same one every other property gets. A path whose
     /// point count changes between keys cannot morph point-for-point; it keeps
     /// its first shape.
-    fn path(&mut self, p: &J, start: f64, scale: Vec2, offset: Vec2) -> VectorPath {
+    fn path(&mut self, p: &J, scale: Vec2, offset: Vec2) -> VectorPath {
         let shape = |v: &J| -> Vec<[Vec2; 3]> {
             let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
             let (vs, ins, outs) = (list("vertices"), list("inTangents"), list("outTangents"));
@@ -804,7 +895,7 @@ impl Importer<'_> {
                     for (k, s) in keyed.iter_mut().zip(&shapes) {
                         k["value"] = serde_json::json!([s[i][part].x, s[i][part].y]);
                     }
-                    self.vec2(Some(&serde_json::json!({ "keyframes": keyed })), start)
+                    self.vec2(Some(&serde_json::json!({ "keyframes": keyed })))
                 };
                 Anchor { point: channel(0), in_tan: channel(1), out_tan: channel(2) }
             })
@@ -812,31 +903,28 @@ impl Importer<'_> {
         VectorPath { anchors, closed }
     }
 
-    fn scalar(&mut self, p: Option<&J>, start: f64, k: f64, or: f64) -> Value<f64> {
-        self.value(p, start, or, |v| v.first().map(|x| x * k), |a, b| (b - a).abs())
+    fn scalar(&mut self, p: Option<&J>, k: f64, or: f64) -> Value<f64> {
+        self.value(p, or, |v| v.first().map(|x| x * k), |a, b| (b - a).abs())
     }
-    fn vec2(&mut self, p: Option<&J>, start: f64) -> Value<Vec2> {
+    fn vec2(&mut self, p: Option<&J>) -> Value<Vec2> {
         self.value(
             p,
-            start,
             Vec2::new(100.0, 100.0),
             |v| Some(Vec2::new(*v.first()?, *v.get(1)?)),
             |a, b| (*b - *a).hypot(),
         )
     }
-    fn vec3(&mut self, p: Option<&J>, start: f64, k: f64, or: Vec3) -> Value<Vec3> {
+    fn vec3(&mut self, p: Option<&J>, k: f64, or: Vec3) -> Value<Vec3> {
         self.value(
             p,
-            start,
             or,
             |v| Some(Vec3::new(v.first()? * k, v.get(1)? * k, v.get(2).copied().unwrap_or(0.0) * k)),
             |a, b| ((b.x - a.x).powi(2) + (b.y - a.y).powi(2) + (b.z - a.z).powi(2)).sqrt(),
         )
     }
-    fn color(&mut self, p: Option<&J>, start: f64, or: Color) -> Value<Color> {
+    fn color(&mut self, p: Option<&J>, or: Color) -> Value<Color> {
         self.value(
             p,
-            start,
             or,
             |v| Some(Color::rgba(*v.first()?, *v.get(1)?, *v.get(2)?, v.get(3).copied().unwrap_or(1.0))),
             // Colour speeds are rare and their units unclear; ease by the
@@ -849,7 +937,6 @@ impl Importer<'_> {
     fn value<T: Animatable + Clone>(
         &mut self,
         p: Option<&J>,
-        start: f64,
         or: T,
         conv: impl Fn(&[f64]) -> Option<T>,
         dist: impl Fn(&T, &T) -> f64,
@@ -881,7 +968,7 @@ impl Importer<'_> {
         };
         let vals: Vec<T> = keys.iter().map(|k| conv(&nums(&k["value"])).unwrap_or_else(|| or.clone())).collect();
         let times: Vec<f64> = keys.iter().map(|k| num(k, "time", 0.0)).collect();
-        let mut frames: Vec<i64> = times.iter().map(|t| self.frame(t - start)).collect();
+        let mut frames: Vec<i64> = times.iter().map(|t| self.frame(*t)).collect();
         // Two keys rounding onto one frame would make a zero-length segment;
         // nudge the later one forward, as AE itself cannot put two on a frame.
         for i in 1..frames.len() {
@@ -1121,7 +1208,7 @@ mod tests {
                   {"matchName":"ADBE Vector Shape - Rect","properties":[{"matchName":"ADBE Vector Rect Size","value":[10,20]}]},
                   {"matchName":"ADBE Vector Graphic - Fill","properties":[{"matchName":"ADBE Vector Fill Color","value":[0,1,0,1]}]}]}]}],
               "transform":[{"matchName":"ADBE Opacity","value":[50]}]},
-             {"index":2,"name":"bottom","layerId":8,"parent":7,"trackMatte":"alpha","sourceId":0,"flags":{},"transform":[
+             {"index":2,"name":"bottom","layerId":8,"parent":7,"trackMatte":"alpha","sourceId":0,"startTime":1,"duration":1,"flags":{},"transform":[
                {"matchName":"ADBE Position","keyframes":[
                  {"time":0,"value":[0,0,0],"outInterpolation":"Linear"},
                  {"time":1,"value":[10,0,0],"inInterpolation":"Linear"}]}]}]}]}}"##;
@@ -1136,7 +1223,9 @@ mod tests {
         assert!(matches!(rect.shape, Some(Shape::Rect { .. })));
         assert_eq!(rect.fill, Some(Value::constant(Color::rgb(0.0, 1.0, 0.0))));
         let Value::Keyframed(t) = &c.root.children[0].transform.position else { panic!("not keyed") };
+        // Key times are layer time: a late start moves the layer, not its keys.
         assert_eq!(t.frames(), vec![0, 24]);
+        assert_eq!(c.root.children[0].timing.map(|t| t.start), Some(24));
         assert_eq!(c.root.children[1].blend, BlendMode::Screen);
         assert_eq!(c.root.children[0].link, Some(c.root.children[1].id));
         assert_eq!(c.root.children[0].matte, Some(MatteMode::Alpha));
@@ -1165,7 +1254,7 @@ mod tests {
             expr_layer: J::Null,
             translated: HashSet::new(),
         };
-        let path = im.path(&shape, 0.0, Vec2::new(1.0, 1.0), Vec2::ZERO);
+        let path = im.path(&shape, Vec2::new(1.0, 1.0), Vec2::ZERO);
         assert!(path.closed);
         assert_eq!(path.anchors.len(), 3);
         assert_eq!(path.anchors[0].out_tan, Value::constant(Vec2::new(2.0, 0.0)));
@@ -1231,7 +1320,7 @@ mod tests {
             expr_layer: J::Null,
             translated: HashSet::new(),
         };
-        let out = im.shape_items(&items, 0.0);
+        let out = im.shape_items(&items);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].compound, Some(BoolOp::Merge));
         assert_eq!(out[0].fill, Some(Value::constant(Color::rgb(0.0, 0.0, 1.0))));

@@ -133,14 +133,51 @@ pub fn text_to_path(
     align: TextAlign,
     max_width: Option<f64>,
 ) -> BezPath {
+    let mut path = BezPath::new();
+    for g in text_glyphs(content, family, size, align, max_width) {
+        path.extend(g.path);
+    }
+    path
+}
+
+/// One glyph's outline in [`text_to_path`]'s centred space, with the units a
+/// text animator counts it in: its character, its word (`None` for
+/// whitespace), and its line.
+#[derive(Clone, Debug)]
+pub struct GlyphOutline {
+    pub path: BezPath,
+    pub char: usize,
+    pub word: Option<usize>,
+    pub line: usize,
+}
+
+/// [`text_to_path`] glyph by glyph.
+pub fn text_glyphs(content: &str, family: &str, size: f64, align: TextAlign, max_width: Option<f64>) -> Vec<GlyphOutline> {
+    // Byte offset of each char -> (char index, word index or None).
+    let mut units = std::collections::HashMap::new();
+    let mut word = 0;
+    let mut in_word = false;
+    for (ci, (b, c)) in content.char_indices().enumerate() {
+        if c.is_whitespace() {
+            if in_word {
+                word += 1;
+            }
+            in_word = false;
+            units.insert(b, (ci, None));
+        } else {
+            in_word = true;
+            units.insert(b, (ci, Some(word)));
+        }
+    }
     with_layout(content, family, size, align, max_width, |layout| {
         // Centre the whole block on the origin. Alignment has already placed
         // each line inside the block, so this only moves the block itself.
         let (w, h) = (layout.width() as f64, layout.height() as f64);
         let (ox, oy) = (-w / 2.0, -h / 2.0);
 
-        let mut path = BezPath::new();
-        for line in layout.lines() {
+        let mut out = Vec::new();
+        for (li, line) in layout.lines().enumerate() {
+            let lr = line.text_range();
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(run) = item else {
                     // Inline boxes are a rich-text feature we don't author.
@@ -162,26 +199,37 @@ pub fn text_to_path(
                     .map(|c| NormalizedCoord::from_bits(*c))
                     .collect();
                 let size = Size::new(run.run().font_size());
-                for glyph in run.positioned_glyphs() {
+                // The text each glyph came from: this line's share of the
+                // run's clusters, in the same visual order as the glyphs.
+                let sources: Vec<usize> = run
+                    .run()
+                    .visual_clusters()
+                    .filter(|c| lr.contains(&c.text_range().start))
+                    .flat_map(|c| {
+                        let at = c.text_range().start;
+                        c.glyphs().map(move |_| at)
+                    })
+                    .collect();
+                for (gi, glyph) in run.positioned_glyphs().enumerate() {
                     let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
                         continue;
                     };
-                    let mut pen = PathPen {
-                        path: std::mem::take(&mut path),
-                        origin: (ox + glyph.x as f64, oy + glyph.y as f64),
-                    };
+                    let mut pen = PathPen { path: BezPath::new(), origin: (ox + glyph.x as f64, oy + glyph.y as f64) };
                     // `DrawSettings` isn't `Copy`, so it's rebuilt per glyph
                     // (it's a couple of words over the borrowed coords).
                     let settings = DrawSettings::unhinted(size, LocationRef::new(&coords));
                     // A glyph that fails to draw is skipped, not fatal — the
                     // same "a bad part falls back, the frame survives" rule
                     // the expression engine follows.
-                    let _ = outline.draw(settings, &mut pen);
-                    path = pen.path;
+                    if outline.draw(settings, &mut pen).is_err() {
+                        continue;
+                    }
+                    let (char, word) = sources.get(gi).and_then(|b| units.get(b)).copied().unwrap_or((0, None));
+                    out.push(GlyphOutline { path: pen.path, char, word, line: li });
                 }
             }
         }
-        path
+        out
     })
     .unwrap_or_default()
 }

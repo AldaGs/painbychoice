@@ -12,7 +12,7 @@ use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
 use crate::effect::ResolvedEffect;
 use crate::expr::EvalCtx;
-use crate::node::{CompId, Document, Node, NodeId, Project};
+use crate::node::{CompId, Document, Node, NodeId, Project, Shape as NodeShape, TextUnit};
 use crate::value::Color;
 
 /// One flat, ready-to-draw item. `source` traces it back to the node that
@@ -572,6 +572,23 @@ fn walk(
                         opacity,
                     });
                 }
+                None if !node.text_animators.is_empty() && matches!(shape, NodeShape::Text { .. }) => {
+                    for (p, offset, alpha) in animated_text(node, shape, ctx) {
+                        let transform = flat * Affine::translate(offset);
+                        let b = (transform * p.clone()).bounding_box();
+                        bounds = Some(bounds.map_or(b, |u: kurbo::Rect| u.union(b)));
+                        scene.items.push(RenderItem {
+                            source: node.id,
+                            transform,
+                            path: p,
+                            fill,
+                            stroke,
+                            stroke_style,
+                            image: None,
+                            opacity: opacity * alpha,
+                        });
+                    }
+                }
                 None => {
                     bounds = Some((flat * path.clone()).bounding_box());
                     scene.items.push(RenderItem {
@@ -837,6 +854,54 @@ fn draw_order(
     // Descending: the largest depth is the furthest away, and goes down first.
     keyed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     keyed.into_iter().map(|(i, _)| i).collect()
+}
+
+
+/// A text shape with text animators, as runs of consecutive glyphs that share
+/// one offset and one opacity: each is drawn as its own item.
+fn animated_text(node: &Node, shape: &NodeShape, ctx: &mut EvalCtx) -> Vec<(BezPath, kurbo::Vec2, f64)> {
+    let NodeShape::Text { content, family, size, align, max_width } = shape else { return Vec::new() };
+    let content = content.resolve(ctx);
+    let glyphs = crate::text::text_glyphs(&content, family, size.resolve(ctx), *align, *max_width);
+    // Each char's index among the non-space chars, for that unit.
+    let mut solid = Vec::new();
+    let mut k = 0;
+    for c in content.chars() {
+        solid.push((!c.is_whitespace()).then_some(k));
+        k += usize::from(!c.is_whitespace());
+    }
+    let words = glyphs.iter().filter_map(|g| g.word).max().map_or(0, |w| w + 1);
+    let lines = glyphs.iter().map(|g| g.line).max().map_or(0, |l| l + 1);
+    let chars = content.chars().count();
+    let count = |u: TextUnit| match u {
+        TextUnit::Chars => chars,
+        TextUnit::CharsExcludingSpaces => k,
+        TextUnit::Words => words,
+        TextUnit::Lines => lines,
+    };
+    let mut out: Vec<(BezPath, kurbo::Vec2, f64)> = Vec::new();
+    for g in glyphs {
+        let (mut offset, mut alpha) = (kurbo::Vec2::ZERO, 1.0);
+        for a in &node.text_animators {
+            let unit = match a.based_on {
+                TextUnit::Chars => Some(g.char),
+                TextUnit::CharsExcludingSpaces => solid.get(g.char).copied().flatten(),
+                TextUnit::Words => g.word,
+                TextUnit::Lines => Some(g.line),
+            };
+            let Some(i) = unit else { continue };
+            let s = a.selector.amount(i, count(a.based_on), ctx);
+            offset += a.position * s;
+            if let Some(o) = a.opacity {
+                alpha *= 1.0 + (o - 1.0) * s;
+            }
+        }
+        match out.last_mut() {
+            Some((p, o, al)) if *o == offset && *al == alpha => p.extend(g.path),
+            _ => out.push((g.path, offset, alpha)),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

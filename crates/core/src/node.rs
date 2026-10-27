@@ -401,6 +401,82 @@ impl Shape {
     }
 }
 
+/// One text animator: what it does to a fully selected unit, and which units
+/// it selects how much of. A unit selected by `a` (0..1) moves by
+/// `position * a` and its opacity mixes toward `opacity` by `a`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextAnimator {
+    pub based_on: TextUnit,
+    pub selector: TextSelector,
+    /// Offset in the layer's space at full selection.
+    #[serde(default)]
+    pub position: Vec2,
+    /// Opacity (0..1) at full selection; `None` leaves opacity alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+}
+
+/// What a selector counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextUnit {
+    Chars,
+    CharsExcludingSpaces,
+    Words,
+    Lines,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum TextSelector {
+    /// AE's Range selector with a Square shape: `start`..`end`, shifted by
+    /// `offset`, all percentages of the unit count. A unit the range edge cuts
+    /// through is selected by the part inside.
+    Range { start: Value<f64>, end: Value<f64>, offset: Value<f64> },
+    /// One curve (`amount`, 0..100) sampled earlier for each later unit — what
+    /// the Type Array expression does. Unit `i` reads it `delays[i]` frames
+    /// back (after the last listed delay, `step` more per unit), plus `shift`.
+    /// `reverse` counts units from the end.
+    Stagger {
+        amount: Value<f64>,
+        #[serde(default)]
+        delays: Vec<f64>,
+        #[serde(default)]
+        step: f64,
+        #[serde(default)]
+        shift: f64,
+        #[serde(default)]
+        reverse: bool,
+    },
+}
+
+impl TextSelector {
+    /// How much of unit `i` of `n` is selected, 0..1, at `ctx`'s frame.
+    pub fn amount(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx) -> f64 {
+        match self {
+            TextSelector::Range { start, end, offset } => {
+                let n = n.max(1) as f64;
+                let o = offset.resolve(ctx);
+                let (a, b) = (start.resolve(ctx) + o, end.resolve(ctx) + o);
+                let (lo, hi) = (a.min(b) / 100.0 * n, a.max(b) / 100.0 * n);
+                let i = i as f64;
+                (hi.min(i + 1.0) - lo.max(i)).clamp(0.0, 1.0)
+            }
+            TextSelector::Stagger { amount, delays, step, shift, reverse } => {
+                let i = if *reverse { n.saturating_sub(1 + i) } else { i };
+                let delay = match delays.len() {
+                    0 => i as f64 * step,
+                    k if i < k => delays[i],
+                    k => delays[k - 1] + (i + 1 - k) as f64 * step,
+                };
+                let at = ctx.frame;
+                ctx.frame = at - shift - delay;
+                let v = amount.resolve(ctx);
+                ctx.frame = at;
+                (v / 100.0).clamp(0.0, 1.0)
+            }
+        }
+    }
+}
+
 /// A stroke: animatable color and width, and how its ends and corners look.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
@@ -726,6 +802,10 @@ pub struct Node {
     /// neither do its children — hiding a group hides what is in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// Per-character motion for a text shape (AE's text animators), applied in
+    /// order. Ignored on any other shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_animators: Vec<TextAnimator>,
     /// The lock switch: an editor-only guard against touching the layer on the
     /// canvas or in the properties panel. Renders exactly as unlocked. Covers
     /// the subtree, like `hidden`.
@@ -780,6 +860,7 @@ impl Node {
             audio: None,
             motion_blur: true,
             hidden: false,
+            text_animators: Vec::new(),
             locked: false,
             link: None,
             children: Vec::new(),
@@ -805,6 +886,7 @@ impl Node {
             audio: None,
             motion_blur: true,
             hidden: false,
+            text_animators: Vec::new(),
             locked: false,
             link: None,
             children: Vec::new(),
@@ -1844,6 +1926,29 @@ mod tests {
             .with_child(Node::group(1, "a"))
             .with_child(Node::group(2, "b"))
             .with_child(Node::group(3, "c").with_child(Node::group(4, "d")))
+    }
+
+    #[test]
+    fn text_selectors_pick_units() {
+        use crate::expr::EvalCtx;
+        // A range over the middle half of 4 units, cutting unit 2 in half.
+        let range = TextSelector::Range {
+            start: Value::constant(25.0),
+            end: Value::constant(62.5),
+            offset: Value::constant(0.0),
+        };
+        let mut ctx = EvalCtx::at(0.0);
+        let got: Vec<f64> = (0..4).map(|i| range.amount(i, 4, &mut ctx)).collect();
+        assert_eq!(got, vec![0.0, 1.0, 0.5, 0.0]);
+        // A 100 -> 0 ramp over frames 0..10; each later unit reads it 5 frames late.
+        let ramp = Value::Keyframed(crate::value::Track::new(vec![
+            crate::value::Keyframe::linear(0, 100.0),
+            crate::value::Keyframe::linear(10, 0.0),
+        ]));
+        let stagger = TextSelector::Stagger { amount: ramp, delays: vec![], step: 5.0, shift: 0.0, reverse: false };
+        let mut ctx = EvalCtx::at(10.0);
+        assert_eq!((stagger.amount(0, 3, &mut ctx), stagger.amount(1, 3, &mut ctx), stagger.amount(2, 3, &mut ctx)), (0.0, 0.5, 1.0));
+        assert_eq!(ctx.frame, 10.0, "the clock is put back");
     }
 
     #[test]
