@@ -28,7 +28,7 @@
 
 use std::cell::RefCell;
 
-use kurbo::{BezPath, Point, Rect, Shape as _};
+use kurbo::{BezPath, Point, Rect, Shape as _, Vec2};
 use serde::{Deserialize, Serialize};
 
 use parley::{
@@ -133,12 +133,90 @@ pub fn text_to_path(
     align: TextAlign,
     max_width: Option<f64>,
 ) -> BezPath {
-    // A guard, not an optimization: parley is happy to lay out nothing, but the
-    // callers below would divide a zero-size block when centring it.
-    if content.is_empty() || !size.is_finite() || size <= 0.0 {
-        return BezPath::new();
-    }
+    with_layout(content, family, size, align, max_width, |layout| {
+        // Centre the whole block on the origin. Alignment has already placed
+        // each line inside the block, so this only moves the block itself.
+        let (w, h) = (layout.width() as f64, layout.height() as f64);
+        let (ox, oy) = (-w / 2.0, -h / 2.0);
 
+        let mut path = BezPath::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(run) = item else {
+                    // Inline boxes are a rich-text feature we don't author.
+                    continue;
+                };
+                let font = run.run().font();
+                let Ok(font_ref) = FontRef::from_index(font.data.data(), font.index) else {
+                    continue;
+                };
+                let outlines = font_ref.outline_glyphs();
+                // Variable-font axis positions. parley hands these back as
+                // raw `i16` bits and skrifa wants the `F2Dot14` newtype over
+                // the same bits — converted rather than transmuted, since a
+                // per-run allocation is nothing next to outlining glyphs.
+                let coords: Vec<NormalizedCoord> = run
+                    .run()
+                    .normalized_coords()
+                    .iter()
+                    .map(|c| NormalizedCoord::from_bits(*c))
+                    .collect();
+                let size = Size::new(run.run().font_size());
+                for glyph in run.positioned_glyphs() {
+                    let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
+                        continue;
+                    };
+                    let mut pen = PathPen {
+                        path: std::mem::take(&mut path),
+                        origin: (ox + glyph.x as f64, oy + glyph.y as f64),
+                    };
+                    // `DrawSettings` isn't `Copy`, so it's rebuilt per glyph
+                    // (it's a couple of words over the borrowed coords).
+                    let settings = DrawSettings::unhinted(size, LocationRef::new(&coords));
+                    // A glyph that fails to draw is skipped, not fatal — the
+                    // same "a bad part falls back, the frame survives" rule
+                    // the expression engine follows.
+                    let _ = outline.draw(settings, &mut pen);
+                    path = pen.path;
+                }
+            }
+        }
+        path
+    })
+    .unwrap_or_default()
+}
+
+/// Where the first line's baseline meets its alignment edge (left, centre or
+/// right) in [`text_to_path`]'s centred space — the point After Effects calls
+/// a text layer's origin. `None` for text that lays out to nothing.
+pub fn text_origin(content: &str, family: &str, size: f64, align: TextAlign, max_width: Option<f64>) -> Option<Vec2> {
+    with_layout(content, family, size, align, max_width, |layout| {
+        let (w, h) = (layout.width() as f64, layout.height() as f64);
+        let baseline = layout.lines().next().map_or(0.0, |l| l.metrics().baseline as f64);
+        let x = match align {
+            TextAlign::Left => -w / 2.0,
+            TextAlign::Center => 0.0,
+            TextAlign::Right => w / 2.0,
+        };
+        Vec2::new(x, baseline - h / 2.0)
+    })
+}
+
+/// Shape and lay out `content`, then hand the layout to `f`. `None` when there
+/// is nothing to lay out.
+fn with_layout<R>(
+    content: &str,
+    family: &str,
+    size: f64,
+    align: TextAlign,
+    max_width: Option<f64>,
+    f: impl FnOnce(&parley::Layout<()>) -> R,
+) -> Option<R> {
+    // A guard, not an optimization: parley is happy to lay out nothing, but the
+    // callers would divide a zero-size block when centring it.
+    if content.is_empty() || !size.is_finite() || size <= 0.0 {
+        return None;
+    }
     FONT_CTX.with(|fcx| {
         LAYOUT_CTX.with(|lcx| {
             let mut fcx = fcx.borrow_mut();
@@ -150,59 +228,9 @@ pub fn text_to_path(
             builder.push_default(StyleProperty::FontSize(size as f32));
             builder.push_default(StyleProperty::FontFamily(font_family(family)));
             let mut layout: parley::Layout<()> = builder.build(content);
-
-            let advance = max_width.map(|w| w as f32);
-            layout.break_all_lines(advance);
+            layout.break_all_lines(max_width.map(|w| w as f32));
             layout.align(align.to_parley(), AlignmentOptions::default());
-
-            // Centre the whole block on the origin. Alignment has already placed
-            // each line inside the block, so this only moves the block itself.
-            let (w, h) = (layout.width() as f64, layout.height() as f64);
-            let (ox, oy) = (-w / 2.0, -h / 2.0);
-
-            let mut path = BezPath::new();
-            for line in layout.lines() {
-                for item in line.items() {
-                    let PositionedLayoutItem::GlyphRun(run) = item else {
-                        // Inline boxes are a rich-text feature we don't author.
-                        continue;
-                    };
-                    let font = run.run().font();
-                    let Ok(font_ref) = FontRef::from_index(font.data.data(), font.index) else {
-                        continue;
-                    };
-                    let outlines = font_ref.outline_glyphs();
-                    // Variable-font axis positions. parley hands these back as
-                    // raw `i16` bits and skrifa wants the `F2Dot14` newtype over
-                    // the same bits — converted rather than transmuted, since a
-                    // per-run allocation is nothing next to outlining glyphs.
-                    let coords: Vec<NormalizedCoord> = run
-                        .run()
-                        .normalized_coords()
-                        .iter()
-                        .map(|c| NormalizedCoord::from_bits(*c))
-                        .collect();
-                    let size = Size::new(run.run().font_size());
-                    for glyph in run.positioned_glyphs() {
-                        let Some(outline) = outlines.get(GlyphId::from(glyph.id)) else {
-                            continue;
-                        };
-                        let mut pen = PathPen {
-                            path: std::mem::take(&mut path),
-                            origin: (ox + glyph.x as f64, oy + glyph.y as f64),
-                        };
-                        // `DrawSettings` isn't `Copy`, so it's rebuilt per glyph
-                        // (it's a couple of words over the borrowed coords).
-                        let settings = DrawSettings::unhinted(size, LocationRef::new(&coords));
-                        // A glyph that fails to draw is skipped, not fatal — the
-                        // same "a bad part falls back, the frame survives" rule
-                        // the expression engine follows.
-                        let _ = outline.draw(settings, &mut pen);
-                        path = pen.path;
-                    }
-                }
-            }
-            path
+            Some(f(&layout))
         })
     })
 }

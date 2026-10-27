@@ -66,8 +66,12 @@ as `Node::mask` (mode-None masks are skipped, as AE ignores them for alpha).
 A shape group's paths share
 one fill as a `Merge` compound (nonzero, like AE), so letter counters are holes.
 Missing transform props fall back to AE's defaults (comp-centre position,
-source-centre anchor). Still to decode in 1a: other default-valued props (e.g.
-stroke colour), text documents.
+source-centre anchor). Text documents are
+decoded (`cos.go` + `parseTextStyle`: font, size, fill/stroke, alignment,
+tracking, leading); text imports with its family, size, alignment and paint,
+anchored at AE's baseline origin (`text::text_origin`). PBC text has no
+weight/style, tracking or leading yet; those are reported. Still to decode in
+1a: other default-valued props (e.g. stroke colour).
 
 ## Step 2 — Shape strokes
 

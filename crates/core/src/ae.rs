@@ -332,16 +332,14 @@ impl Importer<'_> {
         if let Some(&comp) = self.comp_ids.get(&source) {
             node.precomp = Some(comp);
         } else if let Some(text) = l["text"].as_str() {
-            node.shape = Some(Shape::Text {
-                content: Value::constant(text.to_string()),
-                family: String::new(),
-                size: Value::constant(72.0),
-                align: TextAlign::Left,
-                max_width: None,
-            });
-            node.fill = Some(Value::constant(Color::rgb(1.0, 1.0, 1.0)));
-            if l.get("textProperties").is_some() {
-                self.report.drop("text document style (font, size, animators)");
+            self.text(&mut node, text, &l["textStyle"]);
+            if l["textProperties"]["properties"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|p| p["matchName"] == "ADBE Text Animators" && p["properties"].as_array().is_some_and(|a| !a.is_empty()))
+            {
+                self.report.drop("text animators");
             }
         } else if let Some(contents) = l["contents"].as_array() {
             node.children = self.shape_items(contents, start);
@@ -400,6 +398,76 @@ impl Importer<'_> {
         }
         self.count_expressions(l);
         Some(node)
+    }
+
+    /// A text layer from its document-wide style. PBC picks fonts by family
+    /// and centres text on its origin; AE names a PostScript font and puts a
+    /// text layer's origin on the first baseline at the alignment edge, so the
+    /// anchor (and anything placed in the layer's space) moves by the
+    /// difference.
+    fn text(&mut self, node: &mut Node, text: &str, style: &J) {
+        let size = num(style, "fontSize", 72.0).max(1.0);
+        let align = match style["justification"].as_str().unwrap_or("left") {
+            "center" | "justifyCenter" => TextAlign::Center,
+            "right" | "justifyRight" => TextAlign::Right,
+            _ => TextAlign::Left,
+        };
+        let ps = style["font"].as_str().unwrap_or("");
+        let family = self.family(ps);
+        let rgb = |k: &str| {
+            let c = nums(&style[k]);
+            (c.len() >= 3).then(|| Color::rgb(c[0], c[1], c[2]))
+        };
+        if style["applyFill"] != false {
+            node.fill = Some(Value::constant(rgb("fillColor").unwrap_or(Color::rgb(1.0, 1.0, 1.0))));
+        }
+        if style["applyStroke"] == true {
+            node.stroke = Some(Stroke {
+                color: Value::constant(rgb("strokeColor").unwrap_or(Color::rgb(0.0, 0.0, 0.0))),
+                width: Value::constant(num(style, "strokeWidth", 1.0)),
+            });
+        }
+        if num(style, "tracking", 0.0) != 0.0 {
+            self.report.drop("text tracking");
+        }
+        if num(style, "leading", 0.0) != 0.0 {
+            self.report.drop("text leading");
+        }
+        let content = text.to_string();
+        if let Some(o) = crate::text::text_origin(&content, &family, size, align, None) {
+            node.transform.anchor = shift(node.transform.anchor.clone(), o);
+            self.centred.insert(node.id, -o);
+        }
+        node.shape = Some(Shape::Text { content: Value::constant(content), family, size: Value::constant(size), align, max_width: None });
+    }
+
+    /// The installed family a PostScript font name belongs to: the longest
+    /// family whose name, letters and digits only, starts the PostScript name
+    /// ("RocGrotesk-CompressedBold" is in "Roc Grotesk Compressed"). PBC text
+    /// has no weight or style, so a remainder like "Bold" is reported.
+    fn family(&mut self, ps: &str) -> String {
+        if ps.is_empty() {
+            return String::new();
+        }
+        let key = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+        let want = key(ps);
+        let best = crate::text::system_families()
+            .into_iter()
+            .filter(|f| !key(f).is_empty() && want.starts_with(&key(f)))
+            .max_by_key(|f| key(f).len());
+        match best {
+            Some(f) => {
+                let rest = &want[key(&f).len()..];
+                if !rest.is_empty() && !matches!(rest, "regular" | "roman" | "book") {
+                    self.report.drop("font weight/style (family only)");
+                }
+                f
+            }
+            None => {
+                self.report.drop(format!("font not installed: {ps}"));
+                String::new()
+            }
+        }
     }
 
     /// Count every expression under `j` into the report. Expressions are not
@@ -869,5 +937,26 @@ mod tests {
         assert_eq!(out[0].fill, Some(Value::constant(Color::rgb(0.0, 0.0, 1.0))));
         assert_eq!(out[0].children.len(), 2);
         assert!(out[0].children.iter().all(|c| c.fill.is_none()));
+    }
+
+    #[test]
+    fn text_takes_its_style_and_moves_its_origin_to_the_baseline() {
+        let json = r##"{"root":{"id":0,"type":"Folder","children":[
+          {"id":1,"name":"Main","type":"Composition","width":400,"height":400,"framerate":25,"seconds":2,"layers":[
+            {"index":1,"name":"title","layerId":1,"sourceId":0,"kind":"text","text":"Hola","flags":{},
+             "transform":[{"matchName":"ADBE Anchor Point","value":[0,0,0]}],
+             "textStyle":{"fontSize":50,"justification":"right","fillColor":[1,0,0],"applyFill":true,
+                          "strokeColor":[0,0,1],"applyStroke":true,"strokeWidth":3}}]}]}}"##;
+        let (p, _) = import(json).unwrap();
+        let n = &p.root_comp().root.children[0];
+        let Some(Shape::Text { size, align, .. }) = &n.shape else { panic!("not text") };
+        assert_eq!((size, *align), (&Value::constant(50.0), TextAlign::Right));
+        assert_eq!(n.fill, Some(Value::constant(Color::rgb(1.0, 0.0, 0.0))));
+        assert_eq!(n.stroke.as_ref().map(|s| s.width.clone()), Some(Value::constant(3.0)));
+        // AE's origin (right edge, first baseline) becomes the anchor: right of
+        // and below PBC's centred origin.
+        let o = crate::text::text_origin("Hola", "", 50.0, TextAlign::Right, None).unwrap();
+        assert!(o.x > 0.0 && o.y > 0.0, "{o:?}");
+        assert_eq!(n.transform.anchor, Value::constant(Vec3::new(o.x, o.y, 0.0)));
     }
 }
