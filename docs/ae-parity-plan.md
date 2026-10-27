@@ -58,9 +58,12 @@ expressions (~1,900).
 the 15 shared blend modes, alpha mattes (including AE 23's matte-below, by
 swapping the pair). Bezier path vertices are decoded too (`path.go`: shph
 bounding box + normalized ldat triples) and import as `Shape::Vector`, keyframed
-per point; every shape path in the 8 projects now comes across. Still to decode
-in 1a: footage file paths, mask paths (decoded, but need the layer's source size
-to denormalize), default-valued props, text documents.
+per point; every shape path in the 8 projects now comes across. Footage file
+paths, solid colours and mask info (`mkif`: mode, invert) are decoded too:
+footage imports as assets + `Shape::Image` (all 593 referenced files resolve on
+this machine), solids as exact vector rects, and the first Add/Subtract mask
+as `Node::mask` (mode-None masks are skipped, as AE ignores them for alpha).
+Still to decode in 1a: default-valued props, text documents.
 
 ## Step 2 — Shape strokes
 

@@ -15,9 +15,10 @@ use std::collections::{BTreeMap, HashMap};
 use kurbo::Vec2;
 use serde_json::Value as J;
 
-use crate::composite::{BlendMode, MatteMode};
+use crate::asset::{Asset, AssetId, AssetKind};
+use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::path::{Anchor, VectorPath};
-use crate::node::{Comp, CompId, LayerTiming, Node, Project, Shape, Stroke, Transform};
+use crate::node::{Comp, CompId, LayerTiming, Node, NodeId, Project, Shape, Stroke, Transform};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
 use crate::vec3::Vec3;
@@ -54,10 +55,47 @@ pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
         comps.iter().enumerate().map(|(i, c)| (id(c), CompId(i as u64))).collect();
 
     let mut report = ImportReport::default();
+    // File footage becomes project assets, keyed by AE item id. Only the
+    // reference is stored: the file is read when it is drawn, so a path that
+    // does not exist on this machine warns at render time and can be relinked.
+    let mut assets = BTreeMap::new();
+    let mut footage = HashMap::new();
+    let mut files: Vec<&J> = items.values().copied().filter(|i| i["footageType"] == "file").collect();
+    files.sort_by_key(|i| id(i));
+    for item in files {
+        let path = item["file"].as_str().unwrap_or("");
+        let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let kind = match ext.as_str() {
+            "mov" | "mp4" | "m4v" | "avi" | "mxf" | "webm" | "mkv" | "gif" => AssetKind::Video,
+            "png" | "jpg" | "jpeg" | "tif" | "tiff" | "psd" | "ai" | "pdf" | "exr" | "bmp" | "tga" | "webp" | "heic"
+            | "svg" => AssetKind::Image,
+            _ => continue,
+        };
+        let aid = AssetId(assets.len() as u64);
+        let fps = num(item, "framerate", 0.0);
+        let mut asset = Asset::image(aid, path, num(item, "width", 0.0), num(item, "height", 0.0));
+        asset.kind = kind;
+        if kind == AssetKind::Video {
+            asset.fps = fps;
+            asset.frames = (num(item, "seconds", 0.0) * fps).round().max(1.0) as i64;
+        }
+        assets.insert(aid, asset);
+        footage.insert(id(item), aid);
+    }
+
     let mut built = BTreeMap::new();
     for c in &comps {
-        let comp = Importer { items: &items, comp_ids: &comp_ids, report: &mut report, next_id: 1, fps: num(c, "framerate", 30.0) }
-            .comp(c);
+        let comp = Importer {
+            items: &items,
+            comp_ids: &comp_ids,
+            footage: &footage,
+            centred: HashMap::new(),
+            comp_size: Vec2::new(num(c, "width", 1920.0), num(c, "height", 1080.0)),
+            report: &mut report,
+            next_id: 1,
+            fps: num(c, "framerate", 30.0),
+        }
+        .comp(c);
         built.insert(comp_ids[&id(c)], comp);
     }
 
@@ -77,6 +115,7 @@ pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
     let mut project = Project::single(built.remove(&CompId(0)).unwrap());
     project.comps.extend(built);
     project.root = comp_ids[&id(root_comp)];
+    project.assets = assets;
     project.migrate();
     Ok((project, report))
 }
@@ -144,6 +183,13 @@ fn ae_handles(out_k: &J, in_k: &J, dt: f64, dist: f64) -> (Handle, Handle) {
 struct Importer<'a> {
     items: &'a HashMap<u64, &'a J>,
     comp_ids: &'a HashMap<u64, CompId>,
+    footage: &'a HashMap<u64, AssetId>,
+    /// Layers whose content PBC draws centred on the origin (footage), with
+    /// the offset that puts AE's top-left layer space back: anything placed
+    /// in their layer space — linked children, masks — shifts by it.
+    centred: HashMap<NodeId, Vec2>,
+    /// The size of the comp being built, for AE's default layer position.
+    comp_size: Vec2,
     report: &'a mut ImportReport,
     next_id: u64,
     fps: f64,
@@ -186,7 +232,12 @@ impl Importer<'_> {
         for (l, n) in layers.iter().rev().zip(root.children.iter_mut()) {
             if let Some(parent) = l["parent"].as_u64() {
                 match by_ae_id.get(&parent) {
-                    Some(&id) => n.link = Some(id),
+                    Some(&id) => {
+                        n.link = Some(id);
+                        if let Some(&c) = self.centred.get(&id) {
+                            n.transform.position = shift(n.transform.position.clone(), -c);
+                        }
+                    }
                     None => self.report.drop("parent that was not imported (camera/light)"),
                 }
             }
@@ -216,6 +267,24 @@ impl Importer<'_> {
         // clock, which starts at `startTime`.
         let props = l["transform"].as_array().cloned().unwrap_or_default();
         node.transform = self.transform(&props, start, true);
+        // The exporter leaves out properties at their default, and AE's
+        // defaults are not zero: a layer sits at the comp centre, and a layer
+        // with a sized source (footage, solid, precomp) turns about its centre.
+        let has = |m: &str| prop(&props, m).is_some();
+        // The separated X/Y are exported on every layer, so they only count
+        // when they are what is animated (see `position`).
+        let keyed = |m: &str| prop(&props, m).is_some_and(|p| p.get("keyframes").is_some());
+        if !has("ADBE Position") && !keyed("ADBE Position_0") && !keyed("ADBE Position_1") {
+            let c = self.comp_size / 2.0;
+            node.transform.position = Value::constant(Vec3::new(c.x, c.y, 0.0));
+        }
+        if !has("ADBE Anchor Point") {
+            let src = l["sourceId"].as_u64().and_then(|s| self.items.get(&s)).filter(|i| i.get("width").is_some());
+            if let Some(i) = src {
+                let c = Vec2::new(num(i, "width", 0.0), num(i, "height", 0.0)) / 2.0;
+                node.transform.anchor = Value::constant(Vec3::new(c.x, c.y, 0.0));
+            }
+        }
 
         let in_ = l["inPoint"].as_f64().unwrap_or(start);
         if l.get("duration").is_some() || l.get("startTime").is_some() {
@@ -256,6 +325,9 @@ impl Importer<'_> {
         }
 
         let source = l["sourceId"].as_u64().unwrap_or(0);
+        // How AE's normalized mask points map into this layer's space: scaled
+        // by the source size, then offset. Shape and text layers use 1x1.
+        let mut mask_space = (Vec2::new(1.0, 1.0), Vec2::ZERO);
         if let Some(&comp) = self.comp_ids.get(&source) {
             node.precomp = Some(comp);
         } else if let Some(text) = l["text"].as_str() {
@@ -272,15 +344,58 @@ impl Importer<'_> {
             }
         } else if let Some(contents) = l["contents"].as_array() {
             node.children = self.shape_items(contents, start);
-        } else if source != 0 && self.items.get(&source).is_some_and(|i| kind(i) == "Footage") {
-            self.report.drop("footage (no file path in export)");
+        } else if let Some(item) = self.items.get(&source).filter(|i| kind(i) == "Footage") {
+            let size = Vec2::new(num(item, "width", 0.0), num(item, "height", 0.0));
+            mask_space = (size, Vec2::ZERO);
+            match item["footageType"].as_str() {
+                Some("file") => match self.footage.get(&source) {
+                    Some(&asset) => {
+                        node.shape = Some(Shape::Image { asset, size: Value::constant(size), time_remap: None });
+                        // PBC draws footage centred on the origin; AE's layer
+                        // space starts at its top-left corner.
+                        let c = size / 2.0;
+                        node.transform.anchor = shift(node.transform.anchor, -c);
+                        self.centred.insert(node.id, c);
+                        mask_space = (size, -c);
+                    }
+                    None => self.report.drop("footage of an unsupported type (audio, data)"),
+                },
+                Some("solid") if layer_kind != "null" && flags["adjustment"] != J::Bool(true) => {
+                    let rgb = nums(&item["solidColor"]);
+                    // A few plugin solids store 0-255; everything else is 0-1.
+                    let k = if rgb.iter().any(|c| *c > 1.0) { 1.0 / 255.0 } else { 1.0 };
+                    let ch = |i: usize| rgb.get(i).copied().unwrap_or(1.0) * k;
+                    let corners = [Vec2::ZERO, Vec2::new(size.x, 0.0), size, Vec2::new(0.0, size.y)];
+                    node.shape = Some(Shape::Vector { path: VectorPath::polyline(corners, true) });
+                    node.fill = Some(Value::constant(Color::rgb(ch(0), ch(1), ch(2))));
+                }
+                Some("solid") => {}
+                _ => self.report.drop("missing footage (placeholder)"),
+            }
         }
 
         for e in l["effects"].as_array().into_iter().flatten() {
             self.report.drop(format!("effect: {}", e["name"].as_str().unwrap_or("?")));
         }
-        if l.get("masks").is_some() {
-            self.report.drop("layer masks (no path in export)");
+        // A mask in mode None does nothing to the layer's alpha in AE either;
+        // it is there for effects (Stroke, Trace Path) to read.
+        let masks: Vec<&J> =
+            l["masks"].as_array().into_iter().flatten().filter(|m| m["maskMode"] != "none").collect();
+        if let Some(m) = masks.first() {
+            let props = m["properties"].as_array().cloned().unwrap_or_default();
+            // Subtract is an inverted Add for a single mask.
+            let inverted = (m["inverted"] == true) != (m["maskMode"] == "subtract");
+            match (m["maskMode"].as_str(), prop(&props, "ADBE Mask Shape").filter(|p| p["path"].is_object())) {
+                (Some("add" | "subtract") | None, Some(p)) => {
+                    let path = self.path(p, start, mask_space.0, mask_space.1);
+                    node.mask = Some(Mask { inverted, ..Mask::new(Shape::Vector { path }) });
+                }
+                (_, None) => self.report.drop("mask without a path"),
+                (Some(mode), _) => self.report.drop(format!("mask mode: {mode}")),
+            }
+        }
+        for _ in masks.iter().skip(1) {
+            self.report.drop("additional mask (only the first is kept)");
         }
         self.count_expressions(l);
         Some(node)
@@ -347,7 +462,7 @@ impl Importer<'_> {
                     Some(Shape::Ellipse { size: self.vec2(prop(&props, "ADBE Vector Ellipse Size"), start) })
                 }
                 "ADBE Vector Shape - Group" => match prop(&props, "ADBE Vector Shape") {
-                    Some(p) if p["path"].is_object() => Some(Shape::Vector { path: self.path(p, start) }),
+                    Some(p) if p["path"].is_object() => Some(Shape::Vector { path: self.path(p, start, Vec2::new(1.0, 1.0), Vec2::ZERO) }),
                     _ => {
                         self.report.drop("bezier path (no vertices in export)");
                         None
@@ -433,7 +548,7 @@ impl Importer<'_> {
     /// conversion is the same one every other property gets. A path whose
     /// point count changes between keys cannot morph point-for-point; it keeps
     /// its first shape.
-    fn path(&mut self, p: &J, start: f64) -> VectorPath {
+    fn path(&mut self, p: &J, start: f64, scale: Vec2, offset: Vec2) -> VectorPath {
         let shape = |v: &J| -> Vec<[Vec2; 3]> {
             let list = |k: &str| v[k].as_array().cloned().unwrap_or_default();
             let (vs, ins, outs) = (list("vertices"), list("inTangents"), list("outTangents"));
@@ -441,7 +556,8 @@ impl Importer<'_> {
                 let n = j.map(nums).unwrap_or_default();
                 Vec2::new(n.first().copied().unwrap_or(0.0), n.get(1).copied().unwrap_or(0.0))
             };
-            (0..vs.len()).map(|i| [pt(vs.get(i)), pt(ins.get(i)), pt(outs.get(i))]).collect()
+            let sc = |v: Vec2| Vec2::new(v.x * scale.x, v.y * scale.y);
+            (0..vs.len()).map(|i| [sc(pt(vs.get(i))) + offset, sc(pt(ins.get(i))), sc(pt(outs.get(i)))]).collect()
         };
         let base = shape(&p["path"]);
         let closed = p["path"]["closed"].as_bool().unwrap_or(true);
@@ -556,6 +672,18 @@ impl Importer<'_> {
     }
 }
 
+/// Move a position-like value by `d`, keyframes and all. An expression is
+/// left alone: it computes its own value, and nothing evaluates AE expressions
+/// yet anyway.
+fn shift(v: Value<Vec3>, d: Vec2) -> Value<Vec3> {
+    let by = move |p: Vec3| Vec3::new(p.x + d.x, p.y + d.y, p.z);
+    match v {
+        Value::Const(p) => Value::Const(by(p)),
+        Value::Keyframed(t) => Value::Keyframed(t.map_value(by)),
+        e => e,
+    }
+}
+
 /// The exporter's blend-mode names, for the modes PBC has.
 fn blend_mode(name: &str) -> Option<BlendMode> {
     Some(match name {
@@ -643,13 +771,57 @@ mod tests {
             {"time": 1, "path": tri(20.0), "inInterpolation": "Linear"}]});
         let mut report = ImportReport::default();
         let (items, ids) = (HashMap::new(), HashMap::new());
-        let mut im = Importer { items: &items, comp_ids: &ids, report: &mut report, next_id: 1, fps: 10.0 };
-        let path = im.path(&shape, 0.0);
+        let footage = HashMap::new();
+        let mut im = Importer {
+            items: &items,
+            comp_ids: &ids,
+            footage: &footage,
+            centred: HashMap::new(),
+            comp_size: Vec2::new(100.0, 100.0),
+            report: &mut report,
+            next_id: 1,
+            fps: 10.0,
+        };
+        let path = im.path(&shape, 0.0, Vec2::new(1.0, 1.0), Vec2::ZERO);
         assert!(path.closed);
         assert_eq!(path.anchors.len(), 3);
         assert_eq!(path.anchors[0].out_tan, Value::constant(Vec2::new(2.0, 0.0)));
         let Value::Keyframed(t) = &path.anchors[1].point else { panic!("point 1 should animate") };
         assert_eq!(t.frames(), vec![0, 10]);
         assert_eq!(t.keys()[1].value, Vec2::new(20.0, 0.0));
+    }
+
+    #[test]
+    fn footage_solids_and_masks_land_in_ae_layer_space() {
+        let json = r##"{"root":{"id":0,"type":"Folder","children":[
+          {"id":5,"name":"clip.mov","type":"Footage","footageType":"file","file":"D:/a/clip.mov","width":200,"height":100,"framerate":25,"seconds":2},
+          {"id":6,"name":"Red","type":"Footage","footageType":"solid","solidColor":[1,0,0],"width":40,"height":30},
+          {"id":1,"name":"Main","type":"Composition","width":400,"height":400,"framerate":25,"seconds":2,"layers":[
+            {"index":1,"name":"child","layerId":3,"parent":2,"sourceId":6,"flags":{},
+             "transform":[{"matchName":"ADBE Position","value":[100,50,0]}]},
+            {"index":2,"name":"clip","layerId":2,"sourceId":5,"flags":{},
+             "transform":[{"matchName":"ADBE Position_0","value":[0]},{"matchName":"ADBE Position_1","value":[0]}],
+             "masks":[{"matchName":"ADBE Mask Atom","properties":[{"matchName":"ADBE Mask Shape","path":
+               {"closed":true,"vertices":[[0,0],[1,1]],"inTangents":[[0,0],[0,0]],"outTangents":[[0,0],[0,0]]}}]}]}]}]}}"##;
+        let (p, report) = import(json).unwrap();
+        assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+        let a = &p.assets[&AssetId(0)];
+        assert_eq!((a.kind, a.width, a.frames, a.fps), (AssetKind::Video, 200.0, 50, 25.0));
+        let c = p.root_comp();
+        let (clip, child) = (&c.root.children[0], &c.root.children[1]);
+        assert!(matches!(clip.shape, Some(Shape::Image { .. })));
+        // AE's default anchor is the source centre, which is PBC's origin for
+        // centred footage; the default position is the comp centre.
+        assert_eq!(clip.transform.anchor, Value::constant(Vec3::new(0.0, 0.0, 0.0)));
+        assert_eq!(clip.transform.position, Value::constant(Vec3::new(200.0, 200.0, 0.0)));
+        // Everything else in the footage's layer space moves by half its size.
+        assert_eq!(child.transform.position, Value::constant(Vec3::new(0.0, 0.0, 0.0)));
+        assert_eq!(child.link, Some(clip.id));
+        let Some(Mask { shape: Shape::Vector { path }, .. }) = &clip.mask else { panic!("no mask") };
+        assert_eq!(path.anchors[1].point, Value::constant(Vec2::new(100.0, 50.0)));
+        // A solid is an exact rect from its top-left corner, in its colour.
+        assert_eq!(child.fill, Some(Value::constant(Color::rgb(1.0, 0.0, 0.0))));
+        let Some(Shape::Vector { path }) = &child.shape else { panic!("no solid") };
+        assert_eq!(path.anchors[2].point, Value::constant(Vec2::new(40.0, 30.0)));
     }
 }
