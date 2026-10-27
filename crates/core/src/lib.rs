@@ -9,6 +9,7 @@
 //! This crate has no GPU and no windowing dependency on purpose: the engine
 //! must be testable by rendering a frame in a `cargo test`, not a window.
 
+pub mod ae;
 pub mod asset;
 pub mod audio;
 pub mod camera;

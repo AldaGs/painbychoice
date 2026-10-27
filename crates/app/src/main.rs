@@ -37,6 +37,7 @@ USAGE:
   motion render <project.pbc> --out <file|dir> [options]
   motion render --demo --out <file|dir> [options]
   motion demo [--out <dir>]
+  motion import-ae <export.json> <out.pbc>
 
 RENDER OPTIONS:
   --out <path>       Output. An extension ffmpeg knows (.mp4, .mov, .webm)
@@ -78,6 +79,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("import-ae") => match import_ae(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("demo") => {
             demo(args.get(2).map(Path::new).unwrap_or(Path::new("out")));
             ExitCode::SUCCESS
@@ -91,6 +99,22 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Convert an After Effects JSON export to a `.pbc`, and print what could not
+/// be carried across — see `motion_core::ae`.
+fn import_ae(args: &[String]) -> Result<(), String> {
+    let [input, output] = args else { return Err("usage: motion import-ae <export.json> <out.pbc>".into()) };
+    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
+    let (project, report) = motion_core::ae::import(&text)?;
+    let json = serde_json::to_string_pretty(&serde_json::json!({ "project": project }))
+        .map_err(|e| e.to_string())?;
+    std::fs::write(output, json).map_err(|e| format!("{output}: {e}"))?;
+    println!("{} comps -> {output}", project.comps.len());
+    for (what, n) in &report.dropped {
+        println!("  dropped {n:>6}  {what}");
+    }
+    Ok(())
 }
 
 /// The parsed `render` invocation.

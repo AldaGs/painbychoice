@@ -1806,6 +1806,11 @@ impl<'a> EvalCtx<'a> {
     /// layer naming a font this machine hasn't got resolves to the default and
     /// says so here, which is the same "fall back to something drawable, but
     /// make it visible" rule a dangling `Ref` follows.
+    /// The document being resolved, if any — see the `doc` field.
+    pub(crate) fn doc(&self) -> Option<&'a Document> {
+        self.doc
+    }
+
     pub(crate) fn warn_here(&mut self, msg: impl Into<String>) {
         let node = self.current.unwrap_or(NodeId(0));
         self.warn(node, msg);

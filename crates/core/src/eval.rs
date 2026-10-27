@@ -336,6 +336,29 @@ fn content_bounds(scene: &Scene, start: usize, end: usize) -> Option<kurbo::Rect
     })
 }
 
+/// The transform a [`Node::link`] contributes: the linked layer's own, at its
+/// own local time, preceded by whatever it links to in turn. Opacity, timing
+/// and visibility are deliberately not inherited — see `Node::link`.
+fn link_xf(id: crate::node::NodeId, ctx: &mut EvalCtx, depth: u32) -> Xf {
+    let Some(target) = ctx.doc().and_then(|d| d.root.find(id)) else {
+        ctx.warn_here(format!("linked layer {} is missing", id.0));
+        return Xf::IDENTITY;
+    };
+    if depth > 64 {
+        ctx.warn_here("layer links form a cycle");
+        return Xf::IDENTITY;
+    }
+    let up = target.link.map_or(Xf::IDENTITY, |l| link_xf(l, ctx, depth + 1));
+    let (prev_frame, prev_timing) = (ctx.frame, ctx.timing);
+    ctx.frame = target.timing.map_or(ctx.comp_frame, |t| t.local_frame(ctx.comp_frame));
+    ctx.timing = target.timing;
+    let prev_node = ctx.enter_node(id);
+    let (xf, _) = target.transform.resolve(ctx);
+    ctx.exit_node(prev_node);
+    (ctx.frame, ctx.timing) = (prev_frame, prev_timing);
+    up * xf
+}
+
 fn walk(
     node: &Node,
     parent_xf: Xf,
@@ -390,7 +413,10 @@ fn walk(
     // in an expression (a bad script, an ambiguous name) is tagged with it.
     let prev_node = ctx.enter_node(node.id);
     let (local_xf, local_opacity) = node.transform.resolve(ctx);
-    let xf = parent_xf * local_xf;
+    let xf = match node.link {
+        Some(link) => parent_xf * link_xf(link, ctx, 0) * local_xf,
+        None => parent_xf * local_xf,
+    };
     // **The 2.5D seam.** `xf` is the true placement and is what descends to the
     // children, so a depth-carrying hierarchy composes correctly all the way
     // down. `flat` is that placement as an affine, which is all the current
@@ -852,6 +878,26 @@ mod tests {
         let scene = evaluate(&doc, 0.0);
         let drawn: Vec<u64> = scene.items.iter().map(|i| i.source.0).collect();
         assert_eq!(drawn, vec![3]);
+    }
+
+    /// A link follows the other layer's transform, at that layer's own time,
+    /// but not its visibility or its place in the stack.
+    #[test]
+    fn a_linked_layer_follows_the_transform_only() {
+        let mut leader = box_at(1, 0.0);
+        leader.hidden = true;
+        leader.timing = Some(crate::node::LayerTiming { start: 10, in_: 10, out: 20 });
+        leader.transform.position = Value::Keyframed(Track::new(vec![
+            Keyframe::linear(0, Vec3::flat(100.0, 0.0)),
+            Keyframe::linear(10, Vec3::flat(200.0, 0.0)),
+        ]));
+        let mut follower = box_at(2, 5.0);
+        follower.link = Some(NodeId(1));
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root").with_child(leader).with_child(follower));
+        // Comp frame 15 is the leader's local frame 5: x = 150, plus 5 of its own.
+        let scene = evaluate(&doc, 15.0);
+        assert_eq!(scene.items.len(), 1, "the hidden leader still doesn't draw");
+        assert_eq!(scene.items[0].transform.translation(), Vec2::new(155.0, 0.0));
     }
 
     /// Old files have no switches and load visible and unlocked; saving an

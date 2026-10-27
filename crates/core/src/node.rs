@@ -679,6 +679,18 @@ pub struct Node {
     /// the subtree, like `hidden`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// Follow another layer's transform without nesting under it — After
+    /// Effects parenting. Nesting a layer under its parent would also move it
+    /// in the stack and make it inherit the parent's visibility, trim and
+    /// opacity; AE parenting does none of that, so it needs its own link.
+    ///
+    /// The linked layer's transform (and its own link, recursively) is
+    /// resolved at *its* local time and applied between this layer's parent
+    /// and its own transform. Intermediate groups between the linked layer and
+    /// the comp root are not included: links are meant between siblings,
+    /// which is how an AE import lays layers out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<NodeId>,
     pub children: Vec<Node>,
 }
 
@@ -717,6 +729,7 @@ impl Node {
             motion_blur: true,
             hidden: false,
             locked: false,
+            link: None,
             children: Vec::new(),
         }
     }
@@ -741,6 +754,7 @@ impl Node {
             motion_blur: true,
             hidden: false,
             locked: false,
+            link: None,
             children: Vec::new(),
         }
     }
