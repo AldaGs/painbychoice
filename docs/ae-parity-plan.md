@@ -63,7 +63,11 @@ paths, solid colours and mask info (`mkif`: mode, invert) are decoded too:
 footage imports as assets + `Shape::Image` (all 593 referenced files resolve on
 this machine), solids as exact vector rects, and the first Add/Subtract mask
 as `Node::mask` (mode-None masks are skipped, as AE ignores them for alpha).
-Still to decode in 1a: default-valued props, text documents.
+A shape group's paths share
+one fill as a `Merge` compound (nonzero, like AE), so letter counters are holes.
+Missing transform props fall back to AE's defaults (comp-centre position,
+source-centre anchor). Still to decode in 1a: other default-valued props (e.g.
+stroke colour), text documents.
 
 ## Step 2 — Shape strokes
 

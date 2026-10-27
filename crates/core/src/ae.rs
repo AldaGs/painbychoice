@@ -18,6 +18,7 @@ use serde_json::Value as J;
 use crate::asset::{Asset, AssetId, AssetKind};
 use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::path::{Anchor, VectorPath};
+use crate::pathfinder::BoolOp;
 use crate::node::{Comp, CompId, LayerTiming, Node, NodeId, Project, Shape, Stroke, Transform};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
@@ -482,6 +483,23 @@ impl Importer<'_> {
                 out.push(n);
             }
         }
+        // AE paints all of a group's paths as one shape: a letter's counters
+        // are holes in it, by the nonzero rule, not shapes filled on top. With
+        // more than one path, gather them into a Merge compound carrying the
+        // paint, which is the same thing in PBC.
+        let paths: Vec<usize> = (0..out.len()).filter(|&i| out[i].shape.is_some()).collect();
+        if paths.len() > 1 {
+            let mut compound = Node::group(self.fresh(), "Paths");
+            compound.compound = Some(BoolOp::Merge);
+            compound.fill = fill;
+            compound.stroke = stroke;
+            for &i in paths.iter().rev() {
+                let mut leaf = out.remove(i);
+                (leaf.fill, leaf.stroke) = (None, None);
+                compound.children.insert(0, leaf);
+            }
+            out.insert(paths[0], compound);
+        }
         out
     }
 
@@ -823,5 +841,33 @@ mod tests {
         assert_eq!(child.fill, Some(Value::constant(Color::rgb(1.0, 0.0, 0.0))));
         let Some(Shape::Vector { path }) = &child.shape else { panic!("no solid") };
         assert_eq!(path.anchors[2].point, Value::constant(Vec2::new(40.0, 30.0)));
+    }
+
+    #[test]
+    fn a_groups_paths_share_one_fill_as_a_merge_compound() {
+        let path = |x: f64| serde_json::json!({"matchName": "ADBE Vector Shape - Group", "properties": [
+            {"matchName": "ADBE Vector Shape", "path": {"closed": true,
+              "vertices": [[0, 0], [x, 0], [x, x]], "inTangents": [[0,0],[0,0],[0,0]], "outTangents": [[0,0],[0,0],[0,0]]}}]});
+        let fill = serde_json::json!({"matchName": "ADBE Vector Graphic - Fill",
+            "properties": [{"matchName": "ADBE Vector Fill Color", "value": [0, 0, 1, 1]}]});
+        let items = vec![path(10.0), path(5.0), fill];
+        let (all, ids, footage) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let mut report = ImportReport::default();
+        let mut im = Importer {
+            items: &all,
+            comp_ids: &ids,
+            footage: &footage,
+            centred: HashMap::new(),
+            comp_size: Vec2::new(100.0, 100.0),
+            report: &mut report,
+            next_id: 1,
+            fps: 10.0,
+        };
+        let out = im.shape_items(&items, 0.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].compound, Some(BoolOp::Merge));
+        assert_eq!(out[0].fill, Some(Value::constant(Color::rgb(0.0, 0.0, 1.0))));
+        assert_eq!(out[0].children.len(), 2);
+        assert!(out[0].children.iter().all(|c| c.fill.is_none()));
     }
 }
