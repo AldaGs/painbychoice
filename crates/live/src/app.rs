@@ -1789,7 +1789,8 @@ impl ApplicationHandler for App {
         let window = cached.take().unwrap_or_else(|| {
             let attrs = Window::default_attributes()
                 .with_title("Pain By Choice")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+                .with_window_icon(window_icon());
             Arc::new(event_loop.create_window(attrs).unwrap())
         });
 
@@ -5269,4 +5270,27 @@ fn ask_recover(msg: &str) -> bool {
         .set_buttons(rfd::MessageButtons::YesNo)
         .show()
         == rfd::MessageDialogResult::Yes
+}
+
+/// The app icon (assets/brand), decoded for the title bar and taskbar. macOS
+/// ignores window icons; there the bundle's `app-icon.icns` is what shows.
+fn window_icon() -> Option<winit::window::Icon> {
+    const PNG: &[u8] = include_bytes!("../../../assets/brand/png/app-icon-256.png");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(PNG)).read_info().ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut rgba).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    rgba.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(rgba, info.width, info.height).ok()
+}
+
+#[cfg(test)]
+mod window_icon_tests {
+    #[test]
+    fn app_icon_decodes() {
+        let icon = super::window_icon();
+        assert!(icon.is_some(), "assets/brand/png/app-icon-256.png must decode as 8-bit RGBA");
+    }
 }
