@@ -271,6 +271,8 @@ pub(crate) struct TextInfo {
     /// `size` does.
     pub(crate) content: String,
     pub(crate) family: String,
+    pub(crate) weight: u16,
+    pub(crate) italic: bool,
     pub(crate) size: f64,
     pub(crate) align: TextAlign,
     /// `None` = one line, no wrapping.
@@ -518,9 +520,11 @@ impl NodeInfo {
                 pan_anim: a.pan.is_animated(),
             }),
             text: match node.shape.as_ref() {
-                Some(MShape::Text { content, family, size, align, max_width }) => Some(TextInfo {
+                Some(MShape::Text { content, family, weight, italic, size, align, max_width }) => Some(TextInfo {
                     content: content.resolve(ctx),
                     family: family.clone(),
+                    weight: *weight,
+                    italic: *italic,
                     size: size.resolve(ctx),
                     align: *align,
                     max_width: *max_width,
@@ -656,6 +660,8 @@ pub(crate) struct PropEdits {
     /// hovered", which is what ends a preview.
     pub(crate) text_family_preview: Option<String>,
     pub(crate) text_size: Option<f64>,
+    pub(crate) text_weight: Option<u16>,
+    pub(crate) text_italic: Option<bool>,
     pub(crate) text_align: Option<TextAlign>,
     #[allow(clippy::option_option)]
     pub(crate) text_max_width: Option<Option<f64>>,
@@ -1594,6 +1600,20 @@ pub(crate) fn properties_ui(
             if key_button(ui, t.size_anim) {
                 edits.key.insert(PropKind::TextSize);
             }
+            ui.end_row();
+
+            ui.label("Weight");
+            ui.horizontal(|ui| {
+                let mut w = t.weight;
+                if ui.add(egui::DragValue::new(&mut w).speed(10.0).range(100..=900)).changed() {
+                    edits.text_weight = Some(w);
+                }
+                let mut italic = t.italic;
+                if ui.checkbox(&mut italic, "Italic").changed() {
+                    edits.text_italic = Some(italic);
+                }
+            });
+            ui.label("");
             ui.end_row();
 
             ui.label("Align");

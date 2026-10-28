@@ -2295,8 +2295,16 @@ impl App {
         // which auto-keys them exactly like a DragValue drag — that is what
         // makes retyping the string on a later frame produce a second key
         // rather than rewriting the first. The rest are plain fields.
-        if let Some(MShape::Text { content, family, size, align, max_width }) = node.shape.as_mut()
+        if let Some(MShape::Text { content, family, weight, italic, size, align, max_width }) = node.shape.as_mut()
         {
+            if let Some(v) = e.text_weight {
+                *weight = v;
+                changed = true;
+            }
+            if let Some(v) = e.text_italic {
+                *italic = v;
+                changed = true;
+            }
             if let Some(v) = e.text_content.clone() {
                 content.set_at(frame, v);
                 changed = true;
@@ -2709,6 +2717,8 @@ impl App {
                 MShape::Text {
                     content: Value::constant("Text".to_string()),
                     family: String::new(),
+                    weight: 400,
+                    italic: false,
                     size: Value::constant(96.0),
                     align: TextAlign::Left,
                     max_width: None,

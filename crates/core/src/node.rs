@@ -229,6 +229,12 @@ pub enum Shape {
         content: Value<String>,
         /// System font family name. Empty (or not installed) → sans-serif.
         family: String,
+        /// 100–900; the nearest installed face is used. Plain data like
+        /// `family`, since it picks a face rather than moving anything.
+        #[serde(default = "regular_weight")]
+        weight: u16,
+        #[serde(default)]
+        italic: bool,
         /// Font size in pixels.
         size: Value<f64>,
         align: TextAlign,
@@ -266,6 +272,10 @@ pub enum Shape {
     },
 }
 
+fn regular_weight() -> u16 {
+    400
+}
+
 impl Shape {
     pub fn to_path(&self, ctx: &mut EvalCtx) -> BezPath {
         match self {
@@ -281,7 +291,7 @@ impl Shape {
                 let s = size.resolve(ctx);
                 kurbo::Ellipse::new((0.0, 0.0), (s.x / 2.0, s.y / 2.0), 0.0).to_path(0.1)
             }
-            Shape::Text { content, family, size, align, max_width } => {
+            Shape::Text { content, family, weight, italic, size, align, max_width } => {
                 // The substitution is silent by construction — parley falls back
                 // and draws something perfectly good — so it has to be reported
                 // explicitly or the frame just quietly uses the wrong typeface.
@@ -295,7 +305,8 @@ impl Shape {
                 // param, so this is where a keyframed title or a typewriter
                 // script becomes the string this frame actually shapes.
                 let content = content.resolve(ctx);
-                crate::text::text_to_path(&content, family, size.resolve(ctx), *align, *max_width)
+                let style = crate::text::TextStyle { family, weight: *weight, italic: *italic };
+                crate::text::text_to_path(&content, &style, size.resolve(ctx), *align, *max_width)
             }
             // The frame rectangle — the same geometry a `Rect` of this size
             // would produce, which is exactly the point: every overlay and

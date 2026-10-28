@@ -344,8 +344,10 @@ pub fn raise_geometry(
         // Text's non-value half: `family` names a system font (a lookup key, not
         // a value) and align/wrap select a shaping mode, so none of them is a
         // socket. `lower_geometry` reads them straight back out of here.
-        if let Shape::Text { family, align, max_width, .. } = shape {
+        if let Shape::Text { family, weight, italic, align, max_width, .. } = shape {
             node.config.text.family = family.clone();
+            node.config.text.weight = *weight;
+            node.config.text.italic = *italic;
             node.config.text.align = *align;
             node.config.text.max_width = *max_width;
         }
@@ -627,17 +629,20 @@ mod tests {
         let back = shape_round_trips(Shape::Text {
             content: Value::constant("Chapter One".to_string()),
             family: "Georgia".into(),
+            weight: 700,
+            italic: true,
             size: Value::constant(72.0),
             align: crate::text::TextAlign::Center,
             max_width: Some(400.0),
         });
-        let Shape::Text { content, family, size, align, max_width } = &back else {
+        let Shape::Text { content, family, weight, italic, size, align, max_width, .. } = &back else {
             panic!("{back:?}")
         };
         let ctx = &mut crate::expr::EvalCtx::at(0.0);
         assert_eq!(content.resolve(ctx), "Chapter One");
         assert_eq!(size.resolve(ctx), 72.0);
         assert_eq!(family, "Georgia");
+        assert_eq!((*weight, *italic), (700, true));
         assert_eq!(*align, crate::text::TextAlign::Center);
         assert_eq!(*max_width, Some(400.0));
     }

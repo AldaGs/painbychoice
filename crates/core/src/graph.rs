@@ -294,6 +294,10 @@ pub struct TextConfig {
     /// wired, keyframed, and scripted like every other param. `family` stays
     /// config because it names a *system* font: a lookup key, not a value.
     pub family: String,
+    #[serde(default = "regular_weight")]
+    pub weight: u16,
+    #[serde(default)]
+    pub italic: bool,
     pub align: TextAlign,
     /// Wrap width; `None` keeps the text on one line.
     pub max_width: Option<f64>,
@@ -301,8 +305,12 @@ pub struct TextConfig {
 
 impl Default for TextConfig {
     fn default() -> Self {
-        Self { family: String::new(), align: TextAlign::Left, max_width: None }
+        Self { family: String::new(), weight: 400, italic: false, align: TextAlign::Left, max_width: None }
     }
+}
+
+fn regular_weight() -> u16 {
+    400
 }
 
 /// A **geometry driver**: a graph `geometry` output feeding a scene layer's

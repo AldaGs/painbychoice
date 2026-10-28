@@ -860,9 +860,10 @@ fn draw_order(
 /// A text shape with text animators, as runs of consecutive glyphs that share
 /// one offset and one opacity: each is drawn as its own item.
 fn animated_text(node: &Node, shape: &NodeShape, ctx: &mut EvalCtx) -> Vec<(BezPath, kurbo::Vec2, f64)> {
-    let NodeShape::Text { content, family, size, align, max_width } = shape else { return Vec::new() };
+    let NodeShape::Text { content, family, weight, italic, size, align, max_width } = shape else { return Vec::new() };
     let content = content.resolve(ctx);
-    let glyphs = crate::text::text_glyphs(&content, family, size.resolve(ctx), *align, *max_width);
+    let style = crate::text::TextStyle { family, weight: *weight, italic: *italic };
+    let glyphs = crate::text::text_glyphs(&content, &style, size.resolve(ctx), *align, *max_width);
     // Each char's index among the non-space chars, for that unit.
     let mut solid = Vec::new();
     let mut k = 0;
@@ -2352,6 +2353,8 @@ mod tests {
                     Shape::Text {
                         content: Value::constant("Hi".to_string()),
                         family: String::new(),
+                        weight: 400,
+                        italic: false,
                         size: Value::constant(48.0),
                         align: crate::text::TextAlign::Left,
                         max_width: None,
@@ -2381,6 +2384,8 @@ mod tests {
                 Shape::Text {
                     content: Value::constant("Hi".to_string()),
                     family: String::new(),
+                    weight: 400,
+                    italic: false,
                     size: Value::Keyframed(Track::new(vec![
                         Keyframe::linear(0, 20.0),
                         Keyframe::linear(10, 80.0),
@@ -2405,6 +2410,8 @@ mod tests {
         let text = |family: &str| Shape::Text {
             content: Value::constant("Hi".to_string()),
             family: family.into(),
+            weight: 400,
+            italic: false,
             size: Value::constant(32.0),
             align: crate::text::TextAlign::Left,
             max_width: None,
@@ -2441,6 +2448,8 @@ mod tests {
                 Shape::Text {
                     content: Value::constant("two\nlines".to_string()),
                     family: "Georgia".into(),
+                    weight: 400,
+                    italic: false,
                     size: Value::constant(31.0),
                     align: crate::text::TextAlign::Center,
                     max_width: Some(250.0),
@@ -2501,6 +2510,8 @@ mod tests {
                         r#"let s = "HELLO"; s.sub_string(0, min(frame.to_int(), s.len))"#.into(),
                     )),
                     family: String::new(),
+                    weight: 400,
+                    italic: false,
                     size: Value::constant(48.0),
                     align: crate::text::TextAlign::Left,
                     max_width: None,

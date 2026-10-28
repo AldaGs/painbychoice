@@ -233,6 +233,8 @@ pub fn lower_geometry(graph: &NodeGraph, ctx: &GraphCtx, output: &Endpoint) -> O
             Shape::Text {
                 content: Value::expr(param("content", &mut visiting)),
                 family: t.family.clone(),
+                weight: t.weight,
+                italic: t.italic,
                 size: Value::expr(param("size", &mut visiting)),
                 align: t.align,
                 max_width: t.max_width,

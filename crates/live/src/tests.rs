@@ -871,6 +871,8 @@ fn text_node() -> MNode {
         MShape::Text {
             content: Value::constant("hello".to_string()),
             family: String::new(),
+            weight: 400,
+            italic: false,
             size: Value::constant(48.0),
             align: motion_core::text::TextAlign::Left,
             max_width: None,

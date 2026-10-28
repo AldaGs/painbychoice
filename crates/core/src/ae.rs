@@ -458,7 +458,7 @@ impl Importer<'_> {
             _ => TextAlign::Left,
         };
         let ps = style["font"].as_str().unwrap_or("");
-        let family = self.family(ps);
+        let (family, weight, italic) = self.family(ps);
         let rgb = |k: &str| {
             let c = nums(&style[k]);
             (c.len() >= 3).then(|| Color::rgb(c[0], c[1], c[2]))
@@ -480,13 +480,14 @@ impl Importer<'_> {
             self.report.drop("text leading");
         }
         let content = text.to_string();
+        let tstyle = crate::text::TextStyle { family: &family, weight, italic };
         // Paragraph text wraps inside a box given in layer space; PBC centres
         // the wrapped block, so line its aligned edge and top up with the box.
         let (bp, bs) = (nums(&style["boxPos"]), nums(&style["boxSize"]));
         let boxed = (bp.len() == 2 && bs.len() == 2 && bs[0] > 0.0).then(|| (Vec2::new(bp[0], bp[1]), Vec2::new(bs[0], bs[1])));
         let max_width = boxed.map(|(_, s)| s.x);
         let origin = match boxed {
-            Some((p, s)) => crate::text::text_size(&content, &family, size, align, max_width).map(|b| {
+            Some((p, s)) => crate::text::text_size(&content, &tstyle, size, align, max_width).map(|b| {
                 let x = match align {
                     TextAlign::Left => -b.x / 2.0 - p.x,
                     TextAlign::Center => -(p.x + s.x / 2.0),
@@ -494,22 +495,23 @@ impl Importer<'_> {
                 };
                 Vec2::new(x, -b.y / 2.0 - p.y)
             }),
-            None => crate::text::text_origin(&content, &family, size, align, None),
+            None => crate::text::text_origin(&content, &tstyle, size, align, None),
         };
         if let Some(o) = origin {
             node.transform.anchor = shift(node.transform.anchor.clone(), o);
             self.centred.insert(node.id, -o);
         }
-        node.shape = Some(Shape::Text { content: Value::constant(content), family, size: Value::constant(size), align, max_width });
+        node.shape = Some(Shape::Text { content: Value::constant(content), family, weight, italic, size: Value::constant(size), align, max_width });
     }
 
     /// The installed family a PostScript font name belongs to: the longest
     /// family whose name, letters and digits only, starts the PostScript name
-    /// ("RocGrotesk-CompressedBold" is in "Roc Grotesk Compressed"). PBC text
-    /// has no weight or style, so a remainder like "Bold" is reported.
-    fn family(&mut self, ps: &str) -> String {
+    /// ("RocGrotesk-CompressedBold" is in "Roc Grotesk Compressed"), plus the
+    /// weight and italic the remainder ("Bold", "LightItalic") names. A font
+    /// that isn't installed still keeps the weight its name's suffix spells.
+    fn family(&mut self, ps: &str) -> (String, u16, bool) {
         if ps.is_empty() {
-            return String::new();
+            return (String::new(), 400, false);
         }
         let key = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
         let want = key(ps);
@@ -519,15 +521,17 @@ impl Importer<'_> {
             .max_by_key(|f| key(f).len());
         match best {
             Some(f) => {
-                let rest = &want[key(&f).len()..];
-                if !rest.is_empty() && !matches!(rest, "regular" | "roman" | "book") {
-                    self.report.drop("font weight/style (family only)");
+                let face = ps_face(&want[key(&f).len()..]);
+                if face.is_none() {
+                    self.report.drop("font width/style (family and weight only)");
                 }
-                f
+                let (w, i) = face.unwrap_or((400, false));
+                (f, w, i)
             }
             None => {
                 self.report.drop(format!("font not installed: {ps}"));
-                String::new()
+                let (w, i) = ps.rsplit_once('-').and_then(|(_, r)| ps_face(&key(r))).unwrap_or((400, false));
+                (String::new(), w, i)
             }
         }
     }
@@ -1265,6 +1269,30 @@ fn prop<'a>(props: &'a [J], match_name: &str) -> Option<&'a J> {
     props.iter().find(|p| p["matchName"] == match_name)
 }
 
+/// The weight and italic a PostScript name's face suffix spells (lowercase,
+/// letters and digits only: "semibolditalic"). `None` when anything is left
+/// that isn't a weight or italic word — a width like "Condensed", say.
+fn ps_face(rest: &str) -> Option<(u16, bool)> {
+    let rest = rest.strip_suffix("mt").unwrap_or(rest);
+    let (rest, italic) = match rest.strip_suffix("italic").or_else(|| rest.strip_suffix("oblique")) {
+        Some(r) => (r, true),
+        None => (rest, false),
+    };
+    let weight = match rest {
+        "thin" | "hairline" => 100,
+        "extralight" | "ultralight" => 200,
+        "light" => 300,
+        "" | "regular" | "roman" | "book" | "normal" => 400,
+        "medium" => 500,
+        "semibold" | "demibold" => 600,
+        "bold" => 700,
+        "extrabold" | "ultrabold" | "heavy" => 800,
+        "black" => 900,
+        _ => return None,
+    };
+    Some((weight, italic))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1491,8 +1519,20 @@ mod tests {
         assert_eq!(n.stroke.as_ref().map(|s| s.width.clone()), Some(Value::constant(3.0)));
         // AE's origin (right edge, first baseline) becomes the anchor: right of
         // and below PBC's centred origin.
-        let o = crate::text::text_origin("Hola", "", 50.0, TextAlign::Right, None).unwrap();
+        let o = crate::text::text_origin("Hola", &crate::text::TextStyle::family(""), 50.0, TextAlign::Right, None).unwrap();
         assert!(o.x > 0.0 && o.y > 0.0, "{o:?}");
         assert_eq!(n.transform.anchor, Value::constant(Vec3::new(o.x, o.y, 0.0)));
+    }
+
+    #[test]
+    fn a_postscript_suffix_maps_to_weight_and_italic() {
+        assert_eq!(ps_face("bold"), Some((700, false)));
+        assert_eq!(ps_face("semibolditalic"), Some((600, true)));
+        assert_eq!(ps_face("italic"), Some((400, true)));
+        assert_eq!(ps_face(""), Some((400, false)));
+        assert_eq!(ps_face("black"), Some((900, false)));
+        assert_eq!(ps_face("compressedbold"), None, "a width isn't a weight");
+        // Monotype's "MT" tag rides on the end of many names (Arial-BoldMT).
+        assert_eq!(ps_face("bolditalicmt"), Some((700, true)));
     }
 }
