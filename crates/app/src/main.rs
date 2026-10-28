@@ -91,13 +91,24 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("-h") | Some("--help") | None => {
-            println!("{USAGE}");
+            println!("{}\n{USAGE}", banner());
             ExitCode::SUCCESS
         }
         Some(other) => {
             eprintln!("error: unknown command '{other}'\n\n{USAGE}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The compact lockup (assets/brand): stem, red bowl with the play cut, and
+/// the name. Colour only when stdout is a terminal, so piped help stays plain.
+fn banner() -> String {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        "\x1b[1m▌\x1b[31m▶\x1b[0m \x1b[1mPain By Choice\x1b[0m".into()
+    } else {
+        "▌▶ Pain By Choice".into()
     }
 }
 
