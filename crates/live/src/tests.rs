@@ -6024,3 +6024,14 @@ fn an_autosave_is_offered_only_when_it_is_newer_than_the_project() {
     assert!(crate::app::is_newer(&side, &file));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Each clip-bar gesture has its own cursor, and the body's closes once held.
+#[test]
+fn every_clip_grab_has_its_own_cursor() {
+    use crate::timeline::{grab_cursor, ClipGrab::*};
+    let all = [grab_cursor(TrimIn, false), grab_cursor(TrimOut, false), grab_cursor(Slide, false), grab_cursor(Slip, false)];
+    for (i, a) in all.iter().enumerate() {
+        assert!(!all[i + 1..].contains(a), "{a:?} is shared");
+    }
+    assert_ne!(grab_cursor(Slide, true), grab_cursor(Slide, false));
+}

@@ -343,6 +343,35 @@ pub(crate) fn clip_grab_at(px: f32, left: f32, right: f32, handle_w: f32, alt: b
     }
 }
 
+/// The cursor for a clip-bar gesture, so each one reads before you press:
+/// the trim edges point the way they move, the body is a hand that closes
+/// once held, and alt's slip shows the content shifting under the window.
+pub(crate) fn grab_cursor(grab: ClipGrab, held: bool) -> egui::CursorIcon {
+    match grab {
+        ClipGrab::TrimIn => egui::CursorIcon::ResizeWest,
+        ClipGrab::TrimOut => egui::CursorIcon::ResizeEast,
+        ClipGrab::Slide if held => egui::CursorIcon::Grabbing,
+        ClipGrab::Slide => egui::CursorIcon::Grab,
+        ClipGrab::Slip => egui::CursorIcon::ResizeColumn,
+    }
+}
+
+/// Set the cursor over a clip bar spanning `left..right`: the latched grab
+/// while dragging, else what a press at the pointer would grab.
+pub(crate) fn clip_cursor(ui: &egui::Ui, resp: &egui::Response, drag_id: egui::Id, left: f32, right: f32, handle_w: f32) {
+    let grab = if resp.dragged() {
+        ui.ctx().data(|d| d.get_temp::<(ClipGrab, i64, LayerTiming)>(drag_id)).map(|l| l.0)
+    } else {
+        let alt = ui.input(|i| i.modifiers.alt);
+        resp.hover_pos()
+            .filter(|p| p.x > left - handle_w && p.x < right + handle_w)
+            .map(|p| clip_grab_at(p.x, left, right, handle_w, alt))
+    };
+    if let Some(g) = grab {
+        ui.ctx().set_cursor_icon(grab_cursor(g, resp.dragged()));
+    }
+}
+
 /// Apply a drag of `delta` frames to `t`, given what the drag grabbed. Trims
 /// clamp against each other (a clip can't be shorter than one frame) and `in_`
 /// clamps at 0; sliding can't push the clip before frame 0 either.
@@ -1056,6 +1085,7 @@ pub(crate) fn dopesheet_ui(
                     }
                     dragging = true;
                 }
+                clip_cursor(ui, &resp, drag_id, grab_l, grab_r, HANDLE_W);
             });
         }
 

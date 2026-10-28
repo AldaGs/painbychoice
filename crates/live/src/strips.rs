@@ -480,6 +480,7 @@ pub(crate) fn strips_ui(
                     }
                     dragging = true;
                 }
+                clip_cursor(ui, &resp, drag_id, bar.left(), bar.right(), HANDLE_W);
             });
         }
 
