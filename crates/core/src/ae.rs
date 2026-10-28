@@ -529,6 +529,13 @@ impl Importer<'_> {
         if depth > 8 || src.contains('\n') && src.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
             return None;
         }
+        // The constant-stroke idiom divides by the layer's scale in comp
+        // space; PBC strokes scale with their layer, so it folds to a number.
+        if src.replace(' ', "").contains("length(toComp([0,0]),toComp([0.7071,0.7071]))") {
+            let (sx, sy) = self.comp_scale(on);
+            let k = ((sx * sx + sy * sy) / 2.0).sqrt().max(0.001);
+            return literal(&nums(&p["value"]).iter().map(|v| v / k).collect::<Vec<_>>());
+        }
         let mut s = src.trim_end_matches(';').to_string();
         // References first, while their quoted names are intact.
         let mut out = String::new();
@@ -677,10 +684,12 @@ impl Importer<'_> {
     fn effect(&mut self, e: &J) -> Option<Effect> {
         let mn = e["matchName"].as_str()?;
         let props = e["properties"].as_array().cloned().unwrap_or_default();
-        let mut f = |i: u32, or: f64| {
-            let p = prop(&props, &format!("{mn}-{i:04}"));
-            self.value(p, or, |v| v.first().copied(), |a, b| (a - b).abs())
-        };
+        let p = |i: u32| prop(&props, &format!("{mn}-{i:04}")).cloned();
+        // A parameter scaled by `k` from AE's units to PBC's.
+        let mut f = |i: u32, or: f64| self.scalar(p(i).as_ref(), 1.0, or);
+        let mut fk = |me: &mut Self, i: u32, k: f64, or: f64| me.scalar(p(i).as_ref(), k, or);
+        // A static number, for parameters PBC folds into others.
+        let n = |i: u32, or: f64| p(i).and_then(|q| nums(&q["value"]).first().copied()).unwrap_or(or);
         let kind = match mn {
             "ADBE Mosaic" => EffectKind::Mosaic { horizontal: f(1, 10.0), vertical: f(2, 10.0) },
             "ADBE Fractal Noise" => EffectKind::FractalNoise {
@@ -701,9 +710,76 @@ impl Importer<'_> {
                 EffectKind::Colorama { phase, cycles, palette }
             }
             "ADBE Unmult" => EffectKind::Unmult,
+            "ADBE Gaussian Blur 2" => {
+                // AE's Blurriness is about twice the Gaussian's sigma.
+                EffectKind::GaussianBlur { radius: fk(self, 1, 0.5, 0.0) }
+            }
+            "ADBE Sharpen" => EffectKind::Sharpen { amount: fk(self, 1, 0.01, 0.0) },
+            "ADBE Brightness & Contrast 2" => EffectKind::BrightnessContrast {
+                brightness: fk(self, 1, 1.0 / 255.0, 0.0),
+                contrast: fk(self, 2, 0.01, 0.0),
+            },
+            "ADBE HUE SATURATION" => {
+                if n(7, 0.0) != 0.0 {
+                    return None; // Colorize is a different effect
+                }
+                EffectKind::HueSaturation {
+                    hue: fk(self, 4, 1.0, 0.0),
+                    saturation: fk(self, 5, 0.01, 0.0),
+                    lightness: fk(self, 6, 0.01, 0.0),
+                }
+            }
+            "ADBE Exposure2" => {
+                if n(1, 1.0) != 1.0 {
+                    return None; // per-channel mode
+                }
+                EffectKind::Exposure { exposure: fk(self, 3, 1.0, 0.0), offset: fk(self, 4, 1.0, 0.0), gamma: fk(self, 5, 1.0, 1.0) }
+            }
+            "ADBE Fill" => {
+                if n(6, 0.0) != 0.0 || p(1).is_some_and(|m| nums(&m["value"]).first().is_some_and(|v| *v != 0.0)) {
+                    return None; // inverted, or limited to a mask
+                }
+                let color = self.color(p(2).as_ref(), Color::rgb(1.0, 0.0, 0.0));
+                EffectKind::Tint { color, amount: fk(self, 5, 0.01, 1.0) }
+            }
+            "ADBE Drop Shadow" => {
+                if n(6, 0.0) != 0.0 {
+                    return None; // Shadow Only
+                }
+                // Direction is clockwise from up; opacity is stored 0-255.
+                let (dir, dist) = (n(3, 135.0).to_radians(), n(4, 5.0));
+                EffectKind::DropShadow {
+                    color: self.color(p(1).as_ref(), Color::rgb(0.0, 0.0, 0.0)),
+                    offset_x: Value::constant(dist * dir.sin()),
+                    offset_y: Value::constant(-dist * dir.cos()),
+                    radius: fk(self, 5, 0.5, 0.0),
+                    opacity: fk(self, 2, 1.0 / 255.0, 127.5 / 255.0),
+                }
+            }
             _ => return None,
         };
         Some(Effect::new(kind))
+    }
+
+    /// A layer's static scale times its parents', per axis, as fractions.
+    /// Keyed scales count by their first key.
+    fn comp_scale(&self, l: &J) -> (f64, f64) {
+        let (mut sx, mut sy) = (1.0, 1.0);
+        let mut at = Some(l);
+        for _ in 0..32 {
+            let Some(l) = at else { break };
+            let props = l["transform"].as_array().cloned().unwrap_or_default();
+            if let Some(p) = prop(&props, "ADBE Scale") {
+                let v = match p["keyframes"].as_array().and_then(|k| k.first()) {
+                    Some(k) => nums(&k["value"]),
+                    None => nums(&p["value"]),
+                };
+                sx *= v.first().copied().unwrap_or(100.0) / 100.0;
+                sy *= v.get(1).copied().unwrap_or(100.0) / 100.0;
+            }
+            at = l["parent"].as_u64().and_then(|id| self.expr_layers.iter().find(|x| x["layerId"].as_u64() == Some(id)));
+        }
+        (sx.abs(), sy.abs())
     }
 
     /// Count every expression under `j` that was not translated into the
@@ -1160,6 +1236,34 @@ fn prop<'a>(props: &'a [J], match_name: &str) -> Option<&'a J> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_effects_and_the_constant_stroke_idiom_import() {
+        let json = r##"{"root":{"id":0,"type":"Folder","children":[
+          {"id":1,"name":"Main","type":"Composition","width":100,"height":100,"framerate":24,"seconds":1,"layers":[
+            {"index":1,"name":"S","sourceId":0,"layerId":2,"parent":3,"flags":{},
+             "transform":[{"matchName":"ADBE Scale","value":[200,200,100]}],
+             "effects":[
+               {"matchName":"ADBE Drop Shadow","properties":[{"matchName":"ADBE Drop Shadow-0003","value":[90]},{"matchName":"ADBE Drop Shadow-0004","value":[10]}]},
+               {"matchName":"ADBE HUE SATURATION","properties":[{"matchName":"ADBE HUE SATURATION-0005","value":[-50]}]}],
+             "contents":[{"matchName":"ADBE Vector Graphic - Stroke","properties":[{"matchName":"ADBE Vector Stroke Width","value":[8],
+               "expression":"value / Math.max(length(toComp([0,0]), toComp([0.7071,0.7071])), 0.001);"}]},
+               {"matchName":"ADBE Vector Shape - Rect","properties":[]}]},
+            {"index":2,"name":"P","kind":"null","sourceId":0,"layerId":3,"flags":{},"transform":[{"matchName":"ADBE Scale","value":[100,100,100]}]}]}]}}"##;
+        let (p, report) = import(json).unwrap();
+        assert!(!report.dropped.contains_key("expression"), "{:?}", report.dropped);
+        let s = p.root_comp().root.children.iter().find(|n| n.name == "S").unwrap();
+        let EffectKind::DropShadow { offset_x, offset_y, opacity, .. } = &s.effects[0].kind else { panic!() };
+        // 90 degrees is straight right; the default opacity is half.
+        assert!(matches!(offset_x, Value::Const(x) if (x - 10.0).abs() < 1e-9));
+        assert!(matches!(offset_y, Value::Const(y) if y.abs() < 1e-9));
+        assert_eq!(opacity, &Value::constant(0.5));
+        let EffectKind::HueSaturation { saturation, .. } = &s.effects[1].kind else { panic!() };
+        assert_eq!(saturation, &Value::constant(-0.5));
+        // 200% under a 100% parent: the 8 px stroke is authored as 4.
+        let stroke = s.children.iter().find_map(|n| n.stroke.as_ref()).expect("stroke");
+        assert_eq!(stroke.width, Value::constant(4.0));
+    }
 
     #[test]
     fn rig_expressions_and_grid_effects_import() {
