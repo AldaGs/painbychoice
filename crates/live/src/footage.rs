@@ -415,13 +415,14 @@ impl FootageCache {
 
     /// Block until this frame is in hand (or known to have failed).
     ///
-    /// Tests only — the editor must never wait for the worker, which is the
-    /// entire point of it being a worker. Bounded so a design mistake shows up
-    /// as a failing assertion rather than a test run that hangs forever.
-    #[cfg(test)]
+    /// Tests and renders only — the interactive editor must never wait for the
+    /// worker, which is the entire point of it being a worker. A render must,
+    /// or every layer whose footage hasn't decoded yet is silently missing
+    /// from the file. Bounded so a stuck decoder fails a frame's footage
+    /// rather than hanging the render forever.
     pub(crate) fn wait_for(&mut self, paint: ImagePaint) {
         let key = (paint.asset, paint.source_frame);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !self.frames.contains_key(&key) && !self.failed.contains_key(&key) {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return;

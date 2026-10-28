@@ -213,6 +213,14 @@ impl FrameRenderer<'_> {
             shutter,
             motion_core::mat4::Mat4::IDENTITY,
         );
+        // Every footage frame decoded before drawing: the cache only hands back
+        // what it already has, and a render can't show a placeholder.
+        for paint in scene.items.iter().filter_map(|i| i.image) {
+            if let Some(asset) = project.assets.get(&paint.asset) {
+                self.footage.image(asset, paint);
+                self.footage.wait_for(paint);
+            }
+        }
         // Blurred layers rasterized and filtered first, so `to_vello` can drop
         // each one's processed image in place of its raw items — the same order
         // the preview uses. A layer whose readback fails is simply absent from
@@ -587,5 +595,29 @@ mod tests {
                  editor chrome has leaked into the render"
             );
         }
+    }
+
+    /// A manual export without the window: `PBC_FILE` from frame `PBC_FROM`
+    /// to `PBC_TO` at `PBC_SCALE`, as raw RGBA frames into `PBC_OUT`.
+    #[test]
+    #[ignore]
+    fn export_raw_frames() {
+        use std::io::Write;
+        let env = |k: &str| std::env::var(k).unwrap();
+        let project = motion_core::Project::from_pbc(&std::fs::read_to_string(env("PBC_FILE")).unwrap()).unwrap();
+        let comp = project.root;
+        let doc = project.comp(comp).unwrap();
+        let (w, h) = export_size((doc.width, doc.height), env("PBC_SCALE").parse().unwrap());
+        let mut gpu = Headless::new().expect("gpu");
+        let target = OffscreenTarget::new(&gpu.device, w, h).expect("allocate");
+        let mut cache = crate::footage::FootageCache::new(motion_render::default_registry());
+        let mut out = std::fs::File::create(env("PBC_OUT")).unwrap();
+        for f in env("PBC_FROM").parse::<i64>().unwrap()..=env("PBC_TO").parse::<i64>().unwrap() {
+            let rgba = FrameRenderer { device: &gpu.device, queue: &gpu.queue, renderer: &mut gpu.renderer, target: &target, footage: &mut cache }
+                .frame(&project, comp, f as f64)
+                .unwrap();
+            out.write_all(&rgba).unwrap();
+        }
+        println!("size {w}x{h}");
     }
 }
