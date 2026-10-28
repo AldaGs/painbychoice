@@ -22,7 +22,7 @@ pub(crate) struct StripRow {
     /// reading the comp, and a flat list of names loses which layer is inside
     /// which group.
     pub(crate) depth: usize,
-    pub(crate) precomp: bool,
+    pub(crate) kind: crate::layers::RowKind,
     /// `None` = live for the whole comp, which is what every layer is until
     /// someone gives it a range.
     pub(crate) timing: Option<LayerTiming>,
@@ -75,7 +75,7 @@ pub(crate) fn strip_rows(
             id: node.id,
             name: node.name.clone(),
             depth,
-            precomp: node.precomp.is_some(),
+            kind: crate::layers::RowKind::of(node),
             timing: node.timing,
             keys,
             audio: node.audio.as_ref().map(|a| (a.asset, a.enabled)),
@@ -301,12 +301,16 @@ pub(crate) fn strips_ui(
             if name_resp.clicked() {
                 out.select_layer = Some(row.id);
             }
-            let label = if row.precomp {
-                format!("{} {}", icon::PRECOMP, row.name)
-            } else {
-                row.name.clone()
-            };
-            label_text(ui, name_cell, &label, !is_sel);
+            // The type glyph in its accent, then the name beside it.
+            ui.painter_at(name_cell).text(
+                egui::pos2(name_cell.left(), name_cell.center().y),
+                egui::Align2::LEFT_CENTER,
+                row.kind.glyph(),
+                egui::FontId::new(13.0, egui::FontFamily::Name(icon::FAMILY.into())),
+                row.kind.accent(),
+            );
+            let name_cell = name_cell.with_min_x(name_cell.left() + 18.0);
+            label_text(ui, name_cell, &row.name, !is_sel);
 
             match row.timing {
                 // One click gives the layer a range covering the whole comp —
@@ -357,11 +361,14 @@ pub(crate) fn strips_ui(
                 egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
             );
             if bar.width() > 0.0 {
-                let fill = match (timing.is_some(), is_sel) {
-                    (false, _) => egui::Color32::from_gray(44),
-                    (true, false) => egui::Color32::from_rgb(58, 84, 120),
-                    (true, true) => egui::Color32::from_rgb(74, 106, 148),
+                // Tinted with the layer type's accent: faint when it has no
+                // range, stronger when it does, strongest when selected.
+                let tint = match (timing.is_some(), is_sel) {
+                    (false, _) => 0.18,
+                    (true, false) => 0.42,
+                    (true, true) => 0.58,
                 };
+                let fill = egui::Color32::from_gray(32).lerp_to_gamma(row.kind.accent(), tint);
                 painter.rect_filled(bar, 3.0, fill);
                 if is_sel {
                     painter.rect_stroke(

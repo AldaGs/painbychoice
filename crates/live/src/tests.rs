@@ -922,6 +922,20 @@ fn a_precomp_row_shows_the_comp_icon_over_its_shape() {
     assert_eq!(row_glyph(row), icon::PRECOMP);
 }
 
+/// Each layer type has its own accent; the shape kinds share one.
+#[test]
+fn layer_kinds_have_distinct_accents() {
+    use crate::layers::RowKind::*;
+    let kinds = [Group, Rect, Text, Footage, Precomp, Audio];
+    for (i, a) in kinds.iter().enumerate() {
+        for b in &kinds[i + 1..] {
+            assert_ne!(a.accent(), b.accent(), "{a:?} and {b:?} share an accent");
+        }
+    }
+    assert_eq!(Rect.accent(), Ellipse.accent());
+    assert_eq!(Rect.accent(), Path.accent());
+}
+
 #[test]
 fn dope_rows_lists_animated_shape_and_stroke_properties() {
     let mut n = full_node();

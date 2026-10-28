@@ -5,9 +5,9 @@
 
 use crate::*;
 
-/// What kind of thing a layer row is, for its icon. A group has no shape; a
-/// precomp is flagged separately (`TreeRow::precomp`) because it reads as a comp
-/// first and a layer second.
+/// What kind of thing a layer is, for its icon and accent colour. A precomp
+/// wins over its shape (it reads as a comp first), and a shapeless layer that
+/// carries sound is an audio layer rather than a group.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RowKind {
     Group,
@@ -16,19 +16,55 @@ pub(crate) enum RowKind {
     Path,
     Text,
     Footage,
+    Precomp,
+    Audio,
 }
 
 impl RowKind {
-    /// Read a node's row kind from its shape. Precomp-ness is orthogonal and
-    /// lives on the row, not here.
     pub(crate) fn of(node: &motion_core::Node) -> RowKind {
+        if node.precomp.is_some() {
+            return RowKind::Precomp;
+        }
         match &node.shape {
+            None if node.audio.is_some() => RowKind::Audio,
             None => RowKind::Group,
             Some(MShape::Rect { .. }) => RowKind::Rect,
             Some(MShape::Ellipse { .. }) => RowKind::Ellipse,
             Some(MShape::Path(_)) | Some(MShape::Vector { .. }) => RowKind::Path,
             Some(MShape::Text { .. }) => RowKind::Text,
             Some(MShape::Image { .. }) => RowKind::Footage,
+        }
+    }
+
+    /// Whether the layer draws artwork of its own (what "split shape" moves).
+    pub(crate) fn has_shape(self) -> bool {
+        !matches!(self, RowKind::Group | RowKind::Precomp | RowKind::Audio)
+    }
+
+    /// The layer type's accent, shared by the Layers panel and the timeline so
+    /// a kind reads as the same colour everywhere. The shape kinds share one.
+    pub(crate) fn accent(self) -> egui::Color32 {
+        match self {
+            RowKind::Group => egui::Color32::from_rgb(176, 176, 176),
+            RowKind::Rect | RowKind::Ellipse | RowKind::Path => egui::Color32::from_rgb(98, 156, 236),
+            RowKind::Text => egui::Color32::from_rgb(236, 192, 84),
+            RowKind::Footage => egui::Color32::from_rgb(112, 200, 120),
+            RowKind::Precomp => egui::Color32::from_rgb(196, 128, 226),
+            RowKind::Audio => egui::Color32::from_rgb(84, 204, 204),
+        }
+    }
+
+    /// The layer type's glyph. Footage borrows import and audio the knob
+    /// sliders: dedicated glyphs would mean regenerating the icon subset.
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            RowKind::Group => icon::GROUP,
+            RowKind::Rect | RowKind::Path => icon::RECT,
+            RowKind::Ellipse => icon::ELLIPSE,
+            RowKind::Text => icon::TEXT,
+            RowKind::Footage => icon::IMPORT,
+            RowKind::Precomp => icon::PRECOMP,
+            RowKind::Audio => icon::KNOB,
         }
     }
 }
@@ -51,25 +87,9 @@ pub(crate) struct TreeRow {
     pub(crate) locked: bool,
 }
 
-/// The icon a row shows. A precomp wins over its shape — the row is a comp
-/// first — and each shape kind gets its own glyph, so an ellipse no longer
-/// borrows the rectangle's square. Pure, so the mapping is unit-tested rather
-/// than only reachable by eye. A `Path` has no dedicated glyph in the subset, so
-/// it shares the rectangle's — the closest generic filled shape.
+/// The icon a row shows.
 pub(crate) fn row_glyph(row: &TreeRow) -> &'static str {
-    if row.precomp.is_some() {
-        return icon::PRECOMP;
-    }
-    match row.kind {
-        RowKind::Group => icon::GROUP,
-        RowKind::Rect | RowKind::Path => icon::RECT,
-        RowKind::Ellipse => icon::ELLIPSE,
-        RowKind::Text => icon::TEXT,
-        // Borrowed rather than its own glyph: a photo/film icon would mean
-        // regenerating the subsetted icon font, and a missed regen renders
-        // tofu. Footage is the one thing you *import*, so this reads.
-        RowKind::Footage => icon::IMPORT,
-    }
+    row.kind.glyph()
 }
 
 /// Flatten the scene graph depth-first into indented rows, **front-most first**.
@@ -230,19 +250,19 @@ pub(crate) struct TreeEdits {
 /// Adds into the selected node, else the root.
 pub(crate) fn add_menu(ui: &mut egui::Ui, out: &mut crate::dock::CompEdits) {
     for (kind, glyph, label) in [
-        (NewShape::Rect, icon::RECT, "Rectangle"),
-        (NewShape::Ellipse, icon::ELLIPSE, "Ellipse"),
-        (NewShape::Text, icon::TEXT, "Text"),
-        (NewShape::Vector, icon::SHAPE, "Pen path"),
-        (NewShape::Group, icon::GROUP, "Group / null"),
+        (NewShape::Rect, RowKind::Rect, "Rectangle"),
+        (NewShape::Ellipse, RowKind::Ellipse, "Ellipse"),
+        (NewShape::Text, RowKind::Text, "Text"),
+        (NewShape::Vector, RowKind::Path, "Pen path"),
+        (NewShape::Group, RowKind::Group, "Group / null"),
     ] {
-        if ui.button(icon::with_label(glyph, label, egui::Color32::PLACEHOLDER)).clicked() {
+        if ui.button(icon::with_label(glyph.glyph(), label, glyph.accent())).clicked() {
             out.add = Some(kind);
             ui.close();
         }
     }
     ui.separator();
-    let import = icon::with_label(icon::IMPORT, "Import footage…", egui::Color32::PLACEHOLDER);
+    let import = icon::with_label(icon::IMPORT, "Import footage…", RowKind::Footage.accent());
     if ui.add(egui::Button::new(import).shortcut_text("Ctrl+I")).clicked() {
         out.file = Some(FileCmd::Import);
         ui.close();
@@ -393,7 +413,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
                     folded.insert(row.id);
                 }
             }
-            ui.label(icon::text(row_glyph(row)));
+            ui.label(icon::text(row_glyph(row)).color(row.kind.accent()));
             match renaming.as_mut().filter(|(id, _)| *id == row.id) {
                 Some((_, buf)) => {
                     let r = ui.add(egui::TextEdit::singleline(buf).desired_width(110.0));
@@ -488,7 +508,7 @@ fn context_menu(resp: &egui::Response, row: &TreeRow, out: &mut TreeEdits) -> bo
             ui.close();
         }
         // Only a layer that *has* artwork of its own can be split.
-        if row.kind != RowKind::Group
+        if row.kind.has_shape()
             && ui
                 .button("Split shape into child layer")
                 .on_hover_text(
