@@ -48,7 +48,6 @@ pub(crate) const CLOSE: &str = "\u{eb55}";
 // Comps and the layer time model.
 pub(crate) const PRECOMP: &str = "\u{efa5}";
 pub(crate) const OPEN: &str = "\u{ea99}";
-pub(crate) const PRECOMPOSE: &str = "\u{eef7}";
 pub(crate) const TRIM: &str = "\u{eb1b}";
 
 // Keyframes.
@@ -113,6 +112,18 @@ pub(crate) fn text(glyph: &str) -> egui::RichText {
         .size(14.0)
 }
 
+/// A glyph tinted `color` followed by `label` in the body font, as one text —
+/// for menu entries, where the icon and its words are a single click target.
+/// `Color32::PLACEHOLDER` leaves the glyph the widget's own text colour.
+pub(crate) fn with_label(glyph: &str, label: &str, color: egui::Color32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let icon = egui::FontId::new(14.0, egui::FontFamily::Name(FAMILY.into()));
+    job.append(glyph, 0.0, egui::TextFormat::simple(icon, color));
+    let body = egui::TextFormat::simple(egui::FontId::proportional(14.0), egui::Color32::PLACEHOLDER);
+    job.append(label, 6.0, body);
+    job
+}
+
 /// An icon-only button, square-ish and hoverable. `tip` is required — an icon
 /// without a tooltip is a guessing game, and these replace buttons that used to
 /// say what they did in words.
@@ -134,13 +145,3 @@ pub(crate) fn button_enabled(
         .on_hover_text(tip)
 }
 
-/// An icon followed by a label, for buttons that keep their words.
-pub(crate) fn labeled(ui: &mut egui::Ui, glyph: &str, label: &str, tip: &str) -> egui::Response {
-    ui.horizontal(|ui| {
-        let resp = ui.add(egui::Button::new(text(glyph)).min_size(egui::vec2(22.0, 0.0)));
-        ui.small(label);
-        resp
-    })
-    .inner
-    .on_hover_text(tip)
-}

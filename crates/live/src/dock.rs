@@ -557,6 +557,8 @@ pub(crate) enum FileCmd {
 #[derive(Default)]
 pub(crate) struct CompEdits {
     pub(crate) file: Option<FileCmd>,
+    /// A layer chosen from the Layer menu.
+    pub(crate) add: Option<crate::layers::NewShape>,
     pub(crate) width: Option<f64>,
     pub(crate) height: Option<f64>,
     pub(crate) fps: Option<f64>,
@@ -690,6 +692,7 @@ pub(crate) fn comp_ui(
                 }
             }
         });
+        ui.menu_button("Layer", |ui| crate::layers::add_menu(ui, out));
         let busy = render.active.is_some();
         ui.menu_button("Render", |ui| {
             ui.add_enabled_ui(!busy, |ui| {

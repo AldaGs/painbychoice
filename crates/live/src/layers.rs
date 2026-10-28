@@ -226,6 +226,29 @@ pub(crate) struct TreeEdits {
     pub(crate) open_comp: Option<CompId>,
 }
 
+/// The top bar's Layer menu: every layer type you can add, plus import.
+/// Adds into the selected node, else the root.
+pub(crate) fn add_menu(ui: &mut egui::Ui, out: &mut crate::dock::CompEdits) {
+    for (kind, glyph, label) in [
+        (NewShape::Rect, icon::RECT, "Rectangle"),
+        (NewShape::Ellipse, icon::ELLIPSE, "Ellipse"),
+        (NewShape::Text, icon::TEXT, "Text"),
+        (NewShape::Vector, icon::SHAPE, "Pen path"),
+        (NewShape::Group, icon::GROUP, "Group / null"),
+    ] {
+        if ui.button(icon::with_label(glyph, label, egui::Color32::PLACEHOLDER)).clicked() {
+            out.add = Some(kind);
+            ui.close();
+        }
+    }
+    ui.separator();
+    let import = icon::with_label(icon::IMPORT, "Import footage…", egui::Color32::PLACEHOLDER);
+    if ui.add(egui::Button::new(import).shortcut_text("Ctrl+I")).clicked() {
+        out.file = Some(FileCmd::Import);
+        ui.close();
+    }
+}
+
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
 /// row selects that node; the ▲/▼ buttons restack it among its siblings.
 pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
@@ -244,44 +267,6 @@ pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<Node
 fn panel_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.heading("Layers");
-    ui.horizontal(|ui| {
-        if icon::button(ui, icon::RECT, "Add a rectangle").clicked() {
-            out.add = Some(NewShape::Rect);
-        }
-        if icon::button(ui, icon::ELLIPSE, "Add an ellipse").clicked() {
-            out.add = Some(NewShape::Ellipse);
-        }
-        if icon::button(ui, icon::TEXT, "Add a text layer").clicked() {
-            out.add = Some(NewShape::Text);
-        }
-        if icon::button(ui, icon::GROUP, "Add a group").clicked() {
-            out.add = Some(NewShape::Group);
-        }
-        // No dedicated pen glyph in the icon subset (adding one needs a font
-        // regen), so a plain text button — distinct enough beside the icons.
-        if ui.button("Pen").on_hover_text("Draw a vector path with the pen tool").clicked() {
-            out.add = Some(NewShape::Vector);
-        }
-        if icon::button(ui, icon::IMPORT, "Import images, video or audio (Ctrl+I)").clicked() {
-            out.import = true;
-        }
-    });
-    ui.weak("Adds into the selected node, else the root.");
-    // Pre-compose: only meaningful with a non-root layer selected, since the
-    // root *is* the comp.
-    if let Some(id) = selected.filter(|id| rows.iter().any(|r| r.id == *id && r.depth > 0)) {
-        if icon::labeled(
-            ui,
-            icon::PRECOMPOSE,
-            "Pre-compose",
-            "Move this layer into a new comp and leave an instance in its place",
-        )
-        .clicked()
-        {
-            out.precompose = Some(id);
-        }
-    }
-    ui.separator();
     rows_ui(ui, rows, selected, out);
 }
 
@@ -514,6 +499,10 @@ fn context_menu(resp: &egui::Response, row: &TreeRow, out: &mut TreeEdits) -> bo
                 .clicked()
         {
             out.split_shape = Some(row.id);
+            ui.close();
+        }
+        if ui.button("Pre-compose").on_hover_text("Move this layer into a new comp and leave an instance in its place").clicked() {
+            out.precompose = Some(row.id);
             ui.close();
         }
         if ui.button("Group").on_hover_text("Wrap this layer in a new group node").clicked() {

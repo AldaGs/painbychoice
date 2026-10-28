@@ -4917,7 +4917,7 @@ impl App {
                 dirty = true;
             }
         }
-        if let Some(kind) = tree_edits.add {
+        if let Some(kind) = tree_edits.add.or(comp.add) {
             dirty |= self.add_node(kind);
         }
         if let Some(id) = tree_edits.delete {
