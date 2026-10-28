@@ -245,6 +245,9 @@ pub enum PropPath {
     ShapeRadius,
     /// A `Text` shape's font size, in pixels. Only a text layer has one.
     TextSize,
+    /// A `Text` shape's tracking (1/1000 em) and leading (px, 0 = auto).
+    TextTracking,
+    TextLeading,
     /// A `Text` shape's string. The only non-numeric property here — it resolves
     /// to an `ExprValue::Str`, which is what a typewriter script reads and
     /// writes.
@@ -279,6 +282,8 @@ impl PropPath {
             PropPath::ShapeSize => "size",
             PropPath::ShapeRadius => "radius",
             PropPath::TextSize => "text_size",
+            PropPath::TextTracking => "tracking",
+            PropPath::TextLeading => "leading",
             PropPath::TextContent => "content",
             PropPath::TimeRemap => "time_remap",
             PropPath::MaskSize => "mask_size",
@@ -290,7 +295,7 @@ impl PropPath {
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 14] = [
+    pub const ALL: [PropPath; 16] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -302,6 +307,8 @@ impl PropPath {
         PropPath::ShapeSize,
         PropPath::ShapeRadius,
         PropPath::TextSize,
+        PropPath::TextTracking,
+        PropPath::TextLeading,
         PropPath::TextContent,
         PropPath::TimeRemap,
         PropPath::MaskSize,
@@ -331,6 +338,8 @@ impl PropPath {
             | PropPath::StrokeWidth
             | PropPath::ShapeRadius
             | PropPath::TextSize
+            | PropPath::TextTracking
+            | PropPath::TextLeading
             | PropPath::TimeRemap => ExprValue::Num(0.0),
             PropPath::Fill | PropPath::StrokeColor => {
                 ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
@@ -1922,6 +1931,14 @@ impl<'a> EvalCtx<'a> {
             },
             PropPath::TextSize => match &node.shape {
                 Some(Shape::Text { size, .. }) => size.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::TextTracking => match &node.shape {
+                Some(Shape::Text { tracking, .. }) => tracking.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::TextLeading => match &node.shape {
+                Some(Shape::Text { leading, .. }) => leading.resolve(self).to_expr(),
                 _ => prop.zero(),
             },
             PropPath::TextContent => match &node.shape {

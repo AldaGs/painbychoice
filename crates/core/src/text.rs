@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontFamilyName, FontStyle, FontWeight,
-    LayoutContext, PositionedLayoutItem, StyleProperty,
+    LayoutContext, LineHeight, PositionedLayoutItem, StyleProperty,
 };
 use skrifa::{
     instance::{LocationRef, NormalizedCoord, Size},
@@ -90,12 +90,18 @@ pub struct TextStyle<'a> {
     /// face by CSS font matching (fontique does that, not us).
     pub weight: u16,
     pub italic: bool,
+    /// Extra space after every character, in 1/1000 em — After Effects'
+    /// tracking unit, so 100 at 40px adds 4px.
+    pub tracking: f64,
+    /// Baseline-to-baseline distance in px. 0 (or less) is "auto": the font's
+    /// own line height.
+    pub leading: f64,
 }
 
 impl<'a> TextStyle<'a> {
     /// Regular upright `family`.
     pub fn family(family: &'a str) -> Self {
-        Self { family, weight: 400, italic: false }
+        Self { family, weight: 400, italic: false, tracking: 0.0, leading: 0.0 }
     }
 }
 
@@ -308,6 +314,10 @@ fn with_layout<R>(
             if style.italic {
                 builder.push_default(StyleProperty::FontStyle(FontStyle::Italic));
             }
+            builder.push_default(StyleProperty::LetterSpacing((style.tracking / 1000.0 * size) as f32));
+            if style.leading > 0.0 {
+                builder.push_default(StyleProperty::LineHeight(LineHeight::Absolute(style.leading as f32)));
+            }
             let mut layout: parley::Layout<()> = builder.build(content);
             layout.break_all_lines(max_width.map(|w| w as f32));
             layout.align(align.to_parley(), AlignmentOptions::default());
@@ -430,6 +440,32 @@ mod tests {
         assert_eq!(at(300), regular, "300 falls back to Regular");
         let italic = text_to_path("Hamburg", &TextStyle { italic: true, ..TextStyle::family("Arial") }, 40.0, TextAlign::Left, None);
         assert_ne!(italic, regular, "italic picks a different face");
+    }
+
+    #[test]
+    fn tracking_spreads_glyphs_and_leading_spaces_lines() {
+        let style = TextStyle::family("Arial");
+        let w = |tracking| text_bounds("Hamburg", &TextStyle { tracking, ..style }, 40.0, TextAlign::Left, None).unwrap().width();
+        // 7 letters, 6 gaps between the outer ones: +100/1000 em at 40px is 4px each.
+        assert!((w(100.0) - w(0.0) - 24.0).abs() < 0.01, "{} vs {}", w(100.0), w(0.0));
+        assert!(w(-50.0) < w(0.0), "negative tracking tightens");
+
+        let h = |leading| text_bounds("one\ntwo\nthree", &TextStyle { leading, ..style }, 40.0, TextAlign::Left, None).unwrap().height();
+        // Three lines, two line gaps: going from 60 to 100px leading adds 80px.
+        assert!((h(100.0) - h(60.0) - 80.0).abs() < 0.01, "{} vs {}", h(100.0), h(60.0));
+        assert_eq!(h(0.0), text_bounds("one\ntwo\nthree", &style, 40.0, TextAlign::Left, None).unwrap().height(), "0 is auto");
+    }
+
+    /// Tracking widens every word, so a box that fit a line without it has to
+    /// wrap once it's added.
+    #[test]
+    fn tracking_is_part_of_box_wrapping() {
+        let lines = |tracking| {
+            let style = TextStyle { tracking, ..TextStyle::family("Arial") };
+            text_glyphs("aaaa bbbb", &style, 20.0, TextAlign::Left, Some(110.0)).iter().map(|g| g.line).max().unwrap() + 1
+        };
+        assert_eq!(lines(0.0), 1);
+        assert_eq!(lines(300.0), 2);
     }
 
     #[test]

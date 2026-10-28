@@ -734,13 +734,15 @@ fn set_effect_num(effect: &mut motion_core::Effect, param: EffectParam, frame: i
 /// Transform is deliberately absent: it stays on the parent, where it goes on
 /// governing the whole subtree. Moving it would change what the *other*
 /// children do, which a restack has no business doing.
-const ARTWORK_PROPS: [PropPath; 9] = [
+const ARTWORK_PROPS: [PropPath; 11] = [
     PropPath::Fill,
     PropPath::StrokeColor,
     PropPath::StrokeWidth,
     PropPath::ShapeSize,
     PropPath::ShapeRadius,
     PropPath::TextSize,
+    PropPath::TextTracking,
+    PropPath::TextLeading,
     PropPath::TextContent,
     PropPath::TimeRemap,
     PropPath::MaskSize,
@@ -2295,7 +2297,8 @@ impl App {
         // which auto-keys them exactly like a DragValue drag — that is what
         // makes retyping the string on a later frame produce a second key
         // rather than rewriting the first. The rest are plain fields.
-        if let Some(MShape::Text { content, family, weight, italic, size, align, max_width }) = node.shape.as_mut()
+        if let Some(MShape::Text { content, family, weight, italic, size, tracking, leading, align, max_width }) =
+            node.shape.as_mut()
         {
             if let Some(v) = e.text_weight {
                 *weight = v;
@@ -2315,6 +2318,14 @@ impl App {
             }
             if let Some(v) = e.text_size {
                 size.set_at(frame, v);
+                changed = true;
+            }
+            if let Some(v) = e.text_tracking {
+                tracking.set_at(frame, v);
+                changed = true;
+            }
+            if let Some(v) = e.text_leading {
+                leading.set_at(frame, v);
                 changed = true;
             }
             if let Some(v) = e.text_align {
@@ -2719,6 +2730,8 @@ impl App {
                     family: String::new(),
                     weight: 400,
                     italic: false,
+                    tracking: Value::constant(0.0),
+                    leading: Value::constant(0.0),
                     size: Value::constant(96.0),
                     align: TextAlign::Left,
                     max_width: None,

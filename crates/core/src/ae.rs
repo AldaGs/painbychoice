@@ -473,14 +473,12 @@ impl Importer<'_> {
                 style: Default::default(),
             });
         }
-        if num(style, "tracking", 0.0) != 0.0 {
-            self.report.drop("text tracking");
-        }
-        if num(style, "leading", 0.0) != 0.0 {
-            self.report.drop("text leading");
-        }
+        // AE's tracking is already 1/1000 em; its leading is px, with auto
+        // leading exported as 0 (or flagged), which is PBC's auto too.
+        let tracking = num(style, "tracking", 0.0);
+        let leading = if style["autoLeading"] == true { 0.0 } else { num(style, "leading", 0.0) };
         let content = text.to_string();
-        let tstyle = crate::text::TextStyle { family: &family, weight, italic };
+        let tstyle = crate::text::TextStyle { family: &family, weight, italic, tracking, leading };
         // Paragraph text wraps inside a box given in layer space; PBC centres
         // the wrapped block, so line its aligned edge and top up with the box.
         let (bp, bs) = (nums(&style["boxPos"]), nums(&style["boxSize"]));
@@ -501,7 +499,7 @@ impl Importer<'_> {
             node.transform.anchor = shift(node.transform.anchor.clone(), o);
             self.centred.insert(node.id, -o);
         }
-        node.shape = Some(Shape::Text { content: Value::constant(content), family, weight, italic, size: Value::constant(size), align, max_width });
+        node.shape = Some(Shape::Text { content: Value::constant(content), family, weight, italic, size: Value::constant(size), tracking: Value::constant(tracking), leading: Value::constant(leading), align, max_width });
     }
 
     /// The installed family a PostScript font name belongs to: the longest
@@ -1510,16 +1508,18 @@ mod tests {
             {"index":1,"name":"title","layerId":1,"sourceId":0,"kind":"text","text":"Hola","flags":{},
              "transform":[{"matchName":"ADBE Anchor Point","value":[0,0,0]}],
              "textStyle":{"fontSize":50,"justification":"right","fillColor":[1,0,0],"applyFill":true,
-                          "strokeColor":[0,0,1],"applyStroke":true,"strokeWidth":3}}]}]}}"##;
+                          "strokeColor":[0,0,1],"applyStroke":true,"strokeWidth":3,
+                          "tracking":50,"leading":60}}]}]}}"##;
         let (p, _) = import(json).unwrap();
         let n = &p.root_comp().root.children[0];
-        let Some(Shape::Text { size, align, .. }) = &n.shape else { panic!("not text") };
+        let Some(Shape::Text { size, align, tracking, leading, .. }) = &n.shape else { panic!("not text") };
         assert_eq!((size, *align), (&Value::constant(50.0), TextAlign::Right));
+        assert_eq!((tracking, leading), (&Value::constant(50.0), &Value::constant(60.0)));
         assert_eq!(n.fill, Some(Value::constant(Color::rgb(1.0, 0.0, 0.0))));
         assert_eq!(n.stroke.as_ref().map(|s| s.width.clone()), Some(Value::constant(3.0)));
         // AE's origin (right edge, first baseline) becomes the anchor: right of
         // and below PBC's centred origin.
-        let o = crate::text::text_origin("Hola", &crate::text::TextStyle::family(""), 50.0, TextAlign::Right, None).unwrap();
+        let o = crate::text::text_origin("Hola", &crate::text::TextStyle { tracking: 50.0, leading: 60.0, ..crate::text::TextStyle::family("") }, 50.0, TextAlign::Right, None).unwrap();
         assert!(o.x > 0.0 && o.y > 0.0, "{o:?}");
         assert_eq!(n.transform.anchor, Value::constant(Vec3::new(o.x, o.y, 0.0)));
     }

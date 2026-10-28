@@ -311,6 +311,15 @@ pub fn raise_geometry(
             return Err(RaiseShapeError::Keyframed(label));
         }
     }
+    // Tracking and leading ride in config, not sockets, so only a constant
+    // survives the trip; anything animated is refused like a keyed socket.
+    if let Shape::Text { tracking, leading, .. } = shape {
+        for (label, v) in [("Tracking", tracking), ("Leading", leading)] {
+            if !matches!(v, Value::Const(_)) {
+                return Err(RaiseShapeError::Keyframed(label));
+            }
+        }
+    }
 
     let kind = match shape {
         Shape::Rect { .. } => "rect",
@@ -344,7 +353,10 @@ pub fn raise_geometry(
         // Text's non-value half: `family` names a system font (a lookup key, not
         // a value) and align/wrap select a shaping mode, so none of them is a
         // socket. `lower_geometry` reads them straight back out of here.
-        if let Shape::Text { family, weight, italic, align, max_width, .. } = shape {
+        if let Shape::Text { family, weight, italic, tracking, leading, align, max_width, .. } = shape {
+            let c = |v: &Value<f64>| if let Value::Const(x) = v { *x } else { 0.0 };
+            node.config.text.tracking = c(tracking);
+            node.config.text.leading = c(leading);
             node.config.text.family = family.clone();
             node.config.text.weight = *weight;
             node.config.text.italic = *italic;
@@ -631,6 +643,8 @@ mod tests {
             family: "Georgia".into(),
             weight: 700,
             italic: true,
+            tracking: Value::constant(0.0),
+            leading: Value::constant(0.0),
             size: Value::constant(72.0),
             align: crate::text::TextAlign::Center,
             max_width: Some(400.0),

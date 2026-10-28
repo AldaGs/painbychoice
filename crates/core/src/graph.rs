@@ -298,6 +298,12 @@ pub struct TextConfig {
     pub weight: u16,
     #[serde(default)]
     pub italic: bool,
+    /// Tracking (1/1000 em) and leading (px, 0 = auto) as constants: they
+    /// aren't sockets yet, so a graph-authored text can't animate them.
+    #[serde(default)]
+    pub tracking: f64,
+    #[serde(default)]
+    pub leading: f64,
     pub align: TextAlign,
     /// Wrap width; `None` keeps the text on one line.
     pub max_width: Option<f64>,
@@ -305,7 +311,7 @@ pub struct TextConfig {
 
 impl Default for TextConfig {
     fn default() -> Self {
-        Self { family: String::new(), weight: 400, italic: false, align: TextAlign::Left, max_width: None }
+        Self { family: String::new(), weight: 400, italic: false, tracking: 0.0, leading: 0.0, align: TextAlign::Left, max_width: None }
     }
 }
 

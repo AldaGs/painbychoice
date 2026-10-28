@@ -274,6 +274,11 @@ pub(crate) struct TextInfo {
     pub(crate) weight: u16,
     pub(crate) italic: bool,
     pub(crate) size: f64,
+    pub(crate) tracking: f64,
+    /// 0 = auto.
+    pub(crate) leading: f64,
+    pub(crate) tracking_anim: bool,
+    pub(crate) leading_anim: bool,
     pub(crate) align: TextAlign,
     /// `None` = one line, no wrapping.
     pub(crate) max_width: Option<f64>,
@@ -520,7 +525,11 @@ impl NodeInfo {
                 pan_anim: a.pan.is_animated(),
             }),
             text: match node.shape.as_ref() {
-                Some(MShape::Text { content, family, weight, italic, size, align, max_width }) => Some(TextInfo {
+                Some(MShape::Text { content, family, weight, italic, size, tracking, leading, align, max_width }) => Some(TextInfo {
+                    tracking: tracking.resolve(ctx),
+                    leading: leading.resolve(ctx),
+                    tracking_anim: is_anim(node, PropKind::TextTracking),
+                    leading_anim: is_anim(node, PropKind::TextLeading),
                     content: content.resolve(ctx),
                     family: family.clone(),
                     weight: *weight,
@@ -660,6 +669,8 @@ pub(crate) struct PropEdits {
     /// hovered", which is what ends a preview.
     pub(crate) text_family_preview: Option<String>,
     pub(crate) text_size: Option<f64>,
+    pub(crate) text_tracking: Option<f64>,
+    pub(crate) text_leading: Option<f64>,
     pub(crate) text_weight: Option<u16>,
     pub(crate) text_italic: Option<bool>,
     pub(crate) text_align: Option<TextAlign>,
@@ -1602,6 +1613,30 @@ pub(crate) fn properties_ui(
             }
             ui.end_row();
 
+            ui.label("Tracking");
+            let mut tracking = t.tracking;
+            if ui.add(crate::calc::num(&mut tracking).speed(1.0)).on_hover_text("1/1000 em").changed() {
+                edits.text_tracking = Some(tracking);
+            }
+            if key_button(ui, t.tracking_anim) {
+                edits.key.insert(PropKind::TextTracking);
+            }
+            ui.end_row();
+
+            ui.label("Leading");
+            let mut leading = t.leading;
+            if ui
+                .add(crate::calc::num(&mut leading).speed(0.5).range(0.0..=f64::MAX))
+                .on_hover_text("Line spacing in px; 0 is auto")
+                .changed()
+            {
+                edits.text_leading = Some(leading);
+            }
+            if key_button(ui, t.leading_anim) {
+                edits.key.insert(PropKind::TextLeading);
+            }
+            ui.end_row();
+
             ui.label("Weight");
             ui.horizontal(|ui| {
                 let mut w = t.weight;
@@ -1698,6 +1733,8 @@ pub(crate) enum PropKind {
     ShapeSize,
     ShapeRadius,
     TextSize,
+    TextTracking,
+    TextLeading,
     TextContent,
     TimeRemap,
     MaskSize,
@@ -1727,7 +1764,7 @@ pub(crate) enum PropKind {
 impl PropKind {
     /// The **fixed** animatable properties, in row order. Path points are dynamic
     /// and are appended per node by [`prop_kinds_of`], never listed here.
-    pub(crate) const ALL: [PropKind; 16] = [
+    pub(crate) const ALL: [PropKind; 18] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -1739,6 +1776,8 @@ impl PropKind {
         PropKind::ShapeSize,
         PropKind::ShapeRadius,
         PropKind::TextSize,
+        PropKind::TextTracking,
+        PropKind::TextLeading,
         PropKind::TextContent,
         PropKind::TimeRemap,
         PropKind::MaskSize,
@@ -1776,6 +1815,8 @@ impl PropKind {
             PropKind::ShapeSize => "Size",
             PropKind::ShapeRadius => "Radius",
             PropKind::TextSize => "Font Size",
+            PropKind::TextTracking => "Tracking",
+            PropKind::TextLeading => "Leading",
             PropKind::TextContent => "Content",
             PropKind::TimeRemap => "Time Remap",
             PropKind::MaskSize => "Mask Size",
@@ -1805,6 +1846,8 @@ impl PropKind {
             PropPath::ShapeSize => PropKind::ShapeSize,
             PropPath::ShapeRadius => PropKind::ShapeRadius,
             PropPath::TextSize => PropKind::TextSize,
+            PropPath::TextTracking => PropKind::TextTracking,
+            PropPath::TextLeading => PropKind::TextLeading,
             PropPath::TextContent => PropKind::TextContent,
             PropPath::PathPoint { index, part } => PropKind::PathPoint { index, part },
             PropPath::TimeRemap => PropKind::TimeRemap,
@@ -2119,6 +2162,14 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { size, .. } => PropRef::Num(size),
             _ => return None,
         },
+        PropKind::TextTracking => match node.shape.as_ref()? {
+            MShape::Text { tracking, .. } => PropRef::Num(tracking),
+            _ => return None,
+        },
+        PropKind::TextLeading => match node.shape.as_ref()? {
+            MShape::Text { leading, .. } => PropRef::Num(leading),
+            _ => return None,
+        },
         PropKind::TextContent => match node.shape.as_ref()? {
             MShape::Text { content, .. } => PropRef::Str(content),
             _ => return None,
@@ -2196,6 +2247,14 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         },
         PropKind::TextSize => match node.shape.as_mut()? {
             MShape::Text { size, .. } => PropRefMut::Num(size),
+            _ => return None,
+        },
+        PropKind::TextTracking => match node.shape.as_mut()? {
+            MShape::Text { tracking, .. } => PropRefMut::Num(tracking),
+            _ => return None,
+        },
+        PropKind::TextLeading => match node.shape.as_mut()? {
+            MShape::Text { leading, .. } => PropRefMut::Num(leading),
             _ => return None,
         },
         PropKind::Effect { index, param } => {

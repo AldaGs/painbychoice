@@ -237,6 +237,12 @@ pub enum Shape {
         italic: bool,
         /// Font size in pixels.
         size: Value<f64>,
+        /// Letter spacing in 1/1000 em (AE's tracking unit).
+        #[serde(default = "zero_value")]
+        tracking: Value<f64>,
+        /// Line spacing in px; 0 is auto.
+        #[serde(default = "zero_value")]
+        leading: Value<f64>,
         align: TextAlign,
         /// Wrap width; `None` keeps the text on one line.
         max_width: Option<f64>,
@@ -276,6 +282,10 @@ fn regular_weight() -> u16 {
     400
 }
 
+fn zero_value() -> Value<f64> {
+    Value::constant(0.0)
+}
+
 impl Shape {
     pub fn to_path(&self, ctx: &mut EvalCtx) -> BezPath {
         match self {
@@ -291,7 +301,7 @@ impl Shape {
                 let s = size.resolve(ctx);
                 kurbo::Ellipse::new((0.0, 0.0), (s.x / 2.0, s.y / 2.0), 0.0).to_path(0.1)
             }
-            Shape::Text { content, family, weight, italic, size, align, max_width } => {
+            Shape::Text { content, family, weight, italic, size, tracking, leading, align, max_width } => {
                 // The substitution is silent by construction — parley falls back
                 // and draws something perfectly good — so it has to be reported
                 // explicitly or the frame just quietly uses the wrong typeface.
@@ -305,7 +315,13 @@ impl Shape {
                 // param, so this is where a keyframed title or a typewriter
                 // script becomes the string this frame actually shapes.
                 let content = content.resolve(ctx);
-                let style = crate::text::TextStyle { family, weight: *weight, italic: *italic };
+                let style = crate::text::TextStyle {
+                    family,
+                    weight: *weight,
+                    italic: *italic,
+                    tracking: tracking.resolve(ctx),
+                    leading: leading.resolve(ctx),
+                };
                 crate::text::text_to_path(&content, &style, size.resolve(ctx), *align, *max_width)
             }
             // The frame rectangle — the same geometry a `Rect` of this size
@@ -361,9 +377,11 @@ impl Shape {
                 radius.migrate_frames(fps);
             }
             Shape::Ellipse { size } => size.migrate_frames(fps),
-            Shape::Text { content, size, .. } => {
+            Shape::Text { content, size, tracking, leading, .. } => {
                 content.migrate_frames(fps);
                 size.migrate_frames(fps);
+                tracking.migrate_frames(fps);
+                leading.migrate_frames(fps);
             }
             Shape::Image { size, time_remap, .. } => {
                 size.migrate_frames(fps);
@@ -392,9 +410,11 @@ impl Shape {
                 radius.retime(ratio);
             }
             Shape::Ellipse { size } => size.retime(ratio),
-            Shape::Text { content, size, .. } => {
+            Shape::Text { content, size, tracking, leading, .. } => {
                 content.retime(ratio);
                 size.retime(ratio);
+                tracking.retime(ratio);
+                leading.retime(ratio);
             }
             Shape::Image { size, time_remap, .. } => {
                 size.retime(ratio);

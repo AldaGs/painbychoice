@@ -873,6 +873,8 @@ fn text_node() -> MNode {
             family: String::new(),
             weight: 400,
             italic: false,
+            tracking: Value::constant(0.0),
+            leading: Value::constant(0.0),
             size: Value::constant(48.0),
             align: motion_core::text::TextAlign::Left,
             max_width: None,

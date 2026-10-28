@@ -860,9 +860,17 @@ fn draw_order(
 /// A text shape with text animators, as runs of consecutive glyphs that share
 /// one offset and one opacity: each is drawn as its own item.
 fn animated_text(node: &Node, shape: &NodeShape, ctx: &mut EvalCtx) -> Vec<(BezPath, kurbo::Vec2, f64)> {
-    let NodeShape::Text { content, family, weight, italic, size, align, max_width } = shape else { return Vec::new() };
+    let NodeShape::Text { content, family, weight, italic, size, tracking, leading, align, max_width } = shape else {
+        return Vec::new();
+    };
     let content = content.resolve(ctx);
-    let style = crate::text::TextStyle { family, weight: *weight, italic: *italic };
+    let style = crate::text::TextStyle {
+        family,
+        weight: *weight,
+        italic: *italic,
+        tracking: tracking.resolve(ctx),
+        leading: leading.resolve(ctx),
+    };
     let glyphs = crate::text::text_glyphs(&content, &style, size.resolve(ctx), *align, *max_width);
     // Each char's index among the non-space chars, for that unit.
     let mut solid = Vec::new();
@@ -2355,6 +2363,8 @@ mod tests {
                         family: String::new(),
                         weight: 400,
                         italic: false,
+                        tracking: Value::constant(0.0),
+                        leading: Value::constant(0.0),
                         size: Value::constant(48.0),
                         align: crate::text::TextAlign::Left,
                         max_width: None,
@@ -2386,6 +2396,8 @@ mod tests {
                     family: String::new(),
                     weight: 400,
                     italic: false,
+                    tracking: Value::constant(0.0),
+                    leading: Value::constant(0.0),
                     size: Value::Keyframed(Track::new(vec![
                         Keyframe::linear(0, 20.0),
                         Keyframe::linear(10, 80.0),
@@ -2412,6 +2424,8 @@ mod tests {
             family: family.into(),
             weight: 400,
             italic: false,
+            tracking: Value::constant(0.0),
+            leading: Value::constant(0.0),
             size: Value::constant(32.0),
             align: crate::text::TextAlign::Left,
             max_width: None,
@@ -2450,6 +2464,8 @@ mod tests {
                     family: "Georgia".into(),
                     weight: 400,
                     italic: false,
+                    tracking: Value::constant(0.0),
+                    leading: Value::constant(0.0),
                     size: Value::constant(31.0),
                     align: crate::text::TextAlign::Center,
                     max_width: Some(250.0),
@@ -2512,6 +2528,8 @@ mod tests {
                     family: String::new(),
                     weight: 400,
                     italic: false,
+                    tracking: Value::constant(0.0),
+                    leading: Value::constant(0.0),
                     size: Value::constant(48.0),
                     align: crate::text::TextAlign::Left,
                     max_width: None,
