@@ -96,6 +96,10 @@ pub struct Asset {
     /// which is the unit every position in the audio path is measured in.
     #[serde(default)]
     pub samples: u64,
+    /// Which layer of a layered still this asset shows; `None` for the whole
+    /// file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<SourceLayer>,
 }
 
 impl Asset {
@@ -114,6 +118,7 @@ impl Asset {
             sample_rate: 0,
             channels: 0,
             samples: 0,
+            layer: None,
         }
     }
 
@@ -142,6 +147,7 @@ impl Asset {
             sample_rate,
             channels,
             samples,
+            layer: None,
         }
     }
 
@@ -185,6 +191,7 @@ impl Asset {
             sample_rate: 0,
             channels: 0,
             samples: 0,
+            layer: None,
         }
     }
 
@@ -221,6 +228,7 @@ impl Asset {
             sample_rate: self.sample_rate,
             channels: self.channels,
             samples: self.samples,
+            layer: self.layer.clone(),
         }
     }
 
@@ -405,7 +413,7 @@ pub trait FrameStream: Send {
 /// only knows about pixels does not have to mention them — but a decoder that
 /// finds an audio stream in a video *can* report it, which is what lets one
 /// layer carry both picture and sound.
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct AssetMeta {
     pub kind: AssetKind,
     pub width: f64,
@@ -415,6 +423,28 @@ pub struct AssetMeta {
     pub sample_rate: u32,
     pub channels: u16,
     pub samples: u64,
+    /// The one layer of a layered file (PSD, AI/PDF) to show; `None` for the
+    /// whole file. Set from the asset, not by `open`.
+    pub layer: Option<SourceLayer>,
+}
+
+/// One layer of a layered still — what After Effects' "import as composition"
+/// makes a footage item of.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceLayer {
+    /// The PSD layer record index (group dividers counted); `None` where the
+    /// format only names layers (AI/PDF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(default)]
+    pub name: String,
+    /// The layer's box (left, top, right, bottom) in document pixels (PSD) or
+    /// page points (AI/PDF).
+    pub bounds: [f64; 4],
+    /// Document Size: the frame is the whole canvas with the layer in place.
+    /// Otherwise it is cropped to `bounds`.
+    #[serde(default)]
+    pub full_frame: bool,
 }
 
 impl Default for AssetKind {
@@ -469,6 +499,7 @@ impl AssetMeta {
             sample_rate: self.sample_rate,
             channels: self.channels,
             samples: self.samples,
+            layer: self.layer,
         }
     }
 }

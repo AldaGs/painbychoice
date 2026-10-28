@@ -574,7 +574,7 @@ fn serve(
     let ahead = run_ahead(meta, sessions.len() + 1);
     let opened = decoders
         .stream(path, want, meta)
-        .map(|stream| Session { asset, meta: *meta, stream, until: want + ahead });
+        .map(|stream| Session { asset, meta: meta.clone(), stream, until: want + ahead });
     let Some(mut s) = opened else {
         // No sequential mode — a still, where one frame is already in order.
         return decoders.frame(path, want, meta).map_err(|e| e.to_string());

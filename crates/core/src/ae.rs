@@ -77,6 +77,17 @@ pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
         let fps = num(item, "framerate", 0.0);
         let mut asset = Asset::image(aid, path, num(item, "width", 0.0), num(item, "height", 0.0));
         asset.kind = kind;
+        // One layer of a layered PSD / AI file, as AE's comp import makes.
+        let sl = &item["sourceLayer"];
+        if sl.is_object() {
+            let b = nums(&sl["bounds"]);
+            asset.layer = Some(crate::asset::SourceLayer {
+                index: sl["index"].as_i64().filter(|i| *i >= 0).map(|i| i as u32),
+                name: sl["name"].as_str().unwrap_or("").to_string(),
+                bounds: [0, 1, 2, 3].map(|i| b.get(i).copied().unwrap_or(0.0)),
+                full_frame: sl["fullFrame"] == true,
+            });
+        }
         if kind == AssetKind::Video {
             asset.fps = fps;
             asset.frames = (num(item, "seconds", 0.0) * fps).round().max(1.0) as i64;
@@ -687,7 +698,7 @@ impl Importer<'_> {
         let p = |i: u32| prop(&props, &format!("{mn}-{i:04}")).cloned();
         // A parameter scaled by `k` from AE's units to PBC's.
         let mut f = |i: u32, or: f64| self.scalar(p(i).as_ref(), 1.0, or);
-        let mut fk = |me: &mut Self, i: u32, k: f64, or: f64| me.scalar(p(i).as_ref(), k, or);
+        let fk = |me: &mut Self, i: u32, k: f64, or: f64| me.scalar(p(i).as_ref(), k, or);
         // A static number, for parameters PBC folds into others.
         let n = |i: u32, or: f64| p(i).and_then(|q| nums(&q["value"]).first().copied()).unwrap_or(or);
         let kind = match mn {

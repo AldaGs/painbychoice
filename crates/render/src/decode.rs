@@ -22,6 +22,8 @@ use motion_core::asset::{
 pub fn default_registry() -> DecoderRegistry {
     let mut reg = DecoderRegistry::new();
     reg.register(Box::new(ImageDecoder));
+    reg.register(Box::new(PsdDecoder::default()));
+    reg.register(Box::new(AiDecoder::default()));
     reg.register(Box::new(RawDecoder));
     reg.register(Box::new(HeicDecoder::new()));
     reg.register(Box::new(FfmpegDecoder::new()));
@@ -83,6 +85,218 @@ impl Decoder for ImageDecoder {
         let (w, h) = img.dimensions();
         Frame::new(w, h, img.into_raw())
     }
+}
+
+/// Photoshop documents: the flattened image, or one layer of it when the
+/// asset names one (After Effects' "import as composition" footage).
+///
+/// Parsed files are kept: a layered PSD backs one asset per layer, and each
+/// would otherwise parse the whole document again.
+#[derive(Default)]
+pub struct PsdDecoder {
+    cache: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<psd::Psd>>>,
+}
+
+impl PsdDecoder {
+    fn load(&self, path: &Path) -> Result<std::sync::Arc<psd::Psd>, DecodeError> {
+        if let Some(p) = self.cache.lock().unwrap().get(path) {
+            return Ok(p.clone());
+        }
+        let bytes = std::fs::read(path).map_err(|e| DecodeError::Malformed(format!("{}: {e}", path.display())))?;
+        // The crate panics on some documents it does not support (e.g. 16-bit
+        // channels); that is a bad file, not a crashed render.
+        let parsed = std::panic::catch_unwind(|| psd::Psd::from_bytes(&bytes))
+            .map_err(|_| DecodeError::Malformed(format!("{}: unsupported PSD", path.display())))?
+            .map_err(|e| DecodeError::Malformed(format!("{}: {e}", path.display())))?;
+        let p = std::sync::Arc::new(parsed);
+        self.cache.lock().unwrap().insert(path.to_path_buf(), p.clone());
+        Ok(p)
+    }
+}
+
+impl Decoder for PsdDecoder {
+    fn name(&self) -> &str {
+        "psd"
+    }
+    fn probe(&self, path: &Path) -> bool {
+        matches!(extension(path).as_str(), "psd" | "psb")
+    }
+    fn open(&self, path: &Path) -> Result<AssetMeta, DecodeError> {
+        let p = self.load(path)?;
+        Ok(AssetMeta::visual(AssetKind::Image, p.width() as f64, p.height() as f64, 1, 0.0))
+    }
+    fn frame(&self, path: &Path, _source_frame: i64, meta: &AssetMeta) -> Result<Frame, DecodeError> {
+        let p = self.load(path)?;
+        let (w, h) = (p.width(), p.height());
+        let Some(want) = &meta.layer else {
+            return Frame::new(w, h, std::panic::catch_unwind(|| p.rgba()).map_err(|_| bad(path))?);
+        };
+        // AE counts group dividers in its layer index and the crate does not,
+        // so the layer is found by name, and by its box when names repeat.
+        let [l, t, r, b] = want.bounds.map(|v| v.round() as i32);
+        let named: Vec<&psd::PsdLayer> = p.layers().iter().filter(|x| x.name().trim() == want.name.trim()).collect();
+        let layer = named
+            .iter()
+            .find(|x| (x.layer_left(), x.layer_top(), x.layer_right(), x.layer_bottom()) == (l, t, r, b))
+            .or(named.first())
+            .ok_or_else(|| DecodeError::Malformed(format!("{}: no layer {:?}", path.display(), want.name)))?;
+        let canvas = std::panic::catch_unwind(|| layer.rgba()).map_err(|_| bad(path))?;
+        if want.full_frame || canvas.len() != (w * h * 4) as usize {
+            return Frame::new(w, h, canvas);
+        }
+        // Layer Size: just the layer's box, clipped to the canvas.
+        let (x0, y0) = (l.clamp(0, w as i32) as u32, t.clamp(0, h as i32) as u32);
+        let (x1, y1) = (r.clamp(0, w as i32) as u32, b.clamp(0, h as i32) as u32);
+        let (cw, ch) = (x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1));
+        let mut out = vec![0u8; (cw * ch * 4) as usize];
+        for y in 0..ch.min(y1 - y0) {
+            let src = (((y0 + y) * w + x0) * 4) as usize;
+            let dst = (y * cw * 4) as usize;
+            out[dst..dst + ((x1 - x0) * 4) as usize].copy_from_slice(&canvas[src..src + ((x1 - x0) * 4) as usize]);
+        }
+        Frame::new(cw, ch, out)
+    }
+}
+
+/// A PDF text string: UTF-16BE behind a byte-order mark, otherwise
+/// PDFDocEncoding, which matches Latin-1 for the accents layer names use.
+fn pdf_text(b: &[u8]) -> String {
+    match b {
+        [0xFE, 0xFF, rest @ ..] => {
+            String::from_utf16_lossy(&rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>())
+        }
+        _ => b.iter().map(|&c| c as char).collect(),
+    }
+}
+
+/// What [`AiDecoder::only_layer`] says about a file with no PDF layers.
+const NO_LAYERS: &str = "no PDF layers";
+
+/// Illustrator files (and PDFs), rasterized at one pixel per point — what
+/// After Effects shows at 100% — through `hayro`. An `.ai` saved with PDF
+/// compatibility (Illustrator's default) is a PDF; one layer of it is shown by
+/// switching every other optional-content group off with `lopdf` first.
+#[derive(Default)]
+pub struct AiDecoder {
+    cache: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<Vec<u8>>>>,
+}
+
+impl AiDecoder {
+    fn bytes(&self, path: &Path) -> Result<std::sync::Arc<Vec<u8>>, DecodeError> {
+        if let Some(b) = self.cache.lock().unwrap().get(path) {
+            return Ok(b.clone());
+        }
+        let b = std::sync::Arc::new(std::fs::read(path).map_err(|e| DecodeError::Malformed(format!("{}: {e}", path.display())))?);
+        self.cache.lock().unwrap().insert(path.to_path_buf(), b.clone());
+        Ok(b)
+    }
+
+    /// `pdf` with only the optional-content group called `name` on.
+    fn only_layer(pdf: &[u8], name: &str) -> Result<Vec<u8>, String> {
+        use lopdf::{Dictionary, Object};
+        let mut doc = lopdf::Document::load_mem(pdf).map_err(|e| e.to_string())?;
+        let props = match doc.catalog().map_err(|e| e.to_string())?.get(b"OCProperties").map_err(|_| NO_LAYERS.to_string())? {
+            Object::Reference(r) => doc.get_object(*r).and_then(Object::as_dict).map_err(|e| e.to_string())?.clone(),
+            o => o.as_dict().map_err(|e| e.to_string())?.clone(),
+        };
+        let ocgs = props.get(b"OCGs").and_then(Object::as_array).map_err(|e| e.to_string())?;
+        let want = ocgs
+            .iter()
+            .filter_map(|o| o.as_reference().ok())
+            .find(|r| {
+                let n = doc.get_object(*r).and_then(Object::as_dict).and_then(|d| d.get(b"Name")).ok();
+                n.and_then(|n| n.as_str().ok()).is_some_and(|n| pdf_text(n).trim() == name.trim())
+            })
+            .ok_or_else(|| format!("no layer {name:?}"))?;
+        let mut config = Dictionary::new();
+        config.set("BaseState", Object::Name(b"OFF".to_vec()));
+        config.set("ON", Object::Array(vec![Object::Reference(want)]));
+        config.set("OFF", Object::Array(vec![]));
+        let mut props = props;
+        props.set("D", Object::Dictionary(config));
+        doc.catalog_mut().map_err(|e| e.to_string())?.set("OCProperties", Object::Dictionary(props));
+        let mut out = Vec::new();
+        doc.save_to(&mut out).map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    fn render(path: &Path, pdf: Vec<u8>) -> Result<(u32, u32, Vec<u8>), DecodeError> {
+        let err = |m: String| DecodeError::Malformed(format!("{}: {m}", path.display()));
+        let pdf = hayro::hayro_syntax::Pdf::new(pdf).map_err(|e| err(format!("{e:?}")))?;
+        let page = pdf.pages().first().ok_or_else(|| err("no pages".into()))?;
+        let pix = hayro::render(
+            page,
+            &hayro::RenderCache::new(),
+            &hayro::hayro_interpret::InterpreterSettings::default(),
+            &hayro::RenderSettings::default(),
+            &hayro::PixmapSettings::default(),
+        );
+        let mut rgba = Vec::with_capacity(pix.data().len() * 4);
+        for p in pix.data() {
+            let un = |c: u8| if p.a == 0 { 0 } else { ((c as u32 * 255) / p.a as u32).min(255) as u8 };
+            rgba.extend_from_slice(&[un(p.r), un(p.g), un(p.b), p.a]);
+        }
+        Ok((pix.width() as u32, pix.height() as u32, rgba))
+    }
+}
+
+impl Decoder for AiDecoder {
+    fn name(&self) -> &str {
+        "ai"
+    }
+    fn probe(&self, path: &Path) -> bool {
+        matches!(extension(path).as_str(), "ai" | "pdf")
+    }
+    fn open(&self, path: &Path) -> Result<AssetMeta, DecodeError> {
+        let pdf = hayro::hayro_syntax::Pdf::new(self.bytes(path)?.to_vec())
+            .map_err(|e| DecodeError::Malformed(format!("{}: {e:?}", path.display())))?;
+        let (w, h) = pdf.pages().first().map(|p| p.render_dimensions()).unwrap_or((0.0, 0.0));
+        Ok(AssetMeta::visual(AssetKind::Image, w as f64, h as f64, 1, 0.0))
+    }
+    fn frame(&self, path: &Path, _source_frame: i64, meta: &AssetMeta) -> Result<Frame, DecodeError> {
+        let bytes = self.bytes(path)?;
+        let pdf = match &meta.layer {
+            // A file without PDF layers (Illustrator's "Create Acrobat
+            // Layers" off) can only be drawn whole.
+            Some(l) if !l.name.is_empty() => match Self::only_layer(&bytes, &l.name) {
+                Ok(pdf) => pdf,
+                Err(m) if m == NO_LAYERS => bytes.to_vec(),
+                Err(m) => return Err(DecodeError::Malformed(format!("{}: {m}", path.display()))),
+            },
+            _ => bytes.to_vec(),
+        };
+        let (w, h, rgba) = Self::render(path, pdf)?;
+        let Some(l) = meta.layer.as_ref().filter(|l| !l.full_frame) else {
+            return Frame::new(w, h, rgba);
+        };
+        // Layer Size: the artwork box at the footage's own size. The box is
+        // in PDF page points, y up from the bottom edge, and may reach past
+        // the page; hayro clips to the page, so that part stays empty.
+        // ponytail: art outside the artboard is lost; render with an offset
+        // transform via `render_into` if a project needs it.
+        let (bx, by) = (l.bounds[0].floor() as i64, (h as f64 - l.bounds[3]).floor() as i64);
+        let (cw, ch) = (meta.width.round().max(1.0) as u32, meta.height.round().max(1.0) as u32);
+        let mut out = vec![0u8; (cw * ch * 4) as usize];
+        for y in 0..ch as i64 {
+            let sy = by + y;
+            if sy < 0 || sy >= h as i64 {
+                continue;
+            }
+            let (x0, x1) = ((-bx).clamp(0, cw as i64), (w as i64 - bx).clamp(0, cw as i64));
+            if x0 >= x1 {
+                continue;
+            }
+            let src = ((sy * w as i64 + bx + x0) * 4) as usize;
+            let dst = ((y * cw as i64 + x0) * 4) as usize;
+            let n = ((x1 - x0) * 4) as usize;
+            out[dst..dst + n].copy_from_slice(&rgba[src..src + n]);
+        }
+        Frame::new(cw, ch, out)
+    }
+}
+
+fn bad(path: &Path) -> DecodeError {
+    DecodeError::Malformed(format!("{}: unsupported PSD", path.display()))
 }
 
 /// Camera RAW, decoded and developed to sRGB in-process via `imagepipe`.
@@ -618,5 +832,86 @@ mod tests {
         assert_eq!(reg.decoder_for(Path::new("a/b/shot.NEF")).map(|d| d.name()), Some("raw"));
         assert_eq!(reg.decoder_for(Path::new("a/b/pic.HEIC")).map(|d| d.name()), Some("heic"));
         assert!(reg.decoder_for(Path::new("notes.txt")).is_none());
+    }
+}
+#[cfg(test)]
+mod ai_layers {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    /// A 20x10 pt page with two layers: "Left" fills the left half red,
+    /// "Right" the right half blue.
+    fn two_layer_pdf() -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let left = doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("Left") });
+        let right = doc.add_object(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("Right") });
+        let content = b"/OC /L BDC 1 0 0 rg 0 0 10 10 re f EMC /OC /R BDC 0 0 1 rg 10 0 10 10 re f EMC".to_vec();
+        let content = doc.add_object(Stream::new(dictionary! {}, content));
+        let pages = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(), 0.into(), 20.into(), 10.into()],
+            "Contents" => content,
+            "Resources" => dictionary! { "Properties" => dictionary! { "L" => left, "R" => right } },
+        });
+        doc.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages,
+            "OCProperties" => dictionary! { "OCGs" => vec![left.into(), right.into()], "D" => dictionary! {} },
+        });
+        doc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn one_layer_of_a_layered_pdf_draws_alone() {
+        let path = std::path::Path::new("layers.pdf");
+        let pdf = two_layer_pdf();
+        let (w, _, all) = super::AiDecoder::render(path, pdf.clone()).unwrap();
+        let px = |rgba: &[u8], x: u32| rgba[(5 * w + x) as usize * 4..][..4].to_vec();
+        assert_eq!((px(&all, 5)[0], px(&all, 15)[2]), (255, 255), "both layers by default");
+        let (_, _, left) = super::AiDecoder::render(path, super::AiDecoder::only_layer(&pdf, "Left").unwrap()).unwrap();
+        assert_eq!(px(&left, 5), vec![255, 0, 0, 255]);
+        assert_eq!(px(&left, 15)[3], 0, "the other layer is off");
+        assert!(super::AiDecoder::only_layer(&pdf, "Nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod psd_smoke {
+    #[test]
+    #[ignore]
+    fn decodes_a_real_layer() {
+        use motion_core::asset::{AssetMeta, Decoder, SourceLayer};
+        let path = std::path::PathBuf::from(std::env::var("PBC_PSD").unwrap());
+        let d = super::PsdDecoder::default();
+        let mut meta = d.open(&path).unwrap();
+        println!("canvas {}x{}", meta.width, meta.height);
+        meta.layer = Some(SourceLayer { index: None, name: std::env::var("PBC_PSD_LAYER").unwrap(), bounds: [201.0, 838.0, 884.0, 1045.0], full_frame: false });
+        let f = d.frame(&path, 0, &meta).unwrap();
+        let opaque = f.rgba.chunks(4).filter(|p| p[3] > 0).count();
+        println!("layer {}x{} opaque px {}", f.width, f.height, opaque);
+        let _ = AssetMeta::default();
+    }
+}
+#[cfg(test)]
+mod ai_smoke {
+    #[test]
+    #[ignore]
+    fn renders_a_real_layer() {
+        use motion_core::asset::{Decoder, SourceLayer};
+        let path = std::path::PathBuf::from(std::env::var("PBC_AI").unwrap());
+        let d = super::AiDecoder::default();
+        let mut meta = d.open(&path).unwrap();
+        println!("page {}x{}", meta.width, meta.height);
+        let b: Vec<f64> = std::env::var("PBC_AI_BOUNDS").unwrap().split(',').map(|v| v.parse().unwrap()).collect();
+        meta.width = std::env::var("PBC_AI_W").unwrap().parse().unwrap();
+        meta.height = std::env::var("PBC_AI_H").unwrap().parse().unwrap();
+        meta.layer = Some(SourceLayer { index: None, name: std::env::var("PBC_AI_LAYER").unwrap(), bounds: [b[0], b[1], b[2], b[3]], full_frame: false });
+        let t = std::time::Instant::now();
+        let f = d.frame(&path, 0, &meta).unwrap();
+        let opaque = f.rgba.chunks(4).filter(|p| p[3] > 0).count();
+        println!("layer {}x{} opaque {} in {:?}", f.width, f.height, opaque, t.elapsed());
+        image::save_buffer(std::env::var("PBC_OUT").unwrap(), &f.rgba, f.width, f.height, image::ColorType::Rgba8).unwrap();
     }
 }
