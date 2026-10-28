@@ -4962,6 +4962,10 @@ impl App {
             Some(FileCmd::Import) | None => {}
         }
         dirty |= replaced;
+        if let Some(edit) = tree_edits.folder.take() {
+            crate::assets::apply_folder_edit(&mut self.project, edit);
+            dirty = true;
+        }
         if let Some(item) = tree_edits.place.take() {
             dirty |= self.place_asset(item);
         }

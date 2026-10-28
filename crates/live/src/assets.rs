@@ -1,15 +1,44 @@
 //! The Assets panel: every file imported into the project, whichever comp uses
-//! it. Read-only for now — the library is edited by importing.
+//! it, filed into folders the user makes.
 
 use crate::*;
 use motion_core::{Asset, AssetKind};
 
 /// What an Assets-panel row carries when dragged: a file from the library or
-/// a composition, both of which become a layer when dropped on Layers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum AssetDrag {
-    File(motion_core::AssetId),
-    Comp(CompId),
+/// a composition, both of which become a layer when dropped on Layers, or move
+/// between folders when dropped in this panel.
+pub(crate) type AssetDrag = motion_core::ProjectItem;
+
+/// A change to the panel's folders.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FolderEdit {
+    New,
+    Rename(usize, String),
+    /// Remove the folder; its items return to the top level.
+    Delete(usize),
+    /// File an item into a folder, or out to the top level with `None`.
+    File(AssetDrag, Option<usize>),
+}
+
+/// Apply a folder edit to the project.
+pub(crate) fn apply_folder_edit(project: &mut MProject, edit: FolderEdit) {
+    match edit {
+        FolderEdit::New => {
+            let name = format!("Folder {}", project.folders.len() + 1);
+            project.folders.push(motion_core::AssetFolder { name, items: Vec::new() });
+        }
+        FolderEdit::Rename(i, name) => {
+            if let Some(f) = project.folders.get_mut(i) {
+                f.name = name;
+            }
+        }
+        FolderEdit::Delete(i) => {
+            if i < project.folders.len() {
+                project.folders.remove(i);
+            }
+        }
+        FolderEdit::File(item, to) => project.file_into(item, to),
+    }
 }
 
 /// A comp's info line, in the same shape as a file's.
@@ -107,53 +136,164 @@ fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), 
 }
 
 pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut TreeEdits) {
+    // The whole panel takes drops too: an item released outside every folder
+    // goes back to the top level. Folder headers claim theirs first.
+    let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
+        ui.set_min_width(ui.available_width());
+        panel_ui(ui, project, current, out);
+        ui.allocate_space(egui::vec2(ui.available_width(), ui.available_height().max(40.0)));
+    });
+    if let Some(item) = dropped {
+        if project.folders.iter().any(|f| f.items.contains(&item)) {
+            out.folder = Some(FolderEdit::File(*item, None));
+        }
+    }
+}
+
+fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.heading("Assets");
         if icon::button(ui, icon::IMPORT, "Import images, video or audio into the project").clicked() {
             out.import_to_library = true;
         }
+        if icon::button(ui, icon::ADD, "New folder").clicked() {
+            out.folder = Some(FolderEdit::New);
+        }
     });
-    ui.weak("Drag onto Layers to add · double-click a comp to open it");
+    ui.weak("Drag onto Layers to add, onto a folder to file · double-click a comp to open it");
     ui.separator();
-    // Compositions first: they are what the project is made of.
-    for (id, c) in &project.comps {
-        let open = *id == current;
-        let dbl = row(
-            ui,
-            AssetDrag::Comp(*id),
-            |ui| {
-                ui.label(icon::text(icon::PRECOMP));
-            },
-            &c.label(*id),
-            |ui| {
-                ui.weak(comp_info(c));
-            },
-            if open { "The open composition".into() } else { "Composition".into() },
+
+    let rename_id = egui::Id::new("folder_rename");
+    let mut renaming: Option<(usize, String)> = ui.data(|d| d.get_temp(rename_id));
+    // Folded folders, by index. View state for the session, not saved.
+    let fold_id = egui::Id::new("folder_folds");
+    let mut folded: std::collections::HashSet<usize> = ui.data(|d| d.get_temp(fold_id)).unwrap_or_default();
+    for (fi, folder) in project.folders.iter().enumerate() {
+        // The header is one click target, allocated before its contents so
+        // the rename box on top keeps its own clicks (as in the Layers panel).
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
+        let open = !folded.contains(&fi);
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        if dbl && !open {
-            out.open_comp = Some(*id);
+        {
+            let ui = &mut row_ui;
+            ui.label(if open { "⏷" } else { "⏵" });
+            ui.label(icon::text(icon::GROUP));
+            match renaming.as_mut().filter(|(i, _)| *i == fi) {
+                Some((_, buf)) => {
+                    let t = ui.add(egui::TextEdit::singleline(buf).desired_width(120.0));
+                    t.request_focus();
+                    if t.lost_focus() {
+                        if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && !buf.trim().is_empty() {
+                            out.folder = Some(FolderEdit::Rename(fi, buf.trim().to_string()));
+                        }
+                        renaming = None;
+                    }
+                }
+                None => {
+                    ui.label(&folder.name);
+                }
+            }
+        }
+        if r.clicked() && !folded.remove(&fi) {
+            folded.insert(fi);
+        }
+        if r.double_clicked() {
+            renaming = Some((fi, folder.name.clone()));
+        }
+        r.context_menu(|ui| {
+            if ui.button("Rename").clicked() {
+                renaming = Some((fi, folder.name.clone()));
+                ui.close();
+            }
+            if ui.button("Delete folder").on_hover_text("Its contents move back to the top level").clicked() {
+                out.folder = Some(FolderEdit::Delete(fi));
+                ui.close();
+            }
+        });
+        if r.dnd_hover_payload::<AssetDrag>().is_some() {
+            let st = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+            ui.painter().rect_stroke(rect, 2.0, st, egui::StrokeKind::Inside);
+        }
+        if let Some(item) = r.dnd_release_payload::<AssetDrag>() {
+            out.folder = Some(FolderEdit::File(*item, Some(fi)));
+        }
+        if open {
+            ui.indent(("folder", fi), |ui| {
+                for item in &folder.items {
+                    item_row(ui, project, current, *item, out);
+                }
+            });
         }
     }
-    for a in project.assets.values() {
-        let _ = row(
-            ui,
-            AssetDrag::File(a.id),
-            |ui| kind_icon(ui, a.kind),
-            &a.name,
-            |ui| {
-                // ponytail: a stat per asset per frame; cache if a library
-                // ever holds hundreds of files.
-                if a.path.exists() {
-                    ui.weak(asset_info(a));
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 60),
-                        format!("{} missing", icon::WARNING),
-                    );
-                }
-            },
-            a.path.display().to_string(),
-        );
+    ui.data_mut(|d| d.insert_temp(fold_id, folded));
+    ui.data_mut(|d| match renaming {
+        Some(v) => {
+            d.insert_temp(rename_id, v);
+        }
+        None => d.remove::<(usize, String)>(rename_id),
+    });
+
+    // Then everything in no folder: compositions first, as they are what the
+    // project is made of.
+    let filed: std::collections::HashSet<AssetDrag> =
+        project.folders.iter().flat_map(|f| f.items.iter().copied()).collect();
+    let loose = project
+        .comps
+        .keys()
+        .map(|id| AssetDrag::Comp(*id))
+        .chain(project.assets.keys().map(|id| AssetDrag::File(*id)))
+        .filter(|i| !filed.contains(i));
+    for item in loose {
+        item_row(ui, project, current, item, out);
+    }
+}
+
+/// One file or comp row. An id whose asset or comp is gone draws nothing.
+fn item_row(ui: &mut egui::Ui, project: &MProject, current: CompId, item: AssetDrag, out: &mut TreeEdits) {
+    match item {
+        AssetDrag::Comp(id) => {
+            let Some(c) = project.comps.get(&id) else { return };
+            let open = id == current;
+            let dbl = row(
+                ui,
+                item,
+                |ui| {
+                    ui.label(icon::text(icon::PRECOMP));
+                },
+                &c.label(id),
+                |ui| {
+                    ui.weak(comp_info(c));
+                },
+                if open { "The open composition".into() } else { "Composition".into() },
+            );
+            if dbl && !open {
+                out.open_comp = Some(id);
+            }
+        }
+        AssetDrag::File(id) => {
+            let Some(a) = project.assets.get(&id) else { return };
+            let _ = row(
+                ui,
+                item,
+                |ui| kind_icon(ui, a.kind),
+                &a.name,
+                |ui| {
+                    // ponytail: a stat per asset per frame; cache if a library
+                    // ever holds hundreds of files.
+                    if a.path.exists() {
+                        ui.weak(asset_info(a));
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 160, 60),
+                            format!("{} missing", icon::WARNING),
+                        );
+                    }
+                },
+                a.path.display().to_string(),
+            );
+        }
     }
 }

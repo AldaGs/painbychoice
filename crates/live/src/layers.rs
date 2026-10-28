@@ -234,6 +234,8 @@ pub(crate) struct TreeEdits {
     /// Add this library item to the open comp — an Assets-panel drop or
     /// double-click.
     pub(crate) place: Option<AssetDrag>,
+    /// An Assets-panel folder change.
+    pub(crate) folder: Option<crate::assets::FolderEdit>,
     pub(crate) delete: Option<NodeId>,
     /// Move the selection into a new composition and leave an instance behind —
     /// the core AE workflow.

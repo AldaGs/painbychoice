@@ -1706,6 +1706,28 @@ pub struct Project {
     /// it, absolute otherwise.
     #[serde(default)]
     pub draft_out: Option<String>,
+    /// The Assets panel's folders. Purely organisational: nothing evaluates
+    /// them. `#[serde(default)]` so a file written before folders still loads.
+    #[serde(default)]
+    pub folders: Vec<AssetFolder>,
+}
+
+/// Something listed in the Assets panel: an imported file or a composition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProjectItem {
+    File(AssetId),
+    Comp(CompId),
+}
+
+/// A named Assets-panel folder. ponytail: flat, no nesting; add a parent
+/// index if nested folders are ever wanted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssetFolder {
+    pub name: String,
+    /// Members, in the order they were filed. An item in no folder sits at the
+    /// top level; an id whose asset or comp is gone is skipped when listed.
+    #[serde(default)]
+    pub items: Vec<ProjectItem>,
 }
 
 /// A named export spec, saved in the `.pbc`.
@@ -1777,6 +1799,18 @@ impl Project {
             legacy_shape_bindings: Vec::new(),
             render_presets: Vec::new(),
             draft_out: None,
+            folders: Vec::new(),
+        }
+    }
+
+    /// File `item` into folder `to`, or back to the top level with `None`. An
+    /// item lives in at most one folder, so it leaves any other first.
+    pub fn file_into(&mut self, item: ProjectItem, to: Option<usize>) {
+        for f in &mut self.folders {
+            f.items.retain(|i| *i != item);
+        }
+        if let Some(f) = to.and_then(|i| self.folders.get_mut(i)) {
+            f.items.push(item);
         }
     }
 
@@ -1926,6 +1960,26 @@ mod tests {
             .with_child(Node::group(1, "a"))
             .with_child(Node::group(2, "b"))
             .with_child(Node::group(3, "c").with_child(Node::group(4, "d")))
+    }
+
+    /// Folders are filed into one at a time, and a file from before folders
+    /// existed still loads, with none.
+    #[test]
+    fn asset_folders_file_items_and_old_files_load() {
+        let mut p = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));
+        let mut json: serde_json::Value = serde_json::to_value(&p).unwrap();
+        json.as_object_mut().unwrap().remove("folders");
+        let old: Project = serde_json::from_value(json).unwrap();
+        assert!(old.folders.is_empty());
+
+        p.folders = vec![AssetFolder { name: "a".into(), items: vec![] }, AssetFolder { name: "b".into(), items: vec![] }];
+        let item = ProjectItem::Comp(CompId(0));
+        p.file_into(item, Some(0));
+        p.file_into(item, Some(1));
+        assert!(p.folders[0].items.is_empty(), "it left the first folder");
+        assert_eq!(p.folders[1].items, vec![item]);
+        p.file_into(item, None);
+        assert!(p.folders[1].items.is_empty(), "back at the top level");
     }
 
     #[test]
