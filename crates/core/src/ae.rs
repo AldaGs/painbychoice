@@ -316,6 +316,9 @@ impl Importer<'_> {
                     Value::Keyframed(t) => Value::Keyframed(t.map_value(|a| Vec3::new(a.x * w, a.y * h, a.z * h))),
                     e => e,
                 }
+            } else if layer_kind == "null" {
+                // A null's default anchor is its top-left corner, not its centre.
+                Value::constant(Vec3::ZERO)
             } else {
                 Value::constant(Vec3::new(w / 2.0, h / 2.0, 0.0))
             };
@@ -781,7 +784,9 @@ impl Importer<'_> {
             let Some(l) = at else { break };
             let props = l["transform"].as_array().cloned().unwrap_or_default();
             if let Some(p) = prop(&props, "ADBE Scale") {
-                let v = match p["keyframes"].as_array().and_then(|k| k.first()) {
+                // ponytail: an animated scale folds at its settled (last) key, since a
+                // pop-in starting at 0 would divide by zero; per-frame needs a script.
+                let v = match p["keyframes"].as_array().and_then(|k| k.last()) {
                     Some(k) => nums(&k["value"]),
                     None => nums(&p["value"]),
                 };
@@ -940,17 +945,23 @@ impl Importer<'_> {
     fn position(&mut self, props: &[J], joined: &str) -> Value<Vec3> {
         let animated = |p: Option<&J>| p.is_some_and(|p| p.get("keyframes").is_some());
         let (px, py) = (prop(props, "ADBE Position_0"), prop(props, "ADBE Position_1"));
-        if !animated(prop(props, joined)) && (animated(px) || animated(py)) {
-            self.report.drop("separated position (X only kept)");
-            let x = self.scalar(px, 1.0, 0.0);
-            let y = match self.scalar(py, 1.0, 0.0) {
-                Value::Const(y) => y,
-                _ => 0.0,
-            };
-            return match x {
-                Value::Const(x) => Value::constant(Vec3::new(x, y, 0.0)),
-                Value::Keyframed(t) => Value::Keyframed(t.map_value(move |x| Vec3::new(x, y, 0.0))),
-                Value::Expr(e) => Value::Expr(e),
+        // Separated X/Y animate is what's live then; the joined value beside
+        // it can be a stale copy, even keyed (in comp space, not the parent's).
+        if animated(px) || animated(py) {
+            let (x, y) = (self.scalar(px, 1.0, 0.0), self.scalar(py, 1.0, 0.0));
+            return match (x, y) {
+                (Value::Const(x), Value::Const(y)) => Value::constant(Vec3::new(x, y, 0.0)),
+                (Value::Keyframed(t), Value::Const(y)) => Value::Keyframed(t.map_value(move |x| Vec3::new(x, y, 0.0))),
+                (Value::Const(x), Value::Keyframed(t)) => Value::Keyframed(t.map_value(move |y| Vec3::new(x, y, 0.0))),
+                // ponytail: both axes keyed keeps X's keys at Y's first value;
+                // merge the two tracks when a project needs it.
+                (Value::Keyframed(t), y) => {
+                    self.report.drop("separated position with both axes keyed (X kept)");
+                    let y = match y { Value::Keyframed(u) => u.keys().first().map_or(0.0, |k| k.value), _ => 0.0 };
+                    Value::Keyframed(t.map_value(move |x| Vec3::new(x, y, 0.0)))
+                }
+                // A scripted axis has no Vec3 form; the joined value stands in.
+                _ => self.vec3(prop(props, joined), 1.0, Vec3::ZERO),
             };
         }
         self.vec3(prop(props, joined), 1.0, Vec3::ZERO)
@@ -1074,7 +1085,17 @@ impl Importer<'_> {
         for i in 0..keys.len() {
             let mut kf = Keyframe::linear(frames[i], vals[i].clone());
             if let Some(next) = keys.get(i + 1) {
-                let (o, n) = ae_handles(&keys[i], next, times[i + 1] - times[i], dist(&vals[i], &vals[i + 1]));
+                // AE's speeds are in its own units (percent, not PBC's 0-1),
+                // so the change they scale against is too: the path length
+                // for a spatial property, the first dimension's change for
+                // anything else, as that's the dimension the speed is read from.
+                let (a, b) = (nums(&keys[i]["value"]), nums(&next["value"]));
+                let raw = if p["valueType"] == "Spatial" {
+                    a.iter().zip(&b).map(|(a, b)| (b - a) * (b - a)).sum::<f64>().sqrt()
+                } else {
+                    a.first().zip(b.first()).map_or(0.0, |(a, b)| b - a)
+                };
+                let (o, n) = ae_handles(&keys[i], next, times[i + 1] - times[i], raw);
                 kf.out_handle = o;
                 if keys[i]["outInterpolation"] == "Hold" {
                     kf.interp = Interp::Hold;
