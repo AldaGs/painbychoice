@@ -293,12 +293,21 @@ impl Importer<'_> {
             let c = self.comp_size / 2.0;
             node.transform.position = Value::constant(Vec3::new(c.x, c.y, 0.0));
         }
-        if !has("ADBE Anchor Point") {
-            let src = l["sourceId"].as_u64().and_then(|s| self.items.get(&s)).filter(|i| i.get("width").is_some());
-            if let Some(i) = src {
-                let c = Vec2::new(num(i, "width", 0.0), num(i, "height", 0.0)) / 2.0;
-                node.transform.anchor = Value::constant(Vec3::new(c.x, c.y, 0.0));
-            }
+        // A layer with a sized source (footage, solid, precomp) stores its
+        // anchor as a fraction of the source — z of its height — and a
+        // left-out one is the source's centre. Source-less layers store pixels.
+        let src = l["sourceId"].as_u64().and_then(|s| self.items.get(&s)).filter(|i| i.get("width").is_some());
+        if let Some(i) = src {
+            let (w, h) = (num(i, "width", 0.0), num(i, "height", 0.0));
+            node.transform.anchor = if has("ADBE Anchor Point") {
+                match std::mem::replace(&mut node.transform.anchor, Value::constant(Vec3::ZERO)) {
+                    Value::Const(a) => Value::Const(Vec3::new(a.x * w, a.y * h, a.z * h)),
+                    Value::Keyframed(t) => Value::Keyframed(t.map_value(|a| Vec3::new(a.x * w, a.y * h, a.z * h))),
+                    e => e,
+                }
+            } else {
+                Value::constant(Vec3::new(w / 2.0, h / 2.0, 0.0))
+            };
         }
 
         let in_ = l["inPoint"].as_f64().unwrap_or(start);
@@ -1270,7 +1279,7 @@ mod tests {
           {"id":6,"name":"Red","type":"Footage","footageType":"solid","solidColor":[1,0,0],"width":40,"height":30},
           {"id":1,"name":"Main","type":"Composition","width":400,"height":400,"framerate":25,"seconds":2,"layers":[
             {"index":1,"name":"child","layerId":3,"parent":2,"sourceId":6,"flags":{},
-             "transform":[{"matchName":"ADBE Position","value":[100,50,0]}]},
+             "transform":[{"matchName":"ADBE Position","value":[100,50,0]},{"matchName":"ADBE Anchor Point","value":[0.25,0.5,0]}]},
             {"index":2,"name":"clip","layerId":2,"sourceId":5,"flags":{},
              "transform":[{"matchName":"ADBE Position_0","value":[0]},{"matchName":"ADBE Position_1","value":[0]}],
              "masks":[{"matchName":"ADBE Mask Atom","properties":[{"matchName":"ADBE Mask Shape","path":
@@ -1295,6 +1304,8 @@ mod tests {
         assert_eq!(child.fill, Some(Value::constant(Color::rgb(1.0, 0.0, 0.0))));
         let Some(Shape::Vector { path }) = &child.shape else { panic!("no solid") };
         assert_eq!(path.anchors[2].point, Value::constant(Vec2::new(40.0, 30.0)));
+        // A sourced layer's anchor is stored as a fraction of its source.
+        assert_eq!(child.transform.anchor, Value::constant(Vec3::new(10.0, 15.0, 0.0)));
     }
 
     #[test]
