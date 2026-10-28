@@ -1754,12 +1754,14 @@ fn the_gizmo_pivot_lands_on_the_layers_anchor_in_the_world() {
 /// selecting a layer resize the whole window: the dopesheet grows a row per
 /// animatable property.
 ///
-/// The node graph is the one exemption — it runs its own `ScrollArea::both`.
+/// The node graph and the timeline are exempt — each runs its own scroll area
+/// (the timeline's sits under its pinned ruler; the curve editor fills the
+/// area exactly).
 #[test]
 fn every_content_leaf_is_kept_from_resizing_its_own_panel() {
     for editor in SWAPPABLE {
         let wrapped = editor.scroll_wrapped();
-        if editor == Editor::NodeGraph {
+        if editor == Editor::NodeGraph || editor == Editor::Timeline {
             assert!(!wrapped, "{editor:?} scrolls itself; nesting a second area fights it");
         } else {
             assert!(wrapped, "{editor:?} would resize its panel as its content changes");

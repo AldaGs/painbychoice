@@ -266,218 +266,224 @@ pub(crate) fn strips_ui(
     });
     let axis = axis.expect("the ruler always allocates the axis");
 
-    if rows.is_empty() {
-        ui.add_space(8.0);
-        ui.weak("This composition has no layers yet.");
-    }
-
-    for (i, row) in rows.iter().enumerate() {
-        let is_sel = selected == Some(row.id);
-        ui.horizontal(|ui| {
+    // The rows scroll under the ruler, which stays pinned above them so it is
+    // always there to scrub. Floating scroll bars take no width, so every
+    // row's track keeps the ruler's axis.
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        if rows.is_empty() {
             ui.add_space(8.0);
-            let cell = label_cell(ui, label_w, ROW_H);
+            ui.weak("This composition has no layers yet.");
+        }
 
-            // The range button sits at the right of the label cell, *placed*
-            // rather than laid out, so it can't widen this row's column and
-            // slide its track out of step with the ruler.
-            let btn_w = cell.width().min(22.0);
-            let btn = egui::Rect::from_min_size(
-                egui::pos2(cell.right() - btn_w, cell.top()),
-                egui::vec2(btn_w, cell.height()),
-            );
-            let name_cell = egui::Rect::from_min_max(
-                egui::pos2(cell.left() + row.depth as f32 * 10.0, cell.top()),
-                egui::pos2(btn.left() - 2.0, cell.bottom()),
-            );
-            let name_resp =
-                ui.interact(name_cell, ui.id().with(("strip_name", i)), egui::Sense::click());
-            if is_sel || name_resp.hovered() {
-                ui.painter_at(cell).rect_filled(
-                    cell,
-                    2.0,
-                    egui::Color32::from_white_alpha(if is_sel { 22 } else { 10 }),
+        for (i, row) in rows.iter().enumerate() {
+            let is_sel = selected == Some(row.id);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let cell = label_cell(ui, label_w, ROW_H);
+
+                // The range button sits at the right of the label cell, *placed*
+                // rather than laid out, so it can't widen this row's column and
+                // slide its track out of step with the ruler.
+                let btn_w = cell.width().min(22.0);
+                let btn = egui::Rect::from_min_size(
+                    egui::pos2(cell.right() - btn_w, cell.top()),
+                    egui::vec2(btn_w, cell.height()),
                 );
-            }
-            if name_resp.clicked() {
-                out.select_layer = Some(row.id);
-            }
-            // The type glyph in its accent, then the name beside it.
-            ui.painter_at(name_cell).text(
-                egui::pos2(name_cell.left(), name_cell.center().y),
-                egui::Align2::LEFT_CENTER,
-                row.kind.glyph(),
-                egui::FontId::new(13.0, egui::FontFamily::Name(icon::FAMILY.into())),
-                row.kind.accent(),
-            );
-            let name_cell = name_cell.with_min_x(name_cell.left() + 18.0);
-            label_text(ui, name_cell, &row.name, !is_sel);
-
-            match row.timing {
-                // One click gives the layer a range covering the whole comp —
-                // exactly what it does today — so arming trimming can never
-                // change what is on screen.
-                None => {
-                    if ui
-                        .put(btn, egui::Button::new(icon::text(icon::TRIM)).frame(false))
-                        .on_hover_text("Give this layer a time range")
-                        .clicked()
-                    {
-                        out.set_layer_timing =
-                            Some((row.id, Some(LayerTiming::new(0, last_frame + 1))));
-                    }
-                }
-                Some(_) => {
-                    if ui
-                        .put(btn, egui::Button::new(icon::text(icon::CLOSE)).frame(false))
-                        .on_hover_text("Back to the whole comp")
-                        .clicked()
-                    {
-                        out.set_layer_timing = Some((row.id, None));
-                    }
-                }
-            }
-
-            ui.add_space(SPLIT_W);
-            let (track, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width() - 8.0, ROW_H),
-                egui::Sense::click_and_drag(),
-            );
-            let painter = ui.painter_at(track);
-            painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
-
-            // The bar. A layer with no range is drawn as a faint full-width
-            // band rather than nothing: "alive the whole time" is a real state
-            // and should look like one, not like a missing layer.
-            let timing = row.timing;
-            let (x0, x1) = match timing {
-                Some(t) => (
-                    axis.frame_to_x(t.in_ as f64),
-                    axis.frame_to_x(t.out as f64),
-                ),
-                None => (track.left(), track.right()),
-            };
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(x0.max(track.left()), track.top() + 3.0),
-                egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
-            );
-            if bar.width() > 0.0 {
-                // Tinted with the layer type's accent: faint when it has no
-                // range, stronger when it does, strongest when selected.
-                let tint = match (timing.is_some(), is_sel) {
-                    (false, _) => 0.18,
-                    (true, false) => 0.42,
-                    (true, true) => 0.58,
-                };
-                let fill = egui::Color32::from_gray(32).lerp_to_gamma(row.kind.accent(), tint);
-                painter.rect_filled(bar, 3.0, fill);
-                if is_sel {
-                    painter.rect_stroke(
-                        bar,
-                        3.0,
-                        egui::Stroke::new(1.0, accent),
-                        egui::StrokeKind::Inside,
+                let name_cell = egui::Rect::from_min_max(
+                    egui::pos2(cell.left() + row.depth as f32 * 10.0, cell.top()),
+                    egui::pos2(btn.left() - 2.0, cell.bottom()),
+                );
+                let name_resp =
+                    ui.interact(name_cell, ui.id().with(("strip_name", i)), egui::Sense::click());
+                if is_sel || name_resp.hovered() {
+                    ui.painter_at(cell).rect_filled(
+                        cell,
+                        2.0,
+                        egui::Color32::from_white_alpha(if is_sel { 22 } else { 10 }),
                     );
                 }
-                // Where local frame 0 sits — the only feedback a slip gives,
-                // since the bar itself doesn't move under one.
-                if let Some(t) = timing {
-                    let sx = axis.frame_to_x(t.start as f64);
-                    if sx > bar.left() && sx < bar.right() {
-                        painter.line_segment(
-                            [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
+                if name_resp.clicked() {
+                    out.select_layer = Some(row.id);
+                }
+                // The type glyph in its accent, then the name beside it.
+                ui.painter_at(name_cell).text(
+                    egui::pos2(name_cell.left(), name_cell.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    row.kind.glyph(),
+                    egui::FontId::new(13.0, egui::FontFamily::Name(icon::FAMILY.into())),
+                    row.kind.accent(),
+                );
+                let name_cell = name_cell.with_min_x(name_cell.left() + 18.0);
+                label_text(ui, name_cell, &row.name, !is_sel);
+
+                match row.timing {
+                    // One click gives the layer a range covering the whole comp —
+                    // exactly what it does today — so arming trimming can never
+                    // change what is on screen.
+                    None => {
+                        if ui
+                            .put(btn, egui::Button::new(icon::text(icon::TRIM)).frame(false))
+                            .on_hover_text("Give this layer a time range")
+                            .clicked()
+                        {
+                            out.set_layer_timing =
+                                Some((row.id, Some(LayerTiming::new(0, last_frame + 1))));
+                        }
+                    }
+                    Some(_) => {
+                        if ui
+                            .put(btn, egui::Button::new(icon::text(icon::CLOSE)).frame(false))
+                            .on_hover_text("Back to the whole comp")
+                            .clicked()
+                        {
+                            out.set_layer_timing = Some((row.id, None));
+                        }
+                    }
+                }
+
+                ui.add_space(SPLIT_W);
+                let (track, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width() - 8.0, ROW_H),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter_at(track);
+                painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
+
+                // The bar. A layer with no range is drawn as a faint full-width
+                // band rather than nothing: "alive the whole time" is a real state
+                // and should look like one, not like a missing layer.
+                let timing = row.timing;
+                let (x0, x1) = match timing {
+                    Some(t) => (
+                        axis.frame_to_x(t.in_ as f64),
+                        axis.frame_to_x(t.out as f64),
+                    ),
+                    None => (track.left(), track.right()),
+                };
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(x0.max(track.left()), track.top() + 3.0),
+                    egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
+                );
+                if bar.width() > 0.0 {
+                    // Tinted with the layer type's accent: faint when it has no
+                    // range, stronger when it does, strongest when selected.
+                    let tint = match (timing.is_some(), is_sel) {
+                        (false, _) => 0.18,
+                        (true, false) => 0.42,
+                        (true, true) => 0.58,
+                    };
+                    let fill = egui::Color32::from_gray(32).lerp_to_gamma(row.kind.accent(), tint);
+                    painter.rect_filled(bar, 3.0, fill);
+                    if is_sel {
+                        painter.rect_stroke(
+                            bar,
+                            3.0,
+                            egui::Stroke::new(1.0, accent),
+                            egui::StrokeKind::Inside,
                         );
                     }
-                }
-            }
-
-            // The waveform, inside the bar and under the keyframe ticks. It
-            // is drawn from the layer's *own* time, so trimming the head
-            // scrolls the sound within the bar exactly as it scrolls the
-            // picture of a trimmed video layer — the whole reason this view
-            // makes sync editable rather than merely visible.
-            if let Some((asset, on)) = row.audio {
-                if let Some(pk) = peaks.get(&asset) {
-                    let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
-                    waveform(&painter, bar, &axis, tb.fps(), start, pk, on);
-                }
-            }
-
-            // Which of this layer's frames are decoded and ready. A remapped
-            // layer gets the empty gutter and nothing in it: its source frame
-            // comes from a curve resolved against the whole project, and a bar
-            // drawn from the natural mapping would be confidently wrong about
-            // every frame — worse than no bar, because it would be believed.
-            if let Some((asset, remapped)) = &row.footage {
-                let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
-                if !remapped {
-                    cache_bar(&painter, bar, &axis, tb.fps(), start, asset, cached);
-                }
-            }
-
-            // Keyframe ticks, clipped to the bar: a key outside the layer's
-            // window never plays, so drawing it on the strip would advertise
-            // motion that can't happen.
-            for &kf in &row.keys {
-                let kx = axis.frame_to_x(kf as f64);
-                if kx < bar.left() || kx > bar.right() {
-                    continue;
-                }
-                painter.line_segment(
-                    [
-                        egui::pos2(kx, bar.top() + 2.0),
-                        egui::pos2(kx, bar.bottom() - 2.0),
-                    ],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(205)),
-                );
-            }
-
-            let px = axis.frame_to_x(frame);
-            painter.line_segment(
-                [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
-                egui::Stroke::new(1.5, playhead_col),
-            );
-
-            // Clicking a strip selects its layer — the row *is* the layer, so
-            // anywhere on it should work, not only the name.
-            if resp.clicked() && !is_sel {
-                out.select_layer = Some(row.id);
-            }
-
-            // Drag: trim an edge, slide the body, alt-drag to slip. The grab
-            // mode and the timing it started from are latched at press, so
-            // applying the *total* delta to the original (not an incremental
-            // delta to the current) lets a drag that clamped at 0 spring back.
-            // A layer with no range has nothing to drag.
-            let Some(timing) = timing else { return };
-            let drag_id = ui.id().with(("strip_drag", i));
-            if resp.drag_started() {
-                // `press_origin`, not `interact_pointer_pos`: egui only fires
-                // `drag_started` once the pointer crosses its threshold, by
-                // which point the pointer has already left the handle it
-                // grabbed — which would read every trim as a slide.
-                if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-                    let alt = ui.input(|i| i.modifiers.alt);
-                    let grab = clip_grab_at(p.x, bar.left(), bar.right(), HANDLE_W, alt);
-                    let anchor = axis.x_to_frame(p.x);
-                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
-                }
-            }
-            if resp.dragged() {
-                let latched: Option<(ClipGrab, i64, LayerTiming)> =
-                    ui.ctx().data(|d| d.get_temp(drag_id));
-                if let (Some((grab, anchor, orig)), Some(p)) =
-                    (latched, resp.interact_pointer_pos())
-                {
-                    let next = drag_clip(orig, grab, axis.x_to_frame(p.x) - anchor);
-                    if next != timing {
-                        out.set_layer_timing = Some((row.id, Some(next)));
+                    // Where local frame 0 sits — the only feedback a slip gives,
+                    // since the bar itself doesn't move under one.
+                    if let Some(t) = timing {
+                        let sx = axis.frame_to_x(t.start as f64);
+                        if sx > bar.left() && sx < bar.right() {
+                            painter.line_segment(
+                                [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
+                            );
+                        }
                     }
                 }
-                dragging = true;
-            }
-        });
-    }
+
+                // The waveform, inside the bar and under the keyframe ticks. It
+                // is drawn from the layer's *own* time, so trimming the head
+                // scrolls the sound within the bar exactly as it scrolls the
+                // picture of a trimmed video layer — the whole reason this view
+                // makes sync editable rather than merely visible.
+                if let Some((asset, on)) = row.audio {
+                    if let Some(pk) = peaks.get(&asset) {
+                        let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
+                        waveform(&painter, bar, &axis, tb.fps(), start, pk, on);
+                    }
+                }
+
+                // Which of this layer's frames are decoded and ready. A remapped
+                // layer gets the empty gutter and nothing in it: its source frame
+                // comes from a curve resolved against the whole project, and a bar
+                // drawn from the natural mapping would be confidently wrong about
+                // every frame — worse than no bar, because it would be believed.
+                if let Some((asset, remapped)) = &row.footage {
+                    let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
+                    if !remapped {
+                        cache_bar(&painter, bar, &axis, tb.fps(), start, asset, cached);
+                    }
+                }
+
+                // Keyframe ticks, clipped to the bar: a key outside the layer's
+                // window never plays, so drawing it on the strip would advertise
+                // motion that can't happen.
+                for &kf in &row.keys {
+                    let kx = axis.frame_to_x(kf as f64);
+                    if kx < bar.left() || kx > bar.right() {
+                        continue;
+                    }
+                    painter.line_segment(
+                        [
+                            egui::pos2(kx, bar.top() + 2.0),
+                            egui::pos2(kx, bar.bottom() - 2.0),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(205)),
+                    );
+                }
+
+                let px = axis.frame_to_x(frame);
+                painter.line_segment(
+                    [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+                    egui::Stroke::new(1.5, playhead_col),
+                );
+
+                // Clicking a strip selects its layer — the row *is* the layer, so
+                // anywhere on it should work, not only the name.
+                if resp.clicked() && !is_sel {
+                    out.select_layer = Some(row.id);
+                }
+
+                // Drag: trim an edge, slide the body, alt-drag to slip. The grab
+                // mode and the timing it started from are latched at press, so
+                // applying the *total* delta to the original (not an incremental
+                // delta to the current) lets a drag that clamped at 0 spring back.
+                // A layer with no range has nothing to drag.
+                let Some(timing) = timing else { return };
+                let drag_id = ui.id().with(("strip_drag", i));
+                if resp.drag_started() {
+                    // `press_origin`, not `interact_pointer_pos`: egui only fires
+                    // `drag_started` once the pointer crosses its threshold, by
+                    // which point the pointer has already left the handle it
+                    // grabbed — which would read every trim as a slide.
+                    if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        let grab = clip_grab_at(p.x, bar.left(), bar.right(), HANDLE_W, alt);
+                        let anchor = axis.x_to_frame(p.x);
+                        ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
+                    }
+                }
+                if resp.dragged() {
+                    let latched: Option<(ClipGrab, i64, LayerTiming)> =
+                        ui.ctx().data(|d| d.get_temp(drag_id));
+                    if let (Some((grab, anchor, orig)), Some(p)) =
+                        (latched, resp.interact_pointer_pos())
+                    {
+                        let next = drag_clip(orig, grab, axis.x_to_frame(p.x) - anchor);
+                        if next != timing {
+                            out.set_layer_timing = Some((row.id, Some(next)));
+                        }
+                    }
+                    dragging = true;
+                }
+            });
+        }
+
+    });
 
     // --- Column splitter, spanning the ruler and every row: the columns are
     // one division of the panel, so there is one thing to grab. Drawn and

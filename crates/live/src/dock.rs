@@ -74,11 +74,12 @@ impl Editor {
     /// `show_dock` for why that matters.
     ///
     /// Excluded: **NodeGraph** runs its own `ScrollArea::both`
-    /// (nesting two would fight over the scroll delta); **Canvas** must measure an exact rect for
+    /// (nesting two would fight over the scroll delta); **Timeline** scrolls
+    /// its own rows so the ruler stays pinned above them; **Canvas** must measure an exact rect for
     /// the vello target; **Comp** and **Transport** are single fixed-height
     /// bars in non-resizable panels, so they have nothing to overflow.
     pub(crate) fn scroll_wrapped(self) -> bool {
-        matches!(self, Editor::Layers | Editor::Assets | Editor::Properties | Editor::Timeline)
+        matches!(self, Editor::Layers | Editor::Assets | Editor::Properties)
     }
 }
 

@@ -841,164 +841,6 @@ pub(crate) fn dopesheet_ui(
 
     let axis = axis.expect("ruler always allocates the axis");
 
-    // --- Clip bar: the selected layer's time range, drawn on the same axis as
-    // the keyframe rows. Drag an edge to trim, the body to slide. ---
-    if let Some(clip) = clip {
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            // The cell is allocated at the shared column width like every other
-            // row; the button is *placed* inside it, so a wide button can't
-            // widen this row's column the way it could when the button drove
-            // the layout.
-            let cell = label_cell(ui, label_w, ROW_H);
-            let btn = egui::Rect::from_min_size(
-                cell.left_top(),
-                egui::vec2(cell.width().min(24.0), cell.height()),
-            );
-            match clip.timing {
-                // No range yet: one click gives the layer one covering the
-                // whole comp, which is exactly what it does today — so
-                // enabling trimming never moves anything on screen.
-                None => {
-                    if ui
-                        .put(btn, egui::Button::new(icon::text(icon::TRIM)))
-                        .on_hover_text("Give this layer a time range")
-                        .clicked()
-                    {
-                        out.set_timing = Some(Some(LayerTiming::new(0, last_frame + 1)));
-                    }
-                }
-                Some(_) => {
-                    if ui
-                        .put(btn, egui::Button::new(icon::text(icon::CLOSE)))
-                        .on_hover_text(
-                            "Back to full comp.\n\
-                             Drag an end to trim, the body to slide, \
-                             alt+drag to slip (content moves, window stays).",
-                        )
-                        .clicked()
-                    {
-                        out.set_timing = Some(None);
-                    }
-                }
-            }
-
-            ui.add_space(SPLIT_W);
-            let (track, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width() - 8.0, ROW_H),
-                egui::Sense::click_and_drag(),
-            );
-            let painter = ui.painter_at(track);
-            painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
-
-            let Some(timing) = clip.timing else {
-                painter.text(
-                    egui::pos2(track.left() + 6.0, track.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    "live for the whole comp",
-                    egui::FontId::proportional(10.0),
-                    egui::Color32::from_gray(110),
-                );
-                return;
-            };
-
-            // The bar. Clamped to the track so a clip scrolled off-screen
-            // still paints a sliver at the edge instead of drawing outside.
-            let (x0, x1) = (axis.frame_to_x(timing.in_ as f64), axis.frame_to_x(timing.out as f64));
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(x0.max(track.left()), track.top() + 3.0),
-                egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
-            );
-            // Handles live on the *painted* edges, not the raw ones. A clip can
-            // extend past the visible window in either direction (the default
-            // range runs to `last_frame + 1`, one frame past the view), and an
-            // edge you can't see is an edge you can't grab — so the clamped end
-            // of the bar is what a drag reaches for.
-            let (grab_l, grab_r) = (bar.left(), bar.right());
-            if bar.width() > 0.0 {
-                painter.rect_filled(bar, 3.0, egui::Color32::from_rgb(58, 84, 120));
-                painter.rect_stroke(
-                    bar,
-                    3.0,
-                    egui::Stroke::new(1.0, accent),
-                    egui::StrokeKind::Inside,
-                );
-                // Where local frame 0 sits: the slip marker, and the only
-                // feedback a slip gives — the bar itself doesn't move, so
-                // without this the gesture would look like nothing happening.
-                let sx = axis.frame_to_x(timing.start as f64);
-                if sx > bar.left() && sx < bar.right() {
-                    painter.line_segment(
-                        [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
-                    );
-                } else {
-                    // Slipped out of view: pin an arrow to the edge it went
-                    // past, so "local 0 is off that way" stays legible instead
-                    // of the marker just vanishing.
-                    let (x, text) = if sx <= bar.left() {
-                        (bar.left() + 3.0, "<")
-                    } else {
-                        (bar.right() - 3.0, ">")
-                    };
-                    if bar.width() > 10.0 {
-                        painter.text(
-                            egui::pos2(x, bar.center().y),
-                            if sx <= bar.left() {
-                                egui::Align2::LEFT_CENTER
-                            } else {
-                                egui::Align2::RIGHT_CENTER
-                            },
-                            text,
-                            egui::FontId::proportional(11.0),
-                            egui::Color32::from_gray(170),
-                        );
-                    }
-                }
-            }
-
-            // Playhead over the bar, so the clip reads against the current time.
-            let px = axis.frame_to_x(frame);
-            painter.line_segment(
-                [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
-                egui::Stroke::new(1.5, playhead_col),
-            );
-
-            // Drag. The grab mode and the timing the drag started from are both
-            // latched at press: applying the *total* delta to the original (not
-            // an incremental delta to the current) is what makes a drag that
-            // clamps at 0 spring back when you drag away again.
-            const HANDLE_W: f32 = 6.0;
-            let drag_id = ui.id().with("clip_drag");
-            if resp.drag_started() {
-                // `press_origin`, not `interact_pointer_pos`: egui only fires
-                // `drag_started` once the pointer has crossed its drag
-                // threshold, and by then `interact_pointer_pos` reports where
-                // the pointer is *now* — already off the handle and into the
-                // body, so every trim read as a slide. The marquee below uses
-                // the same input for the same reason.
-                if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-                    let alt = ui.input(|i| i.modifiers.alt);
-                    let grab = clip_grab_at(p.x, grab_l, grab_r, HANDLE_W, alt);
-                    let anchor = axis.x_to_frame(p.x);
-                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
-                }
-            }
-            if resp.dragged() {
-                let latched: Option<(ClipGrab, i64, LayerTiming)> =
-                    ui.ctx().data(|d| d.get_temp(drag_id));
-                if let (Some((grab, anchor, orig)), Some(p)) = (latched, resp.interact_pointer_pos())
-                {
-                    let next = drag_clip(orig, grab, axis.x_to_frame(p.x) - anchor);
-                    if next != timing {
-                        out.set_timing = Some(Some(next));
-                    }
-                }
-                dragging = true;
-            }
-        });
-    }
-
     // --- Zoom / pan. Scroll anywhere over the panel; zoom keeps the
     // frame under the cursor pinned, which is what makes it feel like
     // zooming rather than jumping. ---
@@ -1055,123 +897,287 @@ pub(crate) fn dopesheet_ui(
     };
     let mut marquee_hits = KeySelection::new();
 
-    // No early return: the rows loop is a no-op on an empty slice, and
-    // returning here would skip the edge auto-pan below (which should
-    // still work while scrubbing the ruler with nothing selected).
-    if rows.is_empty() {
-        ui.add_space(8.0);
-        ui.weak("Select a node with animated properties to see its keyframes.");
-    }
-
-    for (row_idx, row) in rows.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            let cell = label_cell(ui, label_w, ROW_H);
-            label_text(ui, cell, &row.label, false);
-
-            // The track: full remaining width, fixed height.
-            ui.add_space(SPLIT_W);
-            let (track, track_resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width() - 8.0, ROW_H),
-                egui::Sense::click_and_drag(),
-            );
-            if track_resp.drag_started() {
-                ui.ctx().data_mut(|d| d.insert_temp(marquee_id, true));
-            }
-            let painter = ui.painter_at(track);
-            painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
-
-            let frame_to_x = |f: f64| axis.frame_to_x(f);
-            let x_to_frame = |x: f32| axis.x_to_frame(x);
-
-            // Playhead line.
-            let px = frame_to_x(frame);
-            painter.line_segment(
-                [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
-                egui::Stroke::new(1.5, playhead_col),
-            );
-
-            // Click on empty track → seek and clear the key selection.
-            if track_resp.clicked() {
-                if let Some(p) = track_resp.interact_pointer_pos() {
-                    out.seek_to = Some(x_to_frame(p.x).clamp(0, last_frame));
-                    out.clear_selection = true;
-                }
-            }
-
-            // Keyframe diamonds (interactive, drawn on top).
-            let cy = track.center().y;
-            for (key_idx, &kf) in row.frames.iter().enumerate() {
-                let kx = frame_to_x(kf as f64);
-                // Skip keys scrolled out of the window — otherwise
-                // their hit rects stay live outside the visible track.
-                if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
-                    continue;
-                }
-                if let Some(m) = marquee {
-                    if m.contains(egui::pos2(kx, cy)) {
-                        marquee_hits.insert((row.kind, key_idx));
+    // The rows scroll under the ruler, which stays pinned above them so it is
+    // always there to scrub. Floating scroll bars take no width, so every
+    // row's track keeps the ruler's axis.
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        // --- Clip bar: the selected layer's time range, drawn on the same axis as
+        // the keyframe rows. Drag an edge to trim, the body to slide. ---
+        if let Some(clip) = clip {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                // The cell is allocated at the shared column width like every other
+                // row; the button is *placed* inside it, so a wide button can't
+                // widen this row's column the way it could when the button drove
+                // the layout.
+                let cell = label_cell(ui, label_w, ROW_H);
+                let btn = egui::Rect::from_min_size(
+                    cell.left_top(),
+                    egui::vec2(cell.width().min(24.0), cell.height()),
+                );
+                match clip.timing {
+                    // No range yet: one click gives the layer one covering the
+                    // whole comp, which is exactly what it does today — so
+                    // enabling trimming never moves anything on screen.
+                    None => {
+                        if ui
+                            .put(btn, egui::Button::new(icon::text(icon::TRIM)))
+                            .on_hover_text("Give this layer a time range")
+                            .clicked()
+                        {
+                            out.set_timing = Some(Some(LayerTiming::new(0, last_frame + 1)));
+                        }
+                    }
+                    Some(_) => {
+                        if ui
+                            .put(btn, egui::Button::new(icon::text(icon::CLOSE)))
+                            .on_hover_text(
+                                "Back to full comp.\n\
+                                 Drag an end to trim, the body to slide, \
+                                 alt+drag to slip (content moves, window stays).",
+                            )
+                            .clicked()
+                        {
+                            out.set_timing = Some(None);
+                        }
                     }
                 }
-                let is_sel = selected_keys.contains(&(row.kind, key_idx));
-                let r = if is_sel { 6.5 } else { 5.0 };
-                let hit = egui::Rect::from_center_size(
-                    egui::pos2(kx, cy),
-                    egui::vec2(r * 2.4, r * 2.4),
+
+                ui.add_space(SPLIT_W);
+                let (track, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width() - 8.0, ROW_H),
+                    egui::Sense::click_and_drag(),
                 );
-                let id = ui.id().with((row_idx, key_idx));
-                let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+                let painter = ui.painter_at(track);
+                painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
 
-                let col = if is_sel || resp.dragged() || resp.hovered() {
-                    egui::Color32::WHITE
-                } else {
-                    accent
+                let Some(timing) = clip.timing else {
+                    painter.text(
+                        egui::pos2(track.left() + 6.0, track.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "live for the whole comp",
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_gray(110),
+                    );
+                    return;
                 };
-                let border = if is_sel {
-                    egui::Stroke::new(2.0, playhead_col)
-                } else {
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(16))
-                };
-                // Diamond = a rotated square.
-                let d = [
-                    egui::pos2(kx, cy - r),
-                    egui::pos2(kx + r, cy),
-                    egui::pos2(kx, cy + r),
-                    egui::pos2(kx - r, cy),
-                ];
-                painter.add(egui::Shape::convex_polygon(d.to_vec(), col, border));
 
-                if resp.clicked() {
-                    // Ctrl/⌘ or shift extends; a plain click replaces.
-                    let mods = ui.input(|i| i.modifiers);
-                    if mods.command || mods.shift {
-                        out.toggle_key = Some((row.kind, key_idx));
+                // The bar. Clamped to the track so a clip scrolled off-screen
+                // still paints a sliver at the edge instead of drawing outside.
+                let (x0, x1) = (axis.frame_to_x(timing.in_ as f64), axis.frame_to_x(timing.out as f64));
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(x0.max(track.left()), track.top() + 3.0),
+                    egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
+                );
+                // Handles live on the *painted* edges, not the raw ones. A clip can
+                // extend past the visible window in either direction (the default
+                // range runs to `last_frame + 1`, one frame past the view), and an
+                // edge you can't see is an edge you can't grab — so the clamped end
+                // of the bar is what a drag reaches for.
+                let (grab_l, grab_r) = (bar.left(), bar.right());
+                if bar.width() > 0.0 {
+                    painter.rect_filled(bar, 3.0, egui::Color32::from_rgb(58, 84, 120));
+                    painter.rect_stroke(
+                        bar,
+                        3.0,
+                        egui::Stroke::new(1.0, accent),
+                        egui::StrokeKind::Inside,
+                    );
+                    // Where local frame 0 sits: the slip marker, and the only
+                    // feedback a slip gives — the bar itself doesn't move, so
+                    // without this the gesture would look like nothing happening.
+                    let sx = axis.frame_to_x(timing.start as f64);
+                    if sx > bar.left() && sx < bar.right() {
+                        painter.line_segment(
+                            [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
+                        );
                     } else {
-                        out.select_key = Some((row.kind, key_idx));
+                        // Slipped out of view: pin an arrow to the edge it went
+                        // past, so "local 0 is off that way" stays legible instead
+                        // of the marker just vanishing.
+                        let (x, text) = if sx <= bar.left() {
+                            (bar.left() + 3.0, "<")
+                        } else {
+                            (bar.right() - 3.0, ">")
+                        };
+                        if bar.width() > 10.0 {
+                            painter.text(
+                                egui::pos2(x, bar.center().y),
+                                if sx <= bar.left() {
+                                    egui::Align2::LEFT_CENTER
+                                } else {
+                                    egui::Align2::RIGHT_CENTER
+                                },
+                                text,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_gray(170),
+                            );
+                        }
+                    }
+                }
+
+                // Playhead over the bar, so the clip reads against the current time.
+                let px = axis.frame_to_x(frame);
+                painter.line_segment(
+                    [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+                    egui::Stroke::new(1.5, playhead_col),
+                );
+
+                // Drag. The grab mode and the timing the drag started from are both
+                // latched at press: applying the *total* delta to the original (not
+                // an incremental delta to the current) is what makes a drag that
+                // clamps at 0 spring back when you drag away again.
+                const HANDLE_W: f32 = 6.0;
+                let drag_id = ui.id().with("clip_drag");
+                if resp.drag_started() {
+                    // `press_origin`, not `interact_pointer_pos`: egui only fires
+                    // `drag_started` once the pointer has crossed its drag
+                    // threshold, and by then `interact_pointer_pos` reports where
+                    // the pointer is *now* — already off the handle and into the
+                    // body, so every trim read as a slide. The marquee below uses
+                    // the same input for the same reason.
+                    if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+                        let alt = ui.input(|i| i.modifiers.alt);
+                        let grab = clip_grab_at(p.x, grab_l, grab_r, HANDLE_W, alt);
+                        let anchor = axis.x_to_frame(p.x);
+                        ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
                     }
                 }
                 if resp.dragged() {
+                    let latched: Option<(ClipGrab, i64, LayerTiming)> =
+                        ui.ctx().data(|d| d.get_temp(drag_id));
+                    if let (Some((grab, anchor, orig)), Some(p)) = (latched, resp.interact_pointer_pos())
+                    {
+                        let next = drag_clip(orig, grab, axis.x_to_frame(p.x) - anchor);
+                        if next != timing {
+                            out.set_timing = Some(Some(next));
+                        }
+                    }
                     dragging = true;
-                    if let Some(p) = resp.interact_pointer_pos() {
-                        // Dragging an unselected key selects it first,
-                        // so the drag acts on what's under the cursor.
-                        if !is_sel {
+                }
+            });
+        }
+
+        // No early return: the rows loop is a no-op on an empty slice, and
+        // returning here would skip the edge auto-pan below (which should
+        // still work while scrubbing the ruler with nothing selected).
+        if rows.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("Select a node with animated properties to see its keyframes.");
+        }
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let cell = label_cell(ui, label_w, ROW_H);
+                label_text(ui, cell, &row.label, false);
+
+                // The track: full remaining width, fixed height.
+                ui.add_space(SPLIT_W);
+                let (track, track_resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width() - 8.0, ROW_H),
+                    egui::Sense::click_and_drag(),
+                );
+                if track_resp.drag_started() {
+                    ui.ctx().data_mut(|d| d.insert_temp(marquee_id, true));
+                }
+                let painter = ui.painter_at(track);
+                painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
+
+                let frame_to_x = |f: f64| axis.frame_to_x(f);
+                let x_to_frame = |x: f32| axis.x_to_frame(x);
+
+                // Playhead line.
+                let px = frame_to_x(frame);
+                painter.line_segment(
+                    [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+                    egui::Stroke::new(1.5, playhead_col),
+                );
+
+                // Click on empty track → seek and clear the key selection.
+                if track_resp.clicked() {
+                    if let Some(p) = track_resp.interact_pointer_pos() {
+                        out.seek_to = Some(x_to_frame(p.x).clamp(0, last_frame));
+                        out.clear_selection = true;
+                    }
+                }
+
+                // Keyframe diamonds (interactive, drawn on top).
+                let cy = track.center().y;
+                for (key_idx, &kf) in row.frames.iter().enumerate() {
+                    let kx = frame_to_x(kf as f64);
+                    // Skip keys scrolled out of the window — otherwise
+                    // their hit rects stay live outside the visible track.
+                    if kx < track.left() - 2.0 || kx > track.right() + 2.0 {
+                        continue;
+                    }
+                    if let Some(m) = marquee {
+                        if m.contains(egui::pos2(kx, cy)) {
+                            marquee_hits.insert((row.kind, key_idx));
+                        }
+                    }
+                    let is_sel = selected_keys.contains(&(row.kind, key_idx));
+                    let r = if is_sel { 6.5 } else { 5.0 };
+                    let hit = egui::Rect::from_center_size(
+                        egui::pos2(kx, cy),
+                        egui::vec2(r * 2.4, r * 2.4),
+                    );
+                    let id = ui.id().with((row_idx, key_idx));
+                    let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+
+                    let col = if is_sel || resp.dragged() || resp.hovered() {
+                        egui::Color32::WHITE
+                    } else {
+                        accent
+                    };
+                    let border = if is_sel {
+                        egui::Stroke::new(2.0, playhead_col)
+                    } else {
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(16))
+                    };
+                    // Diamond = a rotated square.
+                    let d = [
+                        egui::pos2(kx, cy - r),
+                        egui::pos2(kx + r, cy),
+                        egui::pos2(kx, cy + r),
+                        egui::pos2(kx - r, cy),
+                    ];
+                    painter.add(egui::Shape::convex_polygon(d.to_vec(), col, border));
+
+                    if resp.clicked() {
+                        // Ctrl/⌘ or shift extends; a plain click replaces.
+                        let mods = ui.input(|i| i.modifiers);
+                        if mods.command || mods.shift {
+                            out.toggle_key = Some((row.kind, key_idx));
+                        } else {
                             out.select_key = Some((row.kind, key_idx));
                         }
-                        // Report a *delta* from this key's current
-                        // frame, so the whole selection can move as a
-                        // block. Recomputed each frame, so a clamped
-                        // drag catches up once room appears.
-                        let target = x_to_frame(p.x).clamp(0, last_frame);
-                        let delta = target - kf;
-                        if delta != 0 {
-                            out.move_by = Some(delta);
+                    }
+                    if resp.dragged() {
+                        dragging = true;
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            // Dragging an unselected key selects it first,
+                            // so the drag acts on what's under the cursor.
+                            if !is_sel {
+                                out.select_key = Some((row.kind, key_idx));
+                            }
+                            // Report a *delta* from this key's current
+                            // frame, so the whole selection can move as a
+                            // block. Recomputed each frame, so a clamped
+                            // drag catches up once room appears.
+                            let target = x_to_frame(p.x).clamp(0, last_frame);
+                            let delta = target - kf;
+                            if delta != 0 {
+                                out.move_by = Some(delta);
+                            }
                         }
                     }
                 }
-            }
-        });
-    }
+            });
+        }
+
+    });
 
     // --- Column splitter. One continuous strip spanning the ruler and every
     // row, rather than a handle per row: the columns are a single division of
