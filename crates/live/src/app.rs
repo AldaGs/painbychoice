@@ -57,6 +57,11 @@ pub(crate) struct App {
     pub(crate) egui_ctx: egui::Context,
     pub(crate) egui_state: Option<egui_winit::State>,
     pub(crate) egui_renderer: Option<egui_wgpu::Renderer>,
+    /// Panels popped out into their own windows — see [`crate::popout`].
+    pub(crate) popouts: Vec<Popout>,
+    /// Floating windows waiting for the event loop to open them: one just
+    /// popped out mid-frame, or ones restored from a loaded layout.
+    pub(crate) pending_floats: Vec<FloatSpec>,
 
     // Playback clock.
     pub(crate) playing: bool,
@@ -1142,6 +1147,8 @@ impl App {
             },
             egui_state: None,
             egui_renderer: None,
+            popouts: Vec::new(),
+            pending_floats: Vec::new(),
             playing: true,
             anchor: Instant::now(),
             paused_t: 0.0,
@@ -1526,7 +1533,11 @@ impl App {
     /// without a node context, and a node-relative read reports its own
     /// warning rather than being faked.
     pub(crate) fn script_preview(&self, frame: f64) -> Option<(GraphNodeId, Result<String, String>)> {
-        let sel = nodegraph::read_selection(&self.egui_ctx)?;
+        // The node graph keeps its selection in its window's egui memory, and
+        // it may be docked in the main window or floating in another.
+        let sel = std::iter::once(&self.egui_ctx)
+            .chain(self.popouts.iter().map(|p| &p.ctx))
+            .find_map(nodegraph::read_selection)?;
         let graph = scoped_graph(&self.project, self.ng_scope)?;
         let node = graph.node(sel)?;
         if node.kind != "script" {
@@ -1852,6 +1863,7 @@ impl ApplicationHandler for App {
         }
 
         self.state = RenderState::Active { surface, window };
+        self.open_floats(event_loop);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1863,13 +1875,18 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _id: WindowId,
+        id: WindowId,
         event: WindowEvent,
     ) {
         let window = match &self.state {
             RenderState::Active { window, .. } => window.clone(),
             RenderState::Suspended(_) => return,
         };
+        self.open_floats(event_loop);
+        if id != window.id() {
+            self.float_event(id, event, &window);
+            return;
+        }
 
         // Let egui see every event first; if it wants the event exclusively
         // (e.g. dragging the scrubber), don't also treat it as a canvas input.
@@ -2046,6 +2063,7 @@ impl ApplicationHandler for App {
                 // fully-decoded editor at zero redraws.
                 if self.playing
                     || self.egui_ctx.has_requested_repaint()
+                    || self.popouts.iter().any(|p| p.ctx.has_requested_repaint())
                     || self.footage.is_busy()
                 {
                     window.request_redraw();
@@ -3361,6 +3379,12 @@ impl App {
             layout: LayoutState {
                 dock: Some(self.dock.clone()),
                 user_presets: self.presets.iter().filter(|p| !p.builtin).cloned().collect(),
+                windows: self
+                    .popouts
+                    .iter()
+                    .map(Popout::spec)
+                    .chain(self.pending_floats.iter().cloned())
+                    .collect(),
             },
         };
         serde_json::to_string_pretty(&project)
@@ -3601,6 +3625,9 @@ impl App {
         let restored = match layout {
             Some(l) => {
                 self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
+                // The file's floating windows replace the open ones.
+                self.popouts.clear();
+                self.pending_floats = l.windows.into_iter().filter(|w| w.dock.is_floatable()).collect();
                 l.dock
             }
             None => None,
@@ -4190,15 +4217,10 @@ impl App {
         // Modules for a `use` node's picker: id + display name.
         let ng_modules: Vec<(ModuleId, String)> =
             self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            let mut next_id = 0;
-            let mut path = Vec::new();
-            show_dock(
-                dock,
-                ui,
-                &mut next_id,
-                &mut path,
-                &mut |editor, ui| match editor {
+        // Every window's leaves are drawn by this one closure, so a floating
+        // panel reads the same snapshot and reports into the same edits as a
+        // docked one — see `crate::popout`.
+        let mut draw = |editor: Editor, ui: &mut egui::Ui| match editor {
                     Editor::Comp => comp_ui(
                         ui,
                         RenderBar {
@@ -4417,10 +4439,30 @@ impl App {
                                 );
                         }
                     }
-                },
-                &mut dock_cmd,
-            );
+                };
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            let mut next_id = 0;
+            let mut path = Vec::new();
+            show_dock(dock, ui, &mut next_id, &mut path, true, &mut draw, &mut dock_cmd);
         });
+        let float_outputs: Vec<_> = self
+            .popouts
+            .iter_mut()
+            .map(|p| {
+                let raw = p.state.take_egui_input(&p.window);
+                let mut cmd = None;
+                let out = p.ctx.run_ui(raw, |ui| {
+                    // No vello frame behind a floating window: fill what the
+                    // panels leave bare, as the main window's canvas would.
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
+                    let mut next_id = 0;
+                    let mut path = Vec::new();
+                    show_dock(&mut p.dock, ui, &mut next_id, &mut path, false, &mut draw, &mut cmd);
+                });
+                (out, cmd)
+            })
+            .collect();
+        drop(draw);
         // --- Undo: the document as it stands *before* this frame's edits. ---
         // Everything from here to the `history.record` below is the apply
         // phase; a snapshot around the whole of it is what makes undo cover
@@ -4512,9 +4554,29 @@ impl App {
         // Now that egui has finished, restructure the layout tree if an area
         // header asked to. Doing it here (not mid-pass) keeps the panels and
         // their egui ids stable for the frame that was just drawn.
-        if let Some(cmd) = dock_cmd {
-            self.dock.apply(cmd);
-            window.request_redraw();
+        match dock_cmd {
+            Some(DockCmd::PopOut { path, size }) => {
+                if let Some(editor) = self.dock.leaf_at(&path).filter(|e| e.is_swappable()) {
+                    self.dock.apply(DockCmd::Close { path });
+                    // Opened by the next window event: that needs the loop.
+                    self.pending_floats.push(FloatSpec { dock: Dock::Leaf(editor), pos: None, size });
+                }
+                window.request_redraw();
+            }
+            Some(cmd) => {
+                self.dock.apply(cmd);
+                window.request_redraw();
+            }
+            None => {}
+        }
+        let mut float_paint = Vec::with_capacity(float_outputs.len());
+        for (p, (out, cmd)) in self.popouts.iter_mut().zip(float_outputs) {
+            if let Some(cmd) = cmd {
+                p.dock.apply(cmd);
+                p.window.set_title(&format!("Pain By Choice — {}", p.dock.title()));
+                window.request_redraw();
+            }
+            float_paint.push(out);
         }
         // Restore the save-field buffer taken for the UI pass.
         self.preset_name_buf = preset_name_buf;
@@ -5161,6 +5223,10 @@ impl App {
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
 
+        for (p, out) in self.popouts.iter_mut().zip(float_paint) {
+            p.paint(&self.context, out);
+        }
+
         // A slice of the active export, after the frame the user is watching
         // has been presented. Rendering export frames *before* the present
         // would delay the preview by the whole budget and make the editor feel
@@ -5274,7 +5340,7 @@ fn ask_recover(msg: &str) -> bool {
 
 /// The app icon (assets/brand), decoded for the title bar and taskbar. macOS
 /// ignores window icons; there the bundle's `app-icon.icns` is what shows.
-fn window_icon() -> Option<winit::window::Icon> {
+pub(crate) fn window_icon() -> Option<winit::window::Icon> {
     const PNG: &[u8] = include_bytes!("../../../assets/brand/png/app-icon-256.png");
     let mut reader = png::Decoder::new(std::io::Cursor::new(PNG)).read_info().ok()?;
     let mut rgba = vec![0; reader.output_buffer_size()?];
@@ -5292,5 +5358,50 @@ mod window_icon_tests {
     fn app_icon_decodes() {
         let icon = super::window_icon();
         assert!(icon.is_some(), "assets/brand/png/app-icon-256.png must decode as 8-bit RGBA");
+    }
+}
+
+impl App {
+    /// Open any queued floating windows. A window the OS or GPU refuses is
+    /// docked back into the main window rather than lost.
+    pub(crate) fn open_floats(&mut self, event_loop: &ActiveEventLoop) {
+        let RenderState::Active { window, .. } = &self.state else { return };
+        let main = window.clone();
+        for spec in std::mem::take(&mut self.pending_floats) {
+            match Popout::open(event_loop, &mut self.context, spec) {
+                Ok(p) => self.popouts.push(p),
+                Err(spec) => {
+                    eprintln!("could not open a floating window; docking it back");
+                    self.dock.dock_in(spec.dock);
+                }
+            }
+        }
+        main.request_redraw();
+    }
+
+    /// An event for a floating window. Input goes to that window's egui
+    /// context; the redraw always goes to the main window, whose frame runs
+    /// every window's UI pass (see `crate::popout`).
+    fn float_event(&mut self, id: WindowId, event: WindowEvent, main: &Arc<Window>) {
+        let Some(i) = self.popouts.iter().position(|p| p.window.id() == id) else { return };
+        match event {
+            // Closing a floating window docks its panels back: closing the
+            // window is "put this away", not "delete my timeline".
+            WindowEvent::CloseRequested => {
+                let p = self.popouts.remove(i);
+                self.dock.dock_in(p.dock);
+            }
+            WindowEvent::Resized(size) => {
+                let p = &mut self.popouts[i];
+                self.context.resize_surface(&mut p.surface, size.width.max(1), size.height.max(1));
+            }
+            // Painted by the main frame, which this redraw below triggers.
+            WindowEvent::RedrawRequested => {}
+            event => {
+                let p = &mut self.popouts[i];
+                let _ = p.state.on_window_event(&p.window, &event);
+            }
+        }
+        main.request_redraw();
     }
 }

@@ -17,6 +17,7 @@ live/src/
   main.rs       the `use` block, module decls, and `fn main`
   app.rs        App: window/GPU state, winit handler, the per-frame update
   dock.rs       panel layout tree, its editors, the composition bar
+  popout.rs     floating windows: content panels popped out onto other monitors
   layers.rs     scene-tree panel
   props.rs      properties panel, easing, and the PropKind enumeration
   timeline.rs   transport bar, ruler, dopesheet
@@ -96,6 +97,19 @@ mutate mid-render: an area header only *records* a `DockCmd` against the leaf's
 `path` (a `Vec<Branch>` naming it from the root), which `render` applies once
 the egui pass is done. Restructuring the tree while its panels are still laid
 out would desync egui's per-panel ids.
+
+**Floating windows (multi-monitor).** The main window's area headers also carry
+a pop-out button. `DockCmd::PopOut` closes the area and queues a `FloatSpec`; the
+next window event opens it as its own OS window (`popout::Popout`: its own
+surface, egui context and egui renderer, plus a `Dock` of content editors).
+Floating windows have **no update of their own**: `render` runs each one's egui
+pass right after the main one, with the *same* leaf-drawing closure, so their
+panels read the same snapshot and report into the same edits. Closing a
+floating window docks its tree back beside the canvas (`Dock::dock_in`, which
+keeps the canvas innermost). The open windows, with position and size, are
+saved in `LayoutState::windows`. The canvas, comp bar and transport never float
+(`Dock::is_floatable`). Keyboard shortcuts read the main window's input only;
+text fields in a floating panel work as usual. See ADR 0022.
 
 - **Only the content editors are `SWAPPABLE`** (Layers, Assets, Properties,
   Timeline, Nodes). The canvas and the comp/transport toolbars are *structural* leaves

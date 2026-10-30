@@ -27,6 +27,7 @@ itself teaches nothing.
 | [0018](0018-two-render-buttons.md) | Two render buttons: Draft and Master |
 | [0020](0020-the-render-job-is-stepped-not-threaded.md) | The GUI render job is stepped from the redraw loop, not threaded |
 | [0021](0021-audio-is-the-master-clock.md) | Audio is the master clock; the wall clock is the fallback |
+| [0022](0022-floating-windows-share-one-frame.md) | Floating windows share the main window's frame |
 
 ## Decided, not yet built
 

@@ -113,6 +113,11 @@ pub(crate) enum DockCmd {
     Split { path: Vec<Branch>, side: DockSide, size: f32 },
     /// Close the area at `path`; its sibling absorbs the freed space.
     Close { path: Vec<Branch> },
+    /// Move the area at `path` out into its own OS window, `size` points big
+    /// (the area's current size), so it can live on another monitor. Only the
+    /// main window offers it; [`Dock::apply`] ignores it because opening a
+    /// window needs the event loop — `App` handles it instead.
+    PopOut { path: Vec<Branch>, size: (f32, f32) },
 }
 
 /// The panel layout: a binary tree of splits with editors at the leaves.
@@ -266,6 +271,52 @@ impl Dock {
         cur
     }
 
+    /// The editor at the leaf named by `path`, if the path ends on one.
+    pub(crate) fn leaf_at(&self, path: &[Branch]) -> Option<Editor> {
+        let mut cur = self;
+        for &b in path {
+            match cur {
+                Dock::Split { first, second, .. } => {
+                    cur = if b == Branch::First { first } else { second };
+                }
+                Dock::Leaf(_) => return None,
+            }
+        }
+        match cur {
+            Dock::Leaf(e) => Some(*e),
+            Dock::Split { .. } => None,
+        }
+    }
+
+    /// Dock `sub` (a floating window's whole tree) back in, to the right of
+    /// the canvas. It wraps the innermost leaf — the canvas, per
+    /// [`Dock::is_valid`] — so the canvas stays innermost and the tree stays
+    /// valid whatever `sub` holds.
+    pub(crate) fn dock_in(&mut self, sub: Dock) {
+        let mut cur = self;
+        while let Dock::Split { second, .. } = cur {
+            cur = second;
+        }
+        let canvas = std::mem::replace(cur, Dock::Leaf(Editor::Canvas));
+        *cur = Dock::Split {
+            side: DockSide::Right,
+            size: PROPS_W,
+            resizable: true,
+            first: Box::new(sub),
+            second: Box::new(canvas),
+        };
+    }
+
+    /// Whether this tree may live in a floating window: content editors only.
+    /// The canvas is the main window's single vello target, and the comp bar
+    /// and transport are its fixed chrome, so none of them can leave it.
+    pub(crate) fn is_floatable(&self) -> bool {
+        match self {
+            Dock::Leaf(e) => e.is_swappable(),
+            Dock::Split { first, second, .. } => first.is_floatable() && second.is_floatable(),
+        }
+    }
+
     /// Apply a deferred layout edit. Each op is a local tree rewrite; every path
     /// is re-resolved here (never held across the UI pass), so a command that no
     /// longer matches the tree simply finds a leaf where it expected a split, or
@@ -313,6 +364,8 @@ impl Dock {
                     }
                 }
             }
+            // Needs the event loop; see the variant.
+            DockCmd::PopOut { .. } => {}
         }
     }
 
@@ -404,6 +457,10 @@ pub(crate) struct LayoutState {
     /// Presets saved via the Layout menu (built-ins omitted).
     #[serde(default)]
     pub(crate) user_presets: Vec<Preset>,
+    /// Panels popped out into their own windows, so a two-monitor setup
+    /// reopens the way it was left. Absent in older files → none.
+    #[serde(default)]
+    pub(crate) windows: Vec<crate::popout::FloatSpec>,
 }
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
@@ -417,11 +474,15 @@ pub(crate) struct LayoutState {
 /// collects at most one area-header interaction (split/join/retype) to be
 /// applied after the pass — the tree must not be restructured while its panels
 /// are still being laid out this frame.
+///
+/// `can_pop` offers the pop-out button: true in the main window, false in a
+/// floating one (which is already out).
 pub(crate) fn show_dock(
     node: &mut Dock,
     ui: &mut egui::Ui,
     next_id: &mut u32,
     path: &mut Vec<Branch>,
+    can_pop: bool,
     draw: &mut dyn FnMut(Editor, &mut egui::Ui),
     cmd: &mut Option<DockCmd>,
 ) {
@@ -430,7 +491,7 @@ pub(crate) fn show_dock(
             // Content areas get a header (picker + split/close); the three
             // structural leaves (canvas, comp, transport) don't — see `SWAPPABLE`.
             if editor.is_swappable() {
-                area_header(ui, *editor, path, cmd);
+                area_header(ui, *editor, path, can_pop, cmd);
             }
             if editor.scroll_wrapped() {
                 // Vertical only: the dopesheet maps frames across the panel's
@@ -464,7 +525,7 @@ pub(crate) fn show_dock(
             };
             let resp = panel.show(ui, |ui| {
                 path.push(Branch::First);
-                show_dock(first, ui, next_id, path, draw, cmd);
+                show_dock(first, ui, next_id, path, can_pop, draw, cmd);
                 path.pop();
             });
             // Read the size back so the tree — not egui's private panel memory —
@@ -493,7 +554,7 @@ pub(crate) fn show_dock(
             // (rather than into a sibling panel) is what makes the nesting
             // depth-first and the geometry exact.
             path.push(Branch::Second);
-            show_dock(second, ui, next_id, path, draw, cmd);
+            show_dock(second, ui, next_id, path, can_pop, draw, cmd);
             path.pop();
         }
     }
@@ -504,7 +565,13 @@ pub(crate) fn show_dock(
 /// records a [`DockCmd`] against this leaf's `path`, applied once the frame's
 /// UI is done. At most one command survives a frame, which is all a click can
 /// produce anyway.
-pub(crate) fn area_header(ui: &mut egui::Ui, editor: Editor, path: &[Branch], cmd: &mut Option<DockCmd>) {
+pub(crate) fn area_header(
+    ui: &mut egui::Ui,
+    editor: Editor,
+    path: &[Branch],
+    can_pop: bool,
+    cmd: &mut Option<DockCmd>,
+) {
     // Measured before any content is drawn, so a split starts at half the area.
     let area = ui.max_rect();
     ui.horizontal(|ui| {
@@ -522,6 +589,12 @@ pub(crate) fn area_header(ui: &mut egui::Ui, editor: Editor, path: &[Branch], cm
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if icon::button(ui, icon::CLOSE, "Close this area").clicked() {
                 *cmd = Some(DockCmd::Close { path: path.to_vec() });
+            }
+            if can_pop && icon::button(ui, icon::OPEN, "Pop out into its own window").clicked() {
+                *cmd = Some(DockCmd::PopOut {
+                    path: path.to_vec(),
+                    size: (area.width(), area.height()),
+                });
             }
             if icon::button(ui, icon::SPLIT_H, "Split top / bottom").clicked() {
                 *cmd = Some(DockCmd::Split {
