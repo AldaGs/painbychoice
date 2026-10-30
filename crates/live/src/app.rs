@@ -1884,7 +1884,7 @@ impl ApplicationHandler for App {
         };
         self.open_floats(event_loop);
         if id != window.id() {
-            self.float_event(id, event, &window);
+            self.float_event(event_loop, id, event, &window);
             return;
         }
 
@@ -1916,32 +1916,7 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. }
                 if !consumed && event.state == ElementState::Pressed =>
             {
-                match event.logical_key {
-                    Key::Named(NamedKey::Space) => self.toggle_play(),
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Named(NamedKey::ArrowRight) => {
-                        self.playing = false;
-                        self.seek_frame(self.current_frame() + 1);
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        self.playing = false;
-                        self.seek_frame(self.current_frame() - 1);
-                    }
-                    Key::Character(ref s) if s == "r" || s == "R" => {
-                        // Restart the *preview*: to the work-area start, not
-                        // always frame 0.
-                        self.seek_frame(self.loop_bounds_frames().0);
-                    }
-                    // AE's work-area keys: B sets the start at the playhead, N
-                    // the end. View state — nothing in the document changes.
-                    Key::Character(ref s) if s == "b" || s == "B" => {
-                        self.set_work_start(self.current_frame());
-                    }
-                    Key::Character(ref s) if s == "n" || s == "N" => {
-                        self.set_work_end(self.current_frame());
-                    }
-                    _ => {}
-                }
+                self.plain_key(event_loop, &event.logical_key);
                 window.request_redraw();
             }
 
@@ -3905,7 +3880,7 @@ impl App {
         // clock keeps real time). Skipped mid-drag so a gizmo stays
         // responsive, and during a font-picker preview, which draws a
         // different project.
-        let dragging = self.egui_ctx.input(|i| i.pointer.any_down());
+        let dragging = self.contexts().any(|c| c.input(|i| i.pointer.any_down()));
         if !dragging && previewing.is_none() && self.doc().motion_blur.enabled {
             if let Some(vs) = self.motion_blur_preview(frame, fit, canvas) {
                 self.vscene = vs;
@@ -4473,8 +4448,7 @@ impl App {
         // undoable. Not while typing, and not with the pen armed — there it
         // removes anchors. A locked layer and the root can't be deleted.
         let del_key = self.tool.pen_mode().is_none()
-            && !self.egui_ctx.egui_wants_keyboard_input()
-            && self.egui_ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+            && self.shortcut(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
         let delete_keys = del_key && !self.selected_keys.is_empty();
         if del_key && !delete_keys {
             let root = &self.doc().root;
@@ -4917,19 +4891,11 @@ impl App {
         // handler because that one never sees a modifier state, and suppressed
         // while a text field has focus so Ctrl+V in a numeric box still pastes
         // text instead of keyframes.
-        if !self.egui_ctx.egui_wants_keyboard_input() {
-            let (copy, paste) = self.egui_ctx.input(|i| {
-                (
-                    i.modifiers.command && i.key_pressed(egui::Key::C),
-                    i.modifiers.command && i.key_pressed(egui::Key::V),
-                )
-            });
-            if copy {
-                self.copy_selected_keys();
-            }
-            if paste {
-                dirty |= self.paste_keys();
-            }
+        if self.shortcut(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            self.copy_selected_keys();
+        }
+        if self.shortcut(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            dirty |= self.paste_keys();
         }
         // Easing edits target the single selected key (the editor only appears
         // when exactly one is selected).
@@ -4993,10 +4959,8 @@ impl App {
         }
         // File commands: the menu, or their shortcuts — the latter not while a
         // text field has focus, same rule as undo.
-        let shortcut = if self.egui_ctx.egui_wants_keyboard_input() {
-            None
-        } else {
-            self.egui_ctx.input_mut(|i| {
+        let shortcut = self.contexts().filter(|c| !c.egui_wants_keyboard_input()).find_map(|c| {
+            c.input_mut(|i| {
                 use egui::{Key, KeyboardShortcut as K, Modifiers as M};
                 [
                     (K::new(M::COMMAND | M::ALT, Key::S), FileCmd::SaveIncrement),
@@ -5010,7 +4974,7 @@ impl App {
                 .find(|(k, _)| i.consume_shortcut(k))
                 .map(|(_, c)| c)
             })
-        };
+        });
         // Opening a different project is not an edit *of* the open one: undoing
         // across that boundary would resurrect a document the user has moved on
         // from, and the layout/selection restored with it are gone anyway.
@@ -5042,7 +5006,7 @@ impl App {
         // One comparison covers every edit above. `PartialEq` on the document
         // early-outs at the first difference, so an idle frame costs a few
         // field reads; the clone is only kept when it actually differs.
-        let pointer_down = self.egui_ctx.input(|i| i.pointer.any_down());
+        let pointer_down = self.contexts().any(|c| c.input(|i| i.pointer.any_down()));
         if replaced {
             self.history.clear();
         } else if self.project != before {
@@ -5058,20 +5022,15 @@ impl App {
         // swap this performs is never itself mistaken for an edit. Suppressed
         // while a text field has focus, like keyframe copy/paste — Ctrl+Z in a
         // name field belongs to the field.
-        if !self.egui_ctx.egui_wants_keyboard_input() {
-            let (undo, redo) = self.egui_ctx.input(|i| {
-                (
-                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
-                    i.modifiers.command
-                        && (i.key_pressed(egui::Key::Y)
-                            || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
-                )
-            });
-            if undo {
-                dirty |= self.undo();
-            } else if redo {
-                dirty |= self.redo();
-            }
+        let undo = self.shortcut(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z));
+        let redo = self.shortcut(|i| {
+            i.modifiers.command
+                && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))
+        });
+        if undo {
+            dirty |= self.undo();
+        } else if redo {
+            dirty |= self.redo();
         }
         match comp.history {
             Some(HistoryCmd::Undo) => dirty |= self.undo(),
@@ -5362,6 +5321,51 @@ mod window_icon_tests {
 }
 
 impl App {
+    /// The egui context of every window: the main one, then each floating
+    /// one. Shortcuts read all of them, so they work from whichever window
+    /// has focus — only the focused window's context sees the key.
+    pub(crate) fn contexts(&self) -> impl Iterator<Item = &egui::Context> {
+        std::iter::once(&self.egui_ctx).chain(self.popouts.iter().map(|p| &p.ctx))
+    }
+
+    /// Whether `f` holds for some window whose text fields don't have the
+    /// keyboard: the gate for every modified-key shortcut.
+    fn shortcut(&self, f: impl Fn(&egui::InputState) -> bool) -> bool {
+        self.contexts().any(|c| !c.egui_wants_keyboard_input() && c.input(&f))
+    }
+
+    /// The bare-key shortcuts (space, arrows, R, B, N, Escape) from whichever
+    /// window has focus. The caller has already let egui have the key first,
+    /// so typing into a field never seeks or plays.
+    fn plain_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Space) => self.toggle_play(),
+            Key::Named(NamedKey::Escape) => event_loop.exit(),
+            Key::Named(NamedKey::ArrowRight) => {
+                self.playing = false;
+                self.seek_frame(self.current_frame() + 1);
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.playing = false;
+                self.seek_frame(self.current_frame() - 1);
+            }
+            Key::Character(s) if s == "r" || s == "R" => {
+                // Restart the *preview*: to the work-area start, not
+                // always frame 0.
+                self.seek_frame(self.loop_bounds_frames().0);
+            }
+            // AE's work-area keys: B sets the start at the playhead, N
+            // the end. View state — nothing in the document changes.
+            Key::Character(s) if s == "b" || s == "B" => {
+                self.set_work_start(self.current_frame());
+            }
+            Key::Character(s) if s == "n" || s == "N" => {
+                self.set_work_end(self.current_frame());
+            }
+            _ => {}
+        }
+    }
+
     /// Open any queued floating windows. A window the OS or GPU refuses is
     /// docked back into the main window rather than lost.
     pub(crate) fn open_floats(&mut self, event_loop: &ActiveEventLoop) {
@@ -5382,7 +5386,13 @@ impl App {
     /// An event for a floating window. Input goes to that window's egui
     /// context; the redraw always goes to the main window, whose frame runs
     /// every window's UI pass (see `crate::popout`).
-    fn float_event(&mut self, id: WindowId, event: WindowEvent, main: &Arc<Window>) {
+    fn float_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        event: WindowEvent,
+        main: &Arc<Window>,
+    ) {
         let Some(i) = self.popouts.iter().position(|p| p.window.id() == id) else { return };
         match event {
             // Closing a floating window docks its panels back: closing the
@@ -5399,7 +5409,12 @@ impl App {
             WindowEvent::RedrawRequested => {}
             event => {
                 let p = &mut self.popouts[i];
-                let _ = p.state.on_window_event(&p.window, &event);
+                let consumed = p.state.on_window_event(&p.window, &event).consumed;
+                if let WindowEvent::KeyboardInput { event, .. } = event {
+                    if !consumed && event.state == ElementState::Pressed {
+                        self.plain_key(event_loop, &event.logical_key);
+                    }
+                }
             }
         }
         main.request_redraw();

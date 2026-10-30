@@ -108,8 +108,11 @@ panels read the same snapshot and report into the same edits. Closing a
 floating window docks its tree back beside the canvas (`Dock::dock_in`, which
 keeps the canvas innermost). The open windows, with position and size, are
 saved in `LayoutState::windows`. The canvas, comp bar and transport never float
-(`Dock::is_floatable`). Keyboard shortcuts read the main window's input only;
-text fields in a floating panel work as usual. See ADR 0022.
+(`Dock::is_floatable`). Shortcuts work from whichever window has focus: the
+bare keys (space, arrows, R/B/N) go through `App::plain_key` from either
+window's winit handler, and the modified ones (undo, delete, copy/paste, file)
+read every context via `App::contexts`, each still suppressed while that
+window's text field has the keyboard. See ADR 0022.
 
 - **Only the content editors are `SWAPPABLE`** (Layers, Assets, Properties,
   Timeline, Nodes). The canvas and the comp/transport toolbars are *structural* leaves

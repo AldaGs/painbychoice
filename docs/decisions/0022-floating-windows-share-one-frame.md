@@ -30,9 +30,9 @@ are saved in the `.pbc` layout.
   windows are open. No cross-window synchronisation exists, so none can drift.
 - Floating windows repaint at the main window's rate, which is already the
   rate the document changes.
-- Shortcuts (undo, delete, copy/paste) read the main context's input, so they
-  don't fire while a floating window has focus. Fixing that means merging key
-  events from every context; it was left out of phase 1.
+- Shortcuts work from any window. The egui-read ones (undo, delete,
+  copy/paste, file) check every window's context; only the focused one sees a
+  key, so a shortcut fires once. The bare winit keys share `App::plain_key`.
 - Positions are physical pixels on the virtual desktop. Wayland ignores them,
   so the OS places the window there.
 - A second canvas (a full-screen preview on another monitor) needs a second
