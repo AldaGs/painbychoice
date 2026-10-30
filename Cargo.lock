@@ -2265,6 +2265,7 @@ dependencies = [
  "kurbo",
  "motion-core",
  "motion-render",
+ "png 0.18.1",
  "pollster",
  "rfd",
  "serde",
