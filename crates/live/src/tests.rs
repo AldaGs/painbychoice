@@ -557,6 +557,7 @@ fn project_round_trips_document_and_layout() {
         layout: LayoutState {
             dock: Some(dock.clone()),
             windows: vec![],
+            preview: None,
             user_presets: vec![Preset {
                 name: "Mine".into(),
                 dock: Dock::design_layout(),
@@ -639,7 +640,7 @@ fn a_multi_comp_project_round_trips_through_save_and_load() {
     let file = SaveFile {
         project: Some(project.clone()),
         document: None,
-        layout: LayoutState { dock: Some(Dock::default_layout()), user_presets: vec![], windows: vec![] },
+        layout: LayoutState { dock: Some(Dock::default_layout()), user_presets: vec![], windows: vec![], preview: None },
     };
     let json = serde_json::to_string(&file).unwrap();
     let back: SaveFile = serde_json::from_str(&json).unwrap();
@@ -6071,11 +6072,14 @@ fn floating_windows_round_trip_through_the_layout_and_old_files_load() {
         dock: Some(Dock::default_layout()),
         user_presets: Vec::new(),
         windows: vec![FloatSpec { dock: Dock::Leaf(Editor::Timeline), pos: Some((1920, 40)), size: (900.0, 400.0) }],
+        preview: Some(PreviewSpec { pos: Some((3840, 0)), size: (960.0, 540.0), fullscreen: true }),
     };
     let back: LayoutState = serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
     assert_eq!(back.windows.len(), 1);
     assert_eq!(back.windows[0].pos, Some((1920, 40)));
+    assert!(back.preview.is_some_and(|p| p.fullscreen && p.pos == Some((3840, 0))));
     // A layout saved before floating windows existed.
     let old: LayoutState = serde_json::from_str(r#"{"user_presets":[]}"#).unwrap();
     assert!(old.windows.is_empty());
+    assert!(old.preview.is_none());
 }

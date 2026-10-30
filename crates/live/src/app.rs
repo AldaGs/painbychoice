@@ -62,6 +62,12 @@ pub(crate) struct App {
     /// Floating windows waiting for the event loop to open them: one just
     /// popped out mid-frame, or ones restored from a loaded layout.
     pub(crate) pending_floats: Vec<FloatSpec>,
+    /// The second canvas, if open — see [`Preview`].
+    pub(crate) preview: Option<Preview>,
+    /// A preview window waiting for the event loop to open it.
+    pub(crate) pending_preview: Option<PreviewSpec>,
+    /// The preview window's motion-blurred frame, cached like `mb_preview`.
+    pub(crate) preview_mb: Option<(String, VScene)>,
 
     // Playback clock.
     pub(crate) playing: bool,
@@ -1149,6 +1155,9 @@ impl App {
             egui_renderer: None,
             popouts: Vec::new(),
             pending_floats: Vec::new(),
+            preview: None,
+            pending_preview: None,
+            preview_mb: None,
             playing: true,
             anchor: Instant::now(),
             paused_t: 0.0,
@@ -1814,24 +1823,8 @@ impl ApplicationHandler for App {
         ))
         .expect("create surface");
 
-        while self.renderers.len() <= surface.dev_id {
-            self.renderers.push(None);
-        }
+        self.ensure_renderer(surface.dev_id);
         let device = &self.context.devices[surface.dev_id].device;
-        if self.renderers[surface.dev_id].is_none() {
-            self.renderers[surface.dev_id] = Some(
-                Renderer::new(
-                    device,
-                    RendererOptions {
-                        use_cpu: false,
-                        antialiasing_support: AaSupport::area_only(),
-                        num_init_threads: NonZeroUsize::new(1),
-                        pipeline_cache: None,
-                    },
-                )
-                .expect("create renderer"),
-            );
-        }
 
         // egui: input plumbing + its own wgpu renderer targeting the swapchain.
         if self.egui_state.is_none() {
@@ -1883,6 +1876,10 @@ impl ApplicationHandler for App {
             RenderState::Suspended(_) => return,
         };
         self.open_floats(event_loop);
+        if self.preview.as_ref().is_some_and(|p| p.window.id() == id) {
+            self.preview_event(event_loop, event, &window);
+            return;
+        }
         if id != window.id() {
             self.float_event(event_loop, id, event, &window);
             return;
@@ -3360,6 +3357,7 @@ impl App {
                     .map(Popout::spec)
                     .chain(self.pending_floats.iter().cloned())
                     .collect(),
+                preview: self.preview.as_ref().map(Preview::spec).or_else(|| self.pending_preview.clone()),
             },
         };
         serde_json::to_string_pretty(&project)
@@ -3602,6 +3600,8 @@ impl App {
                 self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
                 // The file's floating windows replace the open ones.
                 self.popouts.clear();
+                self.preview = None;
+                self.pending_preview = l.preview;
                 self.pending_floats = l.windows.into_iter().filter(|w| w.dock.is_floatable()).collect();
                 l.dock
             }
@@ -3666,8 +3666,10 @@ impl App {
     /// readback — the CPU average of window-sized readbacks was what made
     /// playback choppy. `None` when the GPU isn't ready.
     fn motion_blur_preview(&mut self, frame: i64, fit: Affine, canvas: kurbo::Rect) -> Option<VScene> {
-        let (w, h) = match &self.state {
-            RenderState::Active { surface, .. } => (surface.config.width, surface.config.height),
+        let (dev, w, h) = match &self.state {
+            RenderState::Active { surface, .. } => {
+                (surface.dev_id, surface.config.width, surface.config.height)
+            }
             RenderState::Suspended(_) => return None,
         };
         let key = format!(
@@ -3679,6 +3681,24 @@ impl App {
                 return Some(vs.clone());
             }
         }
+        let out = self.motion_blur_scene(frame, fit, (dev, w, h), Some(canvas), self.nav.orbit_matrix());
+        self.mb_preview = Some((key, out.clone()));
+        Some(out)
+    }
+
+    /// One motion-blurred frame: every shutter sample, averaged. `canvas` is
+    /// the editor's chrome (ghosts, selection, passepartout) for the main
+    /// canvas; `None` draws the bare composition, as the preview window and
+    /// an export do. `target` is the device and pixel size it is drawn for.
+    fn motion_blur_scene(
+        &mut self,
+        frame: i64,
+        fit: Affine,
+        target: (usize, u32, u32),
+        canvas: Option<kurbo::Rect>,
+        orbit: motion_core::Mat4,
+    ) -> VScene {
+        let (dev, w, h) = target;
         let doc = self.doc();
         let (mb, dims, bg, pp) = (doc.motion_blur, (doc.width, doc.height), doc.bg, doc.passepartout);
         let full = kurbo::Rect::new(0.0, 0.0, w as f64, h as f64);
@@ -3689,15 +3709,18 @@ impl App {
                 self.current,
                 frame as f64,
                 shutter,
-                self.nav.orbit_matrix(),
+                orbit,
             );
-            let effect_images = self.effect_images(&scene, fit);
-            let chrome = crate::scene::Chrome {
-                ghosts: &self.onion.ghosts,
-                selected: self.selected,
-                passepartout: pp,
-                canvas,
-                border: true,
+            let effect_images = self.effect_images_on(&scene, fit, (dev, w, h));
+            let chrome = match canvas {
+                Some(canvas) => crate::scene::Chrome {
+                    ghosts: &self.onion.ghosts,
+                    selected: self.selected,
+                    passepartout: pp,
+                    canvas,
+                    border: true,
+                },
+                None => crate::scene::Chrome::none(),
             };
             let vs = to_vello(
                 &scene,
@@ -3719,8 +3742,7 @@ impl App {
             out.append(&vs, None);
             out.pop_layer();
         }
-        self.mb_preview = Some((key, out.clone()));
-        Some(out)
+        out
     }
 
     fn effect_images(
@@ -3738,6 +3760,21 @@ impl App {
             }
             RenderState::Suspended(_) => return HashMap::new(),
         };
+        self.effect_images_on(scene, fit, (dev, w, h))
+    }
+
+    /// [`Self::effect_images`] for a given device and pixel size: the blur
+    /// images are device-space, so each window needs its own.
+    fn effect_images_on(
+        &mut self,
+        scene: &MScene,
+        fit: Affine,
+        (dev, w, h): (usize, u32, u32),
+    ) -> std::collections::HashMap<NodeId, vello::peniko::ImageData> {
+        use std::collections::HashMap;
+        if !scene.groups.iter().any(|g| crate::scene::needs_readback(scene, g)) {
+            return HashMap::new();
+        }
         let device = &self.context.devices[dev].device;
         let queue = &self.context.devices[dev].queue;
         let Some(renderer) = self.renderers[dev].as_mut() else {
@@ -4121,7 +4158,7 @@ impl App {
             .map(|(id, c)| CompEntry { id: *id, label: c.label(*id) })
             .collect();
         let current_comp = self.current;
-        let mut layout = LayoutEdits::default();
+        let mut layout = LayoutEdits { preview_open: self.preview.is_some(), ..Default::default() };
         // Panels are drawn by walking the layout tree; each leaf dispatches to
         // the matching editor. Nothing here knows *where* a panel is — that's
         // the tree's business, which is the whole point of the refactor.
@@ -4562,6 +4599,13 @@ impl App {
                 self.dock = preset.dock.clone();
                 window.request_redraw();
             }
+        }
+        if layout.toggle_preview {
+            match self.preview.take() {
+                Some(_) => {}
+                None => self.pending_preview = Some(PreviewSpec::default()),
+            }
+            window.request_redraw();
         }
         if let Some(name) = layout.save_as {
             let current = self.dock.clone();
@@ -5185,6 +5229,7 @@ impl App {
         for (p, out) in self.popouts.iter_mut().zip(float_paint) {
             p.paint(&self.context, out);
         }
+        self.paint_preview(&scene, previewing.as_ref(), frame);
 
         // A slice of the active export, after the frame the user is watching
         // has been presented. Rendering export frames *before* the present
@@ -5371,6 +5416,14 @@ impl App {
     pub(crate) fn open_floats(&mut self, event_loop: &ActiveEventLoop) {
         let RenderState::Active { window, .. } = &self.state else { return };
         let main = window.clone();
+        if let Some(spec) = self.pending_preview.take() {
+            self.preview = Preview::open(event_loop, &mut self.context, &spec);
+            if let Some(p) = &self.preview {
+                self.ensure_renderer(p.surface.dev_id);
+            } else {
+                eprintln!("could not open the preview window");
+            }
+        }
         for spec in std::mem::take(&mut self.pending_floats) {
             match Popout::open(event_loop, &mut self.context, spec) {
                 Ok(p) => self.popouts.push(p),
@@ -5416,6 +5469,128 @@ impl App {
                     }
                 }
             }
+        }
+        main.request_redraw();
+    }
+}
+
+impl App {
+    /// A vello renderer for device `dev`, created the first time a window
+    /// lands on it.
+    pub(crate) fn ensure_renderer(&mut self, dev: usize) {
+        while self.renderers.len() <= dev {
+            self.renderers.push(None);
+        }
+        if self.renderers[dev].is_none() {
+            self.renderers[dev] = Some(
+                Renderer::new(
+                    &self.context.devices[dev].device,
+                    RendererOptions {
+                        use_cpu: false,
+                        antialiasing_support: AaSupport::area_only(),
+                        num_init_threads: NonZeroUsize::new(1),
+                        pipeline_cache: None,
+                    },
+                )
+                .expect("create renderer"),
+            );
+        }
+    }
+
+    /// Draw and present the preview window, if one is open. `scene` is the
+    /// main canvas's evaluation; it is reused unless the canvas is orbited,
+    /// because the preview shows the comp's own camera, not the viewer's.
+    fn paint_preview(&mut self, scene: &MScene, previewing: Option<&MProject>, frame: i64) {
+        let Some(p) = &self.preview else { return };
+        let (dev, w, h) = (p.surface.dev_id, p.surface.config.width, p.surface.config.height);
+        let doc = self.doc();
+        let fit = fit_transform(doc, kurbo::Rect::new(0.0, 0.0, w as f64, h as f64));
+        let (dims, bg, blur) = ((doc.width, doc.height), doc.bg, doc.motion_blur.enabled);
+        let vs = if blur {
+            let key = format!("{:?}", (self.doc_rev, frame, self.current, fit, (w, h)));
+            match &self.preview_mb {
+                Some((k, vs)) if *k == key => vs.clone(),
+                _ => {
+                    let vs = self.motion_blur_scene(frame, fit, (dev, w, h), None, motion_core::Mat4::IDENTITY);
+                    self.preview_mb = Some((key, vs.clone()));
+                    vs
+                }
+            }
+        } else {
+            let own;
+            let scene = if self.nav.orbit == (0.0, 0.0) {
+                scene
+            } else {
+                own = evaluate_comp(previewing.unwrap_or(&self.project), self.current, frame as f64);
+                &own
+            };
+            let fx = self.effect_images_on(scene, fit, (dev, w, h));
+            to_vello(
+                scene,
+                fit,
+                dims,
+                bg,
+                &crate::scene::Chrome::none(),
+                &mut self.footage,
+                &self.project.assets,
+                &fx,
+            )
+        };
+
+        let Some(p) = &self.preview else { return };
+        use wgpu::CurrentSurfaceTexture as Cst;
+        let texture = match p.surface.surface.get_current_texture() {
+            Cst::Success(tx) | Cst::Suboptimal(tx) => tx,
+            _ => {
+                p.window.request_redraw();
+                return;
+            }
+        };
+        let handle = &self.context.devices[dev];
+        let Some(renderer) = self.renderers[dev].as_mut() else { return };
+        renderer
+            .render_to_texture(
+                &handle.device,
+                &handle.queue,
+                &vs,
+                &p.surface.target_view,
+                &vello::RenderParams {
+                    // Black, not the editor's backdrop: this is a screening.
+                    base_color: Color::BLACK,
+                    width: w,
+                    height: h,
+                    antialiasing_method: AaConfig::Area,
+                },
+            )
+            .expect("render preview");
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = handle
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("preview") });
+        p.surface.blitter.copy(&handle.device, &mut encoder, &p.surface.target_view, &view);
+        handle.queue.submit([encoder.finish()]);
+        texture.present();
+    }
+
+    /// An event for the preview window. It has no UI, so nothing goes to egui:
+    /// F / F11 toggle fullscreen, Escape leaves it, and every other key is a
+    /// bare-key shortcut — except that Escape here never quits the app.
+    fn preview_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent, main: &Arc<Window>) {
+        let Some(p) = &mut self.preview else { return };
+        match event {
+            WindowEvent::CloseRequested => self.preview = None,
+            WindowEvent::Resized(size) => {
+                self.context.resize_surface(&mut p.surface, size.width.max(1), size.height.max(1));
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match &event.logical_key {
+                    Key::Named(NamedKey::F11) => p.toggle_fullscreen(),
+                    Key::Character(c) if c == "f" || c == "F" => p.toggle_fullscreen(),
+                    Key::Named(NamedKey::Escape) => p.window.set_fullscreen(None),
+                    key => self.plain_key(event_loop, key),
+                }
+            }
+            _ => return,
         }
         main.request_redraw();
     }

@@ -179,3 +179,88 @@ impl Dock {
         names.join(" · ")
     }
 }
+
+/// The preview window as saved in the `.pbc` layout.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct PreviewSpec {
+    /// Outer position in physical pixels, as [`FloatSpec::pos`].
+    #[serde(default)]
+    pub(crate) pos: Option<(i32, i32)>,
+    /// Inner size in logical points (the windowed size, kept while fullscreen).
+    pub(crate) size: (f32, f32),
+    #[serde(default)]
+    pub(crate) fullscreen: bool,
+}
+
+impl Default for PreviewSpec {
+    fn default() -> Self {
+        PreviewSpec { pos: None, size: (960.0, 540.0), fullscreen: false }
+    }
+}
+
+/// A second canvas: the composition and nothing else, for a client monitor or
+/// a projector. It is what an export of this frame would look like —
+/// [`Chrome::none`], no zoom, pan or orbit — fitted to its own window.
+///
+/// Like a floating window it has no update of its own: the main frame builds
+/// its vello scene and presents it (`App::paint_preview`). It takes no editing
+/// input; keys go to the bare-key shortcuts, so Space still plays from it, and
+/// F / F11 toggle fullscreen on whichever monitor it is on.
+pub(crate) struct Preview {
+    pub(crate) window: Arc<Window>,
+    pub(crate) surface: RenderSurface<'static>,
+}
+
+impl Preview {
+    pub(crate) fn open(
+        event_loop: &ActiveEventLoop,
+        context: &mut RenderContext,
+        spec: &PreviewSpec,
+    ) -> Option<Preview> {
+        let mut attrs = Window::default_attributes()
+            .with_title("Pain By Choice — Preview")
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                spec.size.0.max(160.0) as f64,
+                spec.size.1.max(90.0) as f64,
+            ))
+            .with_window_icon(window_icon());
+        if let Some((x, y)) = spec.pos {
+            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+        }
+        let window = Arc::new(event_loop.create_window(attrs).ok()?);
+        let size = window.inner_size();
+        let surface = pollster::block_on(context.create_surface(
+            window.clone(),
+            size.width.max(1),
+            size.height.max(1),
+            wgpu::PresentMode::AutoVsync,
+        ))
+        .ok()?;
+        let preview = Preview { window, surface };
+        if spec.fullscreen {
+            preview.toggle_fullscreen();
+        }
+        Some(preview)
+    }
+
+    pub(crate) fn spec(&self) -> PreviewSpec {
+        let fullscreen = self.window.fullscreen().is_some();
+        let size = self.window.inner_size().to_logical::<f32>(self.window.scale_factor());
+        PreviewSpec {
+            pos: self.window.outer_position().ok().map(|p| (p.x, p.y)),
+            // Fullscreen's size is the monitor's; there's nothing to restore.
+            size: if fullscreen { PreviewSpec::default().size } else { (size.width, size.height) },
+            fullscreen,
+        }
+    }
+
+    /// Borderless fullscreen on the monitor the window is on now — so you
+    /// drag it to the second screen first, then press F.
+    pub(crate) fn toggle_fullscreen(&self) {
+        let next = match self.window.fullscreen() {
+            Some(_) => None,
+            None => Some(winit::window::Fullscreen::Borderless(self.window.current_monitor())),
+        };
+        self.window.set_fullscreen(next);
+    }
+}

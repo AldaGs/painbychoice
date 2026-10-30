@@ -461,6 +461,9 @@ pub(crate) struct LayoutState {
     /// reopens the way it was left. Absent in older files → none.
     #[serde(default)]
     pub(crate) windows: Vec<crate::popout::FloatSpec>,
+    /// The preview window, if it was open.
+    #[serde(default)]
+    pub(crate) preview: Option<crate::popout::PreviewSpec>,
 }
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
@@ -684,6 +687,10 @@ pub(crate) struct LayoutEdits {
     pub(crate) apply: Option<usize>,
     /// Save the current layout as a user preset under this (trimmed) name.
     pub(crate) save_as: Option<String>,
+    /// In: whether the preview window is open, for the menu's checkbox.
+    pub(crate) preview_open: bool,
+    /// Out: open the preview window, or close it.
+    pub(crate) toggle_preview: bool,
 }
 
 /// Top composition bar: editable resolution, fps, and duration, plus the Layout
@@ -1049,6 +1056,18 @@ pub(crate) fn comp_ui(
                     layout.apply = Some(i);
                     ui.close();
                 }
+            }
+            ui.separator();
+            // The second canvas: the bare comp in its own window, for another
+            // monitor. Lives here because it is part of the workspace.
+            let mut open = layout.preview_open;
+            if ui
+                .checkbox(&mut open, "Preview window")
+                .on_hover_text("The composition alone, in its own window. F toggles fullscreen.")
+                .changed()
+            {
+                layout.toggle_preview = true;
+                ui.close();
             }
             ui.separator();
             ui.horizontal(|ui| {

@@ -17,7 +17,7 @@ live/src/
   main.rs       the `use` block, module decls, and `fn main`
   app.rs        App: window/GPU state, winit handler, the per-frame update
   dock.rs       panel layout tree, its editors, the composition bar
-  popout.rs     floating windows: content panels popped out onto other monitors
+  popout.rs     floating windows and the preview window, for other monitors
   layers.rs     scene-tree panel
   props.rs      properties panel, easing, and the PropKind enumeration
   timeline.rs   transport bar, ruler, dopesheet
@@ -112,7 +112,10 @@ saved in `LayoutState::windows`. The canvas, comp bar and transport never float
 bare keys (space, arrows, R/B/N) go through `App::plain_key` from either
 window's winit handler, and the modified ones (undo, delete, copy/paste, file)
 read every context via `App::contexts`, each still suppressed while that
-window's text field has the keyboard. See ADR 0022.
+window's text field has the keyboard. **The preview window** (Layout ▸ Preview window) is a second canvas: the
+bare composition, as an export would draw it, fitted to its own window. The main
+frame draws it after the floating windows (`App::paint_preview`). F / F11 toggle
+fullscreen on its monitor. See ADR 0022.
 
 - **Only the content editors are `SWAPPABLE`** (Layers, Assets, Properties,
   Timeline, Nodes). The canvas and the comp/transport toolbars are *structural* leaves
