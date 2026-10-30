@@ -57,6 +57,17 @@ pub(crate) struct App {
     pub(crate) egui_ctx: egui::Context,
     pub(crate) egui_state: Option<egui_winit::State>,
     pub(crate) egui_renderer: Option<egui_wgpu::Renderer>,
+    /// Panels popped out into their own windows — see [`crate::popout`].
+    pub(crate) popouts: Vec<Popout>,
+    /// Floating windows waiting for the event loop to open them: one just
+    /// popped out mid-frame, or ones restored from a loaded layout.
+    pub(crate) pending_floats: Vec<FloatSpec>,
+    /// The second canvas, if open — see [`Preview`].
+    pub(crate) preview: Option<Preview>,
+    /// A preview window waiting for the event loop to open it.
+    pub(crate) pending_preview: Option<PreviewSpec>,
+    /// The preview window's motion-blurred frame, cached like `mb_preview`.
+    pub(crate) preview_mb: Option<(String, VScene)>,
 
     // Playback clock.
     pub(crate) playing: bool,
@@ -1142,6 +1153,11 @@ impl App {
             },
             egui_state: None,
             egui_renderer: None,
+            popouts: Vec::new(),
+            pending_floats: Vec::new(),
+            preview: None,
+            pending_preview: None,
+            preview_mb: None,
             playing: true,
             anchor: Instant::now(),
             paused_t: 0.0,
@@ -1526,7 +1542,11 @@ impl App {
     /// without a node context, and a node-relative read reports its own
     /// warning rather than being faked.
     pub(crate) fn script_preview(&self, frame: f64) -> Option<(GraphNodeId, Result<String, String>)> {
-        let sel = nodegraph::read_selection(&self.egui_ctx)?;
+        // The node graph keeps its selection in its window's egui memory, and
+        // it may be docked in the main window or floating in another.
+        let sel = std::iter::once(&self.egui_ctx)
+            .chain(self.popouts.iter().map(|p| &p.ctx))
+            .find_map(nodegraph::read_selection)?;
         let graph = scoped_graph(&self.project, self.ng_scope)?;
         let node = graph.node(sel)?;
         if node.kind != "script" {
@@ -1803,24 +1823,8 @@ impl ApplicationHandler for App {
         ))
         .expect("create surface");
 
-        while self.renderers.len() <= surface.dev_id {
-            self.renderers.push(None);
-        }
+        self.ensure_renderer(surface.dev_id);
         let device = &self.context.devices[surface.dev_id].device;
-        if self.renderers[surface.dev_id].is_none() {
-            self.renderers[surface.dev_id] = Some(
-                Renderer::new(
-                    device,
-                    RendererOptions {
-                        use_cpu: false,
-                        antialiasing_support: AaSupport::area_only(),
-                        num_init_threads: NonZeroUsize::new(1),
-                        pipeline_cache: None,
-                    },
-                )
-                .expect("create renderer"),
-            );
-        }
 
         // egui: input plumbing + its own wgpu renderer targeting the swapchain.
         if self.egui_state.is_none() {
@@ -1852,6 +1856,7 @@ impl ApplicationHandler for App {
         }
 
         self.state = RenderState::Active { surface, window };
+        self.open_floats(event_loop);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1863,13 +1868,22 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _id: WindowId,
+        id: WindowId,
         event: WindowEvent,
     ) {
         let window = match &self.state {
             RenderState::Active { window, .. } => window.clone(),
             RenderState::Suspended(_) => return,
         };
+        self.open_floats(event_loop);
+        if self.preview.as_ref().is_some_and(|p| p.window.id() == id) {
+            self.preview_event(event_loop, event, &window);
+            return;
+        }
+        if id != window.id() {
+            self.float_event(event_loop, id, event, &window);
+            return;
+        }
 
         // Let egui see every event first; if it wants the event exclusively
         // (e.g. dragging the scrubber), don't also treat it as a canvas input.
@@ -1899,32 +1913,7 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. }
                 if !consumed && event.state == ElementState::Pressed =>
             {
-                match event.logical_key {
-                    Key::Named(NamedKey::Space) => self.toggle_play(),
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Named(NamedKey::ArrowRight) => {
-                        self.playing = false;
-                        self.seek_frame(self.current_frame() + 1);
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        self.playing = false;
-                        self.seek_frame(self.current_frame() - 1);
-                    }
-                    Key::Character(ref s) if s == "r" || s == "R" => {
-                        // Restart the *preview*: to the work-area start, not
-                        // always frame 0.
-                        self.seek_frame(self.loop_bounds_frames().0);
-                    }
-                    // AE's work-area keys: B sets the start at the playhead, N
-                    // the end. View state — nothing in the document changes.
-                    Key::Character(ref s) if s == "b" || s == "B" => {
-                        self.set_work_start(self.current_frame());
-                    }
-                    Key::Character(ref s) if s == "n" || s == "N" => {
-                        self.set_work_end(self.current_frame());
-                    }
-                    _ => {}
-                }
+                self.plain_key(event_loop, &event.logical_key);
                 window.request_redraw();
             }
 
@@ -2046,6 +2035,7 @@ impl ApplicationHandler for App {
                 // fully-decoded editor at zero redraws.
                 if self.playing
                     || self.egui_ctx.has_requested_repaint()
+                    || self.popouts.iter().any(|p| p.ctx.has_requested_repaint())
                     || self.footage.is_busy()
                 {
                     window.request_redraw();
@@ -3361,6 +3351,13 @@ impl App {
             layout: LayoutState {
                 dock: Some(self.dock.clone()),
                 user_presets: self.presets.iter().filter(|p| !p.builtin).cloned().collect(),
+                windows: self
+                    .popouts
+                    .iter()
+                    .map(Popout::spec)
+                    .chain(self.pending_floats.iter().cloned())
+                    .collect(),
+                preview: self.preview.as_ref().map(Preview::spec).or_else(|| self.pending_preview.clone()),
             },
         };
         serde_json::to_string_pretty(&project)
@@ -3601,6 +3598,11 @@ impl App {
         let restored = match layout {
             Some(l) => {
                 self.presets.extend(l.user_presets.into_iter().filter(|p| p.dock.is_valid()));
+                // The file's floating windows replace the open ones.
+                self.popouts.clear();
+                self.preview = None;
+                self.pending_preview = l.preview;
+                self.pending_floats = l.windows.into_iter().filter(|w| w.dock.is_floatable()).collect();
                 l.dock
             }
             None => None,
@@ -3664,8 +3666,10 @@ impl App {
     /// readback — the CPU average of window-sized readbacks was what made
     /// playback choppy. `None` when the GPU isn't ready.
     fn motion_blur_preview(&mut self, frame: i64, fit: Affine, canvas: kurbo::Rect) -> Option<VScene> {
-        let (w, h) = match &self.state {
-            RenderState::Active { surface, .. } => (surface.config.width, surface.config.height),
+        let (dev, w, h) = match &self.state {
+            RenderState::Active { surface, .. } => {
+                (surface.dev_id, surface.config.width, surface.config.height)
+            }
             RenderState::Suspended(_) => return None,
         };
         let key = format!(
@@ -3677,6 +3681,24 @@ impl App {
                 return Some(vs.clone());
             }
         }
+        let out = self.motion_blur_scene(frame, fit, (dev, w, h), Some(canvas), self.nav.orbit_matrix());
+        self.mb_preview = Some((key, out.clone()));
+        Some(out)
+    }
+
+    /// One motion-blurred frame: every shutter sample, averaged. `canvas` is
+    /// the editor's chrome (ghosts, selection, passepartout) for the main
+    /// canvas; `None` draws the bare composition, as the preview window and
+    /// an export do. `target` is the device and pixel size it is drawn for.
+    fn motion_blur_scene(
+        &mut self,
+        frame: i64,
+        fit: Affine,
+        target: (usize, u32, u32),
+        canvas: Option<kurbo::Rect>,
+        orbit: motion_core::Mat4,
+    ) -> VScene {
+        let (dev, w, h) = target;
         let doc = self.doc();
         let (mb, dims, bg, pp) = (doc.motion_blur, (doc.width, doc.height), doc.bg, doc.passepartout);
         let full = kurbo::Rect::new(0.0, 0.0, w as f64, h as f64);
@@ -3687,15 +3709,18 @@ impl App {
                 self.current,
                 frame as f64,
                 shutter,
-                self.nav.orbit_matrix(),
+                orbit,
             );
-            let effect_images = self.effect_images(&scene, fit);
-            let chrome = crate::scene::Chrome {
-                ghosts: &self.onion.ghosts,
-                selected: self.selected,
-                passepartout: pp,
-                canvas,
-                border: true,
+            let effect_images = self.effect_images_on(&scene, fit, (dev, w, h));
+            let chrome = match canvas {
+                Some(canvas) => crate::scene::Chrome {
+                    ghosts: &self.onion.ghosts,
+                    selected: self.selected,
+                    passepartout: pp,
+                    canvas,
+                    border: true,
+                },
+                None => crate::scene::Chrome::none(),
             };
             let vs = to_vello(
                 &scene,
@@ -3717,8 +3742,7 @@ impl App {
             out.append(&vs, None);
             out.pop_layer();
         }
-        self.mb_preview = Some((key, out.clone()));
-        Some(out)
+        out
     }
 
     fn effect_images(
@@ -3736,6 +3760,21 @@ impl App {
             }
             RenderState::Suspended(_) => return HashMap::new(),
         };
+        self.effect_images_on(scene, fit, (dev, w, h))
+    }
+
+    /// [`Self::effect_images`] for a given device and pixel size: the blur
+    /// images are device-space, so each window needs its own.
+    fn effect_images_on(
+        &mut self,
+        scene: &MScene,
+        fit: Affine,
+        (dev, w, h): (usize, u32, u32),
+    ) -> std::collections::HashMap<NodeId, vello::peniko::ImageData> {
+        use std::collections::HashMap;
+        if !scene.groups.iter().any(|g| crate::scene::needs_readback(scene, g)) {
+            return HashMap::new();
+        }
         let device = &self.context.devices[dev].device;
         let queue = &self.context.devices[dev].queue;
         let Some(renderer) = self.renderers[dev].as_mut() else {
@@ -3878,7 +3917,7 @@ impl App {
         // clock keeps real time). Skipped mid-drag so a gizmo stays
         // responsive, and during a font-picker preview, which draws a
         // different project.
-        let dragging = self.egui_ctx.input(|i| i.pointer.any_down());
+        let dragging = self.contexts().any(|c| c.input(|i| i.pointer.any_down()));
         if !dragging && previewing.is_none() && self.doc().motion_blur.enabled {
             if let Some(vs) = self.motion_blur_preview(frame, fit, canvas) {
                 self.vscene = vs;
@@ -4119,7 +4158,7 @@ impl App {
             .map(|(id, c)| CompEntry { id: *id, label: c.label(*id) })
             .collect();
         let current_comp = self.current;
-        let mut layout = LayoutEdits::default();
+        let mut layout = LayoutEdits { preview_open: self.preview.is_some(), ..Default::default() };
         // Panels are drawn by walking the layout tree; each leaf dispatches to
         // the matching editor. Nothing here knows *where* a panel is — that's
         // the tree's business, which is the whole point of the refactor.
@@ -4190,15 +4229,10 @@ impl App {
         // Modules for a `use` node's picker: id + display name.
         let ng_modules: Vec<(ModuleId, String)> =
             self.project.modules.iter().map(|(id, m)| (*id, m.name.clone())).collect();
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            let mut next_id = 0;
-            let mut path = Vec::new();
-            show_dock(
-                dock,
-                ui,
-                &mut next_id,
-                &mut path,
-                &mut |editor, ui| match editor {
+        // Every window's leaves are drawn by this one closure, so a floating
+        // panel reads the same snapshot and reports into the same edits as a
+        // docked one — see `crate::popout`.
+        let mut draw = |editor: Editor, ui: &mut egui::Ui| match editor {
                     Editor::Comp => comp_ui(
                         ui,
                         RenderBar {
@@ -4417,10 +4451,30 @@ impl App {
                                 );
                         }
                     }
-                },
-                &mut dock_cmd,
-            );
+                };
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            let mut next_id = 0;
+            let mut path = Vec::new();
+            show_dock(dock, ui, &mut next_id, &mut path, true, &mut draw, &mut dock_cmd);
         });
+        let float_outputs: Vec<_> = self
+            .popouts
+            .iter_mut()
+            .map(|p| {
+                let raw = p.state.take_egui_input(&p.window);
+                let mut cmd = None;
+                let out = p.ctx.run_ui(raw, |ui| {
+                    // No vello frame behind a floating window: fill what the
+                    // panels leave bare, as the main window's canvas would.
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
+                    let mut next_id = 0;
+                    let mut path = Vec::new();
+                    show_dock(&mut p.dock, ui, &mut next_id, &mut path, false, &mut draw, &mut cmd);
+                });
+                (out, cmd)
+            })
+            .collect();
+        drop(draw);
         // --- Undo: the document as it stands *before* this frame's edits. ---
         // Everything from here to the `history.record` below is the apply
         // phase; a snapshot around the whole of it is what makes undo cover
@@ -4431,8 +4485,7 @@ impl App {
         // undoable. Not while typing, and not with the pen armed — there it
         // removes anchors. A locked layer and the root can't be deleted.
         let del_key = self.tool.pen_mode().is_none()
-            && !self.egui_ctx.egui_wants_keyboard_input()
-            && self.egui_ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+            && self.shortcut(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
         let delete_keys = del_key && !self.selected_keys.is_empty();
         if del_key && !delete_keys {
             let root = &self.doc().root;
@@ -4512,9 +4565,29 @@ impl App {
         // Now that egui has finished, restructure the layout tree if an area
         // header asked to. Doing it here (not mid-pass) keeps the panels and
         // their egui ids stable for the frame that was just drawn.
-        if let Some(cmd) = dock_cmd {
-            self.dock.apply(cmd);
-            window.request_redraw();
+        match dock_cmd {
+            Some(DockCmd::PopOut { path, size }) => {
+                if let Some(editor) = self.dock.leaf_at(&path).filter(|e| e.is_swappable()) {
+                    self.dock.apply(DockCmd::Close { path });
+                    // Opened by the next window event: that needs the loop.
+                    self.pending_floats.push(FloatSpec { dock: Dock::Leaf(editor), pos: None, size });
+                }
+                window.request_redraw();
+            }
+            Some(cmd) => {
+                self.dock.apply(cmd);
+                window.request_redraw();
+            }
+            None => {}
+        }
+        let mut float_paint = Vec::with_capacity(float_outputs.len());
+        for (p, (out, cmd)) in self.popouts.iter_mut().zip(float_outputs) {
+            if let Some(cmd) = cmd {
+                p.dock.apply(cmd);
+                p.window.set_title(&format!("Pain By Choice — {}", p.dock.title()));
+                window.request_redraw();
+            }
+            float_paint.push(out);
         }
         // Restore the save-field buffer taken for the UI pass.
         self.preset_name_buf = preset_name_buf;
@@ -4526,6 +4599,13 @@ impl App {
                 self.dock = preset.dock.clone();
                 window.request_redraw();
             }
+        }
+        if layout.toggle_preview {
+            match self.preview.take() {
+                Some(_) => {}
+                None => self.pending_preview = Some(PreviewSpec::default()),
+            }
+            window.request_redraw();
         }
         if let Some(name) = layout.save_as {
             let current = self.dock.clone();
@@ -4855,19 +4935,11 @@ impl App {
         // handler because that one never sees a modifier state, and suppressed
         // while a text field has focus so Ctrl+V in a numeric box still pastes
         // text instead of keyframes.
-        if !self.egui_ctx.egui_wants_keyboard_input() {
-            let (copy, paste) = self.egui_ctx.input(|i| {
-                (
-                    i.modifiers.command && i.key_pressed(egui::Key::C),
-                    i.modifiers.command && i.key_pressed(egui::Key::V),
-                )
-            });
-            if copy {
-                self.copy_selected_keys();
-            }
-            if paste {
-                dirty |= self.paste_keys();
-            }
+        if self.shortcut(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            self.copy_selected_keys();
+        }
+        if self.shortcut(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            dirty |= self.paste_keys();
         }
         // Easing edits target the single selected key (the editor only appears
         // when exactly one is selected).
@@ -4931,10 +5003,8 @@ impl App {
         }
         // File commands: the menu, or their shortcuts — the latter not while a
         // text field has focus, same rule as undo.
-        let shortcut = if self.egui_ctx.egui_wants_keyboard_input() {
-            None
-        } else {
-            self.egui_ctx.input_mut(|i| {
+        let shortcut = self.contexts().filter(|c| !c.egui_wants_keyboard_input()).find_map(|c| {
+            c.input_mut(|i| {
                 use egui::{Key, KeyboardShortcut as K, Modifiers as M};
                 [
                     (K::new(M::COMMAND | M::ALT, Key::S), FileCmd::SaveIncrement),
@@ -4948,7 +5018,7 @@ impl App {
                 .find(|(k, _)| i.consume_shortcut(k))
                 .map(|(_, c)| c)
             })
-        };
+        });
         // Opening a different project is not an edit *of* the open one: undoing
         // across that boundary would resurrect a document the user has moved on
         // from, and the layout/selection restored with it are gone anyway.
@@ -4980,7 +5050,7 @@ impl App {
         // One comparison covers every edit above. `PartialEq` on the document
         // early-outs at the first difference, so an idle frame costs a few
         // field reads; the clone is only kept when it actually differs.
-        let pointer_down = self.egui_ctx.input(|i| i.pointer.any_down());
+        let pointer_down = self.contexts().any(|c| c.input(|i| i.pointer.any_down()));
         if replaced {
             self.history.clear();
         } else if self.project != before {
@@ -4996,20 +5066,15 @@ impl App {
         // swap this performs is never itself mistaken for an edit. Suppressed
         // while a text field has focus, like keyframe copy/paste — Ctrl+Z in a
         // name field belongs to the field.
-        if !self.egui_ctx.egui_wants_keyboard_input() {
-            let (undo, redo) = self.egui_ctx.input(|i| {
-                (
-                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
-                    i.modifiers.command
-                        && (i.key_pressed(egui::Key::Y)
-                            || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
-                )
-            });
-            if undo {
-                dirty |= self.undo();
-            } else if redo {
-                dirty |= self.redo();
-            }
+        let undo = self.shortcut(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z));
+        let redo = self.shortcut(|i| {
+            i.modifiers.command
+                && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)))
+        });
+        if undo {
+            dirty |= self.undo();
+        } else if redo {
+            dirty |= self.redo();
         }
         match comp.history {
             Some(HistoryCmd::Undo) => dirty |= self.undo(),
@@ -5161,6 +5226,11 @@ impl App {
             .submit(user_buffers.into_iter().chain([encoder.finish()]));
         surface_texture.present();
 
+        for (p, out) in self.popouts.iter_mut().zip(float_paint) {
+            p.paint(&self.context, out);
+        }
+        self.paint_preview(&scene, previewing.as_ref(), frame);
+
         // A slice of the active export, after the frame the user is watching
         // has been presented. Rendering export frames *before* the present
         // would delay the preview by the whole budget and make the editor feel
@@ -5274,7 +5344,7 @@ fn ask_recover(msg: &str) -> bool {
 
 /// The app icon (assets/brand), decoded for the title bar and taskbar. macOS
 /// ignores window icons; there the bundle's `app-icon.icns` is what shows.
-fn window_icon() -> Option<winit::window::Icon> {
+pub(crate) fn window_icon() -> Option<winit::window::Icon> {
     const PNG: &[u8] = include_bytes!("../../../assets/brand/png/app-icon-256.png");
     let mut reader = png::Decoder::new(std::io::Cursor::new(PNG)).read_info().ok()?;
     let mut rgba = vec![0; reader.output_buffer_size()?];
@@ -5292,5 +5362,236 @@ mod window_icon_tests {
     fn app_icon_decodes() {
         let icon = super::window_icon();
         assert!(icon.is_some(), "assets/brand/png/app-icon-256.png must decode as 8-bit RGBA");
+    }
+}
+
+impl App {
+    /// The egui context of every window: the main one, then each floating
+    /// one. Shortcuts read all of them, so they work from whichever window
+    /// has focus — only the focused window's context sees the key.
+    pub(crate) fn contexts(&self) -> impl Iterator<Item = &egui::Context> {
+        std::iter::once(&self.egui_ctx).chain(self.popouts.iter().map(|p| &p.ctx))
+    }
+
+    /// Whether `f` holds for some window whose text fields don't have the
+    /// keyboard: the gate for every modified-key shortcut.
+    fn shortcut(&self, f: impl Fn(&egui::InputState) -> bool) -> bool {
+        self.contexts().any(|c| !c.egui_wants_keyboard_input() && c.input(&f))
+    }
+
+    /// The bare-key shortcuts (space, arrows, R, B, N, Escape) from whichever
+    /// window has focus. The caller has already let egui have the key first,
+    /// so typing into a field never seeks or plays.
+    fn plain_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+        match key {
+            Key::Named(NamedKey::Space) => self.toggle_play(),
+            Key::Named(NamedKey::Escape) => event_loop.exit(),
+            Key::Named(NamedKey::ArrowRight) => {
+                self.playing = false;
+                self.seek_frame(self.current_frame() + 1);
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.playing = false;
+                self.seek_frame(self.current_frame() - 1);
+            }
+            Key::Character(s) if s == "r" || s == "R" => {
+                // Restart the *preview*: to the work-area start, not
+                // always frame 0.
+                self.seek_frame(self.loop_bounds_frames().0);
+            }
+            // AE's work-area keys: B sets the start at the playhead, N
+            // the end. View state — nothing in the document changes.
+            Key::Character(s) if s == "b" || s == "B" => {
+                self.set_work_start(self.current_frame());
+            }
+            Key::Character(s) if s == "n" || s == "N" => {
+                self.set_work_end(self.current_frame());
+            }
+            _ => {}
+        }
+    }
+
+    /// Open any queued floating windows. A window the OS or GPU refuses is
+    /// docked back into the main window rather than lost.
+    pub(crate) fn open_floats(&mut self, event_loop: &ActiveEventLoop) {
+        let RenderState::Active { window, .. } = &self.state else { return };
+        let main = window.clone();
+        if let Some(spec) = self.pending_preview.take() {
+            self.preview = Preview::open(event_loop, &mut self.context, &spec);
+            if let Some(p) = &self.preview {
+                self.ensure_renderer(p.surface.dev_id);
+            } else {
+                eprintln!("could not open the preview window");
+            }
+        }
+        for spec in std::mem::take(&mut self.pending_floats) {
+            match Popout::open(event_loop, &mut self.context, spec) {
+                Ok(p) => self.popouts.push(p),
+                Err(spec) => {
+                    eprintln!("could not open a floating window; docking it back");
+                    self.dock.dock_in(spec.dock);
+                }
+            }
+        }
+        main.request_redraw();
+    }
+
+    /// An event for a floating window. Input goes to that window's egui
+    /// context; the redraw always goes to the main window, whose frame runs
+    /// every window's UI pass (see `crate::popout`).
+    fn float_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: WindowId,
+        event: WindowEvent,
+        main: &Arc<Window>,
+    ) {
+        let Some(i) = self.popouts.iter().position(|p| p.window.id() == id) else { return };
+        match event {
+            // Closing a floating window docks its panels back: closing the
+            // window is "put this away", not "delete my timeline".
+            WindowEvent::CloseRequested => {
+                let p = self.popouts.remove(i);
+                self.dock.dock_in(p.dock);
+            }
+            WindowEvent::Resized(size) => {
+                let p = &mut self.popouts[i];
+                self.context.resize_surface(&mut p.surface, size.width.max(1), size.height.max(1));
+            }
+            // Painted by the main frame, which this redraw below triggers.
+            WindowEvent::RedrawRequested => {}
+            event => {
+                let p = &mut self.popouts[i];
+                let consumed = p.state.on_window_event(&p.window, &event).consumed;
+                if let WindowEvent::KeyboardInput { event, .. } = event {
+                    if !consumed && event.state == ElementState::Pressed {
+                        self.plain_key(event_loop, &event.logical_key);
+                    }
+                }
+            }
+        }
+        main.request_redraw();
+    }
+}
+
+impl App {
+    /// A vello renderer for device `dev`, created the first time a window
+    /// lands on it.
+    pub(crate) fn ensure_renderer(&mut self, dev: usize) {
+        while self.renderers.len() <= dev {
+            self.renderers.push(None);
+        }
+        if self.renderers[dev].is_none() {
+            self.renderers[dev] = Some(
+                Renderer::new(
+                    &self.context.devices[dev].device,
+                    RendererOptions {
+                        use_cpu: false,
+                        antialiasing_support: AaSupport::area_only(),
+                        num_init_threads: NonZeroUsize::new(1),
+                        pipeline_cache: None,
+                    },
+                )
+                .expect("create renderer"),
+            );
+        }
+    }
+
+    /// Draw and present the preview window, if one is open. `scene` is the
+    /// main canvas's evaluation; it is reused unless the canvas is orbited,
+    /// because the preview shows the comp's own camera, not the viewer's.
+    fn paint_preview(&mut self, scene: &MScene, previewing: Option<&MProject>, frame: i64) {
+        let Some(p) = &self.preview else { return };
+        let (dev, w, h) = (p.surface.dev_id, p.surface.config.width, p.surface.config.height);
+        let doc = self.doc();
+        let fit = fit_transform(doc, kurbo::Rect::new(0.0, 0.0, w as f64, h as f64));
+        let (dims, bg, blur) = ((doc.width, doc.height), doc.bg, doc.motion_blur.enabled);
+        let vs = if blur {
+            let key = format!("{:?}", (self.doc_rev, frame, self.current, fit, (w, h)));
+            match &self.preview_mb {
+                Some((k, vs)) if *k == key => vs.clone(),
+                _ => {
+                    let vs = self.motion_blur_scene(frame, fit, (dev, w, h), None, motion_core::Mat4::IDENTITY);
+                    self.preview_mb = Some((key, vs.clone()));
+                    vs
+                }
+            }
+        } else {
+            let own;
+            let scene = if self.nav.orbit == (0.0, 0.0) {
+                scene
+            } else {
+                own = evaluate_comp(previewing.unwrap_or(&self.project), self.current, frame as f64);
+                &own
+            };
+            let fx = self.effect_images_on(scene, fit, (dev, w, h));
+            to_vello(
+                scene,
+                fit,
+                dims,
+                bg,
+                &crate::scene::Chrome::none(),
+                &mut self.footage,
+                &self.project.assets,
+                &fx,
+            )
+        };
+
+        let Some(p) = &self.preview else { return };
+        use wgpu::CurrentSurfaceTexture as Cst;
+        let texture = match p.surface.surface.get_current_texture() {
+            Cst::Success(tx) | Cst::Suboptimal(tx) => tx,
+            _ => {
+                p.window.request_redraw();
+                return;
+            }
+        };
+        let handle = &self.context.devices[dev];
+        let Some(renderer) = self.renderers[dev].as_mut() else { return };
+        renderer
+            .render_to_texture(
+                &handle.device,
+                &handle.queue,
+                &vs,
+                &p.surface.target_view,
+                &vello::RenderParams {
+                    // Black, not the editor's backdrop: this is a screening.
+                    base_color: Color::BLACK,
+                    width: w,
+                    height: h,
+                    antialiasing_method: AaConfig::Area,
+                },
+            )
+            .expect("render preview");
+        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = handle
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("preview") });
+        p.surface.blitter.copy(&handle.device, &mut encoder, &p.surface.target_view, &view);
+        handle.queue.submit([encoder.finish()]);
+        texture.present();
+    }
+
+    /// An event for the preview window. It has no UI, so nothing goes to egui:
+    /// F / F11 toggle fullscreen, Escape leaves it, and every other key is a
+    /// bare-key shortcut — except that Escape here never quits the app.
+    fn preview_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent, main: &Arc<Window>) {
+        let Some(p) = &mut self.preview else { return };
+        match event {
+            WindowEvent::CloseRequested => self.preview = None,
+            WindowEvent::Resized(size) => {
+                self.context.resize_surface(&mut p.surface, size.width.max(1), size.height.max(1));
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match &event.logical_key {
+                    Key::Named(NamedKey::F11) => p.toggle_fullscreen(),
+                    Key::Character(c) if c == "f" || c == "F" => p.toggle_fullscreen(),
+                    Key::Named(NamedKey::Escape) => p.window.set_fullscreen(None),
+                    key => self.plain_key(event_loop, key),
+                }
+            }
+            _ => return,
+        }
+        main.request_redraw();
     }
 }

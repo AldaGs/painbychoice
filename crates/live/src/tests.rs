@@ -556,6 +556,8 @@ fn project_round_trips_document_and_layout() {
         document: None,
         layout: LayoutState {
             dock: Some(dock.clone()),
+            windows: vec![],
+            preview: None,
             user_presets: vec![Preset {
                 name: "Mine".into(),
                 dock: Dock::design_layout(),
@@ -638,7 +640,7 @@ fn a_multi_comp_project_round_trips_through_save_and_load() {
     let file = SaveFile {
         project: Some(project.clone()),
         document: None,
-        layout: LayoutState { dock: Some(Dock::default_layout()), user_presets: vec![] },
+        layout: LayoutState { dock: Some(Dock::default_layout()), user_presets: vec![], windows: vec![], preview: None },
     };
     let json = serde_json::to_string(&file).unwrap();
     let back: SaveFile = serde_json::from_str(&json).unwrap();
@@ -6034,4 +6036,50 @@ fn every_clip_grab_has_its_own_cursor() {
         assert!(!all[i + 1..].contains(a), "{a:?} is shared");
     }
     assert_ne!(grab_cursor(Slide, true), grab_cursor(Slide, false));
+}
+
+#[test]
+fn leaf_at_names_the_editor_a_header_path_points_at() {
+    let dock = Dock::default_layout();
+    // Comp bar is the root split's first child.
+    assert_eq!(dock.leaf_at(&[Branch::First]), Some(Editor::Comp));
+    // A split is not a leaf, and a path past a leaf is stale.
+    assert_eq!(dock.leaf_at(&[]), None);
+    assert_eq!(dock.leaf_at(&[Branch::First, Branch::First]), None);
+}
+
+#[test]
+fn docking_a_floating_window_back_keeps_the_layout_valid() {
+    let mut dock = Dock::default_layout();
+    let float = Dock::split(DockSide::Top, 200.0, true, Editor::Timeline, Dock::Leaf(Editor::NodeGraph));
+    assert!(float.is_floatable());
+    dock.dock_in(float);
+    assert!(dock.is_valid(), "canvas must stay the innermost leaf");
+}
+
+#[test]
+fn chrome_and_canvas_never_float() {
+    assert!(Dock::Leaf(Editor::Properties).is_floatable());
+    for e in [Editor::Canvas, Editor::Comp, Editor::Transport] {
+        assert!(!Dock::Leaf(e).is_floatable());
+    }
+    assert!(!Dock::default_layout().is_floatable());
+}
+
+#[test]
+fn floating_windows_round_trip_through_the_layout_and_old_files_load() {
+    let layout = LayoutState {
+        dock: Some(Dock::default_layout()),
+        user_presets: Vec::new(),
+        windows: vec![FloatSpec { dock: Dock::Leaf(Editor::Timeline), pos: Some((1920, 40)), size: (900.0, 400.0) }],
+        preview: Some(PreviewSpec { pos: Some((3840, 0)), size: (960.0, 540.0), fullscreen: true }),
+    };
+    let back: LayoutState = serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+    assert_eq!(back.windows.len(), 1);
+    assert_eq!(back.windows[0].pos, Some((1920, 40)));
+    assert!(back.preview.is_some_and(|p| p.fullscreen && p.pos == Some((3840, 0))));
+    // A layout saved before floating windows existed.
+    let old: LayoutState = serde_json::from_str(r#"{"user_presets":[]}"#).unwrap();
+    assert!(old.windows.is_empty());
+    assert!(old.preview.is_none());
 }
