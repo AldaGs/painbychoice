@@ -20,7 +20,7 @@ use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::effect::{Effect, EffectKind};
 use crate::path::{Anchor, VectorPath};
 use crate::pathfinder::BoolOp;
-use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform};
+use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform, Trim};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
 use crate::vec3::Vec3;
@@ -594,12 +594,7 @@ impl Importer<'_> {
         s = floats(&s);
         s = word(&s, "time", &format!("(frame / {:?})", self.fps));
         s = word(&s, "value", &literal(&nums(&p["value"]))?);
-        // `c ? a : b` → `if c { a } else { b }`, one level deep.
-        if let (Some(q), Some(c)) = (s.find('?'), s.rfind(':')) {
-            if q < c {
-                s = format!("if {} {{ {} }} else {{ {} }}", &s[..q].trim(), s[q + 1..c].trim(), s[c + 1..].trim());
-            }
-        }
+        s = js_statements(&s);
         crate::expr::eval_script(&s, 0.0).ok()?;
         Some(s)
     }
@@ -838,6 +833,15 @@ impl Importer<'_> {
             }
         });
 
+        let trim = find("ADBE Vector Filter - Trim").map(|t| {
+            let props = t["properties"].as_array().cloned().unwrap_or_default();
+            Trim {
+                start: self.scalar(prop(&props, "ADBE Vector Trim Start"), 0.01, 0.0),
+                end: self.scalar(prop(&props, "ADBE Vector Trim End"), 0.01, 1.0),
+                offset: self.scalar(prop(&props, "ADBE Vector Trim Offset"), 1.0 / 360.0, 0.0),
+            }
+        });
+
         let mut out = Vec::new();
         // AE lists contents top-first; PBC draws last on top.
         for item in items.iter().rev() {
@@ -871,7 +875,7 @@ impl Importer<'_> {
                         None
                     }
                 },
-                "ADBE Vector Graphic - Fill" | "ADBE Vector Graphic - Stroke" | "ADBE Vector Materials Group" => None,
+                "ADBE Vector Graphic - Fill" | "ADBE Vector Graphic - Stroke" | "ADBE Vector Materials Group" | "ADBE Vector Filter - Trim" => None,
                 "" => None,
                 other => {
                     self.report.drop(format!("shape item: {other}"));
@@ -884,6 +888,19 @@ impl Importer<'_> {
                 n.stroke = stroke.clone();
                 out.push(n);
             }
+        }
+        // A group's Trim Paths cuts every path in it, nested groups included,
+        // unless a nearer one already did.
+        fn set_trim(nodes: &mut [Node], t: &Trim) {
+            for n in nodes {
+                if n.shape.is_some() && n.trim.is_none() {
+                    n.trim = Some(t.clone());
+                }
+                set_trim(&mut n.children, t);
+            }
+        }
+        if let Some(t) = &trim {
+            set_trim(&mut out, t);
         }
         // AE paints all of a group's paths as one shape: a letter's counters
         // are holes in it, by the nonzero rule, not shapes filled on top. With
@@ -931,6 +948,9 @@ impl Importer<'_> {
                 Value::constant(Vec3::new(cx, cy, z))
             }
             (_, _, Value::Keyframed(track)) => Value::Keyframed(track.map_value(|z| Vec3::new(0.0, 0.0, z))),
+            (None | Some(Value::Const(_)), None | Some(Value::Const(_)), Value::Expr(crate::expr::Expr::Script(s))) => {
+                Value::expr(crate::expr::Expr::Script(format!("vec3({cx:?}, {cy:?}, {{ {s} }})")))
+            }
             _ => {
                 self.report.drop("animated X/Y rotation");
                 Value::constant(Vec3::ZERO)
@@ -1057,15 +1077,27 @@ impl Importer<'_> {
         let Some(p) = p else { return Value::constant(or) };
         if let Some(src) = self.script(p, &self.expr_layer, 0) {
             // A script that ignores the clock folds to a constant through the
-            // usual unit conversion. A live one is kept only where PBC's units
-            // are AE's, since nothing converts its output each frame.
+            // usual unit conversion. A live one is kept when the conversion is
+            // a plain factor (1, % → fraction, degrees → radians), folded into
+            // the script since nothing converts its output each frame.
             let probe = crate::expr::eval_script(&src, 0.0).ok();
             let via = probe.as_ref().map(expr_nums).and_then(|v| conv(&v));
-            let direct = probe.and_then(T::from_expr);
-            let kept = match (src.contains("frame"), via, direct) {
-                (false, Some(v), _) => Some(Value::constant(v)),
-                (true, Some(v), Some(d)) if dist(&v, &d) < 1e-9 => Some(Value::expr(crate::expr::Expr::Script(src))),
-                _ => None,
+            let scaled = |k: f64| match k {
+                1.0 => src.clone(),
+                k => format!("let v = {{ {src} }}; if type_of(v) == \"array\" {{ v.map(|x| x * {k:?}) }} else {{ v * {k:?} }}"),
+            };
+            let matches = |s: &str| {
+                [0.0, 13.0, 240.0, 1000.0].iter().all(|&f| {
+                    let raw = crate::expr::eval_script(&src, f).ok().map(|v| expr_nums(&v)).and_then(|v| conv(&v));
+                    let got = crate::expr::eval_script(s, f).ok().and_then(T::from_expr);
+                    matches!((raw, got), (Some(a), Some(b)) if dist(&a, &b) < 1e-6)
+                })
+            };
+            let kept = match via {
+                Some(v) if !src.contains("frame") => Some(Value::constant(v)),
+                Some(_) => [1.0, 0.01, std::f64::consts::PI / 180.0].into_iter().map(scaled).find(|s| matches(s))
+                    .map(|s| Value::expr(crate::expr::Expr::Script(s))),
+                None => None,
             };
             if let Some(v) = kept {
                 self.translated.insert(p["expression"].as_str().unwrap_or("").to_string());
@@ -1200,7 +1232,8 @@ fn floats(s: &str) -> String {
             }
             out.push_str(&s[start..i]);
             let next = b.get(i).map(|&c| c as char);
-            if next != Some('.') && !next.is_some_and(|c| c.is_alphabetic()) {
+            // An index (`value[0]`) stays an integer.
+            if next != Some('.') && !next.is_some_and(|c| c.is_alphabetic()) && !(prev == '[' && next == Some(']')) {
                 out.push_str(".0");
             }
             continue;
@@ -1209,6 +1242,49 @@ fn floats(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// JS statements as Rhai, per `;`: `var a = x, b = y` → `let a = x; let b = y`,
+/// and `lhs = c ? a : b` (one level deep) → `lhs = if c { a } else { b }`.
+/// `if (c) { … }` and a trailing `[x, y]` are already valid Rhai.
+fn js_statements(s: &str) -> String {
+    let top_level = |t: &str, ch: char| -> Vec<usize> {
+        let mut depth = 0i32;
+        t.char_indices().filter_map(|(i, c)| {
+            match c { '(' | '[' => depth += 1, ')' | ']' => depth -= 1, _ => {} }
+            (c == ch && depth == 0).then_some(i)
+        }).collect()
+    };
+    let split = |t: &str, ch: char| -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        for i in top_level(t, ch) {
+            parts.push(t[start..i].to_string());
+            start = i + 1;
+        }
+        parts.push(t[start..].to_string());
+        parts
+    };
+    split(s, ';').into_iter().map(|st| {
+        let st = match st.find("var ") {
+            Some(v) if st[..v].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '_') => {
+                format!("{}let {}", &st[..v], split(&st[v + 4..], ',').join("; let "))
+            }
+            _ => st,
+        };
+        let (Some(q), Some(c)) = (st.find('?'), st.rfind(':')) else { return st };
+        if q > c {
+            return st;
+        }
+        // The condition starts after the assignment's `=` or the block's `{`.
+        let b = st.as_bytes();
+        let start = (0..q).rev().find(|&i| match b[i] {
+            b'{' => true,
+            b'=' => !matches!(b.get(i + 1), Some(b'=')) && !matches!(b.get(i.wrapping_sub(1)), Some(b'=' | b'<' | b'>' | b'!')),
+            _ => false,
+        }).map_or(0, |i| i + 1);
+        format!("{}if {} {{ {} }} else {{ {} }}", &st[..start], st[start..q].trim(), st[q + 1..c].trim(), st[c + 1..].trim())
+    }).collect::<Vec<_>>().join(";")
 }
 
 /// `s` with every whole-word `w` (not a property access like `x.w`) replaced.
@@ -1366,6 +1442,19 @@ mod tests {
         let a = serde_json::json!({"outInterpolation": "Bezier", "outSpeed": [100], "outInfluence": [0.5]});
         let (o, _) = ae_handles(&a, &b, 1.0, 100.0);
         assert_eq!((o.x, o.y), (0.5, 0.5));
+    }
+
+    #[test]
+    fn js_statement_expressions_run_as_rhai() {
+        use crate::expr::{eval_script, ExprValue};
+        let js = "var x = 297.00, y = 540.00; if (time > 1) { var u = Math.min(1, Math.max(0, (time - 1) / 2)); u = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2; x = 297.00 + 100 * u; } [x, value[1]]";
+        let s = js.replace("Math.", "").replace("time", "(frame / 24.0)").replace("value", "[0, 7]");
+        let s = js_statements(&floats(&s));
+        let at = |f: f64| match eval_script(&s, f) { Ok(ExprValue::Vec3(v)) => (v.x, v.y), r => panic!("{r:?} from {s}") };
+        assert_eq!(at(0.0), (297.0, 7.0));
+        assert_eq!(at(48.0), (347.0, 7.0)); // halfway through the ease
+        assert_eq!(at(240.0), (397.0, 7.0));
+        assert!(matches!(eval_script("vec3(0.0, 0.0, { (frame / 24.0) * 45.0 })", 24.0), Ok(ExprValue::Vec3(v)) if v.z == 45.0));
     }
 
     #[test]

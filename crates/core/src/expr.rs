@@ -1401,6 +1401,12 @@ fn build_engine() -> rhai::Engine {
     engine.register_fn("param_of", |node: &str, name: &str| script_param(Some(node), name));
     engine.register_fn("wiggle", |freq: f64, amp: f64| script_wiggle(freq, amp, 0.0));
     engine.register_fn("wiggle", |freq: f64, amp: f64, seed: f64| script_wiggle(freq, amp, seed));
+    // `Math.pow/min/max` as imported AE expressions name them.
+    engine.register_fn("pow", f64::powf);
+    engine.register_fn("min", f64::min);
+    engine.register_fn("max", f64::max);
+    // A 3-vector, since a bare `[x, y, z]` reads as a colour.
+    engine.register_fn("vec3", |x: f64, y: f64, z: f64| Vec3::new(x, y, z));
     engine
 }
 
@@ -1546,6 +1552,9 @@ pub fn eval_script_ctx(src: &str, ctx: &mut EvalCtx<'_>) -> Result<ExprValue, St
 }
 
 fn dynamic_to_expr_value(d: &rhai::Dynamic) -> Result<ExprValue, String> {
+    if let Some(v) = d.clone().try_cast::<Vec3>() {
+        return Ok(ExprValue::Vec3(v));
+    }
     if let Ok(f) = d.as_float() {
         return Ok(ExprValue::Num(f));
     }

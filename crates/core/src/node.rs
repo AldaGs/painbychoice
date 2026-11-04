@@ -714,6 +714,15 @@ impl LayerTiming {
     }
 }
 
+/// Trim Paths: the part of each contour between `start` and `end` (fractions
+/// of its length, 0–1), turned along it by `offset` (1 = a full lap).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trim {
+    pub start: Value<f64>,
+    pub end: Value<f64>,
+    pub offset: Value<f64>,
+}
+
 /// One node in the scene graph. A group (no shape) just composes its children;
 /// a leaf carries a shape + paint.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -837,6 +846,9 @@ pub struct Node {
     /// order. Ignored on any other shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_animators: Vec<TextAnimator>,
+    /// Draw only part of the path, by length (AE's Trim Paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trim: Option<Trim>,
     /// The lock switch: an editor-only guard against touching the layer on the
     /// canvas or in the properties panel. Renders exactly as unlocked. Covers
     /// the subtree, like `hidden`.
@@ -892,6 +904,7 @@ impl Node {
             motion_blur: true,
             hidden: false,
             text_animators: Vec::new(),
+            trim: None,
             locked: false,
             link: None,
             children: Vec::new(),
@@ -918,6 +931,7 @@ impl Node {
             motion_blur: true,
             hidden: false,
             text_animators: Vec::new(),
+            trim: None,
             locked: false,
             link: None,
             children: Vec::new(),

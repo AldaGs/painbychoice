@@ -320,6 +320,56 @@ fn to_vec2(p: Point) -> Vec2 {
     Vec2::new(p.x, p.y)
 }
 
+/// Trim Paths: the part of each contour of `path` between fractions `start`
+/// and `end` of its length, turned by `offset` laps. A range pushed past the
+/// end by the offset wraps round to the start, as AE's does.
+pub fn trim_path(path: &BezPath, start: f64, end: f64, offset: f64) -> BezPath {
+    use kurbo::{ParamCurve, ParamCurveArclen, PathSeg};
+    const ACC: f64 = 1e-3;
+    let (lo, hi) = (start.min(end).clamp(0.0, 1.0), start.max(end).clamp(0.0, 1.0));
+    let mut out = BezPath::new();
+    if hi - lo >= 1.0 {
+        return path.clone();
+    }
+    if hi <= lo {
+        return out;
+    }
+    let (a, b) = (lo + offset.rem_euclid(1.0), hi + offset.rem_euclid(1.0));
+    let pieces = if b <= 1.0 { vec![(a, b)] } else if a >= 1.0 { vec![(a - 1.0, b - 1.0)] } else { vec![(a, 1.0), (0.0, b - 1.0)] };
+    let els = path.elements();
+    let mut cuts: Vec<usize> = (0..els.len()).filter(|&i| matches!(els[i], PathEl::MoveTo(_))).collect();
+    cuts.push(els.len());
+    for w in cuts.windows(2) {
+        let segs: Vec<PathSeg> = kurbo::segments(els[w[0]..w[1]].iter().copied()).collect();
+        let lens: Vec<f64> = segs.iter().map(|s| s.arclen(ACC)).collect();
+        let total: f64 = lens.iter().sum();
+        for &(a, b) in &pieces {
+            let (a, b) = (a * total, b * total);
+            let (mut at, mut first) = (0.0, true);
+            for (seg, &len) in segs.iter().zip(&lens) {
+                let (s0, s1) = (at, at + len);
+                at = s1;
+                if len <= 0.0 || s1 <= a || s0 >= b {
+                    continue;
+                }
+                let t0 = if a > s0 { seg.inv_arclen(a - s0, ACC) } else { 0.0 };
+                let t1 = if b < s1 { seg.inv_arclen(b - s0, ACC) } else { 1.0 };
+                let sub = seg.subsegment(t0..t1);
+                if first {
+                    out.move_to(sub.start());
+                    first = false;
+                }
+                match sub {
+                    PathSeg::Line(l) => out.line_to(l.p1),
+                    PathSeg::Quad(q) => out.quad_to(q.p1, q.p2),
+                    PathSeg::Cubic(c) => out.curve_to(c.p1, c.p2, c.p3),
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +377,21 @@ mod tests {
 
     fn ctx() -> EvalCtx<'static> {
         EvalCtx::at(0.0)
+    }
+
+    #[test]
+    fn trim_keeps_the_fraction_of_the_length_and_wraps_with_offset() {
+        use kurbo::ParamCurveArclen;
+        let len = |p: &BezPath| kurbo::segments(p.elements().iter().copied()).map(|s| s.arclen(1e-6)).sum::<f64>();
+        let line = BezPath::from_vec(vec![PathEl::MoveTo(Point::ZERO), PathEl::LineTo(Point::new(100.0, 0.0))]);
+        assert!((len(&trim_path(&line, 0.0, 0.25, 0.0)) - 25.0).abs() < 1e-6);
+        assert!(trim_path(&line, 0.5, 0.5, 0.0).is_empty());
+        assert_eq!(trim_path(&line, 0.0, 1.0, 0.3), line);
+        // 0.8–1.2 wraps: two pieces of 20 each.
+        let wrapped = trim_path(&line, 0.6, 1.0, 0.2);
+        assert!((len(&wrapped) - 40.0).abs() < 1e-6);
+        let circle = kurbo::Circle::new(Point::ZERO, 10.0).to_path(1e-6);
+        assert!((len(&trim_path(&circle, 0.0, 0.5, 0.0)) - len(&circle) / 2.0).abs() < 1e-3);
     }
 
     #[test]

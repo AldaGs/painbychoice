@@ -533,7 +533,7 @@ fn walk(
     }
 
     if let Some(shape) = &node.shape {
-        let path = shape.to_path(ctx);
+        let path = trimmed(node, shape.to_path(ctx), ctx);
         let image = shape.image_paint(ctx);
         let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
         let stroke = node
@@ -776,6 +776,14 @@ fn walk(
 /// part — a nested group contributes nothing here — and a child trimmed out of
 /// its time window is skipped, exactly as the walk skips it. Runs every frame,
 /// which is what makes a compound animatable for free.
+/// `path` cut down by the node's Trim Paths, if it has one.
+fn trimmed(node: &Node, path: BezPath, ctx: &mut EvalCtx) -> BezPath {
+    match &node.trim {
+        Some(t) => crate::path::trim_path(&path, t.start.resolve(ctx), t.end.resolve(ctx), t.offset.resolve(ctx)),
+        None => path,
+    }
+}
+
 fn compound_geometry(node: &Node, ctx: &mut EvalCtx, op: crate::pathfinder::BoolOp) -> BezPath {
     let mut paths: Vec<BezPath> = Vec::new();
     for child in &node.children {
@@ -790,7 +798,7 @@ fn compound_geometry(node: &Node, ctx: &mut EvalCtx, op: crate::pathfinder::Bool
             ctx.frame = t.local_frame(ctx.comp_frame);
         }
         let (local_xf, _) = child.transform.resolve(ctx);
-        let p = shape.to_path(ctx);
+        let p = trimmed(child, shape.to_path(ctx), ctx);
         paths.push(local_xf.to_affine_lossy() * p);
         ctx.frame = prev;
     }
