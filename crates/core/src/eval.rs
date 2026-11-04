@@ -12,7 +12,7 @@ use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
 use crate::effect::ResolvedEffect;
 use crate::expr::EvalCtx;
-use crate::node::{CompId, Document, Node, NodeId, Project, Shape as NodeShape, TextUnit};
+use crate::node::{CompId, Document, Node, NodeId, Project, Shape as NodeShape, TextSelector, TextUnit};
 use crate::value::Color;
 
 /// One flat, ready-to-draw item. `source` traces it back to the node that
@@ -533,6 +533,22 @@ fn walk(
     }
 
     if let Some(shape) = &node.shape {
+        // A subtitled text layer shows this frame's subtitle in place of its
+        // content, and remembers which word is being spoken for karaoke.
+        let sub = node.subtitles.as_ref().filter(|_| matches!(shape, NodeShape::Text { .. })).map(|s| s.at(ctx.frame, ctx.comp_fps()));
+        let subbed;
+        let shape = match (&sub, shape) {
+            (Some((text, _)), NodeShape::Text { .. }) => {
+                let mut s = shape.clone();
+                if let NodeShape::Text { content, .. } = &mut s {
+                    *content = crate::value::Value::constant(text.clone());
+                }
+                subbed = s;
+                &subbed
+            }
+            _ => shape,
+        };
+        let active = sub.and_then(|s| s.1);
         let path = trimmed(node, shape.to_path(ctx), ctx);
         let image = shape.image_paint(ctx);
         let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
@@ -573,7 +589,7 @@ fn walk(
                     });
                 }
                 None if !node.text_animators.is_empty() && matches!(shape, NodeShape::Text { .. }) => {
-                    for (p, offset, alpha) in animated_text(node, shape, ctx) {
+                    for (p, offset, alpha, fill) in animated_text(node, shape, ctx, active, fill) {
                         let transform = flat * Affine::translate(offset);
                         let b = (transform * p.clone()).bounding_box();
                         bounds = Some(bounds.map_or(b, |u: kurbo::Rect| u.union(b)));
@@ -894,8 +910,15 @@ fn draw_order(
 
 
 /// A text shape with text animators, as runs of consecutive glyphs that share
-/// one offset and one opacity: each is drawn as its own item.
-fn animated_text(node: &Node, shape: &NodeShape, ctx: &mut EvalCtx) -> Vec<(BezPath, kurbo::Vec2, f64)> {
+/// one offset, opacity and fill: each is drawn as its own item. `active` is the
+/// subtitle's karaoke word, `fill` the layer's own.
+fn animated_text(
+    node: &Node,
+    shape: &NodeShape,
+    ctx: &mut EvalCtx,
+    active: Option<usize>,
+    fill: Option<Color>,
+) -> Vec<(BezPath, kurbo::Vec2, f64, Option<Color>)> {
     let NodeShape::Text { content, family, weight, italic, size, tracking, leading, align, max_width } = shape else {
         return Vec::new();
     };
@@ -924,9 +947,9 @@ fn animated_text(node: &Node, shape: &NodeShape, ctx: &mut EvalCtx) -> Vec<(BezP
         TextUnit::Words => words,
         TextUnit::Lines => lines,
     };
-    let mut out: Vec<(BezPath, kurbo::Vec2, f64)> = Vec::new();
+    let mut out: Vec<(BezPath, kurbo::Vec2, f64, Option<Color>)> = Vec::new();
     for g in glyphs {
-        let (mut offset, mut alpha) = (kurbo::Vec2::ZERO, 1.0);
+        let (mut offset, mut alpha, mut color) = (kurbo::Vec2::ZERO, 1.0, fill);
         for a in &node.text_animators {
             let unit = match a.based_on {
                 TextUnit::Chars => Some(g.char),
@@ -935,15 +958,28 @@ fn animated_text(node: &Node, shape: &NodeShape, ctx: &mut EvalCtx) -> Vec<(BezP
                 TextUnit::Lines => Some(g.line),
             };
             let Some(i) = unit else { continue };
-            let s = a.selector.amount(i, count(a.based_on), ctx);
+            let s = match a.selector {
+                TextSelector::Karaoke { cumulative } => match active {
+                    Some(w) if i == w || (cumulative && i < w) => 1.0,
+                    _ => 0.0,
+                },
+                _ => a.selector.amount(i, count(a.based_on), ctx),
+            };
             offset += a.position * s;
             if let Some(o) = a.opacity {
                 alpha *= 1.0 + (o - 1.0) * s;
             }
+            if let Some(f) = &a.fill {
+                let c = f.resolve(ctx);
+                color = match color {
+                    Some(b) => Some(crate::value::Animatable::lerp(&b, &c, s)),
+                    None => (s > 0.0).then_some(c),
+                };
+            }
         }
         match out.last_mut() {
-            Some((p, o, al)) if *o == offset && *al == alpha => p.extend(g.path),
-            _ => out.push((g.path, offset, alpha)),
+            Some((p, o, al, c)) if *o == offset && *al == alpha && *c == color => p.extend(g.path),
+            _ => out.push((g.path, offset, alpha, color)),
         }
     }
     out
@@ -2414,6 +2450,53 @@ mod tests {
         assert_eq!(scene.items.len(), 1);
         assert!(!scene.items[0].path.is_empty(), "glyph outlines reached the draw list");
         assert!(scene.items[0].fill.is_some(), "text fills like any other shape");
+    }
+
+    /// A subtitled text layer shows the subtitle on screen, nothing between
+    /// subtitles, and a Karaoke animator colors only the word being spoken.
+    #[test]
+    fn subtitles_write_the_text_and_karaoke_colors_the_spoken_word() {
+        use crate::node::{TextAnimator, TextSelector};
+        use crate::subs::{Subtitles, Transcript, Word};
+        let word = |text: &str, start: f64, end: f64| Word { text: text.into(), start, end, p: None, brk: Default::default(), locked: false };
+        let mut layer = Node::shape(
+            1,
+            "subs",
+            Shape::Text {
+                content: Value::constant("ignored".to_string()),
+                family: String::new(),
+                weight: 400,
+                italic: false,
+                tracking: Value::constant(0.0),
+                leading: Value::constant(0.0),
+                size: Value::constant(48.0),
+                align: crate::text::TextAlign::Left,
+                max_width: None,
+            },
+        )
+        .with_fill(Color::rgb(1.0, 1.0, 1.0));
+        layer.subtitles = Some(Subtitles {
+            transcript: Transcript { language: None, words: vec![word("hello", 0.0, 0.5), word("world.", 0.5, 1.0), word("later", 5.0, 6.0)] },
+            rules: Default::default(),
+        });
+        let yellow = Color::rgb(1.0, 1.0, 0.0);
+        layer.text_animators.push(TextAnimator {
+            based_on: TextUnit::Words,
+            selector: TextSelector::Karaoke { cumulative: false },
+            position: Vec2::ZERO,
+            opacity: None,
+            fill: Some(Value::constant(yellow)),
+        });
+        let doc = Document::new(640.0, 480.0, Node::group(0, "root").with_child(layer));
+        let fps = doc.fps;
+        let fills = |seconds: f64| -> Vec<Option<Color>> { evaluate(&doc, seconds * fps).items.iter().map(|i| i.fill).collect() };
+        let white = Some(Color::rgb(1.0, 1.0, 1.0));
+        // Two runs: the spoken word, then the rest.
+        assert_eq!(fills(0.1), [Some(yellow), white]);
+        assert_eq!(fills(0.7), [white, Some(yellow)]);
+        // Between subtitles: no text, nothing drawn.
+        assert!(evaluate(&doc, 3.0 * fps).items.iter().all(|i| i.path.is_empty()));
+        assert_eq!(fills(5.5), [Some(yellow)]);
     }
 
     /// The font size is a `Value`, so it animates — the reason it's a `Value`

@@ -704,7 +704,7 @@ impl Importer<'_> {
                 return None;
             }
         };
-        Some(TextAnimator { based_on, selector, position, opacity })
+        Some(TextAnimator { based_on, selector, position, opacity, fill: None })
     }
 
     /// The PBC effect for an AE one, where PBC has it. Parameters are read by

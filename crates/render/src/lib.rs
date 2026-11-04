@@ -11,6 +11,7 @@ pub mod encode;
 pub mod fx;
 pub mod parallel;
 pub mod raster;
+pub mod transcribe;
 
 pub use audio::{decode_sound, is_audio_file, mix_comp, probe_sound, write_wav, Peaks, Sound};
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};

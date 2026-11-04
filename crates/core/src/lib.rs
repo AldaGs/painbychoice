@@ -28,6 +28,7 @@ pub mod pathfinder;
 pub mod raise;
 pub mod registry;
 pub mod socket;
+pub mod subs;
 pub mod text;
 pub mod timebase;
 pub mod value;

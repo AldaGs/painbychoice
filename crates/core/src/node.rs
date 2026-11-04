@@ -445,6 +445,10 @@ pub struct TextAnimator {
     /// Opacity (0..1) at full selection; `None` leaves opacity alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f64>,
+    /// Fill color at full selection, mixed from the layer's own fill by the
+    /// selection; `None` leaves the fill alone. What karaoke colors words with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Value<Color>>,
 }
 
 /// What a selector counts.
@@ -477,6 +481,13 @@ pub enum TextSelector {
         #[serde(default)]
         reverse: bool,
     },
+    /// The word being spoken in the layer's [`crate::subs::Subtitles`] — or,
+    /// `cumulative`, every word of the subtitle spoken so far. Selects nothing
+    /// on a layer without subtitles. Only meaningful with [`TextUnit::Words`].
+    Karaoke {
+        #[serde(default)]
+        cumulative: bool,
+    },
 }
 
 impl TextSelector {
@@ -504,6 +515,9 @@ impl TextSelector {
                 ctx.frame = at;
                 (v / 100.0).clamp(0.0, 1.0)
             }
+            // Needs the subtitle's active word, which only the text walk
+            // knows; it answers this variant itself.
+            TextSelector::Karaoke { .. } => 0.0,
         }
     }
 }
@@ -857,6 +871,11 @@ pub struct Node {
     /// order. Ignored on any other shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_animators: Vec<TextAnimator>,
+    /// A transcript that writes this text layer's content: each frame shows
+    /// the subtitle on screen then, replacing `content`. Ignored on any other
+    /// shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitles: Option<crate::subs::Subtitles>,
     /// Draw only part of the path, by length (AE's Trim Paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trim: Option<Trim>,
@@ -916,6 +935,7 @@ impl Node {
             hidden: false,
             adjustment: false,
             text_animators: Vec::new(),
+            subtitles: None,
             trim: None,
             locked: false,
             link: None,
@@ -944,6 +964,7 @@ impl Node {
             hidden: false,
             adjustment: false,
             text_animators: Vec::new(),
+            subtitles: None,
             trim: None,
             locked: false,
             link: None,

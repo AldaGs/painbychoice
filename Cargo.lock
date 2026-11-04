@@ -2285,6 +2285,7 @@ dependencies = [
  "lopdf",
  "motion-core",
  "psd",
+ "serde_json",
  "symphonia",
  "tiny-skia",
 ]
