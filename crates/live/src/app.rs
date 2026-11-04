@@ -2250,7 +2250,29 @@ impl App {
                 .retain(|(k, _)| !matches!(k, PropKind::StrokeColor | PropKind::StrokeWidth));
             changed = true;
         }
+        if e.add_trim && node.trim.is_none() {
+            node.trim = Some(motion_core::node::Trim {
+                start: Value::constant(0.0),
+                end: Value::constant(1.0),
+                offset: Value::constant(0.0),
+            });
+            changed = true;
+        }
+        if e.remove_trim {
+            node.trim = None;
+            self.selected_keys
+                .retain(|(k, _)| !matches!(k, PropKind::TrimStart | PropKind::TrimEnd | PropKind::TrimOffset));
+            changed = true;
+        }
         let node = self.doc_mut().root.find_mut(id).expect("checked above");
+        if let Some(t) = node.trim.as_mut() {
+            for (v, edit) in [&mut t.start, &mut t.end, &mut t.offset].into_iter().zip(e.trim) {
+                if let Some(x) = edit {
+                    v.set_at(frame, x);
+                    changed = true;
+                }
+            }
+        }
         if let Some(rgb) = e.stroke_color {
             if let Some(s) = node.stroke.as_mut() {
                 s.color.set_at(frame, rgb_color(rgb));
@@ -5402,13 +5424,12 @@ impl App {
         self.contexts().any(|c| !c.egui_wants_keyboard_input() && c.input(&f))
     }
 
-    /// The bare-key shortcuts (space, arrows, R, B, N, Escape) from whichever
+    /// The bare-key shortcuts (space, arrows, R, B, N) from whichever
     /// window has focus. The caller has already let egui have the key first,
     /// so typing into a field never seeks or plays.
-    fn plain_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+    fn plain_key(&mut self, _event_loop: &ActiveEventLoop, key: &Key) {
         match key {
             Key::Named(NamedKey::Space) => self.toggle_play(),
-            Key::Named(NamedKey::Escape) => event_loop.exit(),
             Key::Named(NamedKey::ArrowRight) => {
                 self.playing = false;
                 self.seek_frame(self.current_frame() + 1);
@@ -5597,7 +5618,7 @@ impl App {
 
     /// An event for the preview window. It has no UI, so nothing goes to egui:
     /// F / F11 toggle fullscreen, Escape leaves it, and every other key is a
-    /// bare-key shortcut — except that Escape here never quits the app.
+    /// bare-key shortcut.
     fn preview_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent, main: &Arc<Window>) {
         let Some(p) = &mut self.preview else { return };
         match event {

@@ -6087,3 +6087,37 @@ fn floating_windows_round_trip_through_the_layout_and_old_files_load() {
     assert!(old.windows.is_empty());
     assert!(old.preview.is_none());
 }
+
+/// Trim Paths keys are ordinary keys: a trimmed shape's draw-on shows in the
+/// dopesheet and keys through the same machinery as a stroke width.
+#[test]
+fn trim_paths_keys_get_dopesheet_rows() {
+    let mut n = full_node();
+    assert!(prop_of(&n, PropKind::TrimEnd).is_none(), "no trim, no property");
+    n.trim = Some(motion_core::node::Trim {
+        start: Value::constant(0.0),
+        end: Value::constant(1.0),
+        offset: Value::constant(0.0),
+    });
+    prop_of_mut(&mut n, PropKind::TrimEnd).unwrap().insert_key(12);
+    let rows = dope_rows(&n);
+    assert_eq!(rows.iter().map(|r| (r.label.as_str(), r.frames.clone())).collect::<Vec<_>>(), vec![("Trim End", vec![12])]);
+}
+
+/// Timeline rows with layers inside start closed; opening one shows its
+/// children, and the selection's ancestors open themselves.
+#[test]
+fn strip_rows_fold_closed_by_default() {
+    let leaf = MNode::group(3, "path");
+    let group = MNode::group(2, "group").with_child(leaf);
+    let layer = MNode::group(1, "shape layer").with_child(group);
+    let root = MNode::group(0, "root").with_child(layer).with_child(MNode::group(4, "other"));
+    let rows = crate::strips::strip_rows(&root, &Default::default());
+    let names = |v: Vec<&crate::strips::StripRow>| v.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+    let mut open = std::collections::HashSet::new();
+    assert_eq!(names(crate::strips::visible_rows(&rows, &open, None)), ["other", "shape layer"]);
+    open.insert(NodeId(1));
+    assert_eq!(names(crate::strips::visible_rows(&rows, &open, None)), ["other", "shape layer", "group"]);
+    open.clear();
+    assert_eq!(names(crate::strips::visible_rows(&rows, &open, Some(NodeId(3)))), ["other", "shape layer", "group", "path"]);
+}

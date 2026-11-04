@@ -50,6 +50,44 @@ pub(crate) struct StripRow {
     /// source frame from a curve resolved against the whole project, so the
     /// honest bar for one is no bar at all.
     pub(crate) footage: Option<(motion_core::Asset, bool)>,
+    /// How many layers sit directly inside this one; above zero it folds.
+    pub(crate) children: usize,
+}
+
+/// The rows left showing when only the rows in `open` show what is inside
+/// them: everything with children starts closed, so a shape layer is one row
+/// until you open it. The selected row's ancestors count as open, so picking a
+/// layer on the canvas never leaves it hidden in a closed group.
+pub(crate) fn visible_rows<'a>(
+    rows: &'a [StripRow],
+    open: &std::collections::HashSet<NodeId>,
+    selected: Option<NodeId>,
+) -> Vec<&'a StripRow> {
+    // Ancestors of the selection: walking back, each row shallower than the
+    // last one kept is the next parent up.
+    let mut forced = std::collections::HashSet::new();
+    if let Some(i) = rows.iter().position(|r| Some(r.id) == selected) {
+        let mut depth = rows[i].depth;
+        for r in rows[..i].iter().rev() {
+            if r.depth < depth {
+                forced.insert(r.id);
+                depth = r.depth;
+            }
+        }
+    }
+    let mut hide_below: Option<usize> = None;
+    let mut out = Vec::new();
+    for row in rows {
+        match hide_below {
+            Some(d) if row.depth > d => continue,
+            _ => hide_below = None,
+        }
+        if row.children > 0 && !open.contains(&row.id) && !forced.contains(&row.id) {
+            hide_below = Some(row.depth);
+        }
+        out.push(row);
+    }
+    out
 }
 
 /// Flatten a comp's layers into strip rows.
@@ -85,6 +123,7 @@ pub(crate) fn strip_rows(
                     .map(|a| (a.clone(), time_remap.is_some())),
                 _ => None,
             },
+            children: node.children.len(),
         });
         // Front-most first, matching the layers panel — the two are the same
         // list of layers and must not disagree about their order.
@@ -275,7 +314,10 @@ pub(crate) fn strips_ui(
             ui.weak("This composition has no layers yet.");
         }
 
-        for (i, row) in rows.iter().enumerate() {
+        // Rows opened by hand, by id. View state for the session, not saved.
+        let open_id = egui::Id::new("strip_open");
+        let mut open: std::collections::HashSet<NodeId> = ui.data(|d| d.get_temp(open_id)).unwrap_or_default();
+        for row in visible_rows(rows, &open, selected) {
             let is_sel = selected == Some(row.id);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -294,7 +336,7 @@ pub(crate) fn strips_ui(
                     egui::pos2(btn.left() - 2.0, cell.bottom()),
                 );
                 let name_resp =
-                    ui.interact(name_cell, ui.id().with(("strip_name", i)), egui::Sense::click());
+                    ui.interact(name_cell, ui.id().with(("strip_name", row.id)), egui::Sense::click());
                 if is_sel || name_resp.hovered() {
                     ui.painter_at(cell).rect_filled(
                         cell,
@@ -305,7 +347,25 @@ pub(crate) fn strips_ui(
                 if name_resp.clicked() {
                     out.select_layer = Some(row.id);
                 }
-                // The type glyph in its accent, then the name beside it.
+                // The fold arrow for a row with layers inside, then the type
+                // glyph in its accent, then the name beside it.
+                let arrow = egui::Rect::from_min_size(name_cell.min, egui::vec2(12.0, name_cell.height()));
+                if row.children > 0 {
+                    let resp = ui.interact(arrow, ui.id().with(("strip_fold", row.id)), egui::Sense::click());
+                    let is_open = open.contains(&row.id);
+                    let c = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+                    let m = arrow.center();
+                    let pts = if is_open {
+                        vec![m + egui::vec2(-4.0, -2.0), m + egui::vec2(4.0, -2.0), m + egui::vec2(0.0, 3.0)]
+                    } else {
+                        vec![m + egui::vec2(-2.0, -4.0), m + egui::vec2(3.0, 0.0), m + egui::vec2(-2.0, 4.0)]
+                    };
+                    ui.painter_at(arrow).add(egui::Shape::convex_polygon(pts, c, egui::Stroke::NONE));
+                    if resp.on_hover_text(if is_open { "Collapse" } else { "Expand" }).clicked() && !open.remove(&row.id) {
+                        open.insert(row.id);
+                    }
+                }
+                let name_cell = name_cell.with_min_x(arrow.right());
                 ui.painter_at(name_cell).text(
                     egui::pos2(name_cell.left(), name_cell.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -454,7 +514,7 @@ pub(crate) fn strips_ui(
                 // delta to the current) lets a drag that clamped at 0 spring back.
                 // A layer with no range has nothing to drag.
                 let Some(timing) = timing else { return };
-                let drag_id = ui.id().with(("strip_drag", i));
+                let drag_id = ui.id().with(("strip_drag", row.id));
                 if resp.drag_started() {
                     // `press_origin`, not `interact_pointer_pos`: egui only fires
                     // `drag_started` once the pointer crosses its threshold, by
@@ -483,7 +543,7 @@ pub(crate) fn strips_ui(
                 clip_cursor(ui, &resp, drag_id, bar.left(), bar.right(), HANDLE_W);
             });
         }
-
+        ui.data_mut(|d| d.insert_temp(open_id, open));
     });
 
     // --- Column splitter, spanning the ruler and every row: the columns are

@@ -71,6 +71,9 @@ pub(crate) struct NodeInfo {
     pub(crate) radius: Option<f64>,
     /// Stroke color + width, `None` when the node has no stroke.
     pub(crate) stroke: Option<([f32; 3], f64)>,
+    /// Trim Paths start, end (fractions) and offset (laps), when it has one.
+    pub(crate) trim: Option<[f64; 3]>,
+    pub(crate) trim_anim: [bool; 3],
     pub(crate) anchor_anim: bool,
     pub(crate) pos_anim: bool,
     pub(crate) rot_anim: bool,
@@ -517,6 +520,8 @@ impl NodeInfo {
             radius_anim: is_anim(node, PropKind::ShapeRadius),
             stroke_color_anim: is_anim(node, PropKind::StrokeColor),
             stroke_width_anim: is_anim(node, PropKind::StrokeWidth),
+            trim: node.trim.as_ref().map(|t| [t.start.resolve(ctx), t.end.resolve(ctx), t.offset.resolve(ctx)]),
+            trim_anim: [PropKind::TrimStart, PropKind::TrimEnd, PropKind::TrimOffset].map(|k| is_anim(node, k)),
             audio: node.audio.as_ref().map(|a| AudioInfo {
                 level: a.level.resolve(ctx),
                 pan: a.pan.resolve(ctx),
@@ -659,6 +664,10 @@ pub(crate) struct PropEdits {
     /// Add a default stroke to a node that has none / drop the one it has.
     pub(crate) add_stroke: bool,
     pub(crate) remove_stroke: bool,
+    /// Trim start, end, offset in stored units (fractions, laps).
+    pub(crate) trim: [Option<f64>; 3],
+    pub(crate) add_trim: bool,
+    pub(crate) remove_trim: bool,
     // Text-layer edits. `text_max_width` is a double option on purpose: the
     // outer says "the user changed it this frame", the inner is the value —
     // `Some(None)` is "stop wrapping", which a flat `Option` couldn't express.
@@ -1158,6 +1167,37 @@ pub(crate) fn properties_ui(
                 edits.key.insert(PropKind::StrokeWidth);
             }
             ui.end_row();
+        }
+
+        // --- Trim Paths: draws part of the path by length. Shown as AE
+        // shows it, percent and degrees; stored as fractions and laps. ---
+        if n.size.is_some() || n.path_pts.len() > 1 || n.trim.is_some() {
+            ui.label("Trim");
+            if n.trim.is_some() {
+                if ui.small_button("✕").on_hover_text("Remove Trim Paths").clicked() {
+                    edits.remove_trim = true;
+                }
+            } else if ui.small_button("+ add").on_hover_text("Draw part of the path, by length").clicked() {
+                edits.add_trim = true;
+            }
+            ui.label("");
+            ui.end_row();
+        }
+        if let Some(t) = n.trim {
+            let rows = [("  Start", "%", 100.0, PropKind::TrimStart), ("  End", "%", 100.0, PropKind::TrimEnd), ("  Offset", "°", 360.0, PropKind::TrimOffset)];
+            for (i, (label, unit, k, kind)) in rows.into_iter().enumerate() {
+                ui.label(label);
+                let mut v = t[i] * k;
+                let field = crate::calc::num(&mut v).speed(0.5).suffix(unit);
+                let field = if i < 2 { field.range(0.0..=100.0) } else { field };
+                if ui.add(field).changed() {
+                    edits.trim[i] = Some(v / k);
+                }
+                if key_button(ui, n.trim_anim[i]) {
+                    edits.key.insert(kind);
+                }
+                ui.end_row();
+            }
         }
 
         // --- Parametric geometry. Absent for groups and for imported
@@ -1730,6 +1770,10 @@ pub(crate) enum PropKind {
     Fill,
     StrokeColor,
     StrokeWidth,
+    /// Trim Paths, as fractions of the length (start, end) and laps (offset).
+    TrimStart,
+    TrimEnd,
+    TrimOffset,
     ShapeSize,
     ShapeRadius,
     TextSize,
@@ -1764,7 +1808,7 @@ pub(crate) enum PropKind {
 impl PropKind {
     /// The **fixed** animatable properties, in row order. Path points are dynamic
     /// and are appended per node by [`prop_kinds_of`], never listed here.
-    pub(crate) const ALL: [PropKind; 18] = [
+    pub(crate) const ALL: [PropKind; 21] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -1773,6 +1817,9 @@ impl PropKind {
         PropKind::Fill,
         PropKind::StrokeColor,
         PropKind::StrokeWidth,
+        PropKind::TrimStart,
+        PropKind::TrimEnd,
+        PropKind::TrimOffset,
         PropKind::ShapeSize,
         PropKind::ShapeRadius,
         PropKind::TextSize,
@@ -1812,6 +1859,9 @@ impl PropKind {
             PropKind::Fill => "Fill",
             PropKind::StrokeColor => "Stroke",
             PropKind::StrokeWidth => "Stroke W",
+            PropKind::TrimStart => "Trim Start",
+            PropKind::TrimEnd => "Trim End",
+            PropKind::TrimOffset => "Trim Offset",
             PropKind::ShapeSize => "Size",
             PropKind::ShapeRadius => "Radius",
             PropKind::TextSize => "Font Size",
@@ -2128,6 +2178,9 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
         PropKind::Fill => PropRef::Color(node.fill.as_ref()?),
         PropKind::StrokeColor => PropRef::Color(&node.stroke.as_ref()?.color),
         PropKind::StrokeWidth => PropRef::Num(&node.stroke.as_ref()?.width),
+        PropKind::TrimStart => PropRef::Num(&node.trim.as_ref()?.start),
+        PropKind::TrimEnd => PropRef::Num(&node.trim.as_ref()?.end),
+        PropKind::TrimOffset => PropRef::Num(&node.trim.as_ref()?.offset),
         PropKind::ShapeSize => match node.shape.as_ref()? {
             MShape::Rect { size, .. }
             | MShape::Ellipse { size }
@@ -2225,6 +2278,9 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         PropKind::Fill => PropRefMut::Color(node.fill.as_mut()?),
         PropKind::StrokeColor => PropRefMut::Color(&mut node.stroke.as_mut()?.color),
         PropKind::StrokeWidth => PropRefMut::Num(&mut node.stroke.as_mut()?.width),
+        PropKind::TrimStart => PropRefMut::Num(&mut node.trim.as_mut()?.start),
+        PropKind::TrimEnd => PropRefMut::Num(&mut node.trim.as_mut()?.end),
+        PropKind::TrimOffset => PropRefMut::Num(&mut node.trim.as_mut()?.offset),
         PropKind::ShapeSize => match node.shape.as_mut()? {
             MShape::Rect { size, .. }
             | MShape::Ellipse { size }
