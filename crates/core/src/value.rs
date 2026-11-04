@@ -268,12 +268,16 @@ impl<T> Keyframe<T> {
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct Track<T> {
     keys: Vec<Keyframe<T>>,
+    /// A script run on the sampled value each frame, with it bound to `value`
+    /// (AE's expression on a keyframed property). `None` for plain keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
 }
 
 impl<T: Animatable> Track<T> {
     pub fn new(mut keys: Vec<Keyframe<T>>) -> Self {
         keys.sort_by_key(|k| k.frame);
-        Self { keys }
+        Self { keys, expr: None }
     }
 
     pub fn keys(&self) -> &[Keyframe<T>] {
@@ -283,7 +287,7 @@ impl<T: Animatable> Track<T> {
     /// Re-type every key's value, keeping the timing. Widening only — the
     /// mapped track is still sorted, so it skips the re-sort `new` does.
     pub fn map_value<U: Animatable>(self, f: impl Fn(T) -> U) -> Track<U> {
-        Track { keys: self.keys.into_iter().map(|k| k.map_value(&f)).collect() }
+        Track { keys: self.keys.into_iter().map(|k| k.map_value(&f)).collect(), expr: self.expr }
     }
 
     pub fn len(&self) -> usize {
@@ -653,7 +657,13 @@ impl<T: Animatable + FromExpr + ToExpr> Value<T> {
     pub fn resolve(&self, ctx: &mut EvalCtx) -> T {
         match self {
             Value::Const(v) => v.clone(),
-            Value::Keyframed(track) => track.sample(ctx.frame),
+            Value::Keyframed(track) => {
+                let v = track.sample(ctx.frame);
+                match &track.expr {
+                    Some(src) => crate::expr::eval_script_value(src, ctx, v.to_expr()).ok().and_then(T::from_expr).unwrap_or(v),
+                    None => v,
+                }
+            }
             Value::Expr(e) => T::from_expr(eval_expr(e, ctx)).unwrap_or_else(T::fallback),
         }
     }

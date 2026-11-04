@@ -260,6 +260,7 @@ fn draw_item(scene: &Scene, i: usize, target: &mut Pixmap, scale: f64, report: &
                 motion_core::LineJoin::Round => tiny_skia::LineJoin::Round,
                 motion_core::LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
             },
+            dash: st.dash.and_then(|[d, g]| tiny_skia::StrokeDash::new(vec![(d * scale) as f32, (g * scale) as f32], 0.0)),
             ..Default::default()
         };
         target.stroke_path(&path, &paint, &stroke, Transform::identity(), None);

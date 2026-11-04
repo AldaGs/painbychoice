@@ -524,11 +524,14 @@ pub struct StrokeStyle {
     pub join: LineJoin,
     /// A miter longer than this many stroke widths is beveled instead.
     pub miter_limit: f64,
+    /// Dash and gap lengths; `None` is a solid line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dash: Option<[f64; 2]>,
 }
 
 impl Default for StrokeStyle {
     fn default() -> Self {
-        Self { cap: LineCap::Butt, join: LineJoin::Miter, miter_limit: 4.0 }
+        Self { cap: LineCap::Butt, join: LineJoin::Miter, miter_limit: 4.0, dash: None }
     }
 }
 
@@ -549,7 +552,11 @@ impl StrokeStyle {
             LineJoin::Round => kurbo::Join::Round,
             LineJoin::Bevel => kurbo::Join::Bevel,
         };
-        kurbo::Stroke::new(width).with_caps(cap).with_join(join).with_miter_limit(self.miter_limit)
+        let s = kurbo::Stroke::new(width).with_caps(cap).with_join(join).with_miter_limit(self.miter_limit);
+        match self.dash {
+            Some(d) => s.with_dashes(0.0, d),
+            None => s,
+        }
     }
 }
 
@@ -842,6 +849,10 @@ pub struct Node {
     /// neither do its children — hiding a group hides what is in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// An adjustment layer: draws nothing itself, and runs its effects on
+    /// everything its siblings below it have drawn (AE's adjustment switch).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adjustment: bool,
     /// Per-character motion for a text shape (AE's text animators), applied in
     /// order. Ignored on any other shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -903,6 +914,7 @@ impl Node {
             audio: None,
             motion_blur: true,
             hidden: false,
+            adjustment: false,
             text_animators: Vec::new(),
             trim: None,
             locked: false,
@@ -930,6 +942,7 @@ impl Node {
             audio: None,
             motion_blur: true,
             hidden: false,
+            adjustment: false,
             text_animators: Vec::new(),
             trim: None,
             locked: false,

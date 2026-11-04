@@ -11,6 +11,7 @@
 
 pub mod ae;
 pub mod asset;
+mod author;
 pub mod audio;
 pub mod camera;
 pub mod composite;

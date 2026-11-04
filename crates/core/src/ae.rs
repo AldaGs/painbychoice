@@ -32,14 +32,19 @@ pub struct ImportReport {
 }
 
 impl ImportReport {
-    fn drop(&mut self, what: impl Into<String>) {
+    pub(crate) fn drop(&mut self, what: impl Into<String>) {
         *self.dropped.entry(what.into()).or_default() += 1;
     }
 }
 
-/// Parse an exported AE project.
+/// Parse an exported AE project, or an authoring document
+/// (`motion.schema.json`, what `json2jsx` builds an AE project from).
 pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
-    let doc: J = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let mut doc: J = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let mut report = ImportReport::default();
+    if doc.get("root").is_none() && doc.get("compositions").is_some() {
+        doc = crate::author::to_export(&doc, &mut report);
+    }
     let root = doc.get("root").ok_or("no `root` item")?;
 
     // Every project item by id, flattened out of the folder tree.
@@ -56,7 +61,6 @@ pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
     let comp_ids: HashMap<u64, CompId> =
         comps.iter().enumerate().map(|(i, c)| (id(c), CompId(i as u64))).collect();
 
-    let mut report = ImportReport::default();
     // File footage becomes project assets, keyed by AE item id. Only the
     // reference is stored: the file is read when it is drawn, so a path that
     // does not exist on this machine warns at render time and can be relinked.
@@ -253,6 +257,13 @@ impl Importer<'_> {
                 root.children.push(n);
             }
         }
+        // AE switches a matte layer's video off; PBC draws a hidden one as
+        // nothing, which would leave its layer uncut.
+        for i in 0..root.children.len().saturating_sub(1) {
+            if root.children[i].matte.is_some() {
+                root.children[i + 1].hidden = false;
+            }
+        }
         for (l, n) in layers.iter().rev().zip(root.children.iter_mut()) {
             if let Some(parent) = l["parent"].as_u64() {
                 match by_ae_id.get(&parent) {
@@ -324,13 +335,13 @@ impl Importer<'_> {
             };
         }
 
-        let in_ = l["inPoint"].as_f64().unwrap_or(start);
+        // `duration` runs from `startTime`, not from the in-point (a layer
+        // trimmed in at 1s and out at 16s has 16); the export's compOutPoint
+        // adds it to the in-point and overshoots.
+        let in_ = l["inPoint"].as_f64().or(l["compInPoint"].as_f64()).unwrap_or(start);
+        let out = start + num(l, "duration", f64::MAX / 1e6);
         if l.get("duration").is_some() || l.get("startTime").is_some() {
-            node.timing = Some(LayerTiming {
-                start: self.frame(start),
-                in_: self.frame(in_),
-                out: self.frame(in_ + num(l, "duration", f64::MAX / 1e6)),
-            });
+            node.timing = Some(LayerTiming { start: self.frame(start), in_: self.frame(in_), out: self.frame(out) });
         }
         let flags = &l["flags"];
         // A null draws nothing either way, and AE nulls are usually switched
@@ -356,9 +367,7 @@ impl Importer<'_> {
             }
         }
         node.locked = flags["locked"] == J::Bool(true);
-        if flags["adjustment"] == J::Bool(true) {
-            self.report.drop("adjustment layer");
-        }
+        node.adjustment = flags["adjustment"] == J::Bool(true);
         if flags["3D"] == J::Bool(true) {
             self.report.drop("3D layer (imported flat)");
         }
@@ -593,9 +602,17 @@ impl Importer<'_> {
         }
         s = floats(&s);
         s = word(&s, "time", &format!("(frame / {:?})", self.fps));
-        s = word(&s, "value", &literal(&nums(&p["value"]))?);
+        // On a keyframed property `value` stays a name: the track binds it to
+        // the sampled keys each frame.
+        let keyed = p["keyframes"].as_array().and_then(|k| k.first()).map(|k| nums(&k["value"]));
+        if keyed.is_none() && word(&s, "value", "") != s {
+            s = word(&s, "value", &literal(&nums(&p["value"]))?);
+        }
         s = js_statements(&s);
-        crate::expr::eval_script(&s, 0.0).ok()?;
+        match keyed {
+            Some(k) => crate::expr::eval_script_with(&s, 0.0, num_expr(&k)?).ok()?,
+            None => crate::expr::eval_script(&s, 0.0).ok()?,
+        };
         Some(s)
     }
 
@@ -702,6 +719,7 @@ impl Importer<'_> {
         // A static number, for parameters PBC folds into others.
         let n = |i: u32, or: f64| p(i).and_then(|q| nums(&q["value"]).first().copied()).unwrap_or(or);
         let kind = match mn {
+            "ADBE Noise" => EffectKind::Noise { amount: f(1, 0.0), color: f(2, 1.0) },
             "ADBE Mosaic" => EffectKind::Mosaic { horizontal: f(1, 10.0), vertical: f(2, 10.0) },
             "ADBE Fractal Noise" => EffectKind::FractalNoise {
                 contrast: f(4, 100.0),
@@ -822,12 +840,18 @@ impl Importer<'_> {
         let find = |m: &str| items.iter().find(|i| i["matchName"] == m);
         let fill = find("ADBE Vector Graphic - Fill").map(|f| {
             let props = f["properties"].as_array().cloned().unwrap_or_default();
-            self.color(prop(&props, "ADBE Vector Fill Color"), Color::rgb(1.0, 0.0, 0.0))
+            let c = self.color(prop(&props, "ADBE Vector Fill Color"), Color::rgb(1.0, 0.0, 0.0));
+            let o = self.scalar(prop(&props, "ADBE Vector Fill Opacity"), 0.01, 1.0);
+            self.faded(c, o)
         });
         let stroke = find("ADBE Vector Graphic - Stroke").map(|s| {
             let props = s["properties"].as_array().cloned().unwrap_or_default();
             Stroke {
-                color: self.color(prop(&props, "ADBE Vector Stroke Color"), Color::rgb(1.0, 1.0, 1.0)),
+                color: {
+                    let c = self.color(prop(&props, "ADBE Vector Stroke Color"), Color::rgb(1.0, 1.0, 1.0));
+                    let o = self.scalar(prop(&props, "ADBE Vector Stroke Opacity"), 0.01, 1.0);
+                    self.faded(c, o)
+                },
                 width: self.scalar(prop(&props, "ADBE Vector Stroke Width"), 1.0, 2.0),
                 style: stroke_style(&props),
             }
@@ -884,6 +908,11 @@ impl Importer<'_> {
             };
             if let Some(shape) = shape {
                 let mut n = Node::shape(self.fresh(), name(item), shape);
+                // A rect or ellipse sits at its Position inside the group.
+                let at = ["ADBE Vector Rect Position", "ADBE Vector Ellipse Position"].into_iter().find_map(|m| prop(&props, m));
+                if at.is_some() {
+                    n.transform.position = self.vec3(at, 1.0, Vec3::ZERO);
+                }
                 n.fill = fill.clone();
                 n.stroke = stroke.clone();
                 out.push(n);
@@ -922,6 +951,22 @@ impl Importer<'_> {
         out
     }
 
+    /// A paint colour with its separate opacity folded into alpha. Keys on one
+    /// side carry across; both animated keeps the colour's.
+    fn faded(&mut self, c: Value<Color>, o: Value<f64>) -> Value<Color> {
+        let fade = |c: Color, o: f64| Color { a: c.a * o, ..c };
+        match (c, o) {
+            (c, Value::Const(o)) if o == 1.0 => c,
+            (Value::Const(c), Value::Const(o)) => Value::Const(fade(c, o)),
+            (Value::Const(c), Value::Keyframed(t)) => Value::Keyframed(t.map_value(move |o| fade(c, o))),
+            (Value::Keyframed(t), Value::Const(o)) => Value::Keyframed(t.map_value(move |c| fade(c, o))),
+            (c, _) => {
+                self.report.drop("animated paint opacity on an animated colour");
+                c
+            }
+        }
+    }
+
     /// A layer transform or a shape group's. AE scale and opacity are percent.
     fn transform(&mut self, props: &[J], layer: bool) -> Transform {
         let (anchor, pos, scale, opacity) = if layer {
@@ -947,7 +992,11 @@ impl Importer<'_> {
             (None | Some(Value::Const(_)), None | Some(Value::Const(_)), Value::Const(z)) => {
                 Value::constant(Vec3::new(cx, cy, z))
             }
-            (_, _, Value::Keyframed(track)) => Value::Keyframed(track.map_value(|z| Vec3::new(0.0, 0.0, z))),
+            (_, _, Value::Keyframed(track)) => {
+                let mut t = track.map_value(|z| Vec3::new(0.0, 0.0, z));
+                t.expr = t.expr.map(|s| format!("let value = value[2]; vec3(0.0, 0.0, {{ {s} }})"));
+                Value::Keyframed(t)
+            }
             (None | Some(Value::Const(_)), None | Some(Value::Const(_)), Value::Expr(crate::expr::Expr::Script(s))) => {
                 Value::expr(crate::expr::Expr::Script(format!("vec3({cx:?}, {cy:?}, {{ {s} }})")))
             }
@@ -1075,7 +1124,8 @@ impl Importer<'_> {
         T: crate::expr::FromExpr + crate::expr::ToExpr,
     {
         let Some(p) = p else { return Value::constant(or) };
-        if let Some(src) = self.script(p, &self.expr_layer, 0) {
+        let script = self.script(p, &self.expr_layer, 0);
+        if let Some(src) = script.clone() {
             // A script that ignores the clock folds to a constant through the
             // usual unit conversion. A live one is kept when the conversion is
             // a plain factor (1, % → fraction, degrees → radians), folded into
@@ -1149,7 +1199,18 @@ impl Importer<'_> {
             pending_in = next_in;
             keys_out.push(kf);
         }
-        Value::Keyframed(Track::new(keys_out))
+        let mut track = Track::new(keys_out);
+        // A script over the keys reads them as `value`, so it is kept only where
+        // AE's units are PBC's: there is no per-frame conversion between them.
+        if let Some(src) = script {
+            let probe: Vec<f64> = nums(&keys[0]["value"]).iter().map(|x| x + 1.25).collect();
+            let same = matches!((conv(&probe), num_expr(&probe).and_then(T::from_expr)), (Some(a), Some(b)) if dist(&a, &b) < 1e-9);
+            if same {
+                track.expr = Some(src);
+                self.translated.insert(p["expression"].as_str().unwrap_or("").to_string());
+            }
+        }
+        Value::Keyframed(track)
     }
 }
 
@@ -1187,6 +1248,13 @@ fn stroke_style(props: &[J]) -> StrokeStyle {
             _ => LineJoin::Miter,
         },
         miter_limit: prop(props, "ADBE Vector Stroke Miter Limit").and_then(|p| nums(&p["value"]).first().copied()).unwrap_or(4.0),
+        // ponytail: the first dash/gap pair, static; AE allows three, animated.
+        dash: prop(props, "ADBE Vector Stroke Dashes").and_then(|d| {
+            let d = d["properties"].as_array()?;
+            let len = |m: &str| prop(d, m).and_then(|p| nums(&p["value"]).first().copied());
+            let dash = len("ADBE Vector Stroke Dash 1")?;
+            Some([dash, len("ADBE Vector Stroke Gap 1").unwrap_or(dash)])
+        }),
     }
 }
 
@@ -1205,6 +1273,17 @@ fn expr_nums(v: &crate::expr::ExprValue) -> Vec<f64> {
 fn quoted(s: &str) -> Option<(&str, &str)> {
     let end = s.find("\")")?;
     Some((&s[..end], &s[end + 2..]))
+}
+
+/// A property value as a script value: a number, or a vector.
+fn num_expr(v: &[f64]) -> Option<crate::expr::ExprValue> {
+    use crate::expr::ExprValue;
+    match *v {
+        [x] => Some(ExprValue::Num(x)),
+        [x, y] => Some(ExprValue::Vec3(Vec3::new(x, y, 0.0))),
+        [x, y, z] => Some(ExprValue::Vec3(Vec3::new(x, y, z))),
+        _ => None,
+    }
 }
 
 /// A property value as a script literal: a number, or an array.
@@ -1272,18 +1351,33 @@ fn js_statements(s: &str) -> String {
             }
             _ => st,
         };
-        let (Some(q), Some(c)) = (st.find('?'), st.rfind(':')) else { return st };
-        if q > c {
-            return st;
-        }
-        // The condition starts after the assignment's `=` or the block's `{`.
+        let Some(q) = st.find('?') else { return st };
         let b = st.as_bytes();
+        // The condition starts after the enclosing `(`, the assignment's `=`
+        // or the block's `{`; the else-branch ends at the matching `)`.
+        let mut depth = 0;
         let start = (0..q).rev().find(|&i| match b[i] {
-            b'{' => true,
-            b'=' => !matches!(b.get(i + 1), Some(b'=')) && !matches!(b.get(i.wrapping_sub(1)), Some(b'=' | b'<' | b'>' | b'!')),
+            b')' => { depth += 1; false }
+            b'(' if depth == 0 => true,
+            b'(' => { depth -= 1; false }
+            b'{' => depth == 0,
+            b'=' => depth == 0 && !matches!(b.get(i + 1), Some(b'=')) && !matches!(b.get(i.wrapping_sub(1)), Some(b'=' | b'<' | b'>' | b'!')),
             _ => false,
         }).map_or(0, |i| i + 1);
-        format!("{}if {} {{ {} }} else {{ {} }}", &st[..start], st[start..q].trim(), st[q + 1..c].trim(), st[c + 1..].trim())
+        depth = 0;
+        let mut colon = None;
+        let mut end = st.len();
+        for (i, &ch) in b.iter().enumerate().skip(q + 1) {
+            match ch {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' if depth == 0 => { end = i; break }
+                b')' | b']' => depth -= 1,
+                b':' if depth == 0 && colon.is_none() => colon = Some(i),
+                _ => {}
+            }
+        }
+        let Some(c) = colon else { return st };
+        format!("{}if {} {{ {} }} else {{ {} }}{}", &st[..start], st[start..q].trim(), st[q + 1..c].trim(), st[c + 1..end].trim(), &st[end..])
     }).collect::<Vec<_>>().join(";")
 }
 
@@ -1447,6 +1541,7 @@ mod tests {
     #[test]
     fn js_statement_expressions_run_as_rhai() {
         use crate::expr::{eval_script, ExprValue};
+        assert_eq!(js_statements("p = 100 + 3 * (t < 4 ? 1 : 0)"), "p = 100 + 3 * (if t < 4 { 1 } else { 0 })");
         let js = "var x = 297.00, y = 540.00; if (time > 1) { var u = Math.min(1, Math.max(0, (time - 1) / 2)); u = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2; x = 297.00 + 100 * u; } [x, value[1]]";
         let s = js.replace("Math.", "").replace("time", "(frame / 24.0)").replace("value", "[0, 7]");
         let s = js_statements(&floats(&s));
@@ -1455,6 +1550,39 @@ mod tests {
         assert_eq!(at(48.0), (347.0, 7.0)); // halfway through the ease
         assert_eq!(at(240.0), (397.0, 7.0));
         assert!(matches!(eval_script("vec3(0.0, 0.0, { (frame / 24.0) * 45.0 })", 24.0), Ok(ExprValue::Vec3(v)) if v.z == 45.0));
+    }
+
+    #[test]
+    fn authoring_json_imports_adjustment_noise_and_keys_under_an_expression() {
+        let json = r##"{"compositions":[{"name":"Main","width":100,"height":50,"fps":24,"duration":4,"layers":[
+          {"name":"Grain","type":"adjustment","effects":[{"matchName":"ADBE Noise","props":{"ADBE Noise-0001":2}}]},
+          {"name":"Leaf","type":"shape","in":1,"out":3,
+           "transform":{"position":[50,25],"rotation":{"expression":"value + 10","keyframes":[
+             {"time":1,"value":0,"ease":"easeInOut"},{"time":2,"value":90,"interp":"hold"}]}},
+           "shapes":[{"type":"group","items":[
+             {"type":"rect","size":[10,10],"position":[5,0]},
+             {"type":"fill","color":"#FF0000","opacity":50},
+             {"type":"stroke","color":"#000000","strokeWidth":2,"dashes":{"dash":4,"gap":2}}]}]}]}]}"##;
+        let (p, report) = import(json).unwrap();
+        assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+        let c = p.root_comp();
+        let (leaf, grain) = (&c.root.children[0], &c.root.children[1]);
+        assert!(grain.adjustment && matches!(grain.effects[0].kind, EffectKind::Noise { .. }));
+        // in/out are comp seconds; keys move onto the layer's clock.
+        assert_eq!(leaf.timing.map(|t| (t.in_, t.out)), Some((24, 72)));
+        let Value::Keyframed(t) = &leaf.transform.rotation else { panic!("not keyed") };
+        assert_eq!(t.frames(), vec![24, 48]);
+        let rect = &leaf.children[0].children[0];
+        assert_eq!(rect.transform.position, Value::constant(Vec3::new(5.0, 0.0, 0.0)));
+        assert_eq!(rect.fill, Some(Value::constant(Color { a: 0.5, ..Color::rgb(1.0, 0.0, 0.0) })));
+        assert_eq!(rect.stroke.as_ref().unwrap().style.dash, Some([4.0, 2.0]));
+        // The expression runs on the sampled keys: 90 held, plus 10.
+        let mut ctx = crate::expr::EvalCtx::at(60.0);
+        assert_eq!(leaf.transform.rotation.resolve(&mut ctx).z, 100.0);
+        // The adjustment wraps what is drawn below it in a group with its noise.
+        let scene = crate::eval::evaluate_project(&p, 36.0);
+        let g = scene.groups.iter().find(|g| g.source == grain.id).expect("adjustment group");
+        assert!(matches!(g.effects[0], crate::effect::ResolvedEffect::Noise { seed: 36, .. }));
     }
 
     #[test]

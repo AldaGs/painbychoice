@@ -1530,6 +1530,21 @@ pub fn eval_script(src: &str, frame: f64) -> Result<ExprValue, String> {
 /// return-type error — the UI surfaces it; [`eval_expr`] falls back to a neutral
 /// value so a bad script never breaks the frame.
 pub fn eval_script_ctx(src: &str, ctx: &mut EvalCtx<'_>) -> Result<ExprValue, String> {
+    eval_script_inner(src, ctx, None)
+}
+
+/// [`eval_script_ctx`] with the property's own sampled value in scope as
+/// `value` — a script layered on keyframes.
+pub fn eval_script_value(src: &str, ctx: &mut EvalCtx<'_>, value: ExprValue) -> Result<ExprValue, String> {
+    eval_script_inner(src, ctx, Some(value))
+}
+
+/// [`eval_script_value`] with no document behind it, like [`eval_script`].
+pub fn eval_script_with(src: &str, frame: f64, value: ExprValue) -> Result<ExprValue, String> {
+    eval_script_inner(src, &mut EvalCtx::at(frame), Some(value))
+}
+
+fn eval_script_inner(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>) -> Result<ExprValue, String> {
     let frame = ctx.frame;
     // Read the layer clock before parking the context — the same four readings
     // `Expr::Time` exposes, under the same names, so a script and a graph node
@@ -1545,6 +1560,9 @@ pub fn eval_script_ctx(src: &str, ctx: &mut EvalCtx<'_>) -> Result<ExprValue, St
         scope.push_constant("inPoint", in_point);
         scope.push_constant("outPoint", out_point);
         scope.push_constant("t01", t01);
+        if let Some(v) = value {
+            scope.push("value", expr_value_to_dynamic(v));
+        }
         let out: rhai::Dynamic =
             engine.eval_with_scope(&mut scope, src).map_err(|e| e.to_string())?;
         dynamic_to_expr_value(&out)

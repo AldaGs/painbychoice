@@ -360,6 +360,9 @@ fn svg_stroke_style(s: motion_core::StrokeStyle) -> String {
     if s.miter_limit != 4.0 {
         out.push_str(&format!(" stroke-miterlimit=\"{}\"", s.miter_limit));
     }
+    if let Some([d, g]) = s.dash {
+        out.push_str(&format!(" stroke-dasharray=\"{d} {g}\""));
+    }
     out
 }
 

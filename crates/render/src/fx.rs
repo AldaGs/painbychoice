@@ -78,6 +78,7 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             | ResolvedEffect::ColorEmboss { .. }
             | ResolvedEffect::Mosaic { .. }
             | ResolvedEffect::FractalNoise { .. }
+            | ResolvedEffect::Noise { .. }
             | ResolvedEffect::Colorama { .. }
             | ResolvedEffect::Unmult
             | ResolvedEffect::RadialBlur { .. } => rgb,
@@ -119,6 +120,7 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
                 | ResolvedEffect::ColorEmboss { .. }
                 | ResolvedEffect::Mosaic { .. }
                 | ResolvedEffect::FractalNoise { .. }
+                | ResolvedEffect::Noise { .. }
                 | ResolvedEffect::Colorama { .. }
                 | ResolvedEffect::Unmult
                 | ResolvedEffect::RadialBlur { .. }
@@ -194,6 +196,7 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::FractalNoise { contrast, brightness, scale, complexity, evolution, seed } => {
             fractal_noise(px, width, contrast, brightness, scale, complexity, evolution, seed)
         }
+        ResolvedEffect::Noise { amount, color, seed } => noise(px, amount, color, seed),
         ResolvedEffect::Colorama { phase, cycles, ref stops } => colorama(px, phase, cycles, stops),
         ResolvedEffect::Unmult => unmult(px),
     }
@@ -224,6 +227,29 @@ fn fractal_noise(px: &mut [u8], width: usize, contrast: f64, brightness: f64, sc
         let v = ((sum / norm - 0.5) * contrast / 100.0 + 0.5 + brightness / 100.0).clamp(0.0, 1.0);
         let g = (v * 255.0).round() as u8;
         p[..3].fill(g);
+    }
+}
+
+/// Per-pixel grain: each channel moves by up to `amount` percent of full
+/// scale, from a hash of the pixel and `seed`. Grey unless `color`.
+fn noise(px: &mut [u8], amount: f64, color: bool, seed: i64) {
+    let k = (amount / 100.0 * 255.0) as f32;
+    let hash = |i: u32| {
+        let mut h = i.wrapping_mul(0x8da6_b343) ^ (seed as u32).wrapping_mul(0x27d4_eb2d);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        (h & 0xffff) as f32 / 65535.0 - 0.5
+    };
+    for (i, p) in px.chunks_exact_mut(4).enumerate() {
+        if p[3] == 0 {
+            continue;
+        }
+        let i = i as u32 * 3;
+        for c in 0..3 {
+            let r = hash(if color { i + c as u32 } else { i });
+            p[c] = (p[c] as f32 + r * k).round().clamp(0.0, 255.0) as u8;
+        }
     }
 }
 

@@ -111,6 +111,7 @@ macro_rules! effect_fields {
             EffectKind::FractalNoise { contrast, brightness, scale, complexity, evolution, seed } => {
                 (None, vec![contrast, brightness, scale, complexity, evolution, seed])
             }
+            EffectKind::Noise { amount, color } => (None, vec![amount, color]),
             EffectKind::Colorama { phase, cycles, .. } => (None, vec![phase, cycles]),
             EffectKind::Unmult => (None, vec![]),
         }
@@ -336,6 +337,10 @@ pub enum EffectKind {
         evolution: Value<f64>,
         seed: Value<f64>,
     },
+    /// Random grain over every covered pixel (AE Noise): each channel moves by
+    /// up to `amount` percent, a new pattern every frame. `color` above 0.5
+    /// draws each channel independently; otherwise the grain is grey.
+    Noise { amount: Value<f64>, color: Value<f64> },
     /// Map each pixel's intensity through a palette (AE Colorama): phase =
     /// intensity x `cycles` + `phase`, wrapped to 0..1, picks the stop at or
     /// before it — no interpolation, AE's "Interpolate Palette" off. Up to
@@ -537,6 +542,7 @@ impl Effect {
                 evolution: Value::constant(0.0),
                 seed: Value::constant(0.0),
             },
+            EffectType::Noise => EffectKind::Noise { amount: Value::constant(10.0), color: Value::constant(1.0) },
             EffectType::Colorama => EffectKind::Colorama {
                 phase: Value::constant(0.0),
                 cycles: Value::constant(1.0),
@@ -586,6 +592,7 @@ impl Effect {
             EffectKind::ColorEmboss { .. } => EffectType::ColorEmboss,
             EffectKind::Mosaic { .. } => EffectType::Mosaic,
             EffectKind::FractalNoise { .. } => EffectType::FractalNoise,
+            EffectKind::Noise { .. } => EffectType::Noise,
             EffectKind::Colorama { .. } => EffectType::Colorama,
             EffectKind::Unmult => EffectType::Unmult,
             EffectKind::RadialBlur { .. } => EffectType::RadialBlur,
@@ -793,6 +800,11 @@ impl Effect {
                     seed: seed.resolve(ctx),
                 }
             }
+            EffectKind::Noise { amount, color } => ResolvedEffect::Noise {
+                amount: amount.resolve(ctx).clamp(0.0, 100.0),
+                color: color.resolve(ctx) > 0.5,
+                seed: ctx.frame.round() as i64,
+            },
             EffectKind::Colorama { phase, cycles, palette } => {
                 let mut stops = [(f64::INFINITY, [0.0; 4]); COLORAMA_STOPS];
                 let mut sorted = palette.clone();
@@ -933,13 +945,14 @@ pub enum EffectType {
     Mosaic,
     RadialBlur,
     FractalNoise,
+    Noise,
     Colorama,
     Unmult,
 }
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 38] = [
+    pub const ALL: [EffectType; 39] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
@@ -976,6 +989,7 @@ impl EffectType {
         EffectType::Mosaic,
         EffectType::RadialBlur,
         EffectType::FractalNoise,
+        EffectType::Noise,
         EffectType::Colorama,
         EffectType::Unmult,
     ];
@@ -997,7 +1011,7 @@ impl EffectType {
             DropShadow => "Perspective",
             Glow | Posterize | Threshold | ThresholdRgb | FindEdges | Emboss | ColorEmboss
             | Mosaic | Colorama => "Stylize",
-            FractalNoise => "Noise & Grain",
+            FractalNoise | Noise => "Noise & Grain",
             Unmult => "Channel",
         }
     }
@@ -1039,6 +1053,7 @@ impl EffectType {
             EffectType::ColorEmboss => "Color Emboss",
             EffectType::Mosaic => "Mosaic",
             EffectType::FractalNoise => "Fractal Noise",
+            EffectType::Noise => "Noise",
             EffectType::Colorama => "Colorama",
             EffectType::Unmult => "Unmult",
             EffectType::RadialBlur => "Radial Blur",
@@ -1084,6 +1099,7 @@ impl EffectType {
             EffectType::ColorEmboss => "fx.color_emboss",
             EffectType::Mosaic => "fx.mosaic",
             EffectType::FractalNoise => "fx.fractal_noise",
+            EffectType::Noise => "fx.noise",
             EffectType::Colorama => "fx.colorama",
             EffectType::Unmult => "fx.unmult",
             EffectType::RadialBlur => "fx.radial_blur",
@@ -1246,6 +1262,7 @@ impl EffectType {
                 p!("evolution", "Evolution", 1.0),
                 p!("seed", "Random Seed", 1.0),
             ],
+            EffectType::Noise => &[p!("amount", "Amount of Noise", 0.1), p!("color", "Use Color Noise", 1.0)],
             EffectType::Colorama => &[p!("phase", "Add Phase", 0.01), p!("cycles", "Cycle Repetitions", 0.1)],
             EffectType::Unmult => &[],
         }
@@ -1316,6 +1333,8 @@ pub enum ResolvedEffect {
     Mosaic { horizontal: f64, vertical: f64 },
     RadialBlur { amount: f64, center: (f64, f64), zoom: bool },
     FractalNoise { contrast: f64, brightness: f64, scale: f64, complexity: f64, evolution: f64, seed: f64 },
+    /// `seed` is the frame it was resolved on.
+    Noise { amount: f64, color: bool, seed: i64 },
     /// `stops` past the palette's end sit at position infinity.
     Colorama { phase: f64, cycles: f64, stops: [(f64, [f64; 4]); COLORAMA_STOPS] },
     Unmult,

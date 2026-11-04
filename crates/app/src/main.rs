@@ -37,7 +37,7 @@ USAGE:
   motion render <project.pbc> --out <file|dir> [options]
   motion render --demo --out <file|dir> [options]
   motion demo [--out <dir>]
-  motion import-ae <export.json> <out.pbc>
+  motion import-ae <export.json|authoring.json> <out.pbc>
 
 RENDER OPTIONS:
   --out <path>       Output. An extension ffmpeg knows (.mp4, .mov, .webm)
@@ -115,7 +115,7 @@ fn banner() -> String {
 /// Convert an After Effects JSON export to a `.pbc`, and print what could not
 /// be carried across — see `motion_core::ae`.
 fn import_ae(args: &[String]) -> Result<(), String> {
-    let [input, output] = args else { return Err("usage: motion import-ae <export.json> <out.pbc>".into()) };
+    let [input, output] = args else { return Err("usage: motion import-ae <export.json|authoring.json> <out.pbc>".into()) };
     let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
     let (project, report) = motion_core::ae::import(&text)?;
     let json = serde_json::to_string_pretty(&serde_json::json!({ "project": project }))

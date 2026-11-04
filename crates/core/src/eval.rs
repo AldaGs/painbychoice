@@ -695,9 +695,37 @@ fn walk(
         });
     }
 
+    let children_start = scene.items.len();
     for i in draw_order(node, xf, view, ctx) {
         let child = &node.children[i];
         let child_start = scene.items.len();
+        // An adjustment layer wraps everything drawn below it in this group so
+        // far in a group carrying its effects; it draws nothing of its own.
+        // ponytail: its opacity, mask and blend mode are not applied yet.
+        if child.adjustment {
+            let live = child.timing.as_ref().is_none_or(|t| t.is_live(ctx.comp_frame));
+            if live && !child.hidden && child_start > children_start {
+                let prev = ctx.frame;
+                if let Some(t) = &child.timing {
+                    ctx.frame = t.local_frame(ctx.comp_frame);
+                }
+                let effects: Vec<_> = child.effects.iter().filter_map(|e| e.resolve(ctx)).collect();
+                ctx.frame = prev;
+                if !effects.is_empty() {
+                    scene.groups.push(LayerGroup {
+                        source: child.id,
+                        start: children_start,
+                        end: child_start,
+                        blend: BlendMode::Normal,
+                        compose: ComposeMode::SrcOver,
+                        alpha: 1.0,
+                        clip: None,
+                        effects,
+                    });
+                }
+            }
+            continue;
+        }
         // `full`, not `opacity`: a child is outside its parent's group, so the
         // parent's fade has to reach it the ordinary way. Taking the isolated
         // content's 1.0 here would make children of a faded layer draw at full
