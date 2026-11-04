@@ -97,6 +97,10 @@ pub(crate) struct App {
     /// Edit buffer for the open comp's name, so typing doesn't rewrite the
     /// document on every keystroke. Same take/restore dance as the preset name.
     pub(crate) comp_name_buf: String,
+    /// The Subtitles panel's own state, taken for the UI pass like the buffers above.
+    pub(crate) subs_ui: crate::subtitles::SubsUi,
+    /// A transcription running in the background.
+    pub(crate) subs_job: Option<crate::subtitles::SubsJob>,
     /// Every system font family, gathered once at startup. Enumerating the
     /// system collection is far too slow to redo per frame, and the list can't
     /// system collection is far too slow to redo per frame, and the list can't
@@ -136,6 +140,9 @@ pub(crate) struct App {
     /// Which view the timeline panel shows. View state like `view`: how you
     /// were last looking at the keys isn't part of the document.
     pub(crate) timeline_mode: TimelineMode,
+    /// A mode switch from the Tab shortcut, applied with the header's own
+    /// switch so entering the curve editor frames it the same way.
+    pub(crate) pending_mode: Option<TimelineMode>,
     /// The curve editor's vertical window. Paired with `view` — one is the time
     /// axis, this is the value axis — and reset by "Frame All".
     pub(crate) value_view: ValueView,
@@ -1178,6 +1185,8 @@ impl App {
             presets: builtin_presets(),
             preset_name_buf: String::new(),
             comp_name_buf: String::new(),
+            subs_ui: Default::default(),
+            subs_job: None,
             canvas_rect: None,
             nav: CanvasNav::default(),
             pan_drag: None,
@@ -1186,6 +1195,7 @@ impl App {
             work_area: None,
             dope_label_w: 80.0,
             timeline_mode: TimelineMode::default(),
+            pending_mode: None,
             value_view: ValueView::default(),
             shown_props: PropSelection::new(),
             fps_drag: None,
@@ -4195,6 +4205,17 @@ impl App {
         let preset_names: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
         let mut preset_name_buf = std::mem::take(&mut self.preset_name_buf);
         let mut comp_name_buf = std::mem::take(&mut self.comp_name_buf);
+        let mut subs_state = std::mem::take(&mut self.subs_ui);
+        let mut subs_edits = crate::subtitles::SubsEdits::default();
+        let subs_view = crate::subtitles::SubsView {
+            layer: self.selected.and_then(|id| self.project.comp(self.current)?.root.find(id)).filter(|n| matches!(n.shape, Some(MShape::Text { .. }))).map(|n| {
+                (n.subtitles.as_ref(), n.timing.map_or(0, |t| t.start), crate::subtitles::karaoke_of(n))
+            }),
+            frame: self.current_frame(),
+            timebase: self.doc().timebase(),
+            progress: self.subs_job.as_ref().map(|j| j.progress.load(std::sync::atomic::Ordering::Relaxed)),
+            playing: self.playing,
+        };
         // Comps for the switcher, in id order (which is creation order).
         let comp_entries: Vec<CompEntry> = self
             .project
@@ -4311,6 +4332,7 @@ impl App {
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Assets => assets_ui(ui, &self.project, current_comp, &mut tree_edits),
+                    Editor::Subtitles => crate::subtitles::subs_ui(ui, &subs_view, &mut subs_state, &mut subs_edits),
                     Editor::Transport => transport_ui(
                         ui,
                         frame,
@@ -4529,9 +4551,11 @@ impl App {
         // selected layer. Read here, inside the recorded phase, so either is
         // undoable. Not while typing, and not with the pen armed — there it
         // removes anchors. A locked layer and the root can't be deleted.
+        // `selected_keys` is the local taken for the UI pass (put back below);
+        // the field is empty here, so reading it always deleted the layer.
         let del_key = self.tool.pen_mode().is_none()
             && self.shortcut(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-        let delete_keys = del_key && !self.selected_keys.is_empty();
+        let delete_keys = del_key && !selected_keys.is_empty();
         if del_key && !delete_keys {
             let root = &self.doc().root;
             tree_edits.delete = tree_edits
@@ -4637,6 +4661,7 @@ impl App {
         // Restore the save-field buffer taken for the UI pass.
         self.preset_name_buf = preset_name_buf;
         self.comp_name_buf = comp_name_buf;
+        self.subs_ui = subs_state;
         // Layout presets: switch to one, or save the current arrangement as a
         // session preset. Both re-lay out the panels, so a redraw is due.
         if let Some(i) = layout.apply {
@@ -4851,7 +4876,7 @@ impl App {
         if let Some(w) = dope.set_label_w {
             self.dope_label_w = w;
         }
-        if let Some(mode) = dope.set_mode {
+        if let Some(mode) = dope.set_mode.or(self.pending_mode.take()) {
             self.timeline_mode = mode;
             // Entering the curve editor with a stale vertical window would show
             // an empty plot and leave the user to hunt for their curves, so the
@@ -5078,6 +5103,7 @@ impl App {
             Some(FileCmd::Import) | None => {}
         }
         dirty |= replaced;
+        dirty |= self.apply_subs(subs_edits);
         if let Some(edit) = tree_edits.folder.take() {
             crate::assets::apply_folder_edit(&mut self.project, edit);
             dirty = true;
@@ -5282,7 +5308,7 @@ impl App {
         // frozen, which is the one thing the incremental design exists to
         // avoid. Still running means ask for another redraw — otherwise a
         // `ControlFlow::Wait` loop with no input would stall the job forever.
-        if self.step_render() {
+        if self.step_render() || self.subs_job.is_some() {
             window.request_redraw();
         }
     }
@@ -5424,12 +5450,20 @@ impl App {
         self.contexts().any(|c| !c.egui_wants_keyboard_input() && c.input(&f))
     }
 
-    /// The bare-key shortcuts (space, arrows, R, B, N) from whichever
+    /// The bare-key shortcuts (space, Tab, arrows, R, B, N) from whichever
     /// window has focus. The caller has already let egui have the key first,
     /// so typing into a field never seeks or plays.
     fn plain_key(&mut self, _event_loop: &ActiveEventLoop, key: &Key) {
         match key {
             Key::Named(NamedKey::Space) => self.toggle_play(),
+            // Cycle the timeline views in header order.
+            Key::Named(NamedKey::Tab) => {
+                self.pending_mode = Some(match self.timeline_mode {
+                    TimelineMode::Strips => TimelineMode::Dopesheet,
+                    TimelineMode::Dopesheet => TimelineMode::Curves,
+                    TimelineMode::Curves => TimelineMode::Strips,
+                });
+            }
             Key::Named(NamedKey::ArrowRight) => {
                 self.playing = false;
                 self.seek_frame(self.current_frame() + 1);

@@ -217,8 +217,11 @@ pub(crate) fn curves_ui(
     // plot to the right. Both are allocated from one horizontal region so the
     // column boundary is the same object in both views. ---
     ui.add_space(2.0);
+    // Fill the area exactly: the panel reads its size back from what its
+    // content allocated (see `show_dock`), so any shortfall or overshoot
+    // here would resize the timeline every time the curve editor is shown.
     let avail = ui.available_size();
-    let body_h = (avail.y - 8.0).max(80.0);
+    let body_h = avail.y.max(0.0);
     let (column, ruler, plot) = {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(avail.x - 16.0, body_h), egui::Sense::hover());

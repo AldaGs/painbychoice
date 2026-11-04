@@ -308,7 +308,7 @@ pub(crate) fn strips_ui(
     // The rows scroll under the ruler, which stays pinned above them so it is
     // always there to scrub. Floating scroll bars take no width, so every
     // row's track keeps the ruler's axis.
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("timeline_rows").auto_shrink([false; 2]).show(ui, |ui| {
         if rows.is_empty() {
             ui.add_space(8.0);
             ui.weak("This composition has no layers yet.");

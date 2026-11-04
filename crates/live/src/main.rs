@@ -66,6 +66,7 @@ mod props;
 mod renderqueue;
 mod scene;
 mod strips;
+mod subtitles;
 mod theme;
 mod timeline;
 #[cfg(test)]

@@ -929,7 +929,7 @@ pub(crate) fn dopesheet_ui(
     // The rows scroll under the ruler, which stays pinned above them so it is
     // always there to scrub. Floating scroll bars take no width, so every
     // row's track keeps the ruler's axis.
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("timeline_rows").auto_shrink([false; 2]).show(ui, |ui| {
         // --- Clip bar: the selected layer's time range, drawn on the same axis as
         // the keyframe rows. Drag an edge to trim, the body to slide. ---
         if let Some(clip) = clip {

@@ -36,6 +36,8 @@ pub(crate) enum Editor {
     /// area and isn't in the default layout — summon it with the area-header
     /// picker.
     NodeGraph,
+    /// Transcribed subtitles on a text layer: transcribe, rules, the list.
+    Subtitles,
 }
 
 /// The editors a user may freely place, split, and close in a dockable area.
@@ -46,8 +48,8 @@ pub(crate) enum Editor {
 /// and **Transport** are fixed chrome. So those three carry no area header:
 /// they can't be swapped away, split, or closed, which is exactly what keeps
 /// the canvas invariants intact while the content panels rearrange around them.
-pub(crate) const SWAPPABLE: [Editor; 5] =
-    [Editor::Layers, Editor::Assets, Editor::Properties, Editor::Timeline, Editor::NodeGraph];
+pub(crate) const SWAPPABLE: [Editor; 6] =
+    [Editor::Layers, Editor::Assets, Editor::Properties, Editor::Timeline, Editor::NodeGraph, Editor::Subtitles];
 
 impl Editor {
     /// Human name shown in the area-header picker.
@@ -61,6 +63,7 @@ impl Editor {
             Editor::Transport => "Transport",
             Editor::Timeline => "Timeline",
             Editor::NodeGraph => "Nodes",
+            Editor::Subtitles => "Subtitles",
         }
     }
 
@@ -79,7 +82,7 @@ impl Editor {
     /// the vello target; **Comp** and **Transport** are single fixed-height
     /// bars in non-resizable panels, so they have nothing to overflow.
     pub(crate) fn scroll_wrapped(self) -> bool {
-        matches!(self, Editor::Layers | Editor::Assets | Editor::Properties)
+        matches!(self, Editor::Layers | Editor::Assets | Editor::Properties | Editor::Subtitles)
     }
 }
 
