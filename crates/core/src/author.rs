@@ -269,7 +269,7 @@ impl Times {
 
     /// An AnimatableValue as an export property: `value`, `keyframes` with
     /// AE's interpolation fields, and `expression`.
-    fn prop(&self, mn: &str, v: &J, spatial: bool, report: &mut ImportReport) -> J {
+    fn prop(&self, mn: &str, v: &J, spatial: bool, _report: &mut ImportReport) -> J {
         let mut o = json!({ "matchName": mn });
         if spatial {
             o["valueType"] = json!("Spatial");
@@ -288,13 +288,15 @@ impl Times {
             o["expression"] = json!(e);
         }
         if let Some(keys) = obj.get("keyframes").and_then(J::as_array).filter(|k| !k.is_empty()) {
-            if keys.iter().any(|k| k.get("inTangent").is_some() || k.get("outTangent").is_some()) {
-                report.drop("spatial keyframe tangents (straight motion path)");
-            }
             let out: Vec<J> = keys
                 .iter()
                 .map(|k| {
                     let mut kf = json!({ "time": k["time"].as_f64().unwrap_or(0.0) - self.shift, "value": numbers(&k["value"]) });
+                    for t in ["inTangent", "outTangent"] {
+                        if let Some(v) = k.get(t) {
+                            kf[t] = v.clone();
+                        }
+                    }
                     let (interp, ease) = match (k["interp"].as_str(), &k["ease"]) {
                         (Some("hold"), _) => ("Hold", None),
                         (Some("linear"), _) | (_, J::Null) => ("Linear", None),

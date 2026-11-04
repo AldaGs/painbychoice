@@ -6,10 +6,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::expr::{eval_expr, EvalCtx, Expr, FromExpr, ToExpr};
+use crate::vec3::Vec3;
 
 /// Anything that can be interpolated between two states.
 pub trait Animatable: Clone {
     fn lerp(a: &Self, b: &Self, t: f64) -> Self;
+    /// `t` of the way from `a` to `b` along the curve that leaves `a` by
+    /// `out` and reaches `b` by `into` (spatial tangents, relative to each
+    /// end). Only a position has a path to curve; anything else goes straight.
+    fn along(a: &Self, b: &Self, _out: Vec3, _into: Vec3, t: f64) -> Self {
+        Self::lerp(a, b, t)
+    }
 }
 
 impl Animatable for f64 {
@@ -202,6 +209,10 @@ pub struct Keyframe<T> {
     /// key that must survive a save, not a mode the editor is in.
     #[serde(default)]
     pub broken: bool,
+    /// Spatial tangents `[in, out]`, relative to the value: the motion path
+    /// curves through this key along them. `None` is a straight path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial: Option<[Vec3; 2]>,
 }
 
 impl<T> Keyframe<T> {
@@ -215,6 +226,7 @@ impl<T> Keyframe<T> {
             in_handle: Handle::LINEAR_IN,
             interp: Interp::Bezier,
             broken: false,
+            spatial: None,
         }
     }
     /// A key with its timing given explicitly.
@@ -231,7 +243,7 @@ impl<T> Keyframe<T> {
         interp: Interp,
         broken: bool,
     ) -> Self {
-        Self { frame, legacy_seconds: None, value, out_handle, in_handle, interp, broken }
+        Self { frame, legacy_seconds: None, value, out_handle, in_handle, interp, broken, spatial: None }
     }
 
     /// A smoothly-eased key.
@@ -244,6 +256,7 @@ impl<T> Keyframe<T> {
             in_handle: Handle::SMOOTH_IN,
             interp: Interp::Bezier,
             broken: false,
+            spatial: None,
         }
     }
 
@@ -259,6 +272,7 @@ impl<T> Keyframe<T> {
             in_handle: self.in_handle,
             interp: self.interp,
             broken: self.broken,
+            spatial: self.spatial,
         }
     }
 }
@@ -582,7 +596,10 @@ impl<T: Animatable> Track<T> {
                 let u = if span > 0.0 { (frame - a.frame as f64) / span } else { 0.0 };
                 // Temporal easing: solve the timing bezier for eased fraction.
                 let eased = solve_ease(u, a.out_handle, b.in_handle);
-                T::lerp(&a.value, &b.value, eased)
+                match (a.spatial, b.spatial) {
+                    (None, None) => T::lerp(&a.value, &b.value, eased),
+                    (s, e) => T::along(&a.value, &b.value, s.map_or(Vec3::ZERO, |s| s[1]), e.map_or(Vec3::ZERO, |e| e[0]), eased),
+                }
             }
         }
     }
@@ -889,6 +906,23 @@ fn solve_ease(u: f64, p1: Handle, p2: Handle) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spatial_tangents_curve_the_path_and_pace_it_by_distance() {
+        let (a, b) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 0.0, 0.0));
+        let mut k0 = Keyframe::linear(0, a);
+        let mut k1 = Keyframe::linear(10, b);
+        k0.spatial = Some([Vec3::ZERO, Vec3::new(0.0, 100.0, 0.0)]);
+        k1.spatial = Some([Vec3::new(0.0, 100.0, 0.0), Vec3::ZERO]);
+        let t = Track::new(vec![k0, k1]);
+        let mid = t.sample(5.0);
+        // A symmetric arch: halfway along is its top, off the straight line.
+        assert!((mid.x - 50.0).abs() < 0.5 && (mid.y - 75.0).abs() < 0.5, "{mid:?}");
+        assert_eq!(t.sample(10.0), b);
+        // Straight keys still lerp exactly.
+        let s = Track::new(vec![Keyframe::linear(0, a), Keyframe::linear(10, b)]);
+        assert_eq!(s.sample(5.0), Vec3::new(50.0, 0.0, 0.0));
+    }
+
     use super::*;
 
     /// A resolve context at `frame`. These tests only sample constants and

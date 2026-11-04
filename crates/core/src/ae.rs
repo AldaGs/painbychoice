@@ -1168,6 +1168,16 @@ impl Importer<'_> {
         let mut out = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
             let mut kf = Keyframe::linear(frames[i], vals[i].clone());
+            // A motion path's tangents, relative to the key; all-zero ones are
+            // a straight path, left as `None`.
+            let tan = |k: &str| {
+                let v = nums(&keys[i][k]);
+                Vec3::new(v.first().copied().unwrap_or(0.0), v.get(1).copied().unwrap_or(0.0), v.get(2).copied().unwrap_or(0.0))
+            };
+            let (tin, tout) = (tan("inTangent"), tan("outTangent"));
+            if tin != Vec3::ZERO || tout != Vec3::ZERO {
+                kf.spatial = Some([tin, tout]);
+            }
             if let Some(next) = keys.get(i + 1) {
                 // AE's speeds are in its own units (percent, not PBC's 0-1),
                 // so the change they scale against is too: the path length

@@ -153,6 +153,34 @@ impl Animatable for Vec3 {
     fn lerp(a: &Self, b: &Self, t: f64) -> Self {
         *a + (*b - *a) * t
     }
+
+    /// The cubic from `a` to `b` with handles at `a + out` and `b + into`,
+    /// walked by arc length, so the easing paces distance along the path
+    /// as AE's does rather than the curve's own parameter.
+    fn along(a: &Self, b: &Self, out: Vec3, into: Vec3, t: f64) -> Self {
+        let (p1, p2) = (*a + out, *b + into);
+        let at = |u: f64| {
+            let v = 1.0 - u;
+            *a * (v * v * v) + p1 * (3.0 * v * v * u) + p2 * (3.0 * v * u * u) + *b * (u * u * u)
+        };
+        // ponytail: 64 chords, plenty at motion-path scale; adaptive if a
+        // long, tight curve ever shows steps.
+        const N: usize = 64;
+        let pts: Vec<Vec3> = (0..=N).map(|i| at(i as f64 / N as f64)).collect();
+        let lens: Vec<f64> = pts.windows(2).map(|w| { let d = w[1] - w[0]; (d.x * d.x + d.y * d.y + d.z * d.z).sqrt() }).collect();
+        let total: f64 = lens.iter().sum();
+        if total <= 0.0 {
+            return Self::lerp(a, b, t);
+        }
+        let mut want = t.clamp(0.0, 1.0) * total;
+        for (i, &l) in lens.iter().enumerate() {
+            if want <= l || i == N - 1 {
+                return Self::lerp(&pts[i], &pts[i + 1], if l > 0.0 { (want / l).min(1.0) } else { 0.0 });
+            }
+            want -= l;
+        }
+        *b
+    }
 }
 
 #[cfg(test)]
