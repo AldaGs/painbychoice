@@ -244,11 +244,16 @@ fn draw_item(scene: &Scene, i: usize, target: &mut Pixmap, scale: f64, report: &
     if let Some((color, width)) = item.stroke {
         let mut paint = Paint { anti_alias: true, ..Default::default() };
         paint.set_color(sk_color(with_alpha(color, alpha)));
-        // The stroke is scaled with the geometry: a 2px outline at 2× output
-        // is 4px, or the render would not be the same picture larger.
+        // Stroked in the layer's own space and then transformed, as AE and
+        // the editor do: the outline scales with the layer, non-uniformly
+        // too (a layer squashed to 10% wide has 10%-wide vertical sides), and
+        // with the output scale. A layer scaled to nothing draws nothing.
+        let Some(local) = to_sk_path(&item.path, Affine::IDENTITY, 1.0) else { return };
+        let [a, b, c, d, e, f] = (Affine::scale(scale) * item.transform).as_coeffs();
+        let xf = Transform::from_row(a as f32, b as f32, c as f32, d as f32, e as f32, f as f32);
         let st = item.stroke_style;
         let stroke = Stroke {
-            width: (width * scale) as f32,
+            width: width as f32,
             miter_limit: st.miter_limit as f32,
             line_cap: match st.cap {
                 motion_core::LineCap::Butt => tiny_skia::LineCap::Butt,
@@ -260,10 +265,10 @@ fn draw_item(scene: &Scene, i: usize, target: &mut Pixmap, scale: f64, report: &
                 motion_core::LineJoin::Round => tiny_skia::LineJoin::Round,
                 motion_core::LineJoin::Bevel => tiny_skia::LineJoin::Bevel,
             },
-            dash: st.dash.and_then(|[d, g]| tiny_skia::StrokeDash::new(vec![(d * scale) as f32, (g * scale) as f32], 0.0)),
+            dash: st.dash.and_then(|[d, g]| tiny_skia::StrokeDash::new(vec![d as f32, g as f32], 0.0)),
             ..Default::default()
         };
-        target.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        target.stroke_path(&local, &paint, &stroke, xf, None);
     }
 }
 
@@ -411,6 +416,25 @@ mod tests {
         };
         assert_eq!(line(motion_core::LineCap::Butt), 0);
         assert_eq!(line(motion_core::LineCap::Round), 255);
+    }
+
+    /// A stroke scales with its layer, non-uniformly too: squashed to a
+    /// quarter of its width, an 8px vertical line is 2px wide, as in AE.
+    #[test]
+    fn a_stroke_scales_with_its_layer() {
+        let mut n = Node::group(1, "line");
+        let pts = [kurbo::Vec2::new(0.0, 5.0), kurbo::Vec2::new(0.0, 35.0)];
+        n.shape = Some(Shape::Vector { path: motion_core::path::VectorPath::polyline(pts, false) });
+        n.stroke = Some(motion_core::Stroke {
+            color: Value::constant(Color::rgb(1.0, 1.0, 1.0)),
+            width: Value::constant(8.0),
+            style: Default::default(),
+        });
+        n.transform.position = Value::constant(motion_core::vec3::Vec3::new(20.0, 0.0, 0.0));
+        n.transform.scale = Value::constant(motion_core::vec3::Vec3::new(0.25, 1.0, 1.0));
+        let (buf, _, w) = render(&Comp::new(40.0, 40.0, Node::group(0, "root").with_child(n)), 1.0);
+        assert_eq!(px(&buf, w, 20, 20)[0], 255, "the line is there");
+        assert_eq!(px(&buf, w, 22, 20)[0], 0, "and 2px wide, not 8");
     }
 
     /// The floor: a shape reaches actual pixels, in the right place, over a
