@@ -248,6 +248,8 @@ pub enum PropPath {
     /// A `Text` shape's tracking (1/1000 em) and leading (px, 0 = auto).
     TextTracking,
     TextLeading,
+    /// A `Text` shape's weight (100–900), continuous on a variable font.
+    TextWeight,
     /// A `Text` shape's string. The only non-numeric property here — it resolves
     /// to an `ExprValue::Str`, which is what a typewriter script reads and
     /// writes.
@@ -284,6 +286,7 @@ impl PropPath {
             PropPath::TextSize => "text_size",
             PropPath::TextTracking => "tracking",
             PropPath::TextLeading => "leading",
+            PropPath::TextWeight => "weight",
             PropPath::TextContent => "content",
             PropPath::TimeRemap => "time_remap",
             PropPath::MaskSize => "mask_size",
@@ -295,7 +298,7 @@ impl PropPath {
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 16] = [
+    pub const ALL: [PropPath; 17] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -309,6 +312,7 @@ impl PropPath {
         PropPath::TextSize,
         PropPath::TextTracking,
         PropPath::TextLeading,
+        PropPath::TextWeight,
         PropPath::TextContent,
         PropPath::TimeRemap,
         PropPath::MaskSize,
@@ -340,6 +344,7 @@ impl PropPath {
             | PropPath::TextSize
             | PropPath::TextTracking
             | PropPath::TextLeading
+            | PropPath::TextWeight
             | PropPath::TimeRemap => ExprValue::Num(0.0),
             PropPath::Fill | PropPath::StrokeColor => {
                 ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
@@ -1472,7 +1477,7 @@ fn script_wiggle(freq: f64, amp: f64, seed: f64) -> Result<f64, Box<rhai::EvalAl
 }
 
 /// Value noise in [-1, 1]: hashed lattice points, smoothstep-interpolated.
-fn value_noise(t: f64, seed: f64) -> f64 {
+pub(crate) fn value_noise(t: f64, seed: f64) -> f64 {
     let i = t.floor();
     let f = t - i;
     let f = f * f * (3.0 - 2.0 * f); // smoothstep — C1, so no kinks at the lattice
@@ -1544,7 +1549,17 @@ pub fn eval_script_with(src: &str, frame: f64, value: ExprValue) -> Result<ExprV
     eval_script_inner(src, &mut EvalCtx::at(frame), Some(value))
 }
 
+/// [`eval_script_ctx`] with extra numeric constants in scope — what a text
+/// expression selector uses for `textIndex`, `textTotal`, `selectorValue`.
+pub fn eval_script_vars(src: &str, ctx: &mut EvalCtx<'_>, vars: &[(&str, f64)]) -> Result<ExprValue, String> {
+    eval_script_full(src, ctx, None, vars)
+}
+
 fn eval_script_inner(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>) -> Result<ExprValue, String> {
+    eval_script_full(src, ctx, value, &[])
+}
+
+fn eval_script_full(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>, vars: &[(&str, f64)]) -> Result<ExprValue, String> {
     let frame = ctx.frame;
     // Read the layer clock before parking the context — the same four readings
     // `Expr::Time` exposes, under the same names, so a script and a graph node
@@ -1562,6 +1577,9 @@ fn eval_script_inner(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>)
         scope.push_constant("t01", t01);
         if let Some(v) = value {
             scope.push("value", expr_value_to_dynamic(v));
+        }
+        for (name, v) in vars {
+            scope.push_constant(name.to_string(), *v);
         }
         let out: rhai::Dynamic =
             engine.eval_with_scope(&mut scope, src).map_err(|e| e.to_string())?;
@@ -1966,6 +1984,10 @@ impl<'a> EvalCtx<'a> {
             },
             PropPath::TextLeading => match &node.shape {
                 Some(Shape::Text { leading, .. }) => leading.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::TextWeight => match &node.shape {
+                Some(Shape::Text { weight, .. }) => weight.resolve(self).to_expr(),
                 _ => prop.zero(),
             },
             PropPath::TextContent => match &node.shape {

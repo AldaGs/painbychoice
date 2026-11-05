@@ -20,7 +20,7 @@ use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::effect::{Effect, EffectKind};
 use crate::path::{Anchor, VectorPath};
 use crate::pathfinder::BoolOp;
-use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform, Trim};
+use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, RangeShape, SelectorMode, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform, Trim};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
 use crate::vec3::Vec3;
@@ -487,7 +487,7 @@ impl Importer<'_> {
         let tracking = num(style, "tracking", 0.0);
         let leading = if style["autoLeading"] == true { 0.0 } else { num(style, "leading", 0.0) };
         let content = text.to_string();
-        let tstyle = crate::text::TextStyle { family: &family, weight, italic, tracking, leading };
+        let tstyle = crate::text::TextStyle { family: &family, weight: weight as f64, italic, tracking, leading };
         // Paragraph text wraps inside a box given in layer space; PBC centres
         // the wrapped block, so line its aligned edge and top up with the box.
         let (bp, bs) = (nums(&style["boxPos"]), nums(&style["boxSize"]));
@@ -508,7 +508,7 @@ impl Importer<'_> {
             node.transform.anchor = shift(node.transform.anchor.clone(), o);
             self.centred.insert(node.id, -o);
         }
-        node.shape = Some(Shape::Text { content: Value::constant(content), family, weight, italic, size: Value::constant(size), tracking: Value::constant(tracking), leading: Value::constant(leading), align, max_width });
+        node.shape = Some(Shape::Text { content: Value::constant(content), family, weight: Value::constant(weight as f64), italic, size: Value::constant(size), tracking: Value::constant(tracking), leading: Value::constant(leading), align, max_width });
     }
 
     /// The installed family a PostScript font name belongs to: the longest
@@ -624,23 +624,47 @@ impl Importer<'_> {
         let groups = a["properties"].as_array().cloned().unwrap_or_default();
         let props = prop(&groups, "ADBE Text Animator Properties").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
         let selectors = prop(&groups, "ADBE Text Selectors").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
-        let mut position = Vec2::ZERO;
-        let mut opacity = None;
+        let mut anim = TextAnimator::new(TextUnit::Chars);
+        anim.name = a["name"].as_str().or(a["label"].as_str()).unwrap_or("").to_string();
+        let first = |v: &[f64]| v.first().copied();
+        let xy = |v: &[f64]| (v.len() >= 2).then(|| Vec2::new(v[0], v[1]));
+        let d1 = |a: &f64, b: &f64| (a - b).abs();
+        let d2 = |a: &Vec2, b: &Vec2| (*a - *b).hypot();
         for p in &props {
-            let v = nums(&p["value"]);
-            if p["keyframes"].as_array().is_some_and(|k| !k.is_empty()) || p["expression"].as_str().is_some_and(|e| !e.is_empty()) {
-                self.report.drop("text animator property: animated (static value kept)");
-            }
             match p["matchName"].as_str().unwrap_or("") {
-                "ADBE Text Position 3D" if v.len() >= 2 => position = Vec2::new(v[0], v[1]),
-                "ADBE Text Opacity" if !v.is_empty() => opacity = Some(v[0] / 100.0),
+                "ADBE Text Position 3D" => {
+                    anim.position = Some(self.value(Some(p), Vec2::ZERO, xy, d2));
+                    // Depth only when it is used, so a flat animator stays flat.
+                    let z = self.value(Some(p), 0.0, |v| v.get(2).copied(), d1);
+                    if z != Value::constant(0.0) {
+                        anim.position_z = Some(z);
+                    }
+                }
+                "ADBE Text Rotation X" => anim.rotation_x = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Rotation Y" => anim.rotation_y = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Anchor Point 3D" => anim.anchor = Some(self.value(Some(p), Vec2::ZERO, xy, d2)),
+                "ADBE Text Scale 3D" => anim.scale = Some(self.value(Some(p), Vec2::new(100.0, 100.0), xy, d2)),
+                "ADBE Text Rotation" => anim.rotation = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Skew" => anim.skew = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Opacity" => anim.opacity = Some(self.value(Some(p), 1.0, |v| first(v).map(|o| o / 100.0), d1)),
+                "ADBE Text Tracking Amount" => anim.tracking = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Stroke Width" => anim.stroke_width = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Fill Color" => anim.fill = Some(self.color(Some(p), Color::rgb(1.0, 1.0, 1.0))),
+                "ADBE Text Stroke Color" => anim.stroke = Some(self.color(Some(p), Color::rgb(0.0, 0.0, 0.0))),
                 m => self.report.drop(format!("text animator property: {m}")),
             }
         }
-        let Some(sel) = selectors.first() else { return None };
-        if selectors.len() > 1 {
-            self.report.drop("text animator: additional selector");
-        }
+        let mut parsed = selectors.iter().filter_map(|sel| self.text_selector(sel, l));
+        let (based_on, selector, mode) = parsed.next()?;
+        anim.more_selectors = parsed.map(|(_, selector, mode)| crate::node::ExtraSelector { mode, selector }).collect();
+        anim.mode = mode;
+        anim.based_on = based_on;
+        anim.selector = selector;
+        Some(anim)
+    }
+
+    /// One AE text selector: its Based On unit, the selector, and its mode.
+    fn text_selector(&mut self, sel: &J, l: &J) -> Option<(TextUnit, TextSelector, SelectorMode)> {
         let sp = sel["properties"].as_array().cloned().unwrap_or_default();
         let unit = |code: Option<f64>| match code.unwrap_or(1.0) as i64 {
             2 => TextUnit::CharsExcludingSpaces,
@@ -650,12 +674,28 @@ impl Importer<'_> {
         };
         let code = |props: &[J], m: &str| prop(props, m).and_then(|p| nums(&p["value"]).first().copied());
         let pct = |me: &mut Self, m: &str, or: f64| me.value(prop(&sp, m), or, |v| v.first().copied(), |a, b| (a - b).abs());
+        let mode = match code(&sp, "ADBE Text Selector Mode")
+            .or_else(|| prop(&sp, "ADBE Text Range Advanced").and_then(|g| g["properties"].as_array()).and_then(|adv| code(adv, "ADBE Text Selector Mode")))
+            .unwrap_or(1.0) as i64
+        {
+            2 => SelectorMode::Subtract,
+            3 => SelectorMode::Intersect,
+            4 => SelectorMode::Min,
+            5 => SelectorMode::Max,
+            6 => SelectorMode::Difference,
+            _ => SelectorMode::Add,
+        };
         let (based_on, selector) = match sel["matchName"].as_str().unwrap_or("") {
             "ADBE Text Selector" => {
                 let adv = prop(&sp, "ADBE Text Range Advanced").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
-                if code(&adv, "ADBE Text Range Shape").is_some_and(|s| s != 1.0) {
-                    self.report.drop("text range selector shape (Square used)");
-                }
+                let shape = match code(&adv, "ADBE Text Range Shape").unwrap_or(1.0) as i64 {
+                    2 => RangeShape::RampUp,
+                    3 => RangeShape::RampDown,
+                    4 => RangeShape::Triangle,
+                    5 => RangeShape::Round,
+                    6 => RangeShape::Smooth,
+                    _ => RangeShape::Square,
+                };
                 if code(&adv, "ADBE Text Range Units").is_some_and(|u| u == 2.0) {
                     self.report.drop("text range selector by index");
                 }
@@ -663,6 +703,12 @@ impl Importer<'_> {
                     start: pct(self, "ADBE Text Percent Start", 0.0),
                     end: pct(self, "ADBE Text Percent End", 100.0),
                     offset: pct(self, "ADBE Text Percent Offset", 0.0),
+                    amount: pct(self, "ADBE Text Selector Max Amount", 100.0),
+                    shape,
+                    ease_high: code(&adv, "ADBE Text Levels Max Ease").unwrap_or(0.0),
+                    ease_low: code(&adv, "ADBE Text Levels Min Ease").unwrap_or(0.0),
+                    randomize: code(&adv, "ADBE Text Randomize Order").is_some_and(|r| r != 0.0),
+                    seed: code(&adv, "ADBE Text Random Seed").unwrap_or(0.0) as u32,
                 };
                 (unit(code(&adv, "ADBE Text Range Type2")), sel)
             }
@@ -670,7 +716,22 @@ impl Importer<'_> {
                 let amount = prop(&sp, "ADBE Text Expressible Amount")?;
                 let expr = amount["expression"].as_str().unwrap_or("");
                 if !expr.contains("Type Array") {
-                    return None;
+                    // A plain arithmetic AE expression is valid Rhai as is
+                    // (`selectorValue * textIndex / textTotal`); keep it when
+                    // it runs, report it when it doesn't.
+                    let script = expr.trim().trim_end_matches(';').to_string();
+                    let vars = [("textIndex", 1.0), ("textTotal", 1.0), ("selectorValue", 100.0)];
+                    let runs = matches!(
+                        crate::expr::eval_script_vars(&script, &mut crate::expr::EvalCtx::at(0.0), &vars),
+                        Ok(crate::expr::ExprValue::Num(_))
+                    );
+                    if !runs {
+                        self.report.drop("text expression selector: script");
+                        return None;
+                    }
+                    self.translated.insert(expr.to_string());
+                    let sel = TextSelector::Expression { script, amount: Value::constant(100.0) };
+                    return Some((unit(code(&sp, "ADBE Text Range Type2")), sel, mode));
                 }
                 self.translated.insert(expr.to_string());
                 // The selector's name picks the effect: "<Name> - Selector 1".
@@ -699,12 +760,22 @@ impl Importer<'_> {
                 };
                 (unit(code(&sp, "ADBE Text Range Type2")), sel)
             }
+            "ADBE Text Wiggly Selector" => {
+                let sel = TextSelector::Wiggly {
+                    max: pct(self, "ADBE Text Wiggly Max Amount", 100.0),
+                    min: pct(self, "ADBE Text Wiggly Min Amount", -100.0),
+                    wiggles: pct(self, "ADBE Text Temporal Freq", 2.0),
+                    correlation: code(&sp, "ADBE Text Character Correlation").unwrap_or(50.0),
+                    seed: code(&sp, "ADBE Text Random Seed").unwrap_or(0.0) as u32,
+                };
+                (unit(code(&sp, "ADBE Text Range Type2")), sel)
+            }
             m => {
                 self.report.drop(format!("text selector: {m}"));
                 return None;
             }
         };
-        Some(TextAnimator { based_on, selector, position, opacity, fill: None })
+        Some((based_on, selector, mode))
     }
 
     /// The PBC effect for an AE one, where PBC has it. Parameters are read by

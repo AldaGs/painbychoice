@@ -752,7 +752,7 @@ fn set_effect_num(effect: &mut motion_core::Effect, param: EffectParam, frame: i
 /// Transform is deliberately absent: it stays on the parent, where it goes on
 /// governing the whole subtree. Moving it would change what the *other*
 /// children do, which a restack has no business doing.
-const ARTWORK_PROPS: [PropPath; 11] = [
+const ARTWORK_PROPS: [PropPath; 12] = [
     PropPath::Fill,
     PropPath::StrokeColor,
     PropPath::StrokeWidth,
@@ -761,6 +761,7 @@ const ARTWORK_PROPS: [PropPath; 11] = [
     PropPath::TextSize,
     PropPath::TextTracking,
     PropPath::TextLeading,
+    PropPath::TextWeight,
     PropPath::TextContent,
     PropPath::TimeRemap,
     PropPath::MaskSize,
@@ -809,6 +810,8 @@ pub(crate) fn split_shape(
     child.shape = node.shape.take();
     child.fill = node.fill.take();
     child.stroke = node.stroke.take();
+    // Text animators act on the glyphs, so they go where the text goes.
+    child.text_animators = std::mem::take(&mut node.text_animators);
     // Index 0: a parent's shape drew behind every child, and that is precisely
     // where this must land or the split would restack the layer it is meant to
     // leave alone.
@@ -2089,6 +2092,7 @@ impl App {
 
     pub(crate) fn apply_edits(&mut self, frame: i64, e: &PropEdits) -> bool {
         let t = frame as f64;
+        let fps = self.doc().fps;
         let mut ctx = EvalCtx::at(t);
         let Some(id) = self.selected else {
             return false;
@@ -2191,6 +2195,11 @@ impl App {
         }
         if let Some(op) = &e.effect {
             if apply_effect_op(node, frame, op) {
+                changed = true;
+            }
+        }
+        if let Some(op) = &e.text_anim {
+            if apply_text_anim_op(node, frame, fps, op) {
                 changed = true;
             }
         }
@@ -2324,7 +2333,7 @@ impl App {
             node.shape.as_mut()
         {
             if let Some(v) = e.text_weight {
-                *weight = v;
+                weight.set_at(frame, v);
                 changed = true;
             }
             if let Some(v) = e.text_italic {
@@ -2751,7 +2760,7 @@ impl App {
                 MShape::Text {
                     content: Value::constant("Text".to_string()),
                     family: String::new(),
-                    weight: 400,
+                    weight: motion_core::value::Value::constant(400.0),
                     italic: false,
                     tracking: Value::constant(0.0),
                     leading: Value::constant(0.0),

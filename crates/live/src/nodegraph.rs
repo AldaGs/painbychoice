@@ -36,6 +36,7 @@ pub(crate) fn prop_path_label(p: PropPath) -> String {
         PropPath::TextSize => "Font Size",
         PropPath::TextTracking => "Tracking",
         PropPath::TextLeading => "Leading",
+        PropPath::TextWeight => "Weight",
         PropPath::TextContent => "Content",
         PropPath::TimeRemap => "Time Remap",
         PropPath::MaskSize => "Mask Size",

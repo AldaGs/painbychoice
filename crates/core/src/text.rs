@@ -88,7 +88,9 @@ pub struct TextStyle<'a> {
     pub family: &'a str,
     /// CSS/OpenType weight, 100–900. A family that lacks it gets the nearest
     /// face by CSS font matching (fontique does that, not us).
-    pub weight: u16,
+    /// Fractional so it can animate: a variable font sets its `wght` axis to
+    /// exactly this.
+    pub weight: f64,
     pub italic: bool,
     /// Extra space after every character, in 1/1000 em — After Effects'
     /// tracking unit, so 100 at 40px adds 4px.
@@ -101,7 +103,7 @@ pub struct TextStyle<'a> {
 impl<'a> TextStyle<'a> {
     /// Regular upright `family`.
     pub fn family(family: &'a str) -> Self {
-        Self { family, weight: 400, italic: false, tracking: 0.0, leading: 0.0 }
+        Self { family, weight: 400.0, italic: false, tracking: 0.0, leading: 0.0 }
     }
 }
 
@@ -178,6 +180,10 @@ pub struct GlyphOutline {
     pub char: usize,
     pub word: Option<usize>,
     pub line: usize,
+    /// Where the glyph's baseline starts, in the same centred space.
+    pub origin: Vec2,
+    /// How far the pen advances past it.
+    pub advance: f64,
 }
 
 /// [`text_to_path`] glyph by glyph.
@@ -255,7 +261,8 @@ pub fn text_glyphs(content: &str, style: &TextStyle, size: f64, align: TextAlign
                         continue;
                     }
                     let (char, word) = sources.get(gi).and_then(|b| units.get(b)).copied().unwrap_or((0, None));
-                    out.push(GlyphOutline { path: pen.path, char, word, line: li });
+                    let origin = Vec2::new(pen.origin.0, pen.origin.1);
+                    out.push(GlyphOutline { path: pen.path, char, word, line: li, origin, advance: glyph.advance as f64 });
                 }
             }
         }
@@ -310,7 +317,7 @@ fn with_layout<R>(
             let mut builder = lcx.ranged_builder(&mut fcx, content, 1.0, false);
             builder.push_default(StyleProperty::FontSize(size as f32));
             builder.push_default(StyleProperty::FontFamily(font_family(style.family)));
-            builder.push_default(StyleProperty::FontWeight(FontWeight::new(style.weight as f32)));
+            builder.push_default(StyleProperty::FontWeight(FontWeight::new(style.weight.clamp(1.0, 1000.0) as f32)));
             if style.italic {
                 builder.push_default(StyleProperty::FontStyle(FontStyle::Italic));
             }
@@ -432,12 +439,12 @@ mod tests {
     #[test]
     fn weight_picks_the_nearest_face() {
         let at = |weight| text_to_path("Hamburg", &TextStyle { weight, ..TextStyle::family("Arial") }, 40.0, TextAlign::Left, None);
-        let (regular, bold) = (at(400), at(700));
+        let (regular, bold) = (at(400.0), at(700.0));
         assert!(bold.bounding_box().width() > regular.bounding_box().width(), "bold is wider");
         // No 650 cut exists: CSS matching rounds up to Bold. (Not 900 — Windows
         // files Arial Black under Arial.)
-        assert_eq!(at(650), bold, "650 falls to the nearest heavier face");
-        assert_eq!(at(300), regular, "300 falls back to Regular");
+        assert_eq!(at(650.0), bold, "650 falls to the nearest heavier face");
+        assert_eq!(at(300.0), regular, "300 falls back to Regular");
         let italic = text_to_path("Hamburg", &TextStyle { italic: true, ..TextStyle::family("Arial") }, 40.0, TextAlign::Left, None);
         assert_ne!(italic, regular, "italic picks a different face");
     }

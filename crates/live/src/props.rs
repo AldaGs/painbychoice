@@ -114,6 +114,8 @@ pub(crate) struct NodeInfo {
     /// The layer's effect stack, top to bottom in application order — resolved
     /// for display and paired with which parameters to edit.
     pub(crate) effects: Vec<EffectInfo>,
+    /// A text layer's animators, resolved for this frame.
+    pub(crate) text_anims: Vec<TextAnimInfo>,
 }
 
 /// A sound layer's mix, resolved for this frame.
@@ -274,7 +276,8 @@ pub(crate) struct TextInfo {
     /// `size` does.
     pub(crate) content: String,
     pub(crate) family: String,
-    pub(crate) weight: u16,
+    pub(crate) weight: f64,
+    pub(crate) weight_anim: bool,
     pub(crate) italic: bool,
     pub(crate) size: f64,
     pub(crate) tracking: f64,
@@ -537,7 +540,8 @@ impl NodeInfo {
                     leading_anim: is_anim(node, PropKind::TextLeading),
                     content: content.resolve(ctx),
                     family: family.clone(),
-                    weight: *weight,
+                    weight: weight.resolve(ctx),
+                    weight_anim: is_anim(node, PropKind::TextWeight),
                     italic: *italic,
                     size: size.resolve(ctx),
                     align: *align,
@@ -559,6 +563,7 @@ impl NodeInfo {
             path_closed: matches!(&node.shape, Some(MShape::Vector { path }) if path.closed),
             is_group: node.shape.is_none(),
             compound: node.compound,
+            text_anims: crate::textanim::snapshot(node, ctx),
             effects: node
                 .effects
                 .iter()
@@ -680,7 +685,9 @@ pub(crate) struct PropEdits {
     pub(crate) text_size: Option<f64>,
     pub(crate) text_tracking: Option<f64>,
     pub(crate) text_leading: Option<f64>,
-    pub(crate) text_weight: Option<u16>,
+    pub(crate) text_weight: Option<f64>,
+    /// One edit to a text layer's animator stack this frame.
+    pub(crate) text_anim: Option<TextAnimOp>,
     pub(crate) text_italic: Option<bool>,
     pub(crate) text_align: Option<TextAlign>,
     #[allow(clippy::option_option)]
@@ -1680,7 +1687,11 @@ pub(crate) fn properties_ui(
             ui.label("Weight");
             ui.horizontal(|ui| {
                 let mut w = t.weight;
-                if ui.add(egui::DragValue::new(&mut w).speed(10.0).range(100..=900)).changed() {
+                if ui
+                    .add(crate::calc::num(&mut w).speed(5.0).range(100.0..=900.0))
+                    .on_hover_text("Interpolates smoothly on a variable font; snaps to the nearest face otherwise")
+                    .changed()
+                {
                     edits.text_weight = Some(w);
                 }
                 let mut italic = t.italic;
@@ -1688,7 +1699,9 @@ pub(crate) fn properties_ui(
                     edits.text_italic = Some(italic);
                 }
             });
-            ui.label("");
+            if key_button(ui, t.weight_anim) {
+                edits.key.insert(PropKind::TextWeight);
+            }
             ui.end_row();
 
             ui.label("Align");
@@ -1729,6 +1742,10 @@ pub(crate) fn properties_ui(
             ui.end_row();
         }
     });
+
+    if n.text.is_some() {
+        text_animators_ui(ui, &n.text_anims, edits);
+    }
 
     ui.add_space(6.0);
     ui.weak("Drag a field to nudge, or click to type; Enter commits.");
@@ -1779,6 +1796,7 @@ pub(crate) enum PropKind {
     TextSize,
     TextTracking,
     TextLeading,
+    TextWeight,
     TextContent,
     TimeRemap,
     MaskSize,
@@ -1797,6 +1815,10 @@ pub(crate) enum PropKind {
     /// comes along at no cost": with it, a blur radius keyframes, plots and
     /// retimes through exactly the machinery a position does.
     Effect { index: usize, param: EffectParam },
+    /// One value of one text animator — a selector control or a property.
+    /// Indexed like [`PropKind::Effect`], discovered by [`prop_kinds_of`].
+    /// `sel` is which selector a selector control belongs to; 0 for properties.
+    TextAnim { index: usize, sel: usize, param: TextAnimParam },
     /// One control point of a vector path anchor. **Indexed**, so unlike every
     /// variant above it is not a fixed member of `ALL` — a path has as many as it
     /// has anchors, discovered per node by [`prop_kinds_of`]. It sorts last (after
@@ -1808,7 +1830,7 @@ pub(crate) enum PropKind {
 impl PropKind {
     /// The **fixed** animatable properties, in row order. Path points are dynamic
     /// and are appended per node by [`prop_kinds_of`], never listed here.
-    pub(crate) const ALL: [PropKind; 21] = [
+    pub(crate) const ALL: [PropKind; 22] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
@@ -1825,6 +1847,7 @@ impl PropKind {
         PropKind::TextSize,
         PropKind::TextTracking,
         PropKind::TextLeading,
+        PropKind::TextWeight,
         PropKind::TextContent,
         PropKind::TimeRemap,
         PropKind::MaskSize,
@@ -1843,6 +1866,12 @@ impl PropKind {
         // the same parameter names and are not the same row.
         if let PropKind::Effect { index, param } = self {
             return Cow::Owned(format!("FX{} {}", index + 1, param.label()));
+        }
+        if let PropKind::TextAnim { index, sel, param } = self {
+            return Cow::Owned(match sel {
+                0 => format!("Anim{} {}", index + 1, param.label()),
+                s => format!("Anim{} S{} {}", index + 1, s + 1, param.label()),
+            });
         }
         Cow::Borrowed(self.fixed_label())
     }
@@ -1867,6 +1896,7 @@ impl PropKind {
             PropKind::TextSize => "Font Size",
             PropKind::TextTracking => "Tracking",
             PropKind::TextLeading => "Leading",
+            PropKind::TextWeight => "Weight",
             PropKind::TextContent => "Content",
             PropKind::TimeRemap => "Time Remap",
             PropKind::MaskSize => "Mask Size",
@@ -1875,6 +1905,7 @@ impl PropKind {
             // Intercepted by `label` before these are reached.
             PropKind::PathPoint { .. } => "Path Point",
             PropKind::Effect { .. } => "Effect",
+            PropKind::TextAnim { .. } => "Text Animator",
         }
     }
 
@@ -1898,6 +1929,7 @@ impl PropKind {
             PropPath::TextSize => PropKind::TextSize,
             PropPath::TextTracking => PropKind::TextTracking,
             PropPath::TextLeading => PropKind::TextLeading,
+            PropPath::TextWeight => PropKind::TextWeight,
             PropPath::TextContent => PropKind::TextContent,
             PropPath::PathPoint { index, part } => PropKind::PathPoint { index, part },
             PropPath::TimeRemap => PropKind::TimeRemap,
@@ -2223,6 +2255,11 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { leading, .. } => PropRef::Num(leading),
             _ => return None,
         },
+        PropKind::TextWeight => match node.shape.as_ref()? {
+            MShape::Text { weight, .. } => PropRef::Num(weight),
+            _ => return None,
+        },
+        PropKind::TextAnim { index, sel, param } => anim_value(node.text_animators.get(index)?, sel, param)?,
         PropKind::TextContent => match node.shape.as_ref()? {
             MShape::Text { content, .. } => PropRef::Str(content),
             _ => return None,
@@ -2253,6 +2290,11 @@ pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
     for (index, effect) in node.effects.iter().enumerate() {
         for param in effect_params(effect) {
             kinds.push(PropKind::Effect { index, param });
+        }
+    }
+    for (index, a) in node.text_animators.iter().enumerate() {
+        for (sel, param) in anim_params(a) {
+            kinds.push(PropKind::TextAnim { index, sel, param });
         }
     }
     if let Some(MShape::Vector { path }) = &node.shape {
@@ -2313,6 +2355,11 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             MShape::Text { leading, .. } => PropRefMut::Num(leading),
             _ => return None,
         },
+        PropKind::TextWeight => match node.shape.as_mut()? {
+            MShape::Text { weight, .. } => PropRefMut::Num(weight),
+            _ => return None,
+        },
+        PropKind::TextAnim { index, sel, param } => anim_value_mut(node.text_animators.get_mut(index)?, sel, param)?,
         PropKind::Effect { index, param } => {
             PropRefMut::Num(effect_value_mut(node.effects.get_mut(index)?, param)?)
         }

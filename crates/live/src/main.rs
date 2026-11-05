@@ -67,6 +67,7 @@ mod renderqueue;
 mod scene;
 mod strips;
 mod subtitles;
+mod textanim;
 mod theme;
 mod timeline;
 #[cfg(test)]
@@ -89,6 +90,7 @@ use pen::*;
 use props::*;
 use scene::*;
 use strips::*;
+use textanim::*;
 use timeline::*;
 
 fn main() {

@@ -229,10 +229,11 @@ pub enum Shape {
         content: Value<String>,
         /// System font family name. Empty (or not installed) → sans-serif.
         family: String,
-        /// 100–900; the nearest installed face is used. Plain data like
-        /// `family`, since it picks a face rather than moving anything.
-        #[serde(default = "regular_weight")]
-        weight: u16,
+        /// 100–900, animatable. A variable font interpolates its `wght` axis
+        /// continuously; a family of static faces snaps to the nearest one
+        /// (CSS font matching). Accepts the bare number older `.pbc`s stored.
+        #[serde(default = "regular_weight", deserialize_with = "de_weight")]
+        weight: Value<f64>,
         #[serde(default)]
         italic: bool,
         /// Font size in pixels.
@@ -278,8 +279,54 @@ pub enum Shape {
     },
 }
 
-fn regular_weight() -> u16 {
-    400
+fn regular_weight() -> Value<f64> {
+    Value::constant(400.0)
+}
+
+/// `weight` was a plain `u16` before it was animatable.
+fn de_weight<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Value<f64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Value(Value<f64>),
+        Legacy(f64),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::Value(v) => v,
+        Either::Legacy(w) => Value::Const(w),
+    })
+}
+
+/// A text animator's `position` was a plain `Vec2` before it was animatable.
+fn de_opt_vec2_value<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value<Vec2>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Value(Value<Vec2>),
+        Legacy(Vec2),
+    }
+    Ok(Option::<Either>::deserialize(d)?.map(|e| match e {
+        Either::Value(v) => v,
+        Either::Legacy(w) => Value::Const(w),
+    }))
+}
+
+/// A text animator's `opacity` was a plain `Option<f64>` before.
+fn de_opt_f64_value<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value<f64>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Value(Value<f64>),
+        Legacy(f64),
+    }
+    Ok(Option::<Either>::deserialize(d)?.map(|e| match e {
+        Either::Value(v) => v,
+        Either::Legacy(w) => Value::Const(w),
+    }))
+}
+
+fn hundred_value() -> Value<f64> {
+    Value::constant(100.0)
 }
 
 fn zero_value() -> Value<f64> {
@@ -317,7 +364,7 @@ impl Shape {
                 let content = content.resolve(ctx);
                 let style = crate::text::TextStyle {
                     family,
-                    weight: *weight,
+                    weight: weight.resolve(ctx),
                     italic: *italic,
                     tracking: tracking.resolve(ctx),
                     leading: leading.resolve(ctx),
@@ -377,7 +424,8 @@ impl Shape {
                 radius.migrate_frames(fps);
             }
             Shape::Ellipse { size } => size.migrate_frames(fps),
-            Shape::Text { content, size, tracking, leading, .. } => {
+            Shape::Text { content, size, tracking, leading, weight, .. } => {
+                weight.migrate_frames(fps);
                 content.migrate_frames(fps);
                 size.migrate_frames(fps);
                 tracking.migrate_frames(fps);
@@ -410,7 +458,8 @@ impl Shape {
                 radius.retime(ratio);
             }
             Shape::Ellipse { size } => size.retime(ratio),
-            Shape::Text { content, size, tracking, leading, .. } => {
+            Shape::Text { content, size, tracking, leading, weight, .. } => {
+                weight.retime(ratio);
                 content.retime(ratio);
                 size.retime(ratio);
                 tracking.retime(ratio);
@@ -432,23 +481,234 @@ impl Shape {
     }
 }
 
-/// One text animator: what it does to a fully selected unit, and which units
-/// it selects how much of. A unit selected by `a` (0..1) moves by
-/// `position * a` and its opacity mixes toward `opacity` by `a`.
+/// One text animator, After Effects style: a set of properties describing what
+/// happens to a *fully selected* unit, and a selector deciding how much of each
+/// unit (character, word, line) is selected, 0..1. Every property is a
+/// [`Value`], so it can be held constant, keyframed or scripted; the selection
+/// scales its effect per unit.
+///
+/// A unit selected by `s` is, around its own anchor (see [`AnchorGrouping`]):
+/// moved by `anchor * s`, scaled toward `scale` by `s`, skewed by `skew * s`,
+/// rotated by `rotation * s`, then offset by `position * s`. Opacity, fill and
+/// stroke mix toward their targets by `s`, and `tracking` adds `tracking * s`
+/// (1/1000 em) after the unit, pushing the rest of its line along.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextAnimator {
+    /// A label for the editor; not used in evaluation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub based_on: TextUnit,
     pub selector: TextSelector,
+    /// How the first selector folds into the (empty) selection: AE's Mode.
+    /// Subtract on the first selector selects the inverse.
+    #[serde(default, skip_serializing_if = "SelectorMode::is_default")]
+    pub mode: SelectorMode,
+    /// Further selectors, folded in order after the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_selectors: Vec<ExtraSelector>,
+    /// Which units transform as one, around a shared anchor.
+    #[serde(default, skip_serializing_if = "AnchorGrouping::is_default")]
+    pub grouping: AnchorGrouping,
     /// Offset in the layer's space at full selection.
-    #[serde(default)]
-    pub position: Vec2,
-    /// Opacity (0..1) at full selection; `None` leaves opacity alone.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_vec2_value")]
+    pub position: Option<Value<Vec2>>,
+    /// Moves the pivot the unit scales/rotates about, relative to its anchor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opacity: Option<f64>,
+    pub anchor: Option<Value<Vec2>>,
+    /// Scale in percent at full selection (100 is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Value<Vec2>>,
+    /// Rotation in degrees at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Value<f64>>,
+    /// Horizontal skew in degrees at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skew: Option<Value<f64>>,
+    /// Opacity (0..1) at full selection; `None` leaves opacity alone.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_opt_f64_value")]
+    pub opacity: Option<Value<f64>>,
     /// Fill color at full selection, mixed from the layer's own fill by the
     /// selection; `None` leaves the fill alone. What karaoke colors words with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<Value<Color>>,
+    /// Stroke color at full selection, mixed from the layer's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Value<Color>>,
+    /// Stroke width at full selection, mixed from the layer's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_width: Option<Value<f64>>,
+    /// Extra spacing after the unit in 1/1000 em at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking: Option<Value<f64>>,
+    /// Depth offset in px at full selection (positive is away from the
+    /// viewer). Any of the three 3D properties makes the layer per-character
+    /// 3D: each glyph is projected through the comp's camera on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_z: Option<Value<f64>>,
+    /// Rotation about the glyph's X axis in degrees at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_x: Option<Value<f64>>,
+    /// Rotation about the glyph's Y axis in degrees at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_y: Option<Value<f64>>,
+}
+
+impl TextAnimator {
+    /// An animator that does nothing yet: a full-range selector over `based_on`.
+    pub fn new(based_on: TextUnit) -> Self {
+        Self {
+            name: String::new(),
+            based_on,
+            selector: TextSelector::range(),
+            mode: SelectorMode::Add,
+            more_selectors: Vec::new(),
+            grouping: AnchorGrouping::default(),
+            position: None,
+            anchor: None,
+            scale: None,
+            rotation: None,
+            skew: None,
+            opacity: None,
+            fill: None,
+            stroke: None,
+            stroke_width: None,
+            tracking: None,
+            position_z: None,
+            rotation_x: None,
+            rotation_y: None,
+        }
+    }
+
+    /// Whether this animator moves glyphs out of the plane.
+    pub fn is_3d(&self) -> bool {
+        self.position_z.is_some() || self.rotation_x.is_some() || self.rotation_y.is_some()
+    }
+
+    pub(crate) fn each_value(&mut self, f: &mut impl FnMut(&mut dyn Retimable)) {
+        if let Some(v) = &mut self.position { f(v) }
+        if let Some(v) = &mut self.anchor { f(v) }
+        if let Some(v) = &mut self.scale { f(v) }
+        if let Some(v) = &mut self.rotation { f(v) }
+        if let Some(v) = &mut self.skew { f(v) }
+        if let Some(v) = &mut self.opacity { f(v) }
+        if let Some(v) = &mut self.fill { f(v) }
+        if let Some(v) = &mut self.stroke { f(v) }
+        if let Some(v) = &mut self.stroke_width { f(v) }
+        if let Some(v) = &mut self.tracking { f(v) }
+        if let Some(v) = &mut self.position_z { f(v) }
+        if let Some(v) = &mut self.rotation_x { f(v) }
+        if let Some(v) = &mut self.rotation_y { f(v) }
+        self.selector.each_value(f);
+        for s in &mut self.more_selectors {
+            s.selector.each_value(f);
+        }
+    }
+
+    /// Every selector with its mode, the first one first.
+    pub fn selectors(&self) -> impl Iterator<Item = (SelectorMode, &TextSelector)> {
+        std::iter::once((self.mode, &self.selector)).chain(self.more_selectors.iter().map(|s| (s.mode, &s.selector)))
+    }
+
+    /// Selector `k` (0 is the first).
+    pub fn selector_at(&self, k: usize) -> Option<&TextSelector> {
+        match k {
+            0 => Some(&self.selector),
+            k => self.more_selectors.get(k - 1).map(|s| &s.selector),
+        }
+    }
+
+    pub fn selector_at_mut(&mut self, k: usize) -> Option<&mut TextSelector> {
+        match k {
+            0 => Some(&mut self.selector),
+            k => self.more_selectors.get_mut(k - 1).map(|s| &mut s.selector),
+        }
+    }
+
+    /// Selector `k`'s mode.
+    pub fn mode_at_mut(&mut self, k: usize) -> Option<&mut SelectorMode> {
+        match k {
+            0 => Some(&mut self.mode),
+            k => self.more_selectors.get_mut(k - 1).map(|s| &mut s.mode),
+        }
+    }
+
+    /// How much of unit `i` of `n` the whole selector stack selects, -1..1.
+    /// `karaoke` answers a Karaoke selector (it needs the subtitle's word).
+    pub fn selection(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx, karaoke: impl Fn(bool) -> f64) -> f64 {
+        let mut acc = 0.0;
+        for (k, (mode, sel)) in self.selectors().enumerate() {
+            let s = match sel {
+                TextSelector::Karaoke { cumulative } => karaoke(*cumulative),
+                _ => sel.select(i, n, ctx, acc),
+            };
+            acc = if k == 0 && mode == SelectorMode::Subtract { 1.0 - s } else { mode.combine(acc, s) };
+            acc = acc.clamp(-1.0, 1.0);
+        }
+        acc
+    }
+}
+
+/// One selector after an animator's first, with its fold mode.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExtraSelector {
+    #[serde(default)]
+    pub mode: SelectorMode,
+    pub selector: TextSelector,
+}
+
+/// How a selector folds into the selection of the selectors above it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectorMode {
+    #[default]
+    Add,
+    Subtract,
+    Intersect,
+    Min,
+    Max,
+    Difference,
+}
+
+impl SelectorMode {
+    pub const ALL: [SelectorMode; 6] =
+        [SelectorMode::Add, SelectorMode::Subtract, SelectorMode::Intersect, SelectorMode::Min, SelectorMode::Max, SelectorMode::Difference];
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SelectorMode::Add => "Add",
+            SelectorMode::Subtract => "Subtract",
+            SelectorMode::Intersect => "Intersect",
+            SelectorMode::Min => "Min",
+            SelectorMode::Max => "Max",
+            SelectorMode::Difference => "Difference",
+        }
+    }
+
+    /// Fold selection `s` into the running `acc`.
+    pub fn combine(self, acc: f64, s: f64) -> f64 {
+        match self {
+            SelectorMode::Add => acc + s,
+            SelectorMode::Subtract => acc - s,
+            SelectorMode::Intersect => acc * s,
+            SelectorMode::Min => acc.min(s),
+            SelectorMode::Max => acc.max(s),
+            SelectorMode::Difference => (acc - s).abs(),
+        }
+    }
+}
+
+/// Anything with keyframe times that move when the comp is re-gridded.
+pub(crate) trait Retimable {
+    fn retime(&mut self, ratio: f64);
+}
+
+impl<T: crate::value::Animatable + crate::expr::FromExpr + crate::expr::ToExpr> Retimable for Value<T> {
+    fn retime(&mut self, ratio: f64) {
+        Value::retime(self, ratio)
+    }
 }
 
 /// What a selector counts.
@@ -460,12 +720,75 @@ pub enum TextUnit {
     Lines,
 }
 
+/// AE's Anchor Point Grouping: what a selected glyph rotates and scales about.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnchorGrouping {
+    /// Each glyph about its own baseline centre.
+    #[default]
+    Character,
+    /// Each word's glyphs about the word's baseline centre.
+    Word,
+    /// Each line's glyphs about the line's baseline centre.
+    Line,
+    /// Every glyph about the centre of the whole block.
+    All,
+}
+
+impl AnchorGrouping {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The falloff of a [`TextSelector::Range`] across its span.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RangeShape {
+    /// Fully selected inside, not at all outside; units cut by an edge are
+    /// selected by the part inside.
+    #[default]
+    Square,
+    /// 0 before the range, ramping to 1 across it, 1 after.
+    RampUp,
+    /// 1 before the range, ramping to 0 across it, 0 after.
+    RampDown,
+    /// Peaks at the range's middle, 0 at its edges.
+    Triangle,
+    /// A semicircle across the range.
+    Round,
+    /// A smooth bell across the range.
+    Smooth,
+}
+
+impl RangeShape {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TextSelector {
-    /// AE's Range selector with a Square shape: `start`..`end`, shifted by
-    /// `offset`, all percentages of the unit count. A unit the range edge cuts
-    /// through is selected by the part inside.
-    Range { start: Value<f64>, end: Value<f64>, offset: Value<f64> },
+    /// AE's Range selector: `start`..`end`, shifted by `offset`, all
+    /// percentages of the unit count, with a falloff `shape`. `amount` (0..100,
+    /// negative inverts) scales the result; `ease_high`/`ease_low` (-100..100)
+    /// bend the falloff near full and no selection. `randomize` shuffles which
+    /// unit is where in the range, stably per `seed`.
+    Range {
+        start: Value<f64>,
+        end: Value<f64>,
+        offset: Value<f64>,
+        #[serde(default = "hundred_value")]
+        amount: Value<f64>,
+        #[serde(default, skip_serializing_if = "RangeShape::is_default")]
+        shape: RangeShape,
+        #[serde(default)]
+        ease_high: f64,
+        #[serde(default)]
+        ease_low: f64,
+        #[serde(default)]
+        randomize: bool,
+        #[serde(default)]
+        seed: u32,
+    },
     /// One curve (`amount`, 0..100) sampled earlier for each later unit — what
     /// the Type Array expression does. Unit `i` reads it `delays[i]` frames
     /// back (after the last listed delay, `step` more per unit), plus `shift`.
@@ -481,6 +804,18 @@ pub enum TextSelector {
         #[serde(default)]
         reverse: bool,
     },
+    /// AE's Wiggly selector: each unit's selection drifts between `min` and
+    /// `max` (percent, -100..100) at `wiggles` per second. `correlation`
+    /// (0..100) is how much units move together; `seed` picks the pattern.
+    Wiggly {
+        max: Value<f64>,
+        min: Value<f64>,
+        wiggles: Value<f64>,
+        #[serde(default)]
+        correlation: f64,
+        #[serde(default)]
+        seed: u32,
+    },
     /// The word being spoken in the layer's [`crate::subs::Subtitles`] — or,
     /// `cumulative`, every word of the subtitle spoken so far. Selects nothing
     /// on a layer without subtitles. Only meaningful with [`TextUnit::Words`].
@@ -488,19 +823,118 @@ pub enum TextSelector {
         #[serde(default)]
         cumulative: bool,
     },
+    /// AE's Expression selector: `script` runs once per unit with
+    /// `textIndex` (1-based), `textTotal` and `selectorValue` (the selection
+    /// of the selectors above, 0..100) in scope, and returns 0..100.
+    /// `amount` (percent) scales the result. A failing script selects
+    /// nothing and warns.
+    Expression {
+        script: String,
+        #[serde(default = "hundred_value")]
+        amount: Value<f64>,
+    },
 }
 
 impl TextSelector {
-    /// How much of unit `i` of `n` is selected, 0..1, at `ctx`'s frame.
-    pub fn amount(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx) -> f64 {
+    /// A full Square range selecting everything: the AE default.
+    pub fn range() -> Self {
+        TextSelector::Range {
+            start: Value::constant(0.0),
+            end: Value::constant(100.0),
+            offset: Value::constant(0.0),
+            amount: Value::constant(100.0),
+            shape: RangeShape::Square,
+            ease_high: 0.0,
+            ease_low: 0.0,
+            randomize: false,
+            seed: 0,
+        }
+    }
+
+    /// A wiggly selector with AE's defaults.
+    pub fn wiggly() -> Self {
+        TextSelector::Wiggly {
+            max: Value::constant(100.0),
+            min: Value::constant(-100.0),
+            wiggles: Value::constant(2.0),
+            correlation: 50.0,
+            seed: 0,
+        }
+    }
+
+    fn each_value(&mut self, f: &mut impl FnMut(&mut dyn Retimable)) {
         match self {
-            TextSelector::Range { start, end, offset } => {
-                let n = n.max(1) as f64;
+            TextSelector::Range { start, end, offset, amount, .. } => {
+                f(start);
+                f(end);
+                f(offset);
+                f(amount);
+            }
+            TextSelector::Stagger { amount, .. } => f(amount),
+            TextSelector::Wiggly { max, min, wiggles, .. } => {
+                f(max);
+                f(min);
+                f(wiggles);
+            }
+            TextSelector::Karaoke { .. } => {}
+            TextSelector::Expression { amount, .. } => f(amount),
+        }
+    }
+
+    /// How much of unit `i` of `n` is selected at `ctx`'s frame: 0..1, or
+    /// down to -1 for a negative amount (which pushes the other way).
+    pub fn amount(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx) -> f64 {
+        self.select(i, n, ctx, 0.0)
+    }
+
+    /// [`Self::amount`], with `prev` — the selection of the selectors above
+    /// this one, which an Expression selector reads as `selectorValue`.
+    pub fn select(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx, prev: f64) -> f64 {
+        match self {
+            TextSelector::Expression { script, amount } => {
+                let vars = [("textIndex", (i + 1) as f64), ("textTotal", n as f64), ("selectorValue", prev * 100.0)];
+                let v = match crate::expr::eval_script_vars(script, ctx, &vars) {
+                    Ok(crate::expr::ExprValue::Num(v)) => v,
+                    Ok(_) => {
+                        ctx.warn_here("text expression selector must return a number (0..100)".to_string());
+                        0.0
+                    }
+                    Err(e) => {
+                        ctx.warn_here(format!("text expression selector: {e}"));
+                        0.0
+                    }
+                };
+                (v / 100.0 * amount.resolve(ctx) / 100.0).clamp(-1.0, 1.0)
+            }
+            TextSelector::Range { start, end, offset, amount, shape, ease_high, ease_low, randomize, seed } => {
+                let i = if *randomize { shuffled(i, n, *seed) } else { i };
+                let nf = n.max(1) as f64;
                 let o = offset.resolve(ctx);
                 let (a, b) = (start.resolve(ctx) + o, end.resolve(ctx) + o);
-                let (lo, hi) = (a.min(b) / 100.0 * n, a.max(b) / 100.0 * n);
+                let (lo, hi) = (a.min(b) / 100.0 * nf, a.max(b) / 100.0 * nf);
                 let i = i as f64;
-                (hi.min(i + 1.0) - lo.max(i)).clamp(0.0, 1.0)
+                let v = match shape {
+                    RangeShape::Square => (hi.min(i + 1.0) - lo.max(i)).clamp(0.0, 1.0),
+                    _ => {
+                        // Where the unit's centre sits across the span, 0..1.
+                        let c = i + 0.5;
+                        let t = if hi - lo < 1e-9 {
+                            if c < lo { -1.0 } else { 2.0 }
+                        } else {
+                            (c - lo) / (hi - lo)
+                        };
+                        let inside = (0.0..=1.0).contains(&t);
+                        match shape {
+                            RangeShape::RampUp => t.clamp(0.0, 1.0),
+                            RangeShape::RampDown => 1.0 - t.clamp(0.0, 1.0),
+                            _ if !inside => 0.0,
+                            RangeShape::Triangle => 1.0 - (2.0 * t - 1.0).abs(),
+                            RangeShape::Round => (1.0 - (2.0 * t - 1.0).powi(2)).max(0.0).sqrt(),
+                            _ => 0.5 - 0.5 * (std::f64::consts::TAU * t).cos(),
+                        }
+                    }
+                };
+                ease(v, *ease_high, *ease_low) * amount.resolve(ctx) / 100.0
             }
             TextSelector::Stagger { amount, delays, step, shift, reverse } => {
                 let i = if *reverse { n.saturating_sub(1 + i) } else { i };
@@ -515,11 +949,52 @@ impl TextSelector {
                 ctx.frame = at;
                 (v / 100.0).clamp(0.0, 1.0)
             }
+            TextSelector::Wiggly { max, min, wiggles, correlation, seed } => {
+                let (hi, lo) = (max.resolve(ctx), min.resolve(ctx));
+                let t = ctx.frame / ctx.comp_fps().max(1e-9) * wiggles.resolve(ctx);
+                let seed = *seed as f64 * 7919.0;
+                let shared = crate::expr::value_noise(t, seed);
+                let own = crate::expr::value_noise(t + i as f64 * 17.31, seed + 1.0 + i as f64);
+                let k = (correlation / 100.0).clamp(0.0, 1.0);
+                let w = shared * k + own * (1.0 - k); // -1..1
+                ((lo + (hi - lo) * (w * 0.5 + 0.5)) / 100.0).clamp(-1.0, 1.0)
+            }
             // Needs the subtitle's active word, which only the text walk
             // knows; it answers this variant itself.
             TextSelector::Karaoke { .. } => 0.0,
         }
     }
+}
+
+/// Unit `i`'s place in a stable shuffle of `0..n` by `seed`.
+fn shuffled(i: usize, n: usize, seed: u32) -> usize {
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ seed as u64;
+    for k in (1..n).rev() {
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 29;
+        order.swap(k, (h % (k as u64 + 1)) as usize);
+    }
+    order.get(i).copied().unwrap_or(i)
+}
+
+/// AE's Ease High / Ease Low on a selection value `v` (0..1): positive eases
+/// flatten the curve near that end, negative ones sharpen it.
+fn ease(v: f64, high: f64, low: f64) -> f64 {
+    if high == 0.0 && low == 0.0 {
+        return v;
+    }
+    let sign = v.signum();
+    let x = v.abs().clamp(0.0, 1.0);
+    let bend = |x: f64, e: f64| {
+        let e = (e / 100.0).clamp(-1.0, 1.0);
+        // e > 0: x^(1+2e) near 0 (slow start); e < 0: the mirror.
+        if e >= 0.0 { x.powf(1.0 + 2.0 * e) } else { 1.0 - (1.0 - x).powf(1.0 - 2.0 * e) }
+    };
+    // Low shapes the approach from 0, high the approach to 1.
+    let y = if x < 0.5 { 0.5 * bend(2.0 * x, low) } else { 1.0 - 0.5 * bend(2.0 - 2.0 * x, high) };
+    sign * y
 }
 
 /// A stroke: animatable color and width, and how its ends and corners look.
@@ -1183,6 +1658,18 @@ impl Node {
         }
         if let Some(timing) = &mut self.timing {
             timing.retime(ratio);
+        }
+        for a in &mut self.text_animators {
+            a.each_value(&mut |v| v.retime(ratio));
+            // A stagger's delays are frame counts on the same grid.
+            let extra = a.more_selectors.iter_mut().map(|s| &mut s.selector);
+            for sel in std::iter::once(&mut a.selector).chain(extra) {
+                if let TextSelector::Stagger { delays, step, shift, .. } = sel {
+                    delays.iter_mut().for_each(|d| *d *= ratio);
+                    *step *= ratio;
+                    *shift *= ratio;
+                }
+            }
         }
         for child in &mut self.children {
             child.retime(ratio);
@@ -2061,15 +2548,107 @@ mod tests {
         assert!(p.folders[1].items.is_empty(), "back at the top level");
     }
 
+    fn rng(start: f64, end: f64, amount: f64, shape: RangeShape) -> TextSelector {
+        TextSelector::Range {
+            start: Value::constant(start),
+            end: Value::constant(end),
+            offset: Value::constant(0.0),
+            amount: Value::constant(amount),
+            shape,
+            ease_high: 0.0,
+            ease_low: 0.0,
+            randomize: false,
+            seed: 0,
+        }
+    }
+
+    #[test]
+    fn range_shapes_fall_off_across_the_span() {
+        use crate::expr::EvalCtx;
+        let mut ctx = EvalCtx::at(0.0);
+        let with = |shape| rng(0.0, 100.0, 100.0, shape);
+        let at = |s: &TextSelector, ctx: &mut EvalCtx| -> Vec<f64> { (0..4).map(|i| (s.amount(i, 4, ctx) * 1000.0).round() / 1000.0).collect() };
+        assert_eq!(at(&with(RangeShape::RampUp), &mut ctx), vec![0.125, 0.375, 0.625, 0.875]);
+        assert_eq!(at(&with(RangeShape::RampDown), &mut ctx), vec![0.875, 0.625, 0.375, 0.125]);
+        assert_eq!(at(&with(RangeShape::Triangle), &mut ctx), vec![0.25, 0.75, 0.75, 0.25]);
+        // Amount scales, negative inverts.
+        let half = rng(0.0, 100.0, -50.0, RangeShape::Square);
+        assert_eq!(half.amount(0, 4, &mut ctx), -0.5);
+        // Ease keeps the ends where they are.
+        assert_eq!(ease(0.0, 100.0, 100.0), 0.0);
+        assert_eq!(ease(1.0, 100.0, 100.0), 1.0);
+        assert!(ease(0.25, 0.0, 100.0) < 0.25, "ease low slows the start");
+    }
+
+    #[test]
+    fn selector_modes_fold_the_stack() {
+        use crate::expr::EvalCtx;
+        let mut ctx = EvalCtx::at(0.0);
+        // First half of 4 units, then the middle half folded in.
+        let mut a = TextAnimator::new(TextUnit::Chars);
+        a.selector = rng(0.0, 50.0, 100.0, RangeShape::Square);
+        let sel = |a: &TextAnimator, ctx: &mut EvalCtx| -> Vec<f64> { (0..4).map(|i| a.selection(i, 4, ctx, |_| 0.0)).collect() };
+        a.more_selectors.push(ExtraSelector { mode: SelectorMode::Intersect, selector: rng(25.0, 75.0, 100.0, RangeShape::Square) });
+        assert_eq!(sel(&a, &mut ctx), vec![0.0, 1.0, 0.0, 0.0]);
+        a.more_selectors[0].mode = SelectorMode::Add;
+        assert_eq!(sel(&a, &mut ctx), vec![1.0, 1.0, 1.0, 0.0], "clamped to 1");
+        a.more_selectors[0].mode = SelectorMode::Subtract;
+        assert_eq!(sel(&a, &mut ctx), vec![1.0, 0.0, -1.0, 0.0]);
+        a.more_selectors[0].mode = SelectorMode::Difference;
+        assert_eq!(sel(&a, &mut ctx), vec![1.0, 0.0, 1.0, 0.0]);
+        // A lone Subtract selects the inverse, as in AE.
+        a.more_selectors.clear();
+        a.mode = SelectorMode::Subtract;
+        assert_eq!(sel(&a, &mut ctx), vec![0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn an_expression_selector_sees_its_unit() {
+        use crate::expr::EvalCtx;
+        let mut ctx = EvalCtx::at(0.0);
+        let mut a = TextAnimator::new(TextUnit::Chars);
+        a.more_selectors.push(ExtraSelector {
+            mode: SelectorMode::Intersect,
+            selector: TextSelector::Expression { script: "selectorValue * textIndex / textTotal".into(), amount: Value::constant(100.0) },
+        });
+        let got: Vec<f64> = (0..4).map(|i| a.selection(i, 4, &mut ctx, |_| 0.0)).collect();
+        assert_eq!(got, vec![0.25, 0.5, 0.75, 1.0]);
+        // A broken script selects nothing rather than failing the frame.
+        let bad = TextSelector::Expression { script: "nope(".into(), amount: Value::constant(100.0) };
+        assert_eq!(bad.amount(0, 4, &mut ctx), 0.0);
+    }
+
+    #[test]
+    fn randomized_ranges_and_wiggles_are_stable() {
+        use crate::expr::EvalCtx;
+        let n = 10;
+        let mut seen: Vec<usize> = (0..n).map(|i| shuffled(i, n, 7)).collect();
+        assert_eq!((0..n).map(|i| shuffled(i, n, 7)).collect::<Vec<_>>(), seen, "same seed, same order");
+        seen.sort();
+        assert_eq!(seen, (0..n).collect::<Vec<_>>(), "a permutation");
+        let w = TextSelector::wiggly();
+        let mut ctx = EvalCtx::at(12.0);
+        let a: Vec<f64> = (0..5).map(|i| w.amount(i, 5, &mut ctx)).collect();
+        assert!(a.iter().all(|v| (-1.0..=1.0).contains(v)));
+        assert_eq!(a, (0..5).map(|i| w.amount(i, 5, &mut ctx)).collect::<Vec<_>>());
+    }
+
+    /// Animators written before their properties were animatable still load.
+    #[test]
+    fn legacy_text_animators_deserialize() {
+        let json = r#"{"based_on":"Chars","selector":{"Range":{"start":{"Const":0.0},"end":{"Const":100.0},"offset":{"Const":0.0}}},"position":{"x":0.0,"y":-20.0},"opacity":0.5}"#;
+        let a: TextAnimator = serde_json::from_str(json).unwrap();
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        assert_eq!(a.position.unwrap().resolve(&mut ctx), Vec2::new(0.0, -20.0));
+        assert_eq!(a.opacity.unwrap().resolve(&mut ctx), 0.5);
+        assert_eq!(a.selector.amount(0, 1, &mut ctx), 1.0, "amount defaults to 100%");
+    }
+
     #[test]
     fn text_selectors_pick_units() {
         use crate::expr::EvalCtx;
         // A range over the middle half of 4 units, cutting unit 2 in half.
-        let range = TextSelector::Range {
-            start: Value::constant(25.0),
-            end: Value::constant(62.5),
-            offset: Value::constant(0.0),
-        };
+        let range = rng(25.0, 62.5, 100.0, RangeShape::Square);
         let mut ctx = EvalCtx::at(0.0);
         let got: Vec<f64> = (0..4).map(|i| range.amount(i, 4, &mut ctx)).collect();
         assert_eq!(got, vec![0.0, 1.0, 0.5, 0.0]);
