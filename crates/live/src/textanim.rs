@@ -33,9 +33,12 @@ pub(crate) enum TextAnimParam {
     StaggerAmount,
     // Properties.
     Position,
+    PositionZ,
     Anchor,
     Scale,
     Rotation,
+    RotationX,
+    RotationY,
     Skew,
     Opacity,
     Tracking,
@@ -46,11 +49,14 @@ pub(crate) enum TextAnimParam {
 
 impl TextAnimParam {
     /// The properties an animator can hold, in the "Add" menu's order.
-    pub(crate) const PROPERTIES: [TextAnimParam; 10] = [
+    pub(crate) const PROPERTIES: [TextAnimParam; 13] = [
         TextAnimParam::Position,
+        TextAnimParam::PositionZ,
         TextAnimParam::Anchor,
         TextAnimParam::Scale,
         TextAnimParam::Rotation,
+        TextAnimParam::RotationX,
+        TextAnimParam::RotationY,
         TextAnimParam::Skew,
         TextAnimParam::Opacity,
         TextAnimParam::Tracking,
@@ -70,6 +76,9 @@ impl TextAnimParam {
             TextAnimParam::WiggleRate => "Wiggles/Sec",
             TextAnimParam::StaggerAmount => "Influence",
             TextAnimParam::Position => "Position",
+            TextAnimParam::PositionZ => "Position Z",
+            TextAnimParam::RotationX => "X Rotation",
+            TextAnimParam::RotationY => "Y Rotation",
             TextAnimParam::Anchor => "Anchor Point",
             TextAnimParam::Scale => "Scale",
             TextAnimParam::Rotation => "Rotation",
@@ -96,6 +105,9 @@ impl TextAnimParam {
             TextAnimParam::Anchor => a.anchor = v2(0.0, 0.0),
             TextAnimParam::Scale => a.scale = v2(200.0, 200.0),
             TextAnimParam::Rotation => a.rotation = c(45.0),
+            TextAnimParam::PositionZ => a.position_z = c(-300.0),
+            TextAnimParam::RotationX => a.rotation_x = c(90.0),
+            TextAnimParam::RotationY => a.rotation_y = c(90.0),
             TextAnimParam::Skew => a.skew = c(20.0),
             TextAnimParam::Opacity => a.opacity = c(0.0),
             TextAnimParam::Tracking => a.tracking = c(200.0),
@@ -112,6 +124,9 @@ impl TextAnimParam {
             TextAnimParam::Anchor => a.anchor = None,
             TextAnimParam::Scale => a.scale = None,
             TextAnimParam::Rotation => a.rotation = None,
+            TextAnimParam::PositionZ => a.position_z = None,
+            TextAnimParam::RotationX => a.rotation_x = None,
+            TextAnimParam::RotationY => a.rotation_y = None,
             TextAnimParam::Skew => a.skew = None,
             TextAnimParam::Opacity => a.opacity = None,
             TextAnimParam::Tracking => a.tracking = None,
@@ -157,6 +172,9 @@ pub(crate) fn anim_value(a: &TextAnimator, sel: usize, p: TextAnimParam) -> Opti
         P::Anchor => PropRef::Vec2(a.anchor.as_ref()?),
         P::Scale => PropRef::Vec2(a.scale.as_ref()?),
         P::Rotation => PropRef::Num(a.rotation.as_ref()?),
+        P::PositionZ => PropRef::Num(a.position_z.as_ref()?),
+        P::RotationX => PropRef::Num(a.rotation_x.as_ref()?),
+        P::RotationY => PropRef::Num(a.rotation_y.as_ref()?),
         P::Skew => PropRef::Num(a.skew.as_ref()?),
         P::Opacity => PropRef::Num(a.opacity.as_ref()?),
         P::Tracking => PropRef::Num(a.tracking.as_ref()?),
@@ -189,6 +207,9 @@ pub(crate) fn anim_value_mut(a: &mut TextAnimator, sel: usize, p: TextAnimParam)
         P::Anchor => PropRefMut::Vec2(a.anchor.as_mut()?),
         P::Scale => PropRefMut::Vec2(a.scale.as_mut()?),
         P::Rotation => PropRefMut::Num(a.rotation.as_mut()?),
+        P::PositionZ => PropRefMut::Num(a.position_z.as_mut()?),
+        P::RotationX => PropRefMut::Num(a.rotation_x.as_mut()?),
+        P::RotationY => PropRefMut::Num(a.rotation_y.as_mut()?),
         P::Skew => PropRefMut::Num(a.skew.as_mut()?),
         P::Opacity => PropRefMut::Num(a.opacity.as_mut()?),
         P::Tracking => PropRefMut::Num(a.tracking.as_mut()?),
@@ -341,10 +362,12 @@ pub(crate) enum TextAnimPreset {
     TrackingIn,
     WiggleChars,
     ColorSweep,
+    FlipInChars,
+    FlyIn3D,
 }
 
 impl TextAnimPreset {
-    pub(crate) const ALL: [TextAnimPreset; 9] = [
+    pub(crate) const ALL: [TextAnimPreset; 11] = [
         TextAnimPreset::Blank,
         TextAnimPreset::FadeInChars,
         TextAnimPreset::SlideUpWords,
@@ -354,6 +377,8 @@ impl TextAnimPreset {
         TextAnimPreset::TrackingIn,
         TextAnimPreset::WiggleChars,
         TextAnimPreset::ColorSweep,
+        TextAnimPreset::FlipInChars,
+        TextAnimPreset::FlyIn3D,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -367,6 +392,8 @@ impl TextAnimPreset {
             TextAnimPreset::TrackingIn => "Tracking in · whole text",
             TextAnimPreset::WiggleChars => "Wiggle · characters",
             TextAnimPreset::ColorSweep => "Color sweep · characters",
+            TextAnimPreset::FlipInChars => "Flip in 3D · characters",
+            TextAnimPreset::FlyIn3D => "Fly in 3D · characters",
         }
     }
 
@@ -446,6 +473,19 @@ impl TextAnimPreset {
                 a.selector = TextSelector::wiggly();
                 a.position = v2(0.0, 12.0);
                 a.rotation = c(12.0);
+                a
+            }
+            TextAnimPreset::FlipInChars => {
+                let mut a = reveal(TextUnit::CharsExcludingSpaces, RangeShape::Square);
+                a.rotation_y = c(-90.0);
+                a.opacity = c(0.0);
+                a
+            }
+            TextAnimPreset::FlyIn3D => {
+                let mut a = reveal(TextUnit::CharsExcludingSpaces, RangeShape::Square);
+                a.position_z = c(-800.0);
+                a.rotation_x = c(-60.0);
+                a.opacity = c(0.0);
                 a
             }
             TextAnimPreset::ColorSweep => {
@@ -930,7 +970,7 @@ fn value_row(ui: &mut egui::Ui, i: usize, row: AnimRow, edits: &mut PropEdits) {
         match val {
             AnimVal::Num(mut v) => {
                 let suffix = match param {
-                    TextAnimParam::Rotation | TextAnimParam::Skew => "°",
+                    TextAnimParam::Rotation | TextAnimParam::RotationX | TextAnimParam::RotationY | TextAnimParam::Skew => "°",
                     p if !p.is_property() && p != TextAnimParam::WiggleRate => "%",
                     _ => "",
                 };

@@ -7,6 +7,7 @@ use kurbo::{Affine, BezPath, Rect, Shape as _};
 use crate::camera::Projector;
 use crate::mat4::Xf;
 use crate::warp::warp_path;
+use crate::vec3::Vec3;
 
 use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
@@ -571,7 +572,8 @@ fn walk(
             // only the rectangle would leave the image inside it unturned — so
             // a tipped raster layer keeps the flat reading rather than growing
             // a shape its content does not match.
-            let warped = warp.filter(|_| image.is_none()).map(|h| warp_path(&path, &h));
+            let animated = !node.text_animators.is_empty() && matches!(shape, NodeShape::Text { .. });
+            let warped = warp.filter(|_| image.is_none() && !animated).map(|h| warp_path(&path, &h));
             match warped {
                 // Crossed the eye plane: refused rather than drawn torn.
                 Some(None) => {}
@@ -588,15 +590,44 @@ fn walk(
                         opacity,
                     });
                 }
-                None if !node.text_animators.is_empty() && matches!(shape, NodeShape::Text { .. }) => {
-                    for t in animated_text(node, shape, ctx, active, fill, stroke) {
-                        let transform = flat * t.transform;
-                        let b = (transform * t.path.clone()).bounding_box();
+                None if animated => {
+                    let mut pieces = animated_text(node, shape, ctx, active, fill, stroke);
+                    // Per-character 3D: each glyph's world matrix, and its
+                    // depth in view space, so far glyphs draw first.
+                    // A tipped layer projects every glyph, 3D or not.
+                    let world_of = |t: &TextPiece| {
+                        t.spatial
+                            .or_else(|| warp.map(|_| crate::mat4::Mat4::from_affine(t.transform)))
+                            .map(|m| xf.to_mat4() * m)
+                    };
+                    if pieces.iter().any(|t| t.spatial.is_some()) || warp.is_some() {
+                        let view_m = view.map_or(crate::mat4::Mat4::IDENTITY, |v| v.view());
+                        let depth = |t: &TextPiece| {
+                            world_of(t).map_or(0.0, |w| (view_m * w).transform_point(Vec3::new(t.anchor.x, t.anchor.y, 0.0)).z)
+                        };
+                        let mut keyed: Vec<(f64, TextPiece)> = pieces.into_iter().map(|t| (depth(&t), t)).collect();
+                        // Stable, so glyphs at equal depth keep reading order.
+                        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        pieces = keyed.into_iter().map(|(_, t)| t).collect();
+                    }
+                    for t in pieces {
+                        let (transform, path) = match (world_of(&t), view) {
+                            // Through the camera: the exact projective map, drawn
+                            // under the identity like a tipped layer.
+                            (Some(w), Some(v)) => match warp_path(&t.path, &v.homography(&w)) {
+                                Some(p) => (Affine::IDENTITY, p),
+                                None => continue, // behind the eye
+                            },
+                            // No camera: orthographic, depth dropped.
+                            (Some(w), None) => (Xf::Spatial(w).to_affine_lossy(), t.path),
+                            (None, _) => (flat * t.transform, t.path),
+                        };
+                        let b = (transform * path.clone()).bounding_box();
                         bounds = Some(bounds.map_or(b, |u: kurbo::Rect| u.union(b)));
                         scene.items.push(RenderItem {
                             source: node.id,
                             transform,
-                            path: t.path,
+                            path,
                             fill: t.fill,
                             stroke: t.stroke,
                             stroke_style,
@@ -913,6 +944,11 @@ fn draw_order(
 struct TextPiece {
     path: BezPath,
     transform: Affine,
+    /// The glyph's full 3D transform in layer space, when an animator moved it
+    /// out of the plane; `transform` is then unused.
+    spatial: Option<crate::mat4::Mat4>,
+    /// Where the glyph sits in layer space, for depth sorting.
+    anchor: kurbo::Point,
     alpha: f64,
     fill: Option<Color>,
     stroke: Option<(Color, f64)>,
@@ -998,6 +1034,9 @@ fn animated_text(
         stroke: Option<Color>,
         stroke_width: Option<f64>,
         tracking: f64,
+        z: f64,
+        rx: f64,
+        ry: f64,
     }
     let props: Vec<Props> = node
         .text_animators
@@ -1013,6 +1052,9 @@ fn animated_text(
             stroke: a.stroke.as_ref().map(|v| v.resolve(ctx)),
             stroke_width: a.stroke_width.as_ref().map(|v| v.resolve(ctx)),
             tracking: a.tracking.as_ref().map_or(0.0, |v| v.resolve(ctx)),
+            z: a.position_z.as_ref().map_or(0.0, |v| v.resolve(ctx)),
+            rx: a.rotation_x.as_ref().map_or(0.0, |v| v.resolve(ctx)),
+            ry: a.rotation_y.as_ref().map_or(0.0, |v| v.resolve(ctx)),
         })
         .collect();
 
@@ -1053,9 +1095,12 @@ fn animated_text(
         }
     }
 
+    let three_d = node.text_animators.iter().any(|a| a.is_3d());
     let mut out: Vec<TextPiece> = Vec::new();
     for (gi, g) in glyphs.into_iter().enumerate() {
+        use crate::mat4::Mat4;
         let mut xf = Affine::translate((shift[gi], 0.0));
+        let mut m3 = Mat4::from_affine(xf);
         let (mut alpha, mut color, mut line) = (1.0, fill, stroke);
         let own = kurbo::Point::new(g.origin.x + g.advance / 2.0, g.origin.y);
         for (ai, a) in node.text_animators.iter().enumerate() {
@@ -1081,6 +1126,20 @@ fn animated_text(
                 * Affine::scale_non_uniform(sc.x, sc.y)
                 * Affine::translate(-pivot.to_vec2());
             xf = local * xf;
+            if three_d {
+                let pv = Vec3::new(pivot.x, pivot.y, 0.0);
+                let pos = p.position * s;
+                m3 = Mat4::translate(Vec3::new(pos.x, pos.y, p.z * s))
+                    * Mat4::translate(pv)
+                    * Mat4::rotate_z((p.rotation * s).to_radians())
+                    * Mat4::rotate_y((p.ry * s).to_radians())
+                    * Mat4::rotate_x((p.rx * s).to_radians())
+                    * Mat4::from_affine(
+                        Affine::skew((p.skew * s).to_radians().tan(), 0.0) * Affine::scale_non_uniform(sc.x, sc.y),
+                    )
+                    * Mat4::translate(-pv)
+                    * m3;
+            }
             if let Some(o) = p.opacity {
                 alpha *= (1.0 + (o - 1.0) * s).clamp(0.0, 1.0);
             }
@@ -1097,9 +1156,10 @@ fn animated_text(
                 line = Some((c, w));
             }
         }
+        let spatial = three_d.then_some(m3);
         match out.last_mut() {
-            Some(t) if t.transform == xf && t.alpha == alpha && t.fill == color && t.stroke == line => t.path.extend(g.path),
-            _ => out.push(TextPiece { path: g.path, transform: xf, alpha, fill: color, stroke: line }),
+            Some(t) if !three_d && t.transform == xf && t.alpha == alpha && t.fill == color && t.stroke == line => t.path.extend(g.path),
+            _ => out.push(TextPiece { path: g.path, transform: xf, spatial, anchor: own, alpha, fill: color, stroke: line }),
         }
     }
     out
@@ -2666,6 +2726,61 @@ mod tests {
         let ops: Vec<f64> = text(vec![fade]).items.iter().map(|i| i.opacity).collect();
         assert_eq!(ops.len(), 4);
         assert!(ops.windows(2).all(|w| w[0] > w[1]), "fades in order: {ops:?}");
+    }
+
+    /// Per-character 3D: pushing glyphs back in Z through a camera shrinks
+    /// them, turning them 90° about Y with no camera flattens them to a
+    /// sliver, and a far glyph draws before a near one.
+    #[test]
+    fn per_character_3d_projects_each_glyph() {
+        use crate::node::{Project, TextAnimator};
+        let layer = |anims: Vec<TextAnimator>| {
+            let mut l = Node::shape(
+                1,
+                "t",
+                Shape::Text {
+                    content: Value::constant("AB".to_string()),
+                    family: String::new(),
+                    weight: Value::constant(400.0),
+                    italic: false,
+                    tracking: Value::constant(0.0),
+                    leading: Value::constant(0.0),
+                    size: Value::constant(80.0),
+                    align: crate::text::TextAlign::Left,
+                    max_width: None,
+                },
+            )
+            .with_fill(Color::rgb(1.0, 1.0, 1.0));
+            l.text_animators = anims;
+            l
+        };
+        let width = |sc: &Scene| sc.items.iter().map(|i| (i.transform * i.path.clone()).bounding_box()).reduce(|a, b| a.union(b)).map_or(0.0, |r| r.width());
+        let run = |anims: Vec<TextAnimator>, camera: bool| {
+            let mut comp = Comp::new(400.0, 400.0, Node::group(0, "root").with_child(layer(anims)));
+            comp.camera = camera.then(|| crate::camera::Camera::from_distance(1000.0));
+            evaluate_project(&Project::single(comp), 0.0)
+        };
+        let flat = run(vec![], true);
+        if flat.items.is_empty() {
+            return; // No fonts on this machine.
+        }
+        let back = run(vec![TextAnimator { position_z: Some(Value::constant(1000.0)), ..TextAnimator::new(TextUnit::Chars) }], true);
+        assert_eq!(back.items.len(), 2, "one item per glyph");
+        assert!(back.items.iter().all(|i| i.transform == Affine::IDENTITY), "projected into comp space");
+        let ratio = width(&back) / width(&flat);
+        assert!((ratio - 0.5).abs() < 0.05, "half size one camera-distance back: {ratio}");
+
+        let turned = run(vec![TextAnimator { rotation_y: Some(Value::constant(90.0)), ..TextAnimator::new(TextUnit::Chars) }], false);
+        assert!(turned.items.iter().all(|i| (i.transform * i.path.clone()).bounding_box().width() < 1e-6), "edge-on");
+
+        // The second glyph pushed back draws first.
+        let mut a = TextAnimator { position_z: Some(Value::constant(500.0)), ..TextAnimator::new(TextUnit::Chars) };
+        if let crate::node::TextSelector::Range { start, .. } = &mut a.selector {
+            *start = Value::constant(50.0);
+        }
+        let sorted = run(vec![a], true);
+        let xs: Vec<f64> = sorted.items.iter().map(|i| i.path.bounding_box().center().x).collect();
+        assert!(xs[0] > xs[1], "far glyph (B) first: {xs:?}");
     }
 
     #[test]

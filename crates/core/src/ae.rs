@@ -632,7 +632,16 @@ impl Importer<'_> {
         let d2 = |a: &Vec2, b: &Vec2| (*a - *b).hypot();
         for p in &props {
             match p["matchName"].as_str().unwrap_or("") {
-                "ADBE Text Position 3D" => anim.position = Some(self.value(Some(p), Vec2::ZERO, xy, d2)),
+                "ADBE Text Position 3D" => {
+                    anim.position = Some(self.value(Some(p), Vec2::ZERO, xy, d2));
+                    // Depth only when it is used, so a flat animator stays flat.
+                    let z = self.value(Some(p), 0.0, |v| v.get(2).copied(), d1);
+                    if z != Value::constant(0.0) {
+                        anim.position_z = Some(z);
+                    }
+                }
+                "ADBE Text Rotation X" => anim.rotation_x = Some(self.value(Some(p), 0.0, first, d1)),
+                "ADBE Text Rotation Y" => anim.rotation_y = Some(self.value(Some(p), 0.0, first, d1)),
                 "ADBE Text Anchor Point 3D" => anim.anchor = Some(self.value(Some(p), Vec2::ZERO, xy, d2)),
                 "ADBE Text Scale 3D" => anim.scale = Some(self.value(Some(p), Vec2::new(100.0, 100.0), xy, d2)),
                 "ADBE Text Rotation" => anim.rotation = Some(self.value(Some(p), 0.0, first, d1)),

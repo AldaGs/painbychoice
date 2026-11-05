@@ -40,15 +40,22 @@ AE stacks selectors inside one animator and folds them with a mode.
 
 ## Phase 3 — Per-character 3D
 
-- `TextAnimator` gains `position_z`, `rotation_x`, `rotation_y`, and the
-  layer a `per_char_3d` switch (AE's "Enable Per-character 3D").
-- Glyph transforms become 3D (`mat4`) about the grouping anchor. With a
-  camera / 3D layer, each glyph is projected through the existing
-  `warp_path` route that tipped layers already use; without one, the
-  projection is orthographic (rotation X/Y foreshortens, Z does nothing).
-- Glyph depth sorting inside the layer so turned characters overlap right.
-- Editor rows + stopwatches for the new properties; AE import of
-  `ADBE Text Position 3D` z, `ADBE Text Rotation X/Y`.
+- `TextAnimator` gains `position_z`, `rotation_x`, `rotation_y`. There is no
+  separate "Enable Per-character 3D" switch: an animator using any of the
+  three makes the layer per-character 3D, which is the only thing AE's
+  switch gates.
+- Each glyph's transform becomes a `Mat4` about its grouping anchor
+  (T · pivot · Rz · Ry · Rx · skew·scale · pivot⁻¹, composed per animator).
+  With a camera, each glyph goes through the camera's exact homography
+  (`warp_path`) like a tipped layer; without one it is drawn orthographic.
+- Glyphs are depth-sorted in view space, far first, stable for ties.
+- A tipped 3D text layer now keeps its animators (each glyph projected)
+  instead of drawing the static text.
+- Editor: Position Z / X Rotation / Y Rotation rows with stopwatches, and
+  "Flip in 3D" / "Fly in 3D" presets. AE import reads the Z of
+  `ADBE Text Position 3D` and `ADBE Text Rotation X/Y`.
+
+**Status:** implemented (core, editor, AE import, tests).
 
 ## Phase 4 — Per-character blur
 

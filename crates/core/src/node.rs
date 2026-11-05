@@ -540,6 +540,17 @@ pub struct TextAnimator {
     /// Extra spacing after the unit in 1/1000 em at full selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracking: Option<Value<f64>>,
+    /// Depth offset in px at full selection (positive is away from the
+    /// viewer). Any of the three 3D properties makes the layer per-character
+    /// 3D: each glyph is projected through the comp's camera on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_z: Option<Value<f64>>,
+    /// Rotation about the glyph's X axis in degrees at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_x: Option<Value<f64>>,
+    /// Rotation about the glyph's Y axis in degrees at full selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_y: Option<Value<f64>>,
 }
 
 impl TextAnimator {
@@ -562,7 +573,15 @@ impl TextAnimator {
             stroke: None,
             stroke_width: None,
             tracking: None,
+            position_z: None,
+            rotation_x: None,
+            rotation_y: None,
         }
+    }
+
+    /// Whether this animator moves glyphs out of the plane.
+    pub fn is_3d(&self) -> bool {
+        self.position_z.is_some() || self.rotation_x.is_some() || self.rotation_y.is_some()
     }
 
     pub(crate) fn each_value(&mut self, f: &mut impl FnMut(&mut dyn Retimable)) {
@@ -576,6 +595,9 @@ impl TextAnimator {
         if let Some(v) = &mut self.stroke { f(v) }
         if let Some(v) = &mut self.stroke_width { f(v) }
         if let Some(v) = &mut self.tracking { f(v) }
+        if let Some(v) = &mut self.position_z { f(v) }
+        if let Some(v) = &mut self.rotation_x { f(v) }
+        if let Some(v) = &mut self.rotation_y { f(v) }
         self.selector.each_value(f);
         for s in &mut self.more_selectors {
             s.selector.each_value(f);
