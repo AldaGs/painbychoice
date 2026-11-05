@@ -358,7 +358,7 @@ pub fn raise_geometry(
             node.config.text.tracking = c(tracking);
             node.config.text.leading = c(leading);
             node.config.text.family = family.clone();
-            node.config.text.weight = *weight;
+            node.config.text.weight = if let Value::Const(w) = weight { w.round().clamp(1.0, 1000.0) as u16 } else { 400 };
             node.config.text.italic = *italic;
             node.config.text.align = *align;
             node.config.text.max_width = *max_width;
@@ -641,7 +641,7 @@ mod tests {
         let back = shape_round_trips(Shape::Text {
             content: Value::constant("Chapter One".to_string()),
             family: "Georgia".into(),
-            weight: 700,
+            weight: crate::value::Value::constant(700.0),
             italic: true,
             tracking: Value::constant(0.0),
             leading: Value::constant(0.0),
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(content.resolve(ctx), "Chapter One");
         assert_eq!(size.resolve(ctx), 72.0);
         assert_eq!(family, "Georgia");
-        assert_eq!((*weight, *italic), (700, true));
+        assert_eq!((weight.resolve(ctx), *italic), (700.0, true));
         assert_eq!(*align, crate::text::TextAlign::Center);
         assert_eq!(*max_width, Some(400.0));
     }

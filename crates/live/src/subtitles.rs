@@ -260,7 +260,7 @@ pub(crate) fn set_karaoke(node: &mut MNode, rgb: [f32; 3], cumulative: bool) {
     let selector = TextSelector::Karaoke { cumulative };
     match node.text_animators.iter_mut().find(|a| matches!(a.selector, TextSelector::Karaoke { .. })) {
         Some(a) => (a.selector, a.fill) = (selector, fill),
-        None => node.text_animators.push(TextAnimator { based_on: TextUnit::Words, selector, position: Vec2::ZERO, opacity: None, fill }),
+        None => node.text_animators.push(TextAnimator { selector, fill, ..TextAnimator::new(TextUnit::Words) }),
     }
 }
 
@@ -293,7 +293,7 @@ pub(crate) fn new_layer(id: NodeId, w: f64, h: f64) -> MNode {
         MShape::Text {
             content: Value::constant(String::new()),
             family: String::new(),
-            weight: 700,
+            weight: motion_core::value::Value::constant(700.0),
             italic: false,
             tracking: Value::constant(0.0),
             leading: Value::constant(0.0),

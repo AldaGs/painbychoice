@@ -589,19 +589,19 @@ fn walk(
                     });
                 }
                 None if !node.text_animators.is_empty() && matches!(shape, NodeShape::Text { .. }) => {
-                    for (p, offset, alpha, fill) in animated_text(node, shape, ctx, active, fill) {
-                        let transform = flat * Affine::translate(offset);
-                        let b = (transform * p.clone()).bounding_box();
+                    for t in animated_text(node, shape, ctx, active, fill, stroke) {
+                        let transform = flat * t.transform;
+                        let b = (transform * t.path.clone()).bounding_box();
                         bounds = Some(bounds.map_or(b, |u: kurbo::Rect| u.union(b)));
                         scene.items.push(RenderItem {
                             source: node.id,
                             transform,
-                            path: p,
-                            fill,
-                            stroke,
+                            path: t.path,
+                            fill: t.fill,
+                            stroke: t.stroke,
                             stroke_style,
                             image: None,
-                            opacity: opacity * alpha,
+                            opacity: opacity * t.alpha,
                         });
                     }
                 }
@@ -909,28 +909,40 @@ fn draw_order(
 }
 
 
+/// One run of animated text that shares a transform, opacity, fill and stroke.
+struct TextPiece {
+    path: BezPath,
+    transform: Affine,
+    alpha: f64,
+    fill: Option<Color>,
+    stroke: Option<(Color, f64)>,
+}
+
 /// A text shape with text animators, as runs of consecutive glyphs that share
-/// one offset, opacity and fill: each is drawn as its own item. `active` is the
-/// subtitle's karaoke word, `fill` the layer's own.
+/// one transform, opacity, fill and stroke: each is drawn as its own item.
+/// `active` is the subtitle's karaoke word; `fill` and `stroke` the layer's own.
 fn animated_text(
     node: &Node,
     shape: &NodeShape,
     ctx: &mut EvalCtx,
     active: Option<usize>,
     fill: Option<Color>,
-) -> Vec<(BezPath, kurbo::Vec2, f64, Option<Color>)> {
+    stroke: Option<(Color, f64)>,
+) -> Vec<TextPiece> {
+    use crate::node::AnchorGrouping;
     let NodeShape::Text { content, family, weight, italic, size, tracking, leading, align, max_width } = shape else {
         return Vec::new();
     };
     let content = content.resolve(ctx);
+    let size = size.resolve(ctx);
     let style = crate::text::TextStyle {
         family,
-        weight: *weight,
+        weight: weight.resolve(ctx),
         italic: *italic,
         tracking: tracking.resolve(ctx),
         leading: leading.resolve(ctx),
     };
-    let glyphs = crate::text::text_glyphs(&content, &style, size.resolve(ctx), *align, *max_width);
+    let glyphs = crate::text::text_glyphs(&content, &style, size, *align, *max_width);
     // Each char's index among the non-space chars, for that unit.
     let mut solid = Vec::new();
     let mut k = 0;
@@ -947,17 +959,70 @@ fn animated_text(
         TextUnit::Words => words,
         TextUnit::Lines => lines,
     };
-    let mut out: Vec<(BezPath, kurbo::Vec2, f64, Option<Color>)> = Vec::new();
-    for g in glyphs {
-        let (mut offset, mut alpha, mut color) = (kurbo::Vec2::ZERO, 1.0, fill);
-        for a in &node.text_animators {
-            let unit = match a.based_on {
-                TextUnit::Chars => Some(g.char),
-                TextUnit::CharsExcludingSpaces => solid.get(g.char).copied().flatten(),
-                TextUnit::Words => g.word,
-                TextUnit::Lines => Some(g.line),
-            };
-            let Some(i) = unit else { continue };
+    let unit_of = |g: &crate::text::GlyphOutline, u: TextUnit| match u {
+        TextUnit::Chars => Some(g.char),
+        TextUnit::CharsExcludingSpaces => solid.get(g.char).copied().flatten(),
+        TextUnit::Words => g.word,
+        TextUnit::Lines => Some(g.line),
+    };
+
+    // Anchors: the baseline centre of each glyph, word and line, and the
+    // block's centre — what a grouping rotates and scales about.
+    let span = |it: &mut dyn Iterator<Item = &crate::text::GlyphOutline>| {
+        let (mut lo, mut hi, mut y) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        for g in it {
+            lo = lo.min(g.origin.x);
+            hi = hi.max(g.origin.x + g.advance);
+            y = g.origin.y;
+        }
+        kurbo::Point::new((lo + hi) / 2.0, y)
+    };
+    let mut word_anchor = std::collections::HashMap::new();
+    let mut line_anchor = std::collections::HashMap::new();
+    for g in &glyphs {
+        if let Some(w) = g.word {
+            word_anchor.entry(w).or_insert_with(|| span(&mut glyphs.iter().filter(|o| o.word == Some(w))));
+        }
+        line_anchor.entry(g.line).or_insert_with(|| span(&mut glyphs.iter().filter(|o| o.line == g.line)));
+    }
+
+    // Resolve each animator's properties once per frame.
+    struct Props {
+        position: kurbo::Vec2,
+        anchor: kurbo::Vec2,
+        scale: Option<kurbo::Vec2>,
+        rotation: f64,
+        skew: f64,
+        opacity: Option<f64>,
+        fill: Option<Color>,
+        stroke: Option<Color>,
+        stroke_width: Option<f64>,
+        tracking: f64,
+    }
+    let props: Vec<Props> = node
+        .text_animators
+        .iter()
+        .map(|a| Props {
+            position: a.position.as_ref().map_or(kurbo::Vec2::ZERO, |v| v.resolve(ctx)),
+            anchor: a.anchor.as_ref().map_or(kurbo::Vec2::ZERO, |v| v.resolve(ctx)),
+            scale: a.scale.as_ref().map(|v| v.resolve(ctx)),
+            rotation: a.rotation.as_ref().map_or(0.0, |v| v.resolve(ctx)),
+            skew: a.skew.as_ref().map_or(0.0, |v| v.resolve(ctx)),
+            opacity: a.opacity.as_ref().map(|v| v.resolve(ctx)),
+            fill: a.fill.as_ref().map(|v| v.resolve(ctx)),
+            stroke: a.stroke.as_ref().map(|v| v.resolve(ctx)),
+            stroke_width: a.stroke_width.as_ref().map(|v| v.resolve(ctx)),
+            tracking: a.tracking.as_ref().map_or(0.0, |v| v.resolve(ctx)),
+        })
+        .collect();
+
+    // Per-glyph selection per animator, and the extra advance tracking adds
+    // after each glyph.
+    let mut sel = vec![vec![0.0; props.len()]; glyphs.len()];
+    let mut extra = vec![0.0; glyphs.len()];
+    for (gi, g) in glyphs.iter().enumerate() {
+        for (ai, a) in node.text_animators.iter().enumerate() {
+            let Some(i) = unit_of(g, a.based_on) else { continue };
             let s = match a.selector {
                 TextSelector::Karaoke { cumulative } => match active {
                     Some(w) if i == w || (cumulative && i < w) => 1.0,
@@ -965,21 +1030,79 @@ fn animated_text(
                 },
                 _ => a.selector.amount(i, count(a.based_on), ctx),
             };
-            offset += a.position * s;
-            if let Some(o) = a.opacity {
-                alpha *= 1.0 + (o - 1.0) * s;
+            sel[gi][ai] = s;
+            extra[gi] += props[ai].tracking * s * size / 1000.0;
+        }
+    }
+    // Tracking pushes later glyphs along their line, re-aligned so centred
+    // text stays centred and right-aligned text stays flush right.
+    let mut shift = vec![0.0; glyphs.len()];
+    for l in 0..lines {
+        let idx: Vec<usize> = (0..glyphs.len()).filter(|&i| glyphs[i].line == l).collect();
+        let mut run = 0.0;
+        for &i in &idx {
+            shift[i] = run;
+            run += extra[i];
+        }
+        // The last glyph's trailing space doesn't count toward the line width.
+        let total = run - idx.last().map_or(0.0, |&i| extra[i]);
+        let back = match align {
+            crate::text::TextAlign::Left => 0.0,
+            crate::text::TextAlign::Center => total / 2.0,
+            crate::text::TextAlign::Right => total,
+        };
+        for &i in &idx {
+            shift[i] -= back;
+        }
+    }
+
+    let mut out: Vec<TextPiece> = Vec::new();
+    for (gi, g) in glyphs.into_iter().enumerate() {
+        let mut xf = Affine::translate((shift[gi], 0.0));
+        let (mut alpha, mut color, mut line) = (1.0, fill, stroke);
+        let own = kurbo::Point::new(g.origin.x + g.advance / 2.0, g.origin.y);
+        for (ai, a) in node.text_animators.iter().enumerate() {
+            let s = sel[gi][ai];
+            if s == 0.0 {
+                continue;
             }
-            if let Some(f) = &a.fill {
-                let c = f.resolve(ctx);
+            let p = &props[ai];
+            let pivot = match a.grouping {
+                AnchorGrouping::Character => own,
+                AnchorGrouping::Word => g.word.and_then(|w| word_anchor.get(&w).copied()).unwrap_or(own),
+                AnchorGrouping::Line => line_anchor.get(&g.line).copied().unwrap_or(own),
+                AnchorGrouping::All => kurbo::Point::ZERO,
+            } + kurbo::Vec2::new(shift[gi], 0.0)
+                + p.anchor * s;
+            let sc = p.scale.map_or(kurbo::Vec2::new(1.0, 1.0), |v| {
+                kurbo::Vec2::new(1.0 + (v.x / 100.0 - 1.0) * s, 1.0 + (v.y / 100.0 - 1.0) * s)
+            });
+            let local = Affine::translate(p.position * s)
+                * Affine::translate(pivot.to_vec2())
+                * Affine::rotate((p.rotation * s).to_radians())
+                * Affine::skew((p.skew * s).to_radians().tan(), 0.0)
+                * Affine::scale_non_uniform(sc.x, sc.y)
+                * Affine::translate(-pivot.to_vec2());
+            xf = local * xf;
+            if let Some(o) = p.opacity {
+                alpha *= (1.0 + (o - 1.0) * s).clamp(0.0, 1.0);
+            }
+            if let Some(c) = p.fill {
                 color = match color {
-                    Some(b) => Some(crate::value::Animatable::lerp(&b, &c, s)),
+                    Some(b) => Some(crate::value::Animatable::lerp(&b, &c, s.clamp(0.0, 1.0))),
                     None => (s > 0.0).then_some(c),
                 };
             }
+            if p.stroke.is_some() || p.stroke_width.is_some() {
+                let (bc, bw) = line.unwrap_or((p.stroke.unwrap_or(Color::rgb(0.0, 0.0, 0.0)), 0.0));
+                let c = p.stroke.map_or(bc, |c| crate::value::Animatable::lerp(&bc, &c, s.clamp(0.0, 1.0)));
+                let w = p.stroke_width.map_or(bw, |w| (bw + (w - bw) * s).max(0.0));
+                line = Some((c, w));
+            }
         }
         match out.last_mut() {
-            Some((p, o, al, c)) if *o == offset && *al == alpha && *c == color => p.extend(g.path),
-            _ => out.push((g.path, offset, alpha, color)),
+            Some(t) if t.transform == xf && t.alpha == alpha && t.fill == color && t.stroke == line => t.path.extend(g.path),
+            _ => out.push(TextPiece { path: g.path, transform: xf, alpha, fill: color, stroke: line }),
         }
     }
     out
@@ -2433,7 +2556,7 @@ mod tests {
                     Shape::Text {
                         content: Value::constant("Hi".to_string()),
                         family: String::new(),
-                        weight: 400,
+                        weight: crate::value::Value::constant(400.0),
                         italic: false,
                         tracking: Value::constant(0.0),
                         leading: Value::constant(0.0),
@@ -2465,7 +2588,7 @@ mod tests {
             Shape::Text {
                 content: Value::constant("ignored".to_string()),
                 family: String::new(),
-                weight: 400,
+                weight: crate::value::Value::constant(400.0),
                 italic: false,
                 tracking: Value::constant(0.0),
                 leading: Value::constant(0.0),
@@ -2481,11 +2604,9 @@ mod tests {
         });
         let yellow = Color::rgb(1.0, 1.0, 0.0);
         layer.text_animators.push(TextAnimator {
-            based_on: TextUnit::Words,
             selector: TextSelector::Karaoke { cumulative: false },
-            position: Vec2::ZERO,
-            opacity: None,
             fill: Some(Value::constant(yellow)),
+            ..TextAnimator::new(TextUnit::Words)
         });
         let doc = Document::new(640.0, 480.0, Node::group(0, "root").with_child(layer));
         let fps = doc.fps;
@@ -2501,6 +2622,55 @@ mod tests {
 
     /// The font size is a `Value`, so it animates — the reason it's a `Value`
     /// at all. Bigger size at a later frame ⇒ a bigger outline.
+    /// Per-character animators: rotation turns each glyph about its own
+    /// anchor (so every glyph gets its own transform), tracking pushes the
+    /// line wider, and the selector's falloff spreads opacity across units.
+    #[test]
+    fn text_animators_transform_each_character() {
+        use crate::node::{RangeShape, TextAnimator, TextSelector};
+        let text = |anims: Vec<TextAnimator>| {
+            let mut layer = Node::shape(
+                1,
+                "t",
+                Shape::Text {
+                    content: Value::constant("ABCD".to_string()),
+                    family: String::new(),
+                    weight: Value::constant(400.0),
+                    italic: false,
+                    tracking: Value::constant(0.0),
+                    leading: Value::constant(0.0),
+                    size: Value::constant(48.0),
+                    align: crate::text::TextAlign::Left,
+                    max_width: None,
+                },
+            )
+            .with_fill(Color::rgb(1.0, 1.0, 1.0));
+            layer.text_animators = anims;
+            evaluate(&Document::new(640.0, 480.0, Node::group(0, "root").with_child(layer)), 0.0)
+        };
+        let plain = text(vec![TextAnimator::new(TextUnit::Chars)]);
+        if plain.items.is_empty() {
+            return; // No fonts on this machine.
+        }
+        assert_eq!(plain.items.len(), 1, "an animator that does nothing keeps one run");
+
+        let spun = text(vec![TextAnimator { rotation: Some(Value::constant(90.0)), ..TextAnimator::new(TextUnit::Chars) }]);
+        assert_eq!(spun.items.len(), 4, "one transform per glyph");
+
+        let width = |sc: &Scene| sc.items.iter().map(|i| (i.transform * i.path.clone()).bounding_box()).reduce(|a, b| a.union(b)).unwrap().width();
+        let tracked = text(vec![TextAnimator { tracking: Some(Value::constant(500.0)), ..TextAnimator::new(TextUnit::Chars) }]);
+        // Three gaps of 0.5em at 48px.
+        assert!((width(&tracked) - width(&plain) - 72.0).abs() < 0.5, "{} vs {}", width(&tracked), width(&plain));
+
+        let mut fade = TextAnimator { opacity: Some(Value::constant(0.0)), ..TextAnimator::new(TextUnit::Chars) };
+        if let TextSelector::Range { shape, .. } = &mut fade.selector {
+            *shape = RangeShape::RampUp;
+        }
+        let ops: Vec<f64> = text(vec![fade]).items.iter().map(|i| i.opacity).collect();
+        assert_eq!(ops.len(), 4);
+        assert!(ops.windows(2).all(|w| w[0] > w[1]), "fades in order: {ops:?}");
+    }
+
     #[test]
     fn a_text_layers_font_size_animates() {
         use crate::value::{Keyframe, Track};
@@ -2513,7 +2683,7 @@ mod tests {
                 Shape::Text {
                     content: Value::constant("Hi".to_string()),
                     family: String::new(),
-                    weight: 400,
+                    weight: crate::value::Value::constant(400.0),
                     italic: false,
                     tracking: Value::constant(0.0),
                     leading: Value::constant(0.0),
@@ -2541,7 +2711,7 @@ mod tests {
         let text = |family: &str| Shape::Text {
             content: Value::constant("Hi".to_string()),
             family: family.into(),
-            weight: 400,
+            weight: crate::value::Value::constant(400.0),
             italic: false,
             tracking: Value::constant(0.0),
             leading: Value::constant(0.0),
@@ -2581,7 +2751,7 @@ mod tests {
                 Shape::Text {
                     content: Value::constant("two\nlines".to_string()),
                     family: "Georgia".into(),
-                    weight: 400,
+                    weight: crate::value::Value::constant(400.0),
                     italic: false,
                     tracking: Value::constant(0.0),
                     leading: Value::constant(0.0),
@@ -2645,7 +2815,7 @@ mod tests {
                         r#"let s = "HELLO"; s.sub_string(0, min(frame.to_int(), s.len))"#.into(),
                     )),
                     family: String::new(),
-                    weight: 400,
+                    weight: crate::value::Value::constant(400.0),
                     italic: false,
                     tracking: Value::constant(0.0),
                     leading: Value::constant(0.0),

@@ -873,7 +873,7 @@ fn text_node() -> MNode {
         MShape::Text {
             content: Value::constant("hello".to_string()),
             family: String::new(),
-            weight: 400,
+            weight: motion_core::value::Value::constant(400.0),
             italic: false,
             tracking: Value::constant(0.0),
             leading: Value::constant(0.0),
@@ -6120,4 +6120,86 @@ fn strip_rows_fold_closed_by_default() {
     assert_eq!(names(crate::strips::visible_rows(&rows, &open, None)), ["other", "shape layer", "group"]);
     open.clear();
     assert_eq!(names(crate::strips::visible_rows(&rows, &open, Some(NodeId(3)))), ["other", "shape layer", "group", "path"]);
+}
+
+// --- Text animators: the properties-panel ops and their keyframe plumbing. ---
+
+fn text_layer() -> MNode {
+    MNode::shape(1, "title", MShape::Text {
+        content: Value::constant("Hello world".to_string()),
+        family: String::new(),
+        weight: Value::constant(400.0),
+        italic: false,
+        size: Value::constant(48.0),
+        tracking: Value::constant(0.0),
+        leading: Value::constant(0.0),
+        align: TextAlign::Left,
+        max_width: None,
+    })
+}
+
+#[test]
+fn text_weight_is_a_keyframeable_property() {
+    let mut node = text_layer();
+    assert!(prop_kinds_of(&node).contains(&PropKind::TextWeight));
+    let Some(PropRefMut::Num(w)) = prop_of_mut(&mut node, PropKind::TextWeight) else { panic!("weight is numeric") };
+    w.set_at(0, 300.0);
+    w.insert_key(30);
+    w.set_at(30, 800.0);
+    assert!(is_anim(&node, PropKind::TextWeight));
+}
+
+#[test]
+fn a_text_animator_preset_keys_its_reveal_and_exposes_its_values() {
+    use motion_core::node::TextSelector;
+    let mut node = text_layer();
+    assert!(apply_text_anim_op(&mut node, 10, 30.0, &TextAnimOp::Add(TextAnimPreset::SlideUpWords)));
+    let a = &node.text_animators[0];
+    assert!(matches!(&a.selector, TextSelector::Range { start, .. } if start.is_animated()));
+    // Every value it holds is a dopesheet row.
+    let kinds = prop_kinds_of(&node);
+    for p in [TextAnimParam::RangeStart, TextAnimParam::Position, TextAnimParam::Opacity] {
+        assert!(kinds.contains(&PropKind::TextAnim { index: 0, param: p }), "{p:?}");
+    }
+    assert!(is_anim(&node, PropKind::TextAnim { index: 0, param: TextAnimParam::RangeStart }));
+    assert!(!kinds.contains(&PropKind::TextAnim { index: 0, param: TextAnimParam::Rotation }));
+}
+
+#[test]
+fn text_animator_properties_add_edit_and_remove() {
+    let mut node = text_layer();
+    apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Add(TextAnimPreset::Blank));
+    let rot = TextAnimParam::Rotation;
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::AddProp(0, rot)));
+    assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::AddProp(0, rot)), "already there");
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, param: rot, value: AnimVal::Num(90.0) }));
+    let mut ctx = EvalCtx::at(0.0);
+    assert_eq!(node.text_animators[0].rotation.as_ref().unwrap().resolve(&mut ctx), 90.0);
+    // A wrong-typed value no-ops instead of writing.
+    assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, param: rot, value: AnimVal::Vec2(Vec2::ZERO) }));
+    // Switching selector drops the range controls and gains the wiggly ones.
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::SetSelector(0, SelectorKind::Wiggly)));
+    let kinds = prop_kinds_of(&node);
+    assert!(kinds.contains(&PropKind::TextAnim { index: 0, param: TextAnimParam::WiggleRate }));
+    assert!(!kinds.contains(&PropKind::TextAnim { index: 0, param: TextAnimParam::RangeStart }));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::RemoveProp(0, rot)));
+    assert!(node.text_animators[0].rotation.is_none());
+    // Stale indices no-op.
+    assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Remove(5)));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Remove(0)));
+    assert!(node.text_animators.is_empty());
+}
+
+#[test]
+fn every_text_animator_preset_draws() {
+    let mut node = text_layer();
+    node.fill = Some(Value::constant(MColor::rgb(1.0, 1.0, 1.0)));
+    for p in TextAnimPreset::ALL {
+        apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Add(p));
+    }
+    let doc = Document::new(640.0, 480.0, MNode::group(0, "root").with_child(node));
+    for f in [0.0, 15.0, 45.0] {
+        let scene = motion_core::evaluate(&doc, f);
+        assert!(scene.items.iter().all(|i| i.transform.as_coeffs().iter().all(|c| c.is_finite())));
+    }
 }

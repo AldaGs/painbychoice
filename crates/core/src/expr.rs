@@ -248,6 +248,8 @@ pub enum PropPath {
     /// A `Text` shape's tracking (1/1000 em) and leading (px, 0 = auto).
     TextTracking,
     TextLeading,
+    /// A `Text` shape's weight (100–900), continuous on a variable font.
+    TextWeight,
     /// A `Text` shape's string. The only non-numeric property here — it resolves
     /// to an `ExprValue::Str`, which is what a typewriter script reads and
     /// writes.
@@ -284,6 +286,7 @@ impl PropPath {
             PropPath::TextSize => "text_size",
             PropPath::TextTracking => "tracking",
             PropPath::TextLeading => "leading",
+            PropPath::TextWeight => "weight",
             PropPath::TextContent => "content",
             PropPath::TimeRemap => "time_remap",
             PropPath::MaskSize => "mask_size",
@@ -295,7 +298,7 @@ impl PropPath {
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 16] = [
+    pub const ALL: [PropPath; 17] = [
         PropPath::Position,
         PropPath::Rotation,
         PropPath::Scale,
@@ -309,6 +312,7 @@ impl PropPath {
         PropPath::TextSize,
         PropPath::TextTracking,
         PropPath::TextLeading,
+        PropPath::TextWeight,
         PropPath::TextContent,
         PropPath::TimeRemap,
         PropPath::MaskSize,
@@ -340,6 +344,7 @@ impl PropPath {
             | PropPath::TextSize
             | PropPath::TextTracking
             | PropPath::TextLeading
+            | PropPath::TextWeight
             | PropPath::TimeRemap => ExprValue::Num(0.0),
             PropPath::Fill | PropPath::StrokeColor => {
                 ExprValue::Color(Color::rgba(0.0, 0.0, 0.0, 0.0))
@@ -1472,7 +1477,7 @@ fn script_wiggle(freq: f64, amp: f64, seed: f64) -> Result<f64, Box<rhai::EvalAl
 }
 
 /// Value noise in [-1, 1]: hashed lattice points, smoothstep-interpolated.
-fn value_noise(t: f64, seed: f64) -> f64 {
+pub(crate) fn value_noise(t: f64, seed: f64) -> f64 {
     let i = t.floor();
     let f = t - i;
     let f = f * f * (3.0 - 2.0 * f); // smoothstep — C1, so no kinks at the lattice
@@ -1966,6 +1971,10 @@ impl<'a> EvalCtx<'a> {
             },
             PropPath::TextLeading => match &node.shape {
                 Some(Shape::Text { leading, .. }) => leading.resolve(self).to_expr(),
+                _ => prop.zero(),
+            },
+            PropPath::TextWeight => match &node.shape {
+                Some(Shape::Text { weight, .. }) => weight.resolve(self).to_expr(),
                 _ => prop.zero(),
             },
             PropPath::TextContent => match &node.shape {
