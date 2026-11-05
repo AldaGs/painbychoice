@@ -77,6 +77,8 @@ pub(crate) struct NodeInfo {
     pub(crate) anchor_anim: bool,
     pub(crate) pos_anim: bool,
     pub(crate) rot_anim: bool,
+    pub(crate) rot_x_anim: bool,
+    pub(crate) rot_y_anim: bool,
     pub(crate) scale_anim: bool,
     pub(crate) opacity_anim: bool,
     pub(crate) fill_anim: bool,
@@ -457,13 +459,12 @@ impl NodeInfo {
         let pos = tr.position.resolve(ctx);
         let scale = tr.scale.resolve(ctx);
         let anchor = tr.anchor.resolve(ctx);
-        let rot = tr.rotation.resolve(ctx);
         NodeInfo {
             name: node.name.clone(),
             id: node.id.0,
             pos: (pos.x, pos.y, pos.z),
-            rot: rot.z,
-            rot_xy: (rot.x, rot.y),
+            rot: tr.rotation.resolve(ctx),
+            rot_xy: (tr.rotation_x.resolve(ctx), tr.rotation_y.resolve(ctx)),
             scale: (scale.x, scale.y, scale.z),
             anchor: (anchor.x, anchor.y, anchor.z),
             opacity: tr.opacity.resolve(ctx),
@@ -513,6 +514,8 @@ impl NodeInfo {
             anchor_anim: tr.anchor.is_animated(),
             pos_anim: tr.position.is_animated(),
             rot_anim: tr.rotation.is_animated(),
+            rot_x_anim: tr.rotation_x.is_animated(),
+            rot_y_anim: tr.rotation_y.is_animated(),
             scale_anim: tr.scale.is_animated(),
             opacity_anim: tr.opacity.is_animated(),
             // Whether each optional property is animated. `prop_of` already
@@ -1047,23 +1050,27 @@ pub(crate) fn properties_ui(
         // purpose: Z is the rotation a 2D layer has, so it keeps the position
         // and the muscle memory the single field used to own, and the depth
         // pair reads as the addition it is.
-        ui.label("Rotation");
-        ui.horizontal(|ui| {
-            let (mut z, mut rx, mut ry) = (n.rot, n.rot_xy.0, n.rot_xy.1);
-            if ui.add(crate::calc::num(&mut z).speed(0.5).prefix("z ").suffix("°")).changed() {
-                edits.rot = Some(z);
+        // One row per axis, each with its own stopwatch: they are separate
+        // tracks, so X can ease in while Z keeps spinning linearly.
+        let rows = [
+            ("Rotation", "z ", n.rot, n.rot_anim, PropKind::Rotation),
+            ("X Rotation", "x ", n.rot_xy.0, n.rot_x_anim, PropKind::RotationX),
+            ("Y Rotation", "y ", n.rot_xy.1, n.rot_y_anim, PropKind::RotationY),
+        ];
+        for (label, prefix, mut v, anim, kind) in rows {
+            ui.label(label);
+            if ui.add(crate::calc::num(&mut v).speed(0.5).prefix(prefix).suffix("°")).changed() {
+                match kind {
+                    PropKind::RotationX => edits.rot_x = Some(v),
+                    PropKind::RotationY => edits.rot_y = Some(v),
+                    _ => edits.rot = Some(v),
+                }
             }
-            if ui.add(crate::calc::num(&mut rx).speed(0.5).prefix("x ").suffix("°")).changed() {
-                edits.rot_x = Some(rx);
+            if key_button(ui, anim) {
+                edits.key.insert(kind);
             }
-            if ui.add(crate::calc::num(&mut ry).speed(0.5).prefix("y ").suffix("°")).changed() {
-                edits.rot_y = Some(ry);
-            }
-        });
-        if key_button(ui, n.rot_anim) {
-            edits.key.insert(PropKind::Rotation);
+            ui.end_row();
         }
-        ui.end_row();
 
         ui.label("Scale");
         ui.horizontal(|ui| {
@@ -1782,6 +1789,8 @@ pub(crate) enum PropKind {
     Anchor,
     Position,
     Rotation,
+    RotationX,
+    RotationY,
     Scale,
     Opacity,
     Fill,
@@ -1830,10 +1839,12 @@ pub(crate) enum PropKind {
 impl PropKind {
     /// The **fixed** animatable properties, in row order. Path points are dynamic
     /// and are appended per node by [`prop_kinds_of`], never listed here.
-    pub(crate) const ALL: [PropKind; 22] = [
+    pub(crate) const ALL: [PropKind; 24] = [
         PropKind::Anchor,
         PropKind::Position,
         PropKind::Rotation,
+        PropKind::RotationX,
+        PropKind::RotationY,
         PropKind::Scale,
         PropKind::Opacity,
         PropKind::Fill,
@@ -1883,6 +1894,8 @@ impl PropKind {
             PropKind::Anchor => "Anchor",
             PropKind::Position => "Position",
             PropKind::Rotation => "Rotation",
+            PropKind::RotationX => "X Rotation",
+            PropKind::RotationY => "Y Rotation",
             PropKind::Scale => "Scale",
             PropKind::Opacity => "Opacity",
             PropKind::Fill => "Fill",
@@ -1919,6 +1932,8 @@ impl PropKind {
             PropPath::Anchor => PropKind::Anchor,
             PropPath::Position => PropKind::Position,
             PropPath::Rotation => PropKind::Rotation,
+            PropPath::RotationX => PropKind::RotationX,
+            PropPath::RotationY => PropKind::RotationY,
             PropPath::Scale => PropKind::Scale,
             PropPath::Opacity => PropKind::Opacity,
             PropPath::Fill => PropKind::Fill,
@@ -2204,7 +2219,9 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
     Some(match kind {
         PropKind::Anchor => PropRef::Vec3(&tr.anchor),
         PropKind::Position => PropRef::Vec3(&tr.position),
-        PropKind::Rotation => PropRef::Vec3(&tr.rotation),
+        PropKind::Rotation => PropRef::Num(&tr.rotation),
+        PropKind::RotationX => PropRef::Num(&tr.rotation_x),
+        PropKind::RotationY => PropRef::Num(&tr.rotation_y),
         PropKind::Scale => PropRef::Vec3(&tr.scale),
         PropKind::Opacity => PropRef::Num(&tr.opacity),
         PropKind::Fill => PropRef::Color(node.fill.as_ref()?),
@@ -2314,7 +2331,9 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
     Some(match kind {
         PropKind::Anchor => PropRefMut::Vec3(&mut tr.anchor),
         PropKind::Position => PropRefMut::Vec3(&mut tr.position),
-        PropKind::Rotation => PropRefMut::Vec3(&mut tr.rotation),
+        PropKind::Rotation => PropRefMut::Num(&mut tr.rotation),
+        PropKind::RotationX => PropRefMut::Num(&mut tr.rotation_x),
+        PropKind::RotationY => PropRefMut::Num(&mut tr.rotation_y),
         PropKind::Scale => PropRefMut::Vec3(&mut tr.scale),
         PropKind::Opacity => PropRefMut::Num(&mut tr.opacity),
         PropKind::Fill => PropRefMut::Color(node.fill.as_mut()?),

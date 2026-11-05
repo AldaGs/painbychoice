@@ -25,6 +25,8 @@ pub(crate) fn prop_path_label(p: PropPath) -> String {
     let fixed = match p {
         PropPath::Position => "Position",
         PropPath::Rotation => "Rotation",
+        PropPath::RotationX => "X Rotation",
+        PropPath::RotationY => "Y Rotation",
         PropPath::Scale => "Scale",
         PropPath::Opacity => "Opacity",
         PropPath::Anchor => "Anchor",
