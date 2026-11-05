@@ -1549,7 +1549,17 @@ pub fn eval_script_with(src: &str, frame: f64, value: ExprValue) -> Result<ExprV
     eval_script_inner(src, &mut EvalCtx::at(frame), Some(value))
 }
 
+/// [`eval_script_ctx`] with extra numeric constants in scope — what a text
+/// expression selector uses for `textIndex`, `textTotal`, `selectorValue`.
+pub fn eval_script_vars(src: &str, ctx: &mut EvalCtx<'_>, vars: &[(&str, f64)]) -> Result<ExprValue, String> {
+    eval_script_full(src, ctx, None, vars)
+}
+
 fn eval_script_inner(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>) -> Result<ExprValue, String> {
+    eval_script_full(src, ctx, value, &[])
+}
+
+fn eval_script_full(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>, vars: &[(&str, f64)]) -> Result<ExprValue, String> {
     let frame = ctx.frame;
     // Read the layer clock before parking the context — the same four readings
     // `Expr::Time` exposes, under the same names, so a script and a graph node
@@ -1567,6 +1577,9 @@ fn eval_script_inner(src: &str, ctx: &mut EvalCtx<'_>, value: Option<ExprValue>)
         scope.push_constant("t01", t01);
         if let Some(v) = value {
             scope.push("value", expr_value_to_dynamic(v));
+        }
+        for (name, v) in vars {
+            scope.push_constant(name.to_string(), *v);
         }
         let out: rhai::Dynamic =
             engine.eval_with_scope(&mut scope, src).map_err(|e| e.to_string())?;

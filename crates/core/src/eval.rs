@@ -12,7 +12,7 @@ use crate::asset::ImagePaint;
 use crate::composite::{BlendMode, ComposeMode};
 use crate::effect::ResolvedEffect;
 use crate::expr::EvalCtx;
-use crate::node::{CompId, Document, Node, NodeId, Project, Shape as NodeShape, TextSelector, TextUnit};
+use crate::node::{CompId, Document, Node, NodeId, Project, Shape as NodeShape, TextUnit};
 use crate::value::Color;
 
 /// One flat, ready-to-draw item. `source` traces it back to the node that
@@ -1023,13 +1023,10 @@ fn animated_text(
     for (gi, g) in glyphs.iter().enumerate() {
         for (ai, a) in node.text_animators.iter().enumerate() {
             let Some(i) = unit_of(g, a.based_on) else { continue };
-            let s = match a.selector {
-                TextSelector::Karaoke { cumulative } => match active {
-                    Some(w) if i == w || (cumulative && i < w) => 1.0,
-                    _ => 0.0,
-                },
-                _ => a.selector.amount(i, count(a.based_on), ctx),
-            };
+            let s = a.selection(i, count(a.based_on), ctx, |cumulative| match active {
+                Some(w) if i == w || (cumulative && i < w) => 1.0,
+                _ => 0.0,
+            });
             sel[gi][ai] = s;
             extra[gi] += props[ai].tracking * s * size / 1000.0;
         }

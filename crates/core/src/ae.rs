@@ -20,7 +20,7 @@ use crate::composite::{BlendMode, Mask, MatteMode};
 use crate::effect::{Effect, EffectKind};
 use crate::path::{Anchor, VectorPath};
 use crate::pathfinder::BoolOp;
-use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, RangeShape, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform, Trim};
+use crate::node::{Comp, CompId, LayerTiming, LineCap, LineJoin, Node, NodeId, Project, RangeShape, SelectorMode, StrokeStyle, TextAnimator, TextSelector, TextUnit, Shape, Stroke, Transform, Trim};
 use crate::text::TextAlign;
 use crate::value::{Animatable, Color, Handle, Interp, Keyframe, Track, Value};
 use crate::vec3::Vec3;
@@ -645,10 +645,17 @@ impl Importer<'_> {
                 m => self.report.drop(format!("text animator property: {m}")),
             }
         }
-        let Some(sel) = selectors.first() else { return None };
-        if selectors.len() > 1 {
-            self.report.drop("text animator: additional selector");
-        }
+        let mut parsed = selectors.iter().filter_map(|sel| self.text_selector(sel, l));
+        let (based_on, selector, mode) = parsed.next()?;
+        anim.more_selectors = parsed.map(|(_, selector, mode)| crate::node::ExtraSelector { mode, selector }).collect();
+        anim.mode = mode;
+        anim.based_on = based_on;
+        anim.selector = selector;
+        Some(anim)
+    }
+
+    /// One AE text selector: its Based On unit, the selector, and its mode.
+    fn text_selector(&mut self, sel: &J, l: &J) -> Option<(TextUnit, TextSelector, SelectorMode)> {
         let sp = sel["properties"].as_array().cloned().unwrap_or_default();
         let unit = |code: Option<f64>| match code.unwrap_or(1.0) as i64 {
             2 => TextUnit::CharsExcludingSpaces,
@@ -658,6 +665,17 @@ impl Importer<'_> {
         };
         let code = |props: &[J], m: &str| prop(props, m).and_then(|p| nums(&p["value"]).first().copied());
         let pct = |me: &mut Self, m: &str, or: f64| me.value(prop(&sp, m), or, |v| v.first().copied(), |a, b| (a - b).abs());
+        let mode = match code(&sp, "ADBE Text Selector Mode")
+            .or_else(|| prop(&sp, "ADBE Text Range Advanced").and_then(|g| g["properties"].as_array()).and_then(|adv| code(adv, "ADBE Text Selector Mode")))
+            .unwrap_or(1.0) as i64
+        {
+            2 => SelectorMode::Subtract,
+            3 => SelectorMode::Intersect,
+            4 => SelectorMode::Min,
+            5 => SelectorMode::Max,
+            6 => SelectorMode::Difference,
+            _ => SelectorMode::Add,
+        };
         let (based_on, selector) = match sel["matchName"].as_str().unwrap_or("") {
             "ADBE Text Selector" => {
                 let adv = prop(&sp, "ADBE Text Range Advanced").and_then(|g| g["properties"].as_array()).cloned().unwrap_or_default();
@@ -689,7 +707,22 @@ impl Importer<'_> {
                 let amount = prop(&sp, "ADBE Text Expressible Amount")?;
                 let expr = amount["expression"].as_str().unwrap_or("");
                 if !expr.contains("Type Array") {
-                    return None;
+                    // A plain arithmetic AE expression is valid Rhai as is
+                    // (`selectorValue * textIndex / textTotal`); keep it when
+                    // it runs, report it when it doesn't.
+                    let script = expr.trim().trim_end_matches(';').to_string();
+                    let vars = [("textIndex", 1.0), ("textTotal", 1.0), ("selectorValue", 100.0)];
+                    let runs = matches!(
+                        crate::expr::eval_script_vars(&script, &mut crate::expr::EvalCtx::at(0.0), &vars),
+                        Ok(crate::expr::ExprValue::Num(_))
+                    );
+                    if !runs {
+                        self.report.drop("text expression selector: script");
+                        return None;
+                    }
+                    self.translated.insert(expr.to_string());
+                    let sel = TextSelector::Expression { script, amount: Value::constant(100.0) };
+                    return Some((unit(code(&sp, "ADBE Text Range Type2")), sel, mode));
                 }
                 self.translated.insert(expr.to_string());
                 // The selector's name picks the effect: "<Name> - Selector 1".
@@ -733,9 +766,7 @@ impl Importer<'_> {
                 return None;
             }
         };
-        anim.based_on = based_on;
-        anim.selector = selector;
-        Some(anim)
+        Some((based_on, selector, mode))
     }
 
     /// The PBC effect for an AE one, where PBC has it. Parameters are read by

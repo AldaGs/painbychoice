@@ -6159,10 +6159,10 @@ fn a_text_animator_preset_keys_its_reveal_and_exposes_its_values() {
     // Every value it holds is a dopesheet row.
     let kinds = prop_kinds_of(&node);
     for p in [TextAnimParam::RangeStart, TextAnimParam::Position, TextAnimParam::Opacity] {
-        assert!(kinds.contains(&PropKind::TextAnim { index: 0, param: p }), "{p:?}");
+        assert!(kinds.contains(&PropKind::TextAnim { index: 0, sel: 0, param: p }), "{p:?}");
     }
-    assert!(is_anim(&node, PropKind::TextAnim { index: 0, param: TextAnimParam::RangeStart }));
-    assert!(!kinds.contains(&PropKind::TextAnim { index: 0, param: TextAnimParam::Rotation }));
+    assert!(is_anim(&node, PropKind::TextAnim { index: 0, sel: 0, param: TextAnimParam::RangeStart }));
+    assert!(!kinds.contains(&PropKind::TextAnim { index: 0, sel: 0, param: TextAnimParam::Rotation }));
 }
 
 #[test]
@@ -6172,16 +6172,16 @@ fn text_animator_properties_add_edit_and_remove() {
     let rot = TextAnimParam::Rotation;
     assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::AddProp(0, rot)));
     assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::AddProp(0, rot)), "already there");
-    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, param: rot, value: AnimVal::Num(90.0) }));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, sel: 0, param: rot, value: AnimVal::Num(90.0) }));
     let mut ctx = EvalCtx::at(0.0);
     assert_eq!(node.text_animators[0].rotation.as_ref().unwrap().resolve(&mut ctx), 90.0);
     // A wrong-typed value no-ops instead of writing.
-    assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, param: rot, value: AnimVal::Vec2(Vec2::ZERO) }));
+    assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, sel: 0, param: rot, value: AnimVal::Vec2(Vec2::ZERO) }));
     // Switching selector drops the range controls and gains the wiggly ones.
-    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::SetSelector(0, SelectorKind::Wiggly)));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 0, op: SelOp::Kind(SelectorKind::Wiggly) }));
     let kinds = prop_kinds_of(&node);
-    assert!(kinds.contains(&PropKind::TextAnim { index: 0, param: TextAnimParam::WiggleRate }));
-    assert!(!kinds.contains(&PropKind::TextAnim { index: 0, param: TextAnimParam::RangeStart }));
+    assert!(kinds.contains(&PropKind::TextAnim { index: 0, sel: 0, param: TextAnimParam::WiggleRate }));
+    assert!(!kinds.contains(&PropKind::TextAnim { index: 0, sel: 0, param: TextAnimParam::RangeStart }));
     assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::RemoveProp(0, rot)));
     assert!(node.text_animators[0].rotation.is_none());
     // Stale indices no-op.
@@ -6202,4 +6202,26 @@ fn every_text_animator_preset_draws() {
         let scene = motion_core::evaluate(&doc, f);
         assert!(scene.items.iter().all(|i| i.transform.as_coeffs().iter().all(|c| c.is_finite())));
     }
+}
+
+#[test]
+fn stacked_selectors_get_their_own_rows_and_fold() {
+    let mut node = text_layer();
+    apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Add(TextAnimPreset::FadeInChars));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::AddSelector(0)));
+    let second = PropKind::TextAnim { index: 0, sel: 1, param: TextAnimParam::RangeEnd };
+    assert!(prop_kinds_of(&node).contains(&second));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Set { index: 0, sel: 1, param: TextAnimParam::RangeEnd, value: AnimVal::Num(40.0) }));
+    let Some(PropRef::Num(end)) = prop_of(&node, second) else { panic!() };
+    assert_eq!(end.resolve(&mut EvalCtx::at(0.0)), 40.0);
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 1, op: SelOp::Mode(motion_core::node::SelectorMode::Intersect) }));
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 1, op: SelOp::Kind(SelectorKind::Expression) }));
+    // Removing the first selector promotes the second.
+    assert!(apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 0, op: SelOp::Remove }));
+    let a = &node.text_animators[0];
+    assert!(a.more_selectors.is_empty());
+    assert!(matches!(a.selector, motion_core::node::TextSelector::Expression { .. }));
+    assert_eq!(a.mode, motion_core::node::SelectorMode::Intersect);
+    // The last selector can't go.
+    assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 0, op: SelOp::Remove }));
 }

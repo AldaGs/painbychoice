@@ -499,6 +499,13 @@ pub struct TextAnimator {
     pub name: String,
     pub based_on: TextUnit,
     pub selector: TextSelector,
+    /// How the first selector folds into the (empty) selection: AE's Mode.
+    /// Subtract on the first selector selects the inverse.
+    #[serde(default, skip_serializing_if = "SelectorMode::is_default")]
+    pub mode: SelectorMode,
+    /// Further selectors, folded in order after the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_selectors: Vec<ExtraSelector>,
     /// Which units transform as one, around a shared anchor.
     #[serde(default, skip_serializing_if = "AnchorGrouping::is_default")]
     pub grouping: AnchorGrouping,
@@ -542,6 +549,8 @@ impl TextAnimator {
             name: String::new(),
             based_on,
             selector: TextSelector::range(),
+            mode: SelectorMode::Add,
+            more_selectors: Vec::new(),
             grouping: AnchorGrouping::default(),
             position: None,
             anchor: None,
@@ -568,6 +577,104 @@ impl TextAnimator {
         if let Some(v) = &mut self.stroke_width { f(v) }
         if let Some(v) = &mut self.tracking { f(v) }
         self.selector.each_value(f);
+        for s in &mut self.more_selectors {
+            s.selector.each_value(f);
+        }
+    }
+
+    /// Every selector with its mode, the first one first.
+    pub fn selectors(&self) -> impl Iterator<Item = (SelectorMode, &TextSelector)> {
+        std::iter::once((self.mode, &self.selector)).chain(self.more_selectors.iter().map(|s| (s.mode, &s.selector)))
+    }
+
+    /// Selector `k` (0 is the first).
+    pub fn selector_at(&self, k: usize) -> Option<&TextSelector> {
+        match k {
+            0 => Some(&self.selector),
+            k => self.more_selectors.get(k - 1).map(|s| &s.selector),
+        }
+    }
+
+    pub fn selector_at_mut(&mut self, k: usize) -> Option<&mut TextSelector> {
+        match k {
+            0 => Some(&mut self.selector),
+            k => self.more_selectors.get_mut(k - 1).map(|s| &mut s.selector),
+        }
+    }
+
+    /// Selector `k`'s mode.
+    pub fn mode_at_mut(&mut self, k: usize) -> Option<&mut SelectorMode> {
+        match k {
+            0 => Some(&mut self.mode),
+            k => self.more_selectors.get_mut(k - 1).map(|s| &mut s.mode),
+        }
+    }
+
+    /// How much of unit `i` of `n` the whole selector stack selects, -1..1.
+    /// `karaoke` answers a Karaoke selector (it needs the subtitle's word).
+    pub fn selection(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx, karaoke: impl Fn(bool) -> f64) -> f64 {
+        let mut acc = 0.0;
+        for (k, (mode, sel)) in self.selectors().enumerate() {
+            let s = match sel {
+                TextSelector::Karaoke { cumulative } => karaoke(*cumulative),
+                _ => sel.select(i, n, ctx, acc),
+            };
+            acc = if k == 0 && mode == SelectorMode::Subtract { 1.0 - s } else { mode.combine(acc, s) };
+            acc = acc.clamp(-1.0, 1.0);
+        }
+        acc
+    }
+}
+
+/// One selector after an animator's first, with its fold mode.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExtraSelector {
+    #[serde(default)]
+    pub mode: SelectorMode,
+    pub selector: TextSelector,
+}
+
+/// How a selector folds into the selection of the selectors above it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectorMode {
+    #[default]
+    Add,
+    Subtract,
+    Intersect,
+    Min,
+    Max,
+    Difference,
+}
+
+impl SelectorMode {
+    pub const ALL: [SelectorMode; 6] =
+        [SelectorMode::Add, SelectorMode::Subtract, SelectorMode::Intersect, SelectorMode::Min, SelectorMode::Max, SelectorMode::Difference];
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SelectorMode::Add => "Add",
+            SelectorMode::Subtract => "Subtract",
+            SelectorMode::Intersect => "Intersect",
+            SelectorMode::Min => "Min",
+            SelectorMode::Max => "Max",
+            SelectorMode::Difference => "Difference",
+        }
+    }
+
+    /// Fold selection `s` into the running `acc`.
+    pub fn combine(self, acc: f64, s: f64) -> f64 {
+        match self {
+            SelectorMode::Add => acc + s,
+            SelectorMode::Subtract => acc - s,
+            SelectorMode::Intersect => acc * s,
+            SelectorMode::Min => acc.min(s),
+            SelectorMode::Max => acc.max(s),
+            SelectorMode::Difference => (acc - s).abs(),
+        }
     }
 }
 
@@ -694,6 +801,16 @@ pub enum TextSelector {
         #[serde(default)]
         cumulative: bool,
     },
+    /// AE's Expression selector: `script` runs once per unit with
+    /// `textIndex` (1-based), `textTotal` and `selectorValue` (the selection
+    /// of the selectors above, 0..100) in scope, and returns 0..100.
+    /// `amount` (percent) scales the result. A failing script selects
+    /// nothing and warns.
+    Expression {
+        script: String,
+        #[serde(default = "hundred_value")]
+        amount: Value<f64>,
+    },
 }
 
 impl TextSelector {
@@ -738,13 +855,35 @@ impl TextSelector {
                 f(wiggles);
             }
             TextSelector::Karaoke { .. } => {}
+            TextSelector::Expression { amount, .. } => f(amount),
         }
     }
 
     /// How much of unit `i` of `n` is selected at `ctx`'s frame: 0..1, or
     /// down to -1 for a negative amount (which pushes the other way).
     pub fn amount(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx) -> f64 {
+        self.select(i, n, ctx, 0.0)
+    }
+
+    /// [`Self::amount`], with `prev` — the selection of the selectors above
+    /// this one, which an Expression selector reads as `selectorValue`.
+    pub fn select(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx, prev: f64) -> f64 {
         match self {
+            TextSelector::Expression { script, amount } => {
+                let vars = [("textIndex", (i + 1) as f64), ("textTotal", n as f64), ("selectorValue", prev * 100.0)];
+                let v = match crate::expr::eval_script_vars(script, ctx, &vars) {
+                    Ok(crate::expr::ExprValue::Num(v)) => v,
+                    Ok(_) => {
+                        ctx.warn_here("text expression selector must return a number (0..100)".to_string());
+                        0.0
+                    }
+                    Err(e) => {
+                        ctx.warn_here(format!("text expression selector: {e}"));
+                        0.0
+                    }
+                };
+                (v / 100.0 * amount.resolve(ctx) / 100.0).clamp(-1.0, 1.0)
+            }
             TextSelector::Range { start, end, offset, amount, shape, ease_high, ease_low, randomize, seed } => {
                 let i = if *randomize { shuffled(i, n, *seed) } else { i };
                 let nf = n.max(1) as f64;
@@ -1501,10 +1640,13 @@ impl Node {
         for a in &mut self.text_animators {
             a.each_value(&mut |v| v.retime(ratio));
             // A stagger's delays are frame counts on the same grid.
-            if let TextSelector::Stagger { delays, step, shift, .. } = &mut a.selector {
-                delays.iter_mut().for_each(|d| *d *= ratio);
-                *step *= ratio;
-                *shift *= ratio;
+            let extra = a.more_selectors.iter_mut().map(|s| &mut s.selector);
+            for sel in std::iter::once(&mut a.selector).chain(extra) {
+                if let TextSelector::Stagger { delays, step, shift, .. } = sel {
+                    delays.iter_mut().for_each(|d| *d *= ratio);
+                    *step *= ratio;
+                    *shift *= ratio;
+                }
             }
         }
         for child in &mut self.children {
@@ -2414,6 +2556,44 @@ mod tests {
         assert_eq!(ease(0.0, 100.0, 100.0), 0.0);
         assert_eq!(ease(1.0, 100.0, 100.0), 1.0);
         assert!(ease(0.25, 0.0, 100.0) < 0.25, "ease low slows the start");
+    }
+
+    #[test]
+    fn selector_modes_fold_the_stack() {
+        use crate::expr::EvalCtx;
+        let mut ctx = EvalCtx::at(0.0);
+        // First half of 4 units, then the middle half folded in.
+        let mut a = TextAnimator::new(TextUnit::Chars);
+        a.selector = rng(0.0, 50.0, 100.0, RangeShape::Square);
+        let sel = |a: &TextAnimator, ctx: &mut EvalCtx| -> Vec<f64> { (0..4).map(|i| a.selection(i, 4, ctx, |_| 0.0)).collect() };
+        a.more_selectors.push(ExtraSelector { mode: SelectorMode::Intersect, selector: rng(25.0, 75.0, 100.0, RangeShape::Square) });
+        assert_eq!(sel(&a, &mut ctx), vec![0.0, 1.0, 0.0, 0.0]);
+        a.more_selectors[0].mode = SelectorMode::Add;
+        assert_eq!(sel(&a, &mut ctx), vec![1.0, 1.0, 1.0, 0.0], "clamped to 1");
+        a.more_selectors[0].mode = SelectorMode::Subtract;
+        assert_eq!(sel(&a, &mut ctx), vec![1.0, 0.0, -1.0, 0.0]);
+        a.more_selectors[0].mode = SelectorMode::Difference;
+        assert_eq!(sel(&a, &mut ctx), vec![1.0, 0.0, 1.0, 0.0]);
+        // A lone Subtract selects the inverse, as in AE.
+        a.more_selectors.clear();
+        a.mode = SelectorMode::Subtract;
+        assert_eq!(sel(&a, &mut ctx), vec![0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn an_expression_selector_sees_its_unit() {
+        use crate::expr::EvalCtx;
+        let mut ctx = EvalCtx::at(0.0);
+        let mut a = TextAnimator::new(TextUnit::Chars);
+        a.more_selectors.push(ExtraSelector {
+            mode: SelectorMode::Intersect,
+            selector: TextSelector::Expression { script: "selectorValue * textIndex / textTotal".into(), amount: Value::constant(100.0) },
+        });
+        let got: Vec<f64> = (0..4).map(|i| a.selection(i, 4, &mut ctx, |_| 0.0)).collect();
+        assert_eq!(got, vec![0.25, 0.5, 0.75, 1.0]);
+        // A broken script selects nothing rather than failing the frame.
+        let bad = TextSelector::Expression { script: "nope(".into(), amount: Value::constant(100.0) };
+        assert_eq!(bad.amount(0, 4, &mut ctx), 0.0);
     }
 
     #[test]

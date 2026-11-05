@@ -1817,7 +1817,8 @@ pub(crate) enum PropKind {
     Effect { index: usize, param: EffectParam },
     /// One value of one text animator — a selector control or a property.
     /// Indexed like [`PropKind::Effect`], discovered by [`prop_kinds_of`].
-    TextAnim { index: usize, param: TextAnimParam },
+    /// `sel` is which selector a selector control belongs to; 0 for properties.
+    TextAnim { index: usize, sel: usize, param: TextAnimParam },
     /// One control point of a vector path anchor. **Indexed**, so unlike every
     /// variant above it is not a fixed member of `ALL` — a path has as many as it
     /// has anchors, discovered per node by [`prop_kinds_of`]. It sorts last (after
@@ -1866,8 +1867,11 @@ impl PropKind {
         if let PropKind::Effect { index, param } = self {
             return Cow::Owned(format!("FX{} {}", index + 1, param.label()));
         }
-        if let PropKind::TextAnim { index, param } = self {
-            return Cow::Owned(format!("Anim{} {}", index + 1, param.label()));
+        if let PropKind::TextAnim { index, sel, param } = self {
+            return Cow::Owned(match sel {
+                0 => format!("Anim{} {}", index + 1, param.label()),
+                s => format!("Anim{} S{} {}", index + 1, s + 1, param.label()),
+            });
         }
         Cow::Borrowed(self.fixed_label())
     }
@@ -2255,7 +2259,7 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
             MShape::Text { weight, .. } => PropRef::Num(weight),
             _ => return None,
         },
-        PropKind::TextAnim { index, param } => anim_value(node.text_animators.get(index)?, param)?,
+        PropKind::TextAnim { index, sel, param } => anim_value(node.text_animators.get(index)?, sel, param)?,
         PropKind::TextContent => match node.shape.as_ref()? {
             MShape::Text { content, .. } => PropRef::Str(content),
             _ => return None,
@@ -2289,8 +2293,8 @@ pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
         }
     }
     for (index, a) in node.text_animators.iter().enumerate() {
-        for param in anim_params(a) {
-            kinds.push(PropKind::TextAnim { index, param });
+        for (sel, param) in anim_params(a) {
+            kinds.push(PropKind::TextAnim { index, sel, param });
         }
     }
     if let Some(MShape::Vector { path }) = &node.shape {
@@ -2355,7 +2359,7 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
             MShape::Text { weight, .. } => PropRefMut::Num(weight),
             _ => return None,
         },
-        PropKind::TextAnim { index, param } => anim_value_mut(node.text_animators.get_mut(index)?, param)?,
+        PropKind::TextAnim { index, sel, param } => anim_value_mut(node.text_animators.get_mut(index)?, sel, param)?,
         PropKind::Effect { index, param } => {
             PropRefMut::Num(effect_value_mut(node.effects.get_mut(index)?, param)?)
         }

@@ -15,7 +15,7 @@
 //! the panel UI.
 
 use crate::*;
-use motion_core::node::{AnchorGrouping, RangeShape, TextAnimator, TextSelector, TextUnit};
+use motion_core::node::{AnchorGrouping, ExtraSelector, RangeShape, SelectorMode, TextAnimator, TextSelector, TextUnit};
 
 /// One animatable value inside one text animator. Ordered because it rides in
 /// [`PropKind::TextAnim`], the key of a `BTreeSet`: declaration order is
@@ -132,69 +132,93 @@ impl TextAnimParam {
     }
 }
 
-/// Borrow one animatable value of an animator. `None` when it doesn't have it:
-/// a property not added, or a control of another selector kind.
-pub(crate) fn anim_value(a: &TextAnimator, p: TextAnimParam) -> Option<PropRef<'_>> {
+/// Borrow one animatable value of an animator. Selector controls are read
+/// from selector `sel` (0 is the first); properties ignore `sel`. `None` when
+/// it doesn't have it: a property not added, or a control of another
+/// selector kind.
+pub(crate) fn anim_value(a: &TextAnimator, sel: usize, p: TextAnimParam) -> Option<PropRef<'_>> {
     use TextAnimParam as P;
-    Some(match (p, &a.selector) {
-        (P::RangeStart, TextSelector::Range { start, .. }) => PropRef::Num(start),
-        (P::RangeEnd, TextSelector::Range { end, .. }) => PropRef::Num(end),
-        (P::RangeOffset, TextSelector::Range { offset, .. }) => PropRef::Num(offset),
-        (P::RangeAmount, TextSelector::Range { amount, .. }) => PropRef::Num(amount),
-        (P::WiggleMax, TextSelector::Wiggly { max, .. }) => PropRef::Num(max),
-        (P::WiggleMin, TextSelector::Wiggly { min, .. }) => PropRef::Num(min),
-        (P::WiggleRate, TextSelector::Wiggly { wiggles, .. }) => PropRef::Num(wiggles),
-        (P::StaggerAmount, TextSelector::Stagger { amount, .. }) => PropRef::Num(amount),
-        (P::Position, _) => PropRef::Vec2(a.position.as_ref()?),
-        (P::Anchor, _) => PropRef::Vec2(a.anchor.as_ref()?),
-        (P::Scale, _) => PropRef::Vec2(a.scale.as_ref()?),
-        (P::Rotation, _) => PropRef::Num(a.rotation.as_ref()?),
-        (P::Skew, _) => PropRef::Num(a.skew.as_ref()?),
-        (P::Opacity, _) => PropRef::Num(a.opacity.as_ref()?),
-        (P::Tracking, _) => PropRef::Num(a.tracking.as_ref()?),
-        (P::Fill, _) => PropRef::Color(a.fill.as_ref()?),
-        (P::Stroke, _) => PropRef::Color(a.stroke.as_ref()?),
-        (P::StrokeWidth, _) => PropRef::Num(a.stroke_width.as_ref()?),
+    if !p.is_property() {
+        return Some(match (p, a.selector_at(sel)?) {
+            (P::RangeStart, TextSelector::Range { start, .. }) => PropRef::Num(start),
+            (P::RangeEnd, TextSelector::Range { end, .. }) => PropRef::Num(end),
+            (P::RangeOffset, TextSelector::Range { offset, .. }) => PropRef::Num(offset),
+            (P::RangeAmount, TextSelector::Range { amount, .. }) => PropRef::Num(amount),
+            (P::RangeAmount, TextSelector::Expression { amount, .. }) => PropRef::Num(amount),
+            (P::WiggleMax, TextSelector::Wiggly { max, .. }) => PropRef::Num(max),
+            (P::WiggleMin, TextSelector::Wiggly { min, .. }) => PropRef::Num(min),
+            (P::WiggleRate, TextSelector::Wiggly { wiggles, .. }) => PropRef::Num(wiggles),
+            (P::StaggerAmount, TextSelector::Stagger { amount, .. }) => PropRef::Num(amount),
+            _ => return None,
+        });
+    }
+    Some(match p {
+        P::Position => PropRef::Vec2(a.position.as_ref()?),
+        P::Anchor => PropRef::Vec2(a.anchor.as_ref()?),
+        P::Scale => PropRef::Vec2(a.scale.as_ref()?),
+        P::Rotation => PropRef::Num(a.rotation.as_ref()?),
+        P::Skew => PropRef::Num(a.skew.as_ref()?),
+        P::Opacity => PropRef::Num(a.opacity.as_ref()?),
+        P::Tracking => PropRef::Num(a.tracking.as_ref()?),
+        P::Fill => PropRef::Color(a.fill.as_ref()?),
+        P::Stroke => PropRef::Color(a.stroke.as_ref()?),
+        P::StrokeWidth => PropRef::Num(a.stroke_width.as_ref()?),
         _ => return None,
     })
 }
 
 /// Mutable twin of [`anim_value`]; the two must agree.
-pub(crate) fn anim_value_mut(a: &mut TextAnimator, p: TextAnimParam) -> Option<PropRefMut<'_>> {
+pub(crate) fn anim_value_mut(a: &mut TextAnimator, sel: usize, p: TextAnimParam) -> Option<PropRefMut<'_>> {
     use TextAnimParam as P;
-    Some(match (p, &mut a.selector) {
-        (P::RangeStart, TextSelector::Range { start, .. }) => PropRefMut::Num(start),
-        (P::RangeEnd, TextSelector::Range { end, .. }) => PropRefMut::Num(end),
-        (P::RangeOffset, TextSelector::Range { offset, .. }) => PropRefMut::Num(offset),
-        (P::RangeAmount, TextSelector::Range { amount, .. }) => PropRefMut::Num(amount),
-        (P::WiggleMax, TextSelector::Wiggly { max, .. }) => PropRefMut::Num(max),
-        (P::WiggleMin, TextSelector::Wiggly { min, .. }) => PropRefMut::Num(min),
-        (P::WiggleRate, TextSelector::Wiggly { wiggles, .. }) => PropRefMut::Num(wiggles),
-        (P::StaggerAmount, TextSelector::Stagger { amount, .. }) => PropRefMut::Num(amount),
-        (P::Position, _) => PropRefMut::Vec2(a.position.as_mut()?),
-        (P::Anchor, _) => PropRefMut::Vec2(a.anchor.as_mut()?),
-        (P::Scale, _) => PropRefMut::Vec2(a.scale.as_mut()?),
-        (P::Rotation, _) => PropRefMut::Num(a.rotation.as_mut()?),
-        (P::Skew, _) => PropRefMut::Num(a.skew.as_mut()?),
-        (P::Opacity, _) => PropRefMut::Num(a.opacity.as_mut()?),
-        (P::Tracking, _) => PropRefMut::Num(a.tracking.as_mut()?),
-        (P::Fill, _) => PropRefMut::Color(a.fill.as_mut()?),
-        (P::Stroke, _) => PropRefMut::Color(a.stroke.as_mut()?),
-        (P::StrokeWidth, _) => PropRefMut::Num(a.stroke_width.as_mut()?),
+    if !p.is_property() {
+        return Some(match (p, a.selector_at_mut(sel)?) {
+            (P::RangeStart, TextSelector::Range { start, .. }) => PropRefMut::Num(start),
+            (P::RangeEnd, TextSelector::Range { end, .. }) => PropRefMut::Num(end),
+            (P::RangeOffset, TextSelector::Range { offset, .. }) => PropRefMut::Num(offset),
+            (P::RangeAmount, TextSelector::Range { amount, .. }) => PropRefMut::Num(amount),
+            (P::RangeAmount, TextSelector::Expression { amount, .. }) => PropRefMut::Num(amount),
+            (P::WiggleMax, TextSelector::Wiggly { max, .. }) => PropRefMut::Num(max),
+            (P::WiggleMin, TextSelector::Wiggly { min, .. }) => PropRefMut::Num(min),
+            (P::WiggleRate, TextSelector::Wiggly { wiggles, .. }) => PropRefMut::Num(wiggles),
+            (P::StaggerAmount, TextSelector::Stagger { amount, .. }) => PropRefMut::Num(amount),
+            _ => return None,
+        });
+    }
+    Some(match p {
+        P::Position => PropRefMut::Vec2(a.position.as_mut()?),
+        P::Anchor => PropRefMut::Vec2(a.anchor.as_mut()?),
+        P::Scale => PropRefMut::Vec2(a.scale.as_mut()?),
+        P::Rotation => PropRefMut::Num(a.rotation.as_mut()?),
+        P::Skew => PropRefMut::Num(a.skew.as_mut()?),
+        P::Opacity => PropRefMut::Num(a.opacity.as_mut()?),
+        P::Tracking => PropRefMut::Num(a.tracking.as_mut()?),
+        P::Fill => PropRefMut::Color(a.fill.as_mut()?),
+        P::Stroke => PropRefMut::Color(a.stroke.as_mut()?),
+        P::StrokeWidth => PropRefMut::Num(a.stroke_width.as_mut()?),
         _ => return None,
     })
 }
 
-/// Every param an animator currently has, selector controls first.
-pub(crate) fn anim_params(a: &TextAnimator) -> Vec<TextAnimParam> {
-    use TextAnimParam as P;
-    [
-        P::RangeStart, P::RangeEnd, P::RangeOffset, P::RangeAmount, P::WiggleMax, P::WiggleMin, P::WiggleRate, P::StaggerAmount,
-    ]
-    .into_iter()
-    .chain(TextAnimParam::PROPERTIES)
-    .filter(|&p| anim_value(a, p).is_some())
-    .collect()
+const SELECTOR_PARAMS: [TextAnimParam; 8] = [
+    TextAnimParam::RangeStart,
+    TextAnimParam::RangeEnd,
+    TextAnimParam::RangeOffset,
+    TextAnimParam::RangeAmount,
+    TextAnimParam::WiggleMax,
+    TextAnimParam::WiggleMin,
+    TextAnimParam::WiggleRate,
+    TextAnimParam::StaggerAmount,
+];
+
+/// Every `(selector, param)` an animator currently has: each selector's
+/// controls in stack order, then the properties (selector 0).
+pub(crate) fn anim_params(a: &TextAnimator) -> Vec<(usize, TextAnimParam)> {
+    let n = 1 + a.more_selectors.len();
+    (0..n)
+        .flat_map(|k| SELECTOR_PARAMS.into_iter().map(move |p| (k, p)))
+        .chain(TextAnimParam::PROPERTIES.into_iter().map(|p| (0, p)))
+        .filter(|&(k, p)| anim_value(a, k, p).is_some())
+        .collect()
 }
 
 /// A param's value on this frame, as the panel edits it.
@@ -205,11 +229,21 @@ pub(crate) enum AnimVal {
     Color([f32; 3]),
 }
 
+/// One value row of the panel: which selector (for a control), which param,
+/// its value this frame, and whether it is keyed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AnimRow {
+    pub(crate) sel: usize,
+    pub(crate) param: TextAnimParam,
+    pub(crate) val: AnimVal,
+    pub(crate) animated: bool,
+}
+
 /// One animator as the panel shows it: its discrete settings (cloned) and its
 /// values resolved on this frame.
 pub(crate) struct TextAnimInfo {
     pub(crate) anim: TextAnimator,
-    pub(crate) rows: Vec<(TextAnimParam, AnimVal, bool)>,
+    pub(crate) rows: Vec<AnimRow>,
 }
 
 pub(crate) fn snapshot(node: &MNode, ctx: &mut EvalCtx) -> Vec<TextAnimInfo> {
@@ -219,10 +253,10 @@ pub(crate) fn snapshot(node: &MNode, ctx: &mut EvalCtx) -> Vec<TextAnimInfo> {
             anim: a.clone(),
             rows: anim_params(a)
                 .into_iter()
-                .filter_map(|p| {
-                    let r = anim_value(a, p)?;
+                .filter_map(|(sel, param)| {
+                    let r = anim_value(a, sel, param)?;
                     let animated = r.is_animated();
-                    let v = match r {
+                    let val = match r {
                         PropRef::Num(v) => AnimVal::Num(v.resolve(ctx)),
                         PropRef::Vec2(v) => AnimVal::Vec2(v.resolve(ctx)),
                         PropRef::Color(v) => {
@@ -231,30 +265,33 @@ pub(crate) fn snapshot(node: &MNode, ctx: &mut EvalCtx) -> Vec<TextAnimInfo> {
                         }
                         _ => return None,
                     };
-                    Some((p, v, animated))
+                    Some(AnimRow { sel, param, val, animated })
                 })
                 .collect(),
         })
         .collect()
 }
 
-/// Which selector an animator uses, for the panel's picker.
+/// Which kind a selector is, for the panel's picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectorKind {
     Range,
     Wiggly,
     Stagger,
+    Expression,
     Karaoke,
 }
 
 impl SelectorKind {
-    const ALL: [SelectorKind; 4] = [SelectorKind::Range, SelectorKind::Wiggly, SelectorKind::Stagger, SelectorKind::Karaoke];
+    const ALL: [SelectorKind; 5] =
+        [SelectorKind::Range, SelectorKind::Wiggly, SelectorKind::Stagger, SelectorKind::Expression, SelectorKind::Karaoke];
 
     fn of(s: &TextSelector) -> Self {
         match s {
             TextSelector::Range { .. } => SelectorKind::Range,
             TextSelector::Wiggly { .. } => SelectorKind::Wiggly,
             TextSelector::Stagger { .. } => SelectorKind::Stagger,
+            TextSelector::Expression { .. } => SelectorKind::Expression,
             TextSelector::Karaoke { .. } => SelectorKind::Karaoke,
         }
     }
@@ -264,6 +301,7 @@ impl SelectorKind {
             SelectorKind::Range => "Range",
             SelectorKind::Wiggly => "Wiggly",
             SelectorKind::Stagger => "Stagger",
+            SelectorKind::Expression => "Expression",
             SelectorKind::Karaoke => "Karaoke",
         }
     }
@@ -278,6 +316,11 @@ impl SelectorKind {
                 step: 3.0,
                 shift: 0.0,
                 reverse: false,
+            },
+            // AE's default expression selector.
+            SelectorKind::Expression => TextSelector::Expression {
+                script: "selectorValue * textIndex / textTotal".to_string(),
+                amount: Value::constant(100.0),
             },
             SelectorKind::Karaoke => TextSelector::Karaoke { cumulative: false },
         }
@@ -430,6 +473,22 @@ impl TextAnimPreset {
     }
 }
 
+/// One edit to one selector of an animator.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SelOp {
+    Kind(SelectorKind),
+    Mode(SelectorMode),
+    Shape(RangeShape),
+    Ease { high: bool, value: f64 },
+    Randomize(bool),
+    Seed(u32),
+    Correlation(f64),
+    Cumulative(bool),
+    Stagger { step: f64, shift: f64, reverse: bool },
+    Script(String),
+    Remove,
+}
+
 /// One edit to a layer's animator stack this frame.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TextAnimOp {
@@ -440,18 +499,13 @@ pub(crate) enum TextAnimOp {
     Rename(usize, String),
     SetUnit(usize, TextUnit),
     SetGrouping(usize, AnchorGrouping),
-    SetSelector(usize, SelectorKind),
-    SetShape(usize, RangeShape),
-    SetEase { index: usize, high: bool, value: f64 },
-    SetRandomize(usize, bool),
-    SetSeed(usize, u32),
-    SetCorrelation(usize, f64),
-    SetCumulative(usize, bool),
-    SetStagger { index: usize, step: f64, shift: f64, reverse: bool },
+    /// Append a Range selector in Add mode.
+    AddSelector(usize),
+    Selector { index: usize, sel: usize, op: SelOp },
     AddProp(usize, TextAnimParam),
     RemoveProp(usize, TextAnimParam),
     /// Set a value (auto-keying it if it's animated).
-    Set { index: usize, param: TextAnimParam, value: AnimVal },
+    Set { index: usize, sel: usize, param: TextAnimParam, value: AnimVal },
 }
 
 /// Apply one animator edit, returning whether anything changed. Indices are
@@ -485,16 +539,10 @@ pub(crate) fn apply_text_anim_op(node: &mut MNode, frame: i64, fps: f64, op: &Te
                 TextAnimOp::Rename(i, _)
                 | TextAnimOp::SetUnit(i, _)
                 | TextAnimOp::SetGrouping(i, _)
-                | TextAnimOp::SetSelector(i, _)
-                | TextAnimOp::SetShape(i, _)
-                | TextAnimOp::SetRandomize(i, _)
-                | TextAnimOp::SetSeed(i, _)
-                | TextAnimOp::SetCorrelation(i, _)
-                | TextAnimOp::SetCumulative(i, _)
+                | TextAnimOp::AddSelector(i)
                 | TextAnimOp::AddProp(i, _)
                 | TextAnimOp::RemoveProp(i, _)
-                | TextAnimOp::SetEase { index: i, .. }
-                | TextAnimOp::SetStagger { index: i, .. }
+                | TextAnimOp::Selector { index: i, .. }
                 | TextAnimOp::Set { index: i, .. } => *i,
                 _ => return false,
             };
@@ -509,63 +557,103 @@ fn edit_animator(a: &mut TextAnimator, frame: i64, op: &TextAnimOp) -> bool {
         TextAnimOp::Rename(_, s) => a.name = s.clone(),
         &TextAnimOp::SetUnit(_, u) => a.based_on = u,
         &TextAnimOp::SetGrouping(_, g) => a.grouping = g,
-        &TextAnimOp::SetSelector(_, k) => {
-            if SelectorKind::of(&a.selector) == k {
-                return false;
-            }
-            a.selector = k.make();
+        TextAnimOp::AddSelector(_) => {
+            a.more_selectors.push(ExtraSelector { mode: SelectorMode::Add, selector: TextSelector::range() })
         }
-        &TextAnimOp::SetShape(_, s) => match &mut a.selector {
-            TextSelector::Range { shape, .. } => *shape = s,
-            _ => return false,
-        },
-        &TextAnimOp::SetEase { high, value, .. } => match &mut a.selector {
-            TextSelector::Range { ease_high, ease_low, .. } => *(if high { ease_high } else { ease_low }) = value.clamp(-100.0, 100.0),
-            _ => return false,
-        },
-        &TextAnimOp::SetRandomize(_, r) => match &mut a.selector {
-            TextSelector::Range { randomize, .. } => *randomize = r,
-            _ => return false,
-        },
-        &TextAnimOp::SetSeed(_, s) => match &mut a.selector {
-            TextSelector::Range { seed, .. } | TextSelector::Wiggly { seed, .. } => *seed = s,
-            _ => return false,
-        },
-        &TextAnimOp::SetCorrelation(_, c) => match &mut a.selector {
-            TextSelector::Wiggly { correlation, .. } => *correlation = c.clamp(0.0, 100.0),
-            _ => return false,
-        },
-        &TextAnimOp::SetCumulative(_, c) => match &mut a.selector {
-            TextSelector::Karaoke { cumulative } => *cumulative = c,
-            _ => return false,
-        },
-        &TextAnimOp::SetStagger { step: s, shift: sh, reverse: r, .. } => match &mut a.selector {
-            TextSelector::Stagger { step, shift, reverse, .. } => {
-                *step = s;
-                *shift = sh;
-                *reverse = r;
-            }
-            _ => return false,
-        },
+        TextAnimOp::Selector { sel, op, .. } => return edit_selector(a, *sel, op),
         &TextAnimOp::AddProp(_, p) => {
-            if !p.is_property() || anim_value(a, p).is_some() {
+            if !p.is_property() || anim_value(a, 0, p).is_some() {
                 return false;
             }
             p.seed(a);
         }
         &TextAnimOp::RemoveProp(_, p) => {
-            if anim_value(a, p).is_none() {
+            if anim_value(a, 0, p).is_none() {
                 return false;
             }
             p.clear(a);
         }
-        &TextAnimOp::Set { param, value, .. } => match (anim_value_mut(a, param), value) {
+        &TextAnimOp::Set { sel, param, value, .. } => match (anim_value_mut(a, sel, param), value) {
             (Some(PropRefMut::Num(v)), AnimVal::Num(x)) => v.set_at(frame, x),
             (Some(PropRefMut::Vec2(v)), AnimVal::Vec2(x)) => v.set_at(frame, x),
             (Some(PropRefMut::Color(v)), AnimVal::Color(c)) => v.set_at(frame, rgb_color(c)),
             _ => return false,
         },
         TextAnimOp::Add(_) | TextAnimOp::Remove(_) | TextAnimOp::Duplicate(_) | TextAnimOp::Move { .. } => return false,
+    }
+    true
+}
+
+fn edit_selector(a: &mut TextAnimator, k: usize, op: &SelOp) -> bool {
+    if let SelOp::Remove = op {
+        // The stack always keeps one selector: removing the first promotes
+        // the next one (and its mode) into its place.
+        if a.more_selectors.is_empty() || k > a.more_selectors.len() {
+            return false;
+        }
+        if k == 0 {
+            let next = a.more_selectors.remove(0);
+            a.selector = next.selector;
+            a.mode = next.mode;
+        } else {
+            a.more_selectors.remove(k - 1);
+        }
+        return true;
+    }
+    if let &SelOp::Mode(m) = op {
+        return match a.mode_at_mut(k) {
+            Some(mode) if *mode != m => {
+                *mode = m;
+                true
+            }
+            _ => false,
+        };
+    }
+    let Some(s) = a.selector_at_mut(k) else { return false };
+    match op {
+        &SelOp::Kind(kind) => {
+            if SelectorKind::of(s) == kind {
+                return false;
+            }
+            *s = kind.make();
+        }
+        &SelOp::Shape(v) => match s {
+            TextSelector::Range { shape, .. } => *shape = v,
+            _ => return false,
+        },
+        &SelOp::Ease { high, value } => match s {
+            TextSelector::Range { ease_high, ease_low, .. } => *(if high { ease_high } else { ease_low }) = value.clamp(-100.0, 100.0),
+            _ => return false,
+        },
+        &SelOp::Randomize(r) => match s {
+            TextSelector::Range { randomize, .. } => *randomize = r,
+            _ => return false,
+        },
+        &SelOp::Seed(v) => match s {
+            TextSelector::Range { seed, .. } | TextSelector::Wiggly { seed, .. } => *seed = v,
+            _ => return false,
+        },
+        &SelOp::Correlation(c) => match s {
+            TextSelector::Wiggly { correlation, .. } => *correlation = c.clamp(0.0, 100.0),
+            _ => return false,
+        },
+        &SelOp::Cumulative(c) => match s {
+            TextSelector::Karaoke { cumulative } => *cumulative = c,
+            _ => return false,
+        },
+        &SelOp::Stagger { step: st, shift: sh, reverse: r } => match s {
+            TextSelector::Stagger { step, shift, reverse, .. } => {
+                *step = st;
+                *shift = sh;
+                *reverse = r;
+            }
+            _ => return false,
+        },
+        SelOp::Script(src) => match s {
+            TextSelector::Expression { script, .. } => *script = src.clone(),
+            _ => return false,
+        },
+        SelOp::Mode(_) | SelOp::Remove => unreachable!("handled above"),
     }
     true
 }
@@ -683,39 +771,67 @@ pub(crate) fn text_animators_ui(ui: &mut egui::Ui, anims: &[TextAnimInfo], edits
                     ui.label("");
                     ui.end_row();
 
-                    ui.label("Selector");
-                    if let Some(k) = combo(ui, ("ta_sel", i), SelectorKind::of(&a.selector), &SelectorKind::ALL, SelectorKind::label) {
-                        edits.text_anim = Some(TextAnimOp::SetSelector(i, k));
+                    let stacked = !a.more_selectors.is_empty();
+                    for (k, (mode, sel)) in a.selectors().enumerate() {
+                        selector_header(ui, i, k, mode, sel, stacked, edits);
+                        selector_settings(ui, i, k, sel, edits);
+                        for row in info.rows.iter().filter(|r| r.sel == k && !r.param.is_property()) {
+                            value_row(ui, i, *row, edits);
+                        }
                     }
-                    ui.label("");
-                    ui.end_row();
 
-                    selector_settings(ui, i, &a.selector, edits);
-
-                    for &(param, val, animated) in &info.rows {
-                        value_row(ui, i, param, val, animated, edits);
+                    for row in info.rows.iter().filter(|r| r.param.is_property()) {
+                        value_row(ui, i, *row, edits);
                     }
                 });
-                ui.menu_button("+ Property", |ui| {
-                    for p in TextAnimParam::PROPERTIES {
-                        let has = info.rows.iter().any(|r| r.0 == p);
-                        if ui.add_enabled(!has, egui::Button::new(p.label())).clicked() {
-                            edits.text_anim = Some(TextAnimOp::AddProp(i, p));
-                            ui.close();
+                ui.horizontal(|ui| {
+                    ui.menu_button("+ Property", |ui| {
+                        for p in TextAnimParam::PROPERTIES {
+                            let has = info.rows.iter().any(|r| r.param == p);
+                            if ui.add_enabled(!has, egui::Button::new(p.label())).clicked() {
+                                edits.text_anim = Some(TextAnimOp::AddProp(i, p));
+                                ui.close();
+                            }
                         }
+                    });
+                    if ui.button("+ Selector").on_hover_text("Stack another selector; its mode folds it into the ones above").clicked() {
+                        edits.text_anim = Some(TextAnimOp::AddSelector(i));
                     }
                 });
             });
     }
 }
 
+/// A selector's title row: kind, fold mode, and remove.
+fn selector_header(ui: &mut egui::Ui, i: usize, k: usize, mode: SelectorMode, sel: &TextSelector, stacked: bool, edits: &mut PropEdits) {
+    let set = |edits: &mut PropEdits, op| edits.text_anim = Some(TextAnimOp::Selector { index: i, sel: k, op });
+    ui.label(if stacked { format!("Selector {}", k + 1) } else { "Selector".to_string() });
+    ui.horizontal(|ui| {
+        if let Some(kind) = combo(ui, ("ta_sel", i, k), SelectorKind::of(sel), &SelectorKind::ALL, SelectorKind::label) {
+            set(edits, SelOp::Kind(kind));
+        }
+        // A lone Add selector needs no mode picker; show it once it matters.
+        if stacked || mode != SelectorMode::Add {
+            if let Some(m) = combo(ui, ("ta_mode", i, k), mode, &SelectorMode::ALL, SelectorMode::label) {
+                set(edits, SelOp::Mode(m));
+            }
+        }
+        if stacked && ui.small_button("✕").on_hover_text("Remove this selector").clicked() {
+            set(edits, SelOp::Remove);
+        }
+    });
+    ui.label("");
+    ui.end_row();
+}
+
 /// The discrete (non-animatable) settings of a selector.
-fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mut PropEdits) {
+fn selector_settings(ui: &mut egui::Ui, i: usize, k: usize, sel: &TextSelector, edits: &mut PropEdits) {
+    let set = |edits: &mut PropEdits, op| edits.text_anim = Some(TextAnimOp::Selector { index: i, sel: k, op });
     match sel {
         TextSelector::Range { shape, ease_high, ease_low, randomize, seed, .. } => {
             ui.label("  Shape");
-            if let Some(s) = combo(ui, ("ta_shape", i), *shape, &SHAPES, shape_label) {
-                edits.text_anim = Some(TextAnimOp::SetShape(i, s));
+            if let Some(s) = combo(ui, ("ta_shape", i, k), *shape, &SHAPES, shape_label) {
+                set(edits, SelOp::Shape(s));
             }
             ui.label("");
             ui.end_row();
@@ -724,10 +840,10 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mu
             ui.horizontal(|ui| {
                 let (mut h, mut l) = (*ease_high, *ease_low);
                 if ui.add(crate::calc::num(&mut h).speed(1.0).range(-100.0..=100.0).suffix("%")).changed() {
-                    edits.text_anim = Some(TextAnimOp::SetEase { index: i, high: true, value: h });
+                    set(edits, SelOp::Ease { high: true, value: h });
                 }
                 if ui.add(crate::calc::num(&mut l).speed(1.0).range(-100.0..=100.0).suffix("%")).changed() {
-                    edits.text_anim = Some(TextAnimOp::SetEase { index: i, high: false, value: l });
+                    set(edits, SelOp::Ease { high: false, value: l });
                 }
             });
             ui.label("");
@@ -737,12 +853,12 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mu
             ui.horizontal(|ui| {
                 let mut r = *randomize;
                 if ui.checkbox(&mut r, "").changed() {
-                    edits.text_anim = Some(TextAnimOp::SetRandomize(i, r));
+                    set(edits, SelOp::Randomize(r));
                 }
                 if *randomize {
                     let mut s = *seed;
                     if ui.add(egui::DragValue::new(&mut s).prefix("seed ")).changed() {
-                        edits.text_anim = Some(TextAnimOp::SetSeed(i, s));
+                        set(edits, SelOp::Seed(s));
                     }
                 }
             });
@@ -754,11 +870,11 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mu
             ui.horizontal(|ui| {
                 let mut c = *correlation;
                 if ui.add(crate::calc::num(&mut c).speed(1.0).range(0.0..=100.0).suffix("%")).changed() {
-                    edits.text_anim = Some(TextAnimOp::SetCorrelation(i, c));
+                    set(edits, SelOp::Correlation(c));
                 }
                 let mut s = *seed;
                 if ui.add(egui::DragValue::new(&mut s).prefix("seed ")).changed() {
-                    edits.text_anim = Some(TextAnimOp::SetSeed(i, s));
+                    set(edits, SelOp::Seed(s));
                 }
             });
             ui.label("");
@@ -772,9 +888,22 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mu
                 changed |= ui.add(crate::calc::num(&mut sh).speed(0.25).suffix(" f")).on_hover_text("Frames of delay for every unit").changed();
                 changed |= ui.checkbox(&mut r, "Reverse").changed();
                 if changed {
-                    edits.text_anim = Some(TextAnimOp::SetStagger { index: i, step: st, shift: sh, reverse: r });
+                    set(edits, SelOp::Stagger { step: st, shift: sh, reverse: r });
                 }
             });
+            ui.label("");
+            ui.end_row();
+        }
+        TextSelector::Expression { script, .. } => {
+            ui.label("  Script");
+            let mut src = script.clone();
+            if ui
+                .add(egui::TextEdit::multiline(&mut src).code_editor().desired_rows(2).desired_width(220.0))
+                .on_hover_text("Runs per unit; returns 0..100.\nIn scope: textIndex (1-based), textTotal, selectorValue, time, wiggle(), value()…")
+                .changed()
+            {
+                set(edits, SelOp::Script(src));
+            }
             ui.label("");
             ui.end_row();
         }
@@ -782,7 +911,7 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mu
             ui.label("  Cumulative");
             let mut c = *cumulative;
             if ui.checkbox(&mut c, "").on_hover_text("Keep every word spoken so far selected").changed() {
-                edits.text_anim = Some(TextAnimOp::SetCumulative(i, c));
+                set(edits, SelOp::Cumulative(c));
             }
             ui.label("");
             ui.end_row();
@@ -792,22 +921,17 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, sel: &TextSelector, edits: &mu
 
 /// One animatable row: its value editor, stopwatch, and (for a property) a
 /// remove button.
-fn value_row(ui: &mut egui::Ui, i: usize, param: TextAnimParam, val: AnimVal, animated: bool, edits: &mut PropEdits) {
+fn value_row(ui: &mut egui::Ui, i: usize, row: AnimRow, edits: &mut PropEdits) {
+    let AnimRow { sel, param, val, animated } = row;
     let indent = if param.is_property() { "" } else { "  " };
     ui.label(format!("{indent}{}", param.label()));
     ui.horizontal(|ui| {
-        let set = |edits: &mut PropEdits, value| edits.text_anim = Some(TextAnimOp::Set { index: i, param, value });
+        let set = |edits: &mut PropEdits, value| edits.text_anim = Some(TextAnimOp::Set { index: i, sel, param, value });
         match val {
             AnimVal::Num(mut v) => {
                 let suffix = match param {
                     TextAnimParam::Rotation | TextAnimParam::Skew => "°",
-                    TextAnimParam::RangeStart
-                    | TextAnimParam::RangeEnd
-                    | TextAnimParam::RangeOffset
-                    | TextAnimParam::RangeAmount
-                    | TextAnimParam::WiggleMax
-                    | TextAnimParam::WiggleMin
-                    | TextAnimParam::StaggerAmount => "%",
+                    p if !p.is_property() && p != TextAnimParam::WiggleRate => "%",
                     _ => "",
                 };
                 let mut drag = crate::calc::num(&mut v).speed(param.speed()).suffix(suffix);
@@ -838,7 +962,7 @@ fn value_row(ui: &mut egui::Ui, i: usize, param: TextAnimParam, val: AnimVal, an
         }
     });
     if key_button(ui, animated) {
-        edits.key.insert(PropKind::TextAnim { index: i, param });
+        edits.key.insert(PropKind::TextAnim { index: i, sel, param });
     }
     ui.end_row();
 }
