@@ -232,7 +232,12 @@ impl FromExpr for String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PropPath {
     Position,
+    /// The in-plane spin (Z), degrees — a number, like the wire that drives it.
     Rotation,
+    /// Out-of-plane tilt about X, degrees.
+    RotationX,
+    /// Out-of-plane turn about Y, degrees.
+    RotationY,
     Scale,
     Opacity,
     Anchor,
@@ -275,6 +280,8 @@ impl PropPath {
         match self {
             PropPath::Position => "position",
             PropPath::Rotation => "rotation",
+            PropPath::RotationX => "rotation_x",
+            PropPath::RotationY => "rotation_y",
             PropPath::Scale => "scale",
             PropPath::Opacity => "opacity",
             PropPath::Anchor => "anchor",
@@ -298,9 +305,11 @@ impl PropPath {
 
     /// Every referenceable property — for a picker, and for the script node's
     /// list of what `value()` accepts.
-    pub const ALL: [PropPath; 17] = [
+    pub const ALL: [PropPath; 19] = [
         PropPath::Position,
         PropPath::Rotation,
+        PropPath::RotationX,
+        PropPath::RotationY,
         PropPath::Scale,
         PropPath::Opacity,
         PropPath::Anchor,
@@ -335,10 +344,10 @@ impl PropPath {
             | PropPath::MaskSize
             // A path point is planar (Vec2) but rides the one vector kind, z=0.
             | PropPath::PathPoint { .. } => ExprValue::Vec3(Vec3::ZERO),
-            // Rotation's *value* is a 3-vector since 2.5D, even though the
-            // graph still wires it as a scalar — see `socket_type`.
-            PropPath::Rotation => ExprValue::Vec3(Vec3::ZERO),
-            PropPath::Opacity
+            PropPath::Rotation
+            | PropPath::RotationX
+            | PropPath::RotationY
+            | PropPath::Opacity
             | PropPath::StrokeWidth
             | PropPath::ShapeRadius
             | PropPath::TextSize
@@ -360,18 +369,10 @@ impl PropPath {
     /// wire at authoring time rather than resolving it to a fallback at render
     /// time.
     ///
-    /// It follows [`Self::zero`] for every property but one. **Rotation is
-    /// authored as a number and stored as a vector**: the overwhelmingly common
-    /// graph is an oscillator or a script spinning a layer in the screen plane,
-    /// and forcing that through a `join` to reach the Z input would tax the
-    /// common case to spell out a depth nobody asked for. The scalar is lifted
-    /// onto Z at the binding — see [`Self::adapt_driver`], which is the only
-    /// thing that makes this divergence safe.
+    /// Follows [`Self::zero`]: each rotation axis is its own scalar channel,
+    /// so a number wire reaches the spin (or a tilt) directly.
     pub fn socket_type(self) -> crate::socket::SocketType {
         use crate::socket::SocketType as S;
-        if self == PropPath::Rotation {
-            return S::Number;
-        }
         match self.zero() {
             ExprValue::Num(_) => S::Number,
             ExprValue::Vec3(_) => S::Vector,
@@ -381,18 +382,10 @@ impl PropPath {
     }
 
     /// Fit an expression lowered from the graph to this property's value type.
-    ///
-    /// A no-op everywhere the socket type and the value type already agree,
-    /// which is everywhere but rotation: there the wire carried a number (the
-    /// in-plane spin) and the property holds a 3-vector, so the scalar is lifted
-    /// onto Z with the other two axes pinned flat. Unambiguous precisely
-    /// *because* [`Self::socket_type`] refuses anything but a number there — a
-    /// vector wire can never reach this and be mis-read as a spin.
+    /// A no-op today — every socket type matches its property's value type —
+    /// kept as the one place a future divergence would be bridged.
     pub fn adapt_driver(self, e: Expr) -> Expr {
-        match self {
-            PropPath::Rotation => Expr::Vec3 { x: zero_expr(), y: zero_expr(), z: Box::new(e) },
-            _ => e,
-        }
+        e
     }
 }
 
@@ -1947,6 +1940,8 @@ impl<'a> EvalCtx<'a> {
         match prop {
             PropPath::Position => tr.position.resolve(self).to_expr(),
             PropPath::Rotation => tr.rotation.resolve(self).to_expr(),
+            PropPath::RotationX => tr.rotation_x.resolve(self).to_expr(),
+            PropPath::RotationY => tr.rotation_y.resolve(self).to_expr(),
             PropPath::Scale => tr.scale.resolve(self).to_expr(),
             PropPath::Opacity => tr.opacity.resolve(self).to_expr(),
             PropPath::Anchor => tr.anchor.resolve(self).to_expr(),

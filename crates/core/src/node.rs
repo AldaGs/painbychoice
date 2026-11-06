@@ -28,59 +28,118 @@ pub struct NodeId(pub u64);
 /// `kurbo::Affine`, exactly as before 2.5D existed. See [`crate::mat4`] for why
 /// that distinction is load-bearing rather than an optimisation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "TransformRepr")]
 pub struct Transform {
     pub anchor: Value<Vec3>,
     pub position: Value<Vec3>,
-    /// Euler angles in **degrees**, applied Z · Y · X. `z` is the in-plane spin
-    /// every 2D document already had; `x`/`y` are the ones that tip the layer
-    /// out of the plane and force the projected pipeline.
-    ///
-    /// Renamed from the old scalar `rotation_deg`, which a `.pbc` may still be
-    /// keyed on: the `alias` accepts the old name and [`de_rotation`] accepts
-    /// the old *shape*, widening a scalar track into the Z channel.
-    #[serde(default = "zero_rotation", alias = "rotation_deg", deserialize_with = "de_rotation")]
-    pub rotation: Value<Vec3>,
+    /// The in-plane spin (Z), in **degrees** — the rotation every 2D document
+    /// already had, and still the one the 2D handle and a graph wire drive.
+    pub rotation: Value<f64>,
+    /// Out-of-plane tilt about the layer's X axis, degrees. Its own track, so
+    /// it keys, eases and is scripted independently of the other two axes.
+    #[serde(default = "zero_angle")]
+    pub rotation_x: Value<f64>,
+    /// Out-of-plane turn about the layer's Y axis, degrees.
+    #[serde(default = "zero_angle")]
+    pub rotation_y: Value<f64>,
     pub scale: Value<Vec3>,
     pub opacity: Value<f64>,
 }
 
-fn zero_rotation() -> Value<Vec3> {
-    Value::constant(Vec3::ZERO)
+fn zero_angle() -> Value<f64> {
+    Value::constant(0.0)
 }
 
-/// Accept either spelling of a transform's rotation: the 3-vector it is now, or
-/// the bare scalar a pre-2.5D `.pbc` wrote. Untagged, and the vector arm is
-/// tried first — the two payloads are structurally distinct (`{"Const": {"x":
-/// …}}` against `{"Const": 1.5}`), so there is nothing to disambiguate by hand.
-fn de_rotation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Value<Vec3>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        Spatial(Value<Vec3>),
-        Planar(Value<f64>),
-    }
-    Ok(match Repr::deserialize(d)? {
-        Repr::Spatial(v) => v,
-        Repr::Planar(deg) => widen_rotation(deg),
-    })
+/// What a `.pbc` may hold for a transform. Rotation has had three shapes: the
+/// pre-2.5D scalar `rotation_deg`, the 2.5D joined `rotation` 3-vector, and
+/// today's three separate scalar channels. Both older shapes land here and are
+/// split by [`From`] — the next save writes the separated form.
+#[derive(Deserialize)]
+struct TransformRepr {
+    anchor: Value<Vec3>,
+    position: Value<Vec3>,
+    #[serde(default, alias = "rotation_deg")]
+    rotation: Option<RotationRepr>,
+    #[serde(default)]
+    rotation_x: Option<Value<f64>>,
+    #[serde(default)]
+    rotation_y: Option<Value<f64>>,
+    scale: Value<Vec3>,
+    opacity: Value<f64>,
 }
 
-/// Widen a pre-2.5D scalar rotation into the Z channel of a 3D one, preserving
-/// keyframe timing and expression wiring. The old value *was* the Z spin, so an
-/// upgraded document animates identically — that is the acceptance criterion for
-/// this whole migration.
-fn widen_rotation(legacy: Value<f64>) -> Value<Vec3> {
-    match legacy {
-        Value::Const(deg) => Value::Const(Vec3::new(0.0, 0.0, deg)),
-        Value::Keyframed(track) => {
-            Value::Keyframed(track.map_value(|deg| Vec3::new(0.0, 0.0, deg)))
+/// Untagged, and the scalar arm is tried first — the payloads are structurally
+/// distinct (`{"Const": 1.5}` against `{"Const": {"x": …}}`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RotationRepr {
+    Planar(Value<f64>),
+    Joined(Value<Vec3>),
+}
+
+impl From<TransformRepr> for Transform {
+    fn from(r: TransformRepr) -> Self {
+        let (x, y, z) = match r.rotation {
+            None => (zero_angle(), zero_angle(), zero_angle()),
+            Some(RotationRepr::Planar(z)) => (zero_angle(), zero_angle(), z),
+            Some(RotationRepr::Joined(v)) => split_rotation(v),
+        };
+        Self {
+            anchor: r.anchor,
+            position: r.position,
+            rotation: z,
+            // An explicit separated channel beats one recovered from a join.
+            rotation_x: r.rotation_x.unwrap_or(x),
+            rotation_y: r.rotation_y.unwrap_or(y),
+            scale: r.scale,
+            opacity: r.opacity,
         }
-        // The expression drove a scalar; it now drives one component of a join.
-        Value::Expr(e) => Value::Expr(Expr::Vec3 {
-            x: Box::new(Expr::num(0.0)),
-            y: Box::new(Expr::num(0.0)),
-            z: Box::new(e),
-        }),
+    }
+}
+
+/// Split a joined 2.5D rotation into its three channels, preserving key timing,
+/// easing and expression wiring, so an upgraded document animates identically.
+/// An axis whose keys are all zero collapses to a constant rather than
+/// carrying a row of meaningless keyframes.
+fn split_rotation(v: Value<Vec3>) -> (Value<f64>, Value<f64>, Value<f64>) {
+    use crate::expr::Axis;
+    match v {
+        Value::Const(r) => (Value::Const(r.x), Value::Const(r.y), Value::Const(r.z)),
+        Value::Keyframed(track) => {
+            let axis = |a: Axis| -> Value<f64> {
+                let pick = move |v: Vec3| match a {
+                    Axis::X => v.x,
+                    Axis::Y => v.y,
+                    Axis::Z => v.z,
+                };
+                let mut t = track.clone().map_value(pick);
+                // The script saw the joined vector; rebuild it from this
+                // channel alone (the other two read flat) and take ours back.
+                t.expr = t.expr.map(|s| {
+                    let join = match a {
+                        Axis::X => "vec3(value, 0.0, 0.0)",
+                        Axis::Y => "vec3(0.0, value, 0.0)",
+                        Axis::Z => "vec3(0.0, 0.0, value)",
+                    };
+                    let i = match a { Axis::X => 0, Axis::Y => 1, Axis::Z => 2 };
+                    format!("let value = {join}; ({{ {s} }})[{i}]")
+                });
+                if t.expr.is_none() && t.keys().iter().all(|k| k.value == 0.0) && a != Axis::Z {
+                    return zero_angle();
+                }
+                Value::Keyframed(t)
+            };
+            (axis(Axis::X), axis(Axis::Y), axis(Axis::Z))
+        }
+        Value::Expr(e) => {
+            // The common case is the graph's adapt: `vec3(0, 0, spin)`. Peel
+            // it rather than wrapping each axis in a component read.
+            if let Expr::Vec3 { x, y, z } = e {
+                return (Value::Expr(*x), Value::Expr(*y), Value::Expr(*z));
+            }
+            let comp = |axis| Value::Expr(Expr::Comp { a: Box::new(e.clone()), axis });
+            (comp(Axis::X), comp(Axis::Y), comp(Axis::Z))
+        }
     }
 }
 
@@ -89,7 +148,9 @@ impl Default for Transform {
         Self {
             anchor: Value::constant(Vec3::ZERO),
             position: Value::constant(Vec3::ZERO),
-            rotation: zero_rotation(),
+            rotation: zero_angle(),
+            rotation_x: zero_angle(),
+            rotation_y: zero_angle(),
             scale: Value::constant(Vec3::ONE),
             opacity: Value::constant(1.0),
         }
@@ -104,7 +165,11 @@ impl Transform {
     pub fn resolve(&self, ctx: &mut EvalCtx) -> (Xf, f64) {
         let anchor = self.anchor.resolve(ctx);
         let position = self.position.resolve(ctx);
-        let rot = self.rotation.resolve(ctx);
+        let rot = Vec3::new(
+            self.rotation_x.resolve(ctx),
+            self.rotation_y.resolve(ctx),
+            self.rotation.resolve(ctx),
+        );
         let scale = self.scale.resolve(ctx);
         let opacity = self.opacity.resolve(ctx);
 
@@ -140,13 +205,16 @@ impl Transform {
         }
         flat(&self.anchor)
             && flat(&self.position)
-            && matches!(&self.rotation, Value::Const(r) if r.x == 0.0 && r.y == 0.0)
+            && matches!(self.rotation_x, Value::Const(r) if r == 0.0)
+            && matches!(self.rotation_y, Value::Const(r) if r == 0.0)
     }
 
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
         self.anchor.migrate_frames(fps);
         self.position.migrate_frames(fps);
         self.rotation.migrate_frames(fps);
+        self.rotation_x.migrate_frames(fps);
+        self.rotation_y.migrate_frames(fps);
         self.scale.migrate_frames(fps);
         self.opacity.migrate_frames(fps);
     }
@@ -155,6 +223,8 @@ impl Transform {
         self.anchor.retime(ratio);
         self.position.retime(ratio);
         self.rotation.retime(ratio);
+        self.rotation_x.retime(ratio);
+        self.rotation_y.retime(ratio);
         self.scale.retime(ratio);
         self.opacity.retime(ratio);
     }
@@ -2686,15 +2756,14 @@ mod tests {
     }
 
     use super::*;
-    use crate::vec3::Vec3;
     use crate::value::{Keyframe, Track};
 
     /// Build a one-layer comp at `fps` with a position key on `frame`.
     fn comp_with_key(fps: f64, frame: i64) -> Comp {
         let mut transform = Transform::default();
         transform.rotation = Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0, Vec3::ZERO),
-            Keyframe::linear(frame, Vec3::new(0.0, 0.0, 90.0)),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(frame, 90.0),
         ]));
         let layer = Node::group(1, "layer").with_transform(transform);
         let mut comp = Comp::new(1920.0, 1080.0, Node::group(0, "root").with_child(layer));
@@ -3074,7 +3143,8 @@ mod knob_tests {
         }"#;
         let tr: Transform = serde_json::from_str(legacy).unwrap();
         let Value::Const(rot) = tr.rotation else { panic!("still a constant") };
-        assert_eq!(rot, Vec3::new(0.0, 0.0, 90.0), "the spin moved to Z");
+        assert_eq!(rot, 90.0, "the spin is Z");
+        assert_eq!((tr.rotation_x.clone(), tr.rotation_y.clone()), (Value::constant(0.0), Value::constant(0.0)));
         assert!(tr.is_statically_flat());
 
         // And it resolves to the very matrix the old engine built.
@@ -3112,7 +3182,63 @@ mod knob_tests {
         assert_eq!(track.keys().len(), 2);
         assert_eq!(track.keys()[0].frame, 0);
         assert_eq!(track.keys()[1].frame, 24);
-        assert_eq!(track.keys()[1].value, Vec3::new(0.0, 0.0, 180.0));
+        assert_eq!(track.keys()[1].value, 180.0);
+    }
+
+    /// A 2.5D `.pbc` stored rotation as one joined 3-vector track. It splits
+    /// into three channels with the same key frames, so each axis can then be
+    /// keyed on its own — and an axis that never moved stays a constant.
+    #[test]
+    fn a_joined_rotation_track_splits_per_axis() {
+        let joined = r#"{
+            "anchor": {"Const": {"x": 0.0, "y": 0.0}},
+            "position": {"Const": {"x": 0.0, "y": 0.0}},
+            "rotation": {"Keyframed": {"keys": [
+                {"frame": 0, "value": {"x": 0.0, "y": 0.0, "z": 0.0},
+                 "out_handle": {"x": 0.0, "y": 0.0}, "in_handle": {"x": 0.0, "y": 0.0}},
+                {"frame": 24, "value": {"x": 45.0, "y": 0.0, "z": 180.0},
+                 "out_handle": {"x": 0.0, "y": 0.0}, "in_handle": {"x": 0.0, "y": 0.0}}
+            ]}},
+            "scale": {"Const": {"x": 1.0, "y": 1.0}},
+            "opacity": {"Const": 1.0}
+        }"#;
+        let tr: Transform = serde_json::from_str(joined).unwrap();
+        let Value::Keyframed(z) = &tr.rotation else { panic!("z keyed") };
+        let Value::Keyframed(x) = &tr.rotation_x else { panic!("x keyed") };
+        assert_eq!(z.frames(), vec![0, 24]);
+        assert_eq!(x.frames(), vec![0, 24]);
+        assert_eq!((x.keys()[1].value, z.keys()[1].value), (45.0, 180.0));
+        assert_eq!(tr.rotation_y, Value::constant(0.0), "an unmoved axis is a constant");
+
+        // Constant joins split too, and the separated form round-trips.
+        let constant = joined.replace(
+            &joined[joined.find("{\"Keyframed\"").unwrap()..joined.find(",\n            \"scale\"").unwrap()],
+            r#"{"Const": {"x": 10.0, "y": 20.0, "z": 30.0}}"#,
+        );
+        let tr2: Transform = serde_json::from_str(&constant).unwrap();
+        assert_eq!(
+            (tr2.rotation_x.clone(), tr2.rotation_y.clone(), tr2.rotation.clone()),
+            (Value::constant(10.0), Value::constant(20.0), Value::constant(30.0))
+        );
+        let back: Transform = serde_json::from_str(&serde_json::to_string(&tr).unwrap()).unwrap();
+        assert_eq!(back, tr);
+    }
+
+    /// Each axis keys independently: different key frames on X and Z.
+    #[test]
+    fn rotation_axes_animate_independently() {
+        use crate::value::{Keyframe, Track};
+        let doc = Document::new(100.0, 100.0, Node::group(0, "root"));
+        let mut tr = Transform::default();
+        tr.rotation = Value::Keyframed(Track::new(vec![Keyframe::linear(0, 0.0), Keyframe::linear(10, 90.0)]));
+        tr.rotation_x = Value::Keyframed(Track::new(vec![Keyframe::linear(5, 0.0), Keyframe::linear(20, 60.0)]));
+        let at = |f: f64| {
+            let mut ctx = EvalCtx::new(&doc, f);
+            (tr.rotation.resolve(&mut ctx), tr.rotation_x.resolve(&mut ctx))
+        };
+        assert_eq!(at(10.0).0, 90.0);
+        assert!(at(10.0).1 > 0.0 && at(10.0).1 < 60.0, "x is mid-move while z has landed");
+        assert!(!tr.is_statically_flat());
     }
 
     /// Depth is what forces the expensive tier — and only depth. Asserted from
@@ -3126,7 +3252,7 @@ mod knob_tests {
         };
 
         let mut tr = Transform::default();
-        tr.rotation = Value::constant(Vec3::new(0.0, 0.0, 45.0));
+        tr.rotation = Value::constant(45.0);
         assert!(resolve(&tr).is_flat(), "a Z spin is in-plane");
 
         let mut tr = Transform::default();
@@ -3134,7 +3260,7 @@ mod knob_tests {
         assert!(!resolve(&tr).is_flat(), "depth in position leaves the plane");
 
         let mut tr = Transform::default();
-        tr.rotation = Value::constant(Vec3::new(30.0, 0.0, 0.0));
+        tr.rotation_x = Value::constant(30.0);
         assert!(!resolve(&tr).is_flat(), "an X tilt leaves the plane");
     }
 

@@ -1684,7 +1684,7 @@ mod tests {
 
         let mut parent = Node::group(1, "parent");
         parent.transform.position = Value::constant(Vec3::flat(100.0, 0.0));
-        parent.transform.rotation = Value::constant(Vec3::new(0.0, 0.0, 90.0));
+        parent.transform.rotation = Value::constant(90.0);
 
         let doc = Document::new(
             500.0,
@@ -3074,7 +3074,7 @@ mod tests {
         )
         .with_transform(Transform {
             position: Value::constant(Vec3::flat(100.0, 100.0)),
-            rotation: Value::constant(Vec3::new(0.0, 40.0, 0.0)),
+            rotation_y: Value::constant(40.0),
             ..Transform::default()
         });
         let mut comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(card));
@@ -3122,7 +3122,7 @@ mod tests {
     fn without_a_camera_a_tipped_layer_is_not_warped() {
         use crate::node::Project;
         let card = dot(1).with_transform(Transform {
-            rotation: Value::constant(Vec3::new(0.0, 40.0, 0.0)),
+            rotation_y: Value::constant(40.0),
             ..Transform::default()
         });
         let comp = Comp::new(200.0, 200.0, Node::group(0, "root").with_child(card));

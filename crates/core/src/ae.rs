@@ -1052,30 +1052,13 @@ impl Importer<'_> {
         t.opacity = self.scalar(prop(props, opacity), 0.01, 1.0);
         let rz = if layer { "ADBE Rotate Z" } else { "ADBE Vector Rotation" };
         let z = self.scalar(prop(props, rz), 1.0, 0.0);
-        let x = layer.then(|| self.scalar(prop(props, "ADBE Rotate X"), 1.0, 0.0));
-        let y = layer.then(|| self.scalar(prop(props, "ADBE Rotate Y"), 1.0, 0.0));
-        let c = |v: &Option<Value<f64>>| match v {
-            Some(Value::Const(v)) => *v,
-            _ => 0.0,
-        };
-        let (cx, cy) = (c(&x), c(&y));
-        t.rotation = match (x, y, z) {
-            (None | Some(Value::Const(_)), None | Some(Value::Const(_)), Value::Const(z)) => {
-                Value::constant(Vec3::new(cx, cy, z))
-            }
-            (_, _, Value::Keyframed(track)) => {
-                let mut t = track.map_value(|z| Vec3::new(0.0, 0.0, z));
-                t.expr = t.expr.map(|s| format!("let value = value[2]; vec3(0.0, 0.0, {{ {s} }})"));
-                Value::Keyframed(t)
-            }
-            (None | Some(Value::Const(_)), None | Some(Value::Const(_)), Value::Expr(crate::expr::Expr::Script(s))) => {
-                Value::expr(crate::expr::Expr::Script(format!("vec3({cx:?}, {cy:?}, {{ {s} }})")))
-            }
-            _ => {
-                self.report.drop("animated X/Y rotation");
-                Value::constant(Vec3::ZERO)
-            }
-        };
+        // Each axis is its own channel, so animated X/Y tilt comes across
+        // keyed exactly like Z.
+        if layer {
+            t.rotation_x = self.scalar(prop(props, "ADBE Rotate X"), 1.0, 0.0);
+            t.rotation_y = self.scalar(prop(props, "ADBE Rotate Y"), 1.0, 0.0);
+        }
+        t.rotation = z;
         if prop(props, "ADBE Orientation").is_some_and(|o| nums(&o["value"]).iter().any(|v| *v != 0.0)) {
             self.report.drop("3D orientation");
         }
@@ -1659,7 +1642,7 @@ mod tests {
         assert_eq!(rect.stroke.as_ref().unwrap().style.dash, Some([4.0, 2.0]));
         // The expression runs on the sampled keys: 90 held, plus 10.
         let mut ctx = crate::expr::EvalCtx::at(60.0);
-        assert_eq!(leaf.transform.rotation.resolve(&mut ctx).z, 100.0);
+        assert_eq!(leaf.transform.rotation.resolve(&mut ctx), 100.0);
         // The adjustment wraps what is drawn below it in a group with its noise.
         let scene = crate::eval::evaluate_project(&p, 36.0);
         let g = scene.groups.iter().find(|g| g.source == grain.id).expect("adjustment group");

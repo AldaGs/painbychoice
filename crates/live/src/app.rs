@@ -2124,18 +2124,13 @@ impl App {
             tr.position.set_at(frame, v);
             changed = true;
         }
-        if e.rot.is_some() || e.rot_x.is_some() || e.rot_y.is_some() {
-            // One track, three channels: keying any axis keys all of them, so
-            // the untouched axes hold their current value rather than snapping
-            // to whatever the neighbouring keys interpolate to.
-            let cur = tr.rotation.resolve(&mut ctx);
-            let v = motion_core::Vec3::new(
-                e.rot_x.unwrap_or(cur.x),
-                e.rot_y.unwrap_or(cur.y),
-                e.rot.unwrap_or(cur.z),
-            );
-            tr.rotation.set_at(frame, v);
-            changed = true;
+        // Each axis is its own track: editing one keys only that one, so the
+        // other two keep their own keys and easing.
+        for (edit, channel) in [(e.rot, &mut tr.rotation), (e.rot_x, &mut tr.rotation_x), (e.rot_y, &mut tr.rotation_y)] {
+            if let Some(v) = edit {
+                channel.set_at(frame, v);
+                changed = true;
+            }
         }
         if e.scale_x.is_some() || e.scale_y.is_some() || e.scale_z.is_some() {
             let cur = tr.scale.resolve(&mut ctx);
@@ -2861,7 +2856,11 @@ impl App {
                 if let Some(old) = old_world {
                     let ((ra, sx0, sy0), (rb, sx1, sy1)) = (spin_and_scale(old), spin_and_scale(world));
                     let turn = (ra - rb).to_degrees();
-                    remap(&mut node.transform.rotation, |v| v + motion_core::Vec3::new(0.0, 0.0, turn));
+                    match &mut node.transform.rotation {
+                        Value::Const(c) => *c += turn,
+                        Value::Keyframed(track) => *track = track.clone().map_value(|v| v + turn),
+                        Value::Expr(_) => {}
+                    }
                     let (kx, ky) = (sx0 / sx1, sy0 / sy1);
                     if kx.is_finite() && ky.is_finite() {
                         remap(&mut node.transform.scale, |v| motion_core::Vec3::new(v.x * kx, v.y * ky, v.z));

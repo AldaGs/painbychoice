@@ -27,8 +27,8 @@ pub fn demo_document() -> Document {
     .with_transform(Transform {
         position: Value::constant(Vec3::flat(0.0, -120.0)),
         rotation: Value::Keyframed(Track::new(vec![
-            Keyframe::linear(0, Vec3::ZERO),
-            Keyframe::linear(END, Vec3::new(0.0, 0.0, 360.0)),
+            Keyframe::linear(0, 0.0),
+            Keyframe::linear(END, 360.0),
         ])),
         ..Transform::default()
     });
@@ -51,8 +51,8 @@ pub fn demo_document() -> Document {
             Keyframe::smooth(END, Vec3::flat(1620.0, 540.0)),
         ])),
         rotation: Value::Keyframed(Track::new(vec![
-            Keyframe::smooth(0, Vec3::ZERO),
-            Keyframe::smooth(END, Vec3::new(0.0, 0.0, 90.0)),
+            Keyframe::smooth(0, 0.0),
+            Keyframe::smooth(END, 90.0),
         ])),
         ..Transform::default()
     })

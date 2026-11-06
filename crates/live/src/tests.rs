@@ -1261,8 +1261,8 @@ fn comp_at_fps(fps: f64, frame: i64) -> motion_core::node::Comp {
     use motion_core::value::{Keyframe, Track};
     let mut transform = motion_core::node::Transform::default();
     transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
-        Keyframe::linear(frame, motion_core::Vec3::new(0.0, 0.0, 90.0)),
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(frame, 90.0),
     ]));
     let layer = MNode::group(1, "layer").with_transform(transform);
     let mut comp =
@@ -1315,9 +1315,9 @@ fn a_long_drag_does_not_compound_rounding() {
     // Keys one frame apart @ 60fps cannot all survive a 7fps grid.
     let mut comp = comp_at_fps(60.0, 120);
     comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
-        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 45.0)),
-        Keyframe::linear(121, motion_core::Vec3::new(0.0, 0.0, 90.0)),
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(120, 45.0),
+        Keyframe::linear(121, 90.0),
     ]));
     let mut drag = None;
     let mut start = fps_edit(59.0);
@@ -1499,9 +1499,9 @@ fn the_key_selection_survives_a_retime() {
     use motion_core::value::{Keyframe, Track};
     let mut comp = comp_at_fps(60.0, 120);
     comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
-        Keyframe::linear(60, motion_core::Vec3::new(0.0, 0.0, 30.0)),
-        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 90.0)),
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(60, 30.0),
+        Keyframe::linear(120, 90.0),
     ]));
     let mut sel = KeySelection::new();
     sel.insert((PropKind::Rotation, 2)); // the key at frame 120
@@ -1528,10 +1528,10 @@ fn a_selection_follows_keys_that_merge() {
     use motion_core::value::{Keyframe, Track};
     let mut comp = comp_at_fps(60.0, 120);
     comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
-        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 45.0)),
-        Keyframe::linear(121, motion_core::Vec3::new(0.0, 0.0, 60.0)),
-        Keyframe::linear(240, motion_core::Vec3::new(0.0, 0.0, 90.0)),
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(120, 45.0),
+        Keyframe::linear(121, 60.0),
+        Keyframe::linear(240, 90.0),
     ]));
     let mut sel = KeySelection::new();
     sel.insert((PropKind::Rotation, 2)); // frame 121
@@ -1564,9 +1564,9 @@ fn the_selection_does_not_drift_over_a_drag() {
     use motion_core::value::{Keyframe, Track};
     let mut comp = comp_at_fps(60.0, 120);
     comp.root.children[0].transform.rotation = motion_core::Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, motion_core::Vec3::new(0.0, 0.0, 0.0)),
-        Keyframe::linear(120, motion_core::Vec3::new(0.0, 0.0, 45.0)),
-        Keyframe::linear(121, motion_core::Vec3::new(0.0, 0.0, 60.0)),
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(120, 45.0),
+        Keyframe::linear(121, 60.0),
     ]));
     let mut sel = KeySelection::new();
     sel.insert((PropKind::Rotation, 2));
@@ -4059,8 +4059,8 @@ fn framing_ignores_hidden_curves() {
 fn root_with_nested_layers() -> MNode {
     let mut transform = Transform::default();
     transform.rotation = Value::Keyframed(Track::new(vec![
-        Keyframe::linear(0, motion_core::Vec3::ZERO),
-        Keyframe::linear(8, motion_core::Vec3::new(0.0, 0.0, 90.0)),
+        Keyframe::linear(0, 0.0),
+        Keyframe::linear(8, 90.0),
     ]));
     let mut child = MNode::group(2, "child").with_transform(transform);
     child.timing = Some(LayerTiming::new(4, 20));
