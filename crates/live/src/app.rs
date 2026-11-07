@@ -624,12 +624,19 @@ pub(crate) fn camera_proxy(cam: &motion_core::Camera) -> MNode {
     if let Some(z) = &cam.zoom {
         n.set_param(crate::props::CAMERA_ZOOM_PARAM, motion_core::node::ParamValue::Num(z.clone()));
     }
+    if let Some(t) = &cam.point_of_interest {
+        n.transform.anchor = t.clone();
+        n.set_param(crate::props::CAMERA_TARGET_PARAM, motion_core::node::ParamValue::Num(Value::constant(0.0)));
+    }
     n
 }
 
 /// Write an edited [`camera_proxy`] back onto the camera.
 pub(crate) fn camera_write_back(cam: &mut motion_core::Camera, n: MNode) {
     let tr = n.transform;
+    if n.params.iter().any(|p| p.name == crate::props::CAMERA_TARGET_PARAM) {
+        cam.point_of_interest = Some(tr.anchor.clone());
+    }
     cam.position = tr.position;
     cam.rotation = tr.rotation;
     cam.rotation_x = tr.rotation_x;
@@ -4216,6 +4223,11 @@ impl App {
                 zoom: c.focal_length(&mut ctx),
                 zoom_anim: c.zoom.as_ref().is_some_and(|z| z.is_animated()),
                 width: comp.width,
+                poi: c.point_of_interest.as_ref().map(|t| {
+                    let t = t.resolve(&mut ctx);
+                    (t.x, t.y, t.z)
+                }),
+                poi_anim: c.point_of_interest.as_ref().is_some_and(|t| t.is_animated()),
             }
         });
         let timebase = self.doc().timebase();
@@ -5066,6 +5078,37 @@ impl App {
                 if comp.camera_zoom_key {
                     z.insert_key(frame);
                 }
+                dirty = true;
+            }
+        }
+        // Point of interest. Switched on, it starts where the camera already
+        // looks along its axis (the z = 0 plane straight ahead), so an
+        // unrotated camera does not jump.
+        if let Some(on) = comp.camera_poi_toggle {
+            let doc = self.doc().clone();
+            if let Some(cam) = self.doc_mut().camera.as_mut() {
+                cam.point_of_interest = on.then(|| {
+                    let mut ctx = EvalCtx::new(&doc, frame as f64);
+                    let p = cam.position.resolve(&mut ctx);
+                    Value::constant(motion_core::Vec3::new(p.x, p.y, 0.0))
+                });
+                dirty = true;
+            }
+            if !on && self.selected == Some(CAMERA_ID) {
+                self.selected_keys.retain(|(k, _)| *k != PropKind::CameraTarget);
+            }
+        }
+        if comp.camera_poi.iter().any(|e| e.is_some()) {
+            let doc = self.doc().clone();
+            if let Some(t) = self.doc_mut().camera.as_mut().and_then(|c| c.point_of_interest.as_mut()) {
+                let mut ctx = EvalCtx::new(&doc, frame as f64);
+                let cur = t.resolve(&mut ctx);
+                let v = motion_core::Vec3::new(
+                    comp.camera_poi[0].unwrap_or(cur.x),
+                    comp.camera_poi[1].unwrap_or(cur.y),
+                    comp.camera_poi[2].unwrap_or(cur.z),
+                );
+                t.set_at(frame, v);
                 dirty = true;
             }
         }

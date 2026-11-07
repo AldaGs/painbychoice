@@ -6291,3 +6291,30 @@ fn camera_zoom_is_a_keyable_row() {
     layer.set_param(crate::props::CAMERA_ZOOM_PARAM, motion_core::node::ParamValue::Num(Value::constant(1.0)));
     assert!(prop_of(&layer, PropKind::CameraZoom).is_none(), "only the camera has a lens");
 }
+
+/// The point of interest is its own "Point of Interest" row on the camera,
+/// keyed and moved through the shared key code. The camera stand-in never
+/// shows a plain Anchor row, and a camera with no target has no row at all.
+#[test]
+fn camera_point_of_interest_is_a_keyable_row() {
+    use crate::app::{camera_proxy, camera_write_back};
+    let mut cam = motion_core::Camera::from_distance(1000.0);
+    assert!(prop_of(&camera_proxy(&cam), PropKind::CameraTarget).is_none(), "free camera: no target");
+
+    cam.point_of_interest = Some(Value::constant(motion_core::Vec3::ZERO));
+    let mut n = camera_proxy(&cam);
+    prop_of_mut(&mut n, PropKind::CameraTarget).unwrap().insert_key(0);
+    camera_write_back(&mut cam, n);
+    cam.point_of_interest.as_mut().unwrap().set_at(24, motion_core::Vec3::new(100.0, 0.0, 0.0));
+
+    let proxy = camera_proxy(&cam);
+    assert!(prop_of(&proxy, PropKind::Anchor).is_none(), "no stray Anchor row");
+    let rows = crate::timeline::dope_rows(&proxy);
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].kind, rows[0].label.as_str()), (PropKind::CameraTarget, "Point of Interest"));
+
+    let mut n = camera_proxy(&cam);
+    assert!(crate::app::move_keys_in(&mut n, &[(PropKind::CameraTarget, vec![1])], 6, 100));
+    camera_write_back(&mut cam, n);
+    assert_eq!(cam.point_of_interest.as_ref().unwrap().key_frames(), vec![0, 30]);
+}

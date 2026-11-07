@@ -77,6 +77,16 @@ pub struct Camera {
     /// `z = 0` plane always renders at 1:1 and those files frame as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zoom: Option<Value<f64>>,
+    /// Where the camera looks — After Effects' two-node camera. Same space as
+    /// [`Self::position`] (offset from the comp centre, `z` into the scene).
+    ///
+    /// When set, the camera is aimed at this point every frame, staying upright
+    /// (no roll), and the tilt / pan / roll channels turn it further from
+    /// there. So animating the eye orbits a subject that stays framed, and
+    /// animating this point re-aims without touching the eye. `None` is a
+    /// free (one-node) camera aimed by its rotation alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_of_interest: Option<Value<Vec3>>,
     #[serde(default, rename = "distance", skip_serializing)]
     legacy_distance: Option<Value<f64>>,
 }
@@ -95,6 +105,8 @@ struct CameraRepr {
     rotation_y: Option<Value<f64>>,
     #[serde(default)]
     zoom: Option<Value<f64>>,
+    #[serde(default)]
+    point_of_interest: Option<Value<Vec3>>,
     #[serde(default, rename = "distance")]
     legacy_distance: Option<Value<f64>>,
 }
@@ -113,6 +125,7 @@ impl From<CameraRepr> for Camera {
             rotation_x: r.rotation_x.unwrap_or(x),
             rotation_y: r.rotation_y.unwrap_or(y),
             zoom: r.zoom,
+            point_of_interest: r.point_of_interest,
             legacy_distance: r.legacy_distance,
         }
     }
@@ -162,6 +175,7 @@ impl Camera {
             rotation_y: zero_angle(),
             // The lens matches the dolly, so the z = 0 plane starts at 1:1.
             zoom: Some(Value::constant(distance)),
+            point_of_interest: None,
             legacy_distance: None,
         }
     }
@@ -177,6 +191,9 @@ impl Camera {
         if let Some(z) = &mut self.zoom {
             z.migrate_frames(fps);
         }
+        if let Some(p) = &mut self.point_of_interest {
+            p.migrate_frames(fps);
+        }
     }
 
     pub(crate) fn retime(&mut self, ratio: f64) {
@@ -186,6 +203,9 @@ impl Camera {
         self.rotation_y.retime(ratio);
         if let Some(z) = &mut self.zoom {
             z.retime(ratio);
+        }
+        if let Some(p) = &mut self.point_of_interest {
+            p.retime(ratio);
         }
     }
 
@@ -231,6 +251,16 @@ impl Camera {
         let mut camera = Mat4::translate(Vec3::new(centre.x, centre.y, -focal));
         if (rx, ry, rz) != (0.0, 0.0, 0.0) {
             camera = camera * Mat4::rotate_x(-rx) * Mat4::rotate_y(-ry) * Mat4::rotate_z(-rz);
+        }
+        // Aim at the point of interest first (the user's rotation is relative
+        // to that aim, so it sits inside it in the inverse): pan, then tilt,
+        // never roll, so the horizon stays level however the eye moves.
+        if let Some(poi) = &self.point_of_interest {
+            let d = poi.resolve(ctx) - pos;
+            if d.x != 0.0 || d.y != 0.0 || d.z != 0.0 {
+                let (pan, tilt) = look_angles(d);
+                camera = camera * Mat4::rotate_x(-tilt) * Mat4::rotate_y(-pan);
+            }
         }
         camera = camera * Mat4::translate(-eye);
         Projector { eye: centre, distance: focal, orbit, camera }
@@ -388,6 +418,15 @@ impl Projector {
             None => Xf::Spatial(crate::mat4::Mat4::from_affine(view) * m),
         })
     }
+}
+
+/// The pan (about Y) and tilt (about X), radians, that turn the camera's
+/// forward axis (+Z) to point along `d`: `rotate_y(pan) · rotate_x(tilt) · Z`
+/// is `d` normalised. Pan first so the result has no roll.
+fn look_angles(d: Vec3) -> (f64, f64) {
+    let pan = d.x.atan2(d.z);
+    let tilt = (-d.y).atan2(d.x.hypot(d.z));
+    (pan, tilt)
 }
 
 /// Widen a legacy scalar `distance` into a full eye position: centred in x/y,
@@ -690,4 +729,49 @@ mod tests {
         assert!(b.y1 > 1080.0 && b.y0 > 540.0, "runs from below frame up toward the horizon: {b:?}");
     }
 
+
+    /// A two-node camera keeps its point of interest dead centre wherever the
+    /// eye goes — above, beside, behind the subject.
+    #[test]
+    fn the_point_of_interest_stays_centred() {
+        let target = Vec3::new(300.0, -200.0, 800.0); // offset from comp centre
+        for eye in [
+            Vec3::new(0.0, 0.0, -1000.0),
+            Vec3::new(900.0, 0.0, -400.0),
+            Vec3::new(-500.0, -700.0, -900.0),
+            Vec3::new(200.0, 300.0, 2500.0), // past the subject, looking back
+        ] {
+            let mut cam = Camera::from_distance(1000.0);
+            cam.position = Value::constant(eye);
+            cam.point_of_interest = Some(Value::constant(target));
+            let world = Vec3::new(960.0 + target.x, 540.0 + target.y, target.z);
+            let (x, y) = land(&cam, world).expect("in front");
+            assert!((x - 960.0).abs() < 1e-6 && (y - 540.0).abs() < 1e-6, "eye {eye:?} → {x},{y}");
+        }
+    }
+
+    /// Aiming never rolls: a point level with the target, to its side, stays
+    /// level with it on screen.
+    #[test]
+    fn aiming_keeps_the_horizon_level() {
+        let mut cam = Camera::from_distance(1000.0);
+        cam.position = Value::constant(Vec3::new(700.0, -400.0, -900.0));
+        cam.point_of_interest = Some(Value::constant(Vec3::ZERO));
+        let (_, y_side) = land(&cam, Vec3::new(960.0 + 50.0, 540.0, 0.0)).unwrap();
+        let (_, y_mid) = land(&cam, Vec3::new(960.0, 540.0, 0.0)).unwrap();
+        // The side point is off-centre in x; with no roll it may drop a little
+        // from perspective but must not swing to the other side of centre.
+        assert!((y_side - y_mid).abs() < 20.0, "{y_side} vs {y_mid}");
+    }
+
+    /// The camera's own rotation turns it further from the aim: pan 10° with a
+    /// target dead ahead behaves exactly like pan 10° with no target.
+    #[test]
+    fn rotation_adds_to_the_aim() {
+        let mut free = Camera::from_distance(1000.0);
+        free.rotation_y = Value::constant(10.0);
+        let mut aimed = free.clone();
+        aimed.point_of_interest = Some(Value::constant(Vec3::new(0.0, 0.0, 500.0)));
+        assert_eq!(land(&free, MID), land(&aimed, MID));
+    }
 }

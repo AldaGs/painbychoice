@@ -675,6 +675,10 @@ pub(crate) struct CompEdits {
     pub(crate) camera_zoom: Option<f64>,
     /// The lens stopwatch was clicked.
     pub(crate) camera_zoom_key: bool,
+    /// Turn the point of interest on (aim the camera at a point) or off.
+    pub(crate) camera_poi_toggle: Option<bool>,
+    /// Per-axis edits to the point of interest, `[x, y, z]`.
+    pub(crate) camera_poi: [Option<f64>; 3],
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -727,6 +731,9 @@ pub(crate) struct CameraBar {
     pub(crate) zoom_anim: bool,
     /// Composition width, for the field-of-view readout.
     pub(crate) width: f64,
+    /// The point of interest at this frame, when the camera has one.
+    pub(crate) poi: Option<(f64, f64, f64)>,
+    pub(crate) poi_anim: bool,
 }
 
 /// The render bar's inputs and its reported intent, bundled so the composition
@@ -964,7 +971,7 @@ pub(crate) fn comp_ui(
         // object's editor rather than a lone field, behind a popup so the bar
         // stays a bar. The label doubles as a readout: the dolly is the number
         // you reach for most, so it rides on the button.
-        if let Some(CameraBar { pos, rot, pos_anim, rot_anim, selected, zoom, zoom_anim, width }) = camera {
+        if let Some(CameraBar { pos, rot, pos_anim, rot_anim, selected, zoom, zoom_anim, width, poi, poi_anim }) = camera {
             ui.menu_button(format!("Camera  eye {:.0}", -pos.2), |ui| {
                 ui.set_min_width(180.0);
                 ui.horizontal(|ui| {
@@ -1024,6 +1031,35 @@ pub(crate) fn comp_ui(
                         out.camera_zoom_key = true;
                     }
                 });
+
+                // Two-node camera: aim at a point. With it on, the rotation
+                // rows below turn the camera further from that aim.
+                ui.horizontal(|ui| {
+                    let mut on = poi.is_some();
+                    if ui
+                        .checkbox(&mut on, "Point of interest")
+                        .on_hover_text("Aim the camera at a point, so moving it orbits the subject instead of turning away")
+                        .changed()
+                    {
+                        out.camera_poi_toggle = Some(on);
+                    }
+                    if poi.is_some() && crate::props::key_button(ui, poi_anim) {
+                        out.camera_key.push(crate::props::PropKind::CameraTarget);
+                    }
+                });
+                if let Some(mut p) = poi {
+                    ui.horizontal(|ui| {
+                        if ui.add(crate::calc::num(&mut p.0).speed(1.0).prefix("x ")).changed() {
+                            out.camera_poi[0] = Some(p.0);
+                        }
+                        if ui.add(crate::calc::num(&mut p.1).speed(1.0).prefix("y ")).changed() {
+                            out.camera_poi[1] = Some(p.1);
+                        }
+                        if ui.add(crate::calc::num(&mut p.2).speed(1.0).prefix("z ")).changed() {
+                            out.camera_poi[2] = Some(p.2);
+                        }
+                    });
+                }
 
                 // One row per axis, each with its own stopwatch: they are
                 // separate tracks, so a pan can ease while the roll holds.
