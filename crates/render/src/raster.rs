@@ -65,6 +65,19 @@ pub fn rasterize(
     background: Color,
     scale: f64,
 ) -> Result<(Vec<u8>, Vec<String>), RasterError> {
+    rasterize_with(scene, width, height, background, scale, None)
+}
+
+/// [`rasterize`], drawing footage from `footage` when one is given. Without
+/// one, footage is reported exactly as before.
+pub fn rasterize_with(
+    scene: &Scene,
+    width: u32,
+    height: u32,
+    background: Color,
+    scale: f64,
+    footage: Option<&crate::footage::Footage>,
+) -> Result<(Vec<u8>, Vec<String>), RasterError> {
     let (w, h) = (
         ((width as f64 * scale).round() as u32).max(1),
         ((height as f64 * scale).round() as u32).max(1),
@@ -73,7 +86,7 @@ pub fn rasterize(
     pixmap.fill(sk_color(background));
 
     let mut report = Vec::new();
-    draw_range(scene, 0, scene.items.len(), None, &mut pixmap, scale, &mut report);
+    draw_range(scene, 0, scene.items.len(), None, &mut pixmap, scale, footage, &mut report);
 
     // tiny-skia works premultiplied; every encoder here wants straight alpha.
     let mut out = Vec::with_capacity((w as usize) * (h as usize) * 4);
@@ -99,6 +112,7 @@ fn draw_range(
     open: Option<&LayerGroup>,
     target: &mut Pixmap,
     scale: f64,
+    footage: Option<&crate::footage::Footage>,
     report: &mut Vec<String>,
 ) {
     let mut i = start;
@@ -121,11 +135,11 @@ fn draw_range(
             });
         match group {
             Some(g) => {
-                draw_group(scene, g, target, scale, report);
+                draw_group(scene, g, target, scale, footage, report);
                 i = g.end;
             }
             None => {
-                draw_item(scene, i, target, scale, report);
+                draw_item(scene, i, target, scale, footage, report);
                 i += 1;
             }
         }
@@ -143,10 +157,11 @@ fn draw_group(
     g: &LayerGroup,
     target: &mut Pixmap,
     scale: f64,
+    footage: Option<&crate::footage::Footage>,
     report: &mut Vec<String>,
 ) {
     let Some(mut layer) = Pixmap::new(target.width(), target.height()) else { return };
-    draw_range(scene, g.start, g.end, Some(g), &mut layer, scale, report);
+    draw_range(scene, g.start, g.end, Some(g), &mut layer, scale, footage, report);
 
     // A mask clips the layer before it meets the backdrop. Core has already
     // resolved the geometry — including inverting it into a donut — so this
@@ -223,8 +238,38 @@ fn apply_effects(layer: &mut Pixmap, effects: &[motion_core::ResolvedEffect]) {
     }
 }
 
-fn draw_item(scene: &Scene, i: usize, target: &mut Pixmap, scale: f64, report: &mut Vec<String>) {
+fn draw_item(
+    scene: &Scene,
+    i: usize,
+    target: &mut Pixmap,
+    scale: f64,
+    footage: Option<&crate::footage::Footage>,
+    report: &mut Vec<String>,
+) {
     let item = &scene.items[i];
+    if let (Some(paint), Some(footage)) = (item.image, footage) {
+        match footage.frame(paint) {
+            Ok(img) => {
+                // Same placement as the editor's `draw_footage`: the source's
+                // native 0..w × 0..h squeezed onto the item's rect, then the
+                // item's transform, then the output scale.
+                let target_rect = kurbo::Shape::bounding_box(&item.path);
+                let (nw, nh) = (img.width().max(1) as f64, img.height().max(1) as f64);
+                let place = Affine::translate((target_rect.x0, target_rect.y0))
+                    * Affine::scale_non_uniform(target_rect.width() / nw, target_rect.height() / nh);
+                let [a, b, c, d, e, f] = (Affine::scale(scale) * item.transform * place).as_coeffs();
+                let paint = PixmapPaint {
+                    opacity: item.opacity.clamp(0.0, 1.0) as f32,
+                    quality: tiny_skia::FilterQuality::Bilinear,
+                    ..Default::default()
+                };
+                let xf = Transform::from_row(a as f32, b as f32, c as f32, d as f32, e as f32, f as f32);
+                target.draw_pixmap(0, 0, img.as_ref().as_ref(), &paint, xf, None);
+            }
+            Err(e) => report.push(format!("layer {}: {e}", item.source.0)),
+        }
+        return;
+    }
     if item.image.is_some() {
         report.push(format!(
             "layer {} is footage; the CPU rasterizer draws vectors only, so it is \

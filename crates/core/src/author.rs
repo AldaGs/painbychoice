@@ -18,19 +18,42 @@ pub(crate) fn to_export(doc: &J, report: &mut ImportReport) -> J {
     let comps = doc["compositions"].as_array().cloned().unwrap_or_default();
     // Comp ids start at 1; 0 is the root folder.
     let ids: HashMap<&str, u64> = comps.iter().enumerate().map(|(i, c)| (c["name"].as_str().unwrap_or(""), i as u64 + 1)).collect();
-    let children: Vec<J> = comps.iter().enumerate().map(|(i, c)| comp(c, i as u64 + 1, &ids, report)).collect();
-    if doc["assets"].as_array().is_some_and(|a| !a.is_empty()) {
-        report.drop("authoring assets (footage)");
+    // Assets become file footage items, numbered after the comps. Their size,
+    // rate and length must already be filled in — the shell probes the files
+    // (core reads no media), see `motion check`.
+    let assets = doc["assets"].as_array().cloned().unwrap_or_default();
+    let mut src = Sources { assets: HashMap::new(), items: Vec::new(), next: comps.len() as u64 + 1 };
+    for a in &assets {
+        let id = src.next;
+        src.next += 1;
+        let (w, h) = (a["width"].as_f64().unwrap_or(0.0), a["height"].as_f64().unwrap_or(0.0));
+        src.assets.insert(a["name"].as_str().unwrap_or("").to_string(), (id, w, h));
+        src.items.push(json!({
+            "id": id, "name": a["name"], "type": "Footage", "footageType": "file", "file": a["path"],
+            "width": w, "height": h, "framerate": a["fps"].as_f64().unwrap_or(0.0), "seconds": a["duration"].as_f64().unwrap_or(0.0),
+        }));
     }
+    let mut children: Vec<J> = comps.iter().enumerate().map(|(i, c)| comp(c, i as u64 + 1, &ids, &mut src, report)).collect();
+    children.append(&mut src.items);
     json!({ "file": doc["file"], "root": { "id": 0, "name": "root", "type": "Folder", "children": children } })
 }
 
-fn comp(c: &J, id: u64, ids: &HashMap<&str, u64>, report: &mut ImportReport) -> J {
+/// Footage items the layers point at: named assets, plus one solid item per
+/// solid layer (AE keeps solids as project items too).
+struct Sources {
+    /// Asset name → (item id, width, height).
+    assets: HashMap<String, (u64, f64, f64)>,
+    items: Vec<J>,
+    next: u64,
+}
+
+fn comp(c: &J, id: u64, ids: &HashMap<&str, u64>, src: &mut Sources, report: &mut ImportReport) -> J {
     let layers = c["layers"].as_array().cloned().unwrap_or_default();
     let duration = c["duration"].as_f64().unwrap_or(0.0);
     // AE layers are numbered from the top; parents and mattes name them.
     let by_name: HashMap<&str, u64> = layers.iter().enumerate().map(|(i, l)| (l["name"].as_str().unwrap_or(""), i as u64 + 1)).collect();
-    let out: Vec<J> = layers.iter().enumerate().map(|(i, l)| layer(l, i as u64 + 1, duration, ids, &by_name, report)).collect();
+    let size = (c["width"].as_f64().unwrap_or(1920.0), c["height"].as_f64().unwrap_or(1080.0));
+    let out: Vec<J> = layers.iter().enumerate().map(|(i, l)| layer(l, i as u64 + 1, duration, size, ids, &by_name, src, report)).collect();
     json!({
         "id": id,
         "name": c["name"],
@@ -44,7 +67,17 @@ fn comp(c: &J, id: u64, ids: &HashMap<&str, u64>, report: &mut ImportReport) -> 
     })
 }
 
-fn layer(l: &J, id: u64, comp_duration: f64, ids: &HashMap<&str, u64>, by_name: &HashMap<&str, u64>, report: &mut ImportReport) -> J {
+#[allow(clippy::too_many_arguments)]
+fn layer(
+    l: &J,
+    id: u64,
+    comp_duration: f64,
+    comp_size: (f64, f64),
+    ids: &HashMap<&str, u64>,
+    by_name: &HashMap<&str, u64>,
+    src: &mut Sources,
+    report: &mut ImportReport,
+) -> J {
     let kind = l["type"].as_str().unwrap_or("null");
     let start = l["startTime"].as_f64().unwrap_or(0.0);
     let in_ = l["in"].as_f64().unwrap_or(start);
@@ -58,9 +91,24 @@ fn layer(l: &J, id: u64, comp_duration: f64, ids: &HashMap<&str, u64>, by_name: 
     if l["jsx"].as_str().is_some_and(|s| !s.is_empty()) {
         report.drop("layer jsx escape hatch");
     }
-    if matches!(kind, "footage" | "audio" | "solid") {
-        report.drop(format!("{kind} layer"));
+    if kind == "audio" {
+        report.drop("audio layer");
     }
+    // The source a footage or solid layer shows, and its size.
+    let source = match kind {
+        "footage" => l["source"].as_str().and_then(|n| src.assets.get(n)).copied(),
+        "solid" => {
+            let (w, h) = (l["width"].as_f64().unwrap_or(comp_size.0), l["height"].as_f64().unwrap_or(comp_size.1));
+            let id = src.next;
+            src.next += 1;
+            src.items.push(json!({
+                "id": id, "name": l["name"], "type": "Footage", "footageType": "solid",
+                "solidColor": color(&l["color"]).unwrap_or(json!([0.5, 0.5, 0.5])), "width": w, "height": h,
+            }));
+            Some((id, w, h))
+        }
+        _ => None,
+    };
     // Keyframe times are comp seconds here and layer seconds in an export.
     let t = Times { shift: start };
     let mut o = json!({
@@ -78,6 +126,9 @@ fn layer(l: &J, id: u64, comp_duration: f64, ids: &HashMap<&str, u64>, by_name: 
         },
     });
     if let Some(&s) = l["source"].as_str().and_then(|s| ids.get(s)).filter(|_| kind == "precomp") {
+        o["sourceId"] = json!(s);
+    }
+    if let Some((s, ..)) = source {
         o["sourceId"] = json!(s);
     }
     if let Some(&p) = l["parent"].as_str().and_then(|p| by_name.get(p)) {
@@ -118,6 +169,23 @@ fn layer(l: &J, id: u64, comp_duration: f64, ids: &HashMap<&str, u64>, by_name: 
     ] {
         if !tf[key].is_null() {
             transform.push(t.prop(mn, &tf[key], key == "position", report));
+        }
+    }
+    // A sized source's anchor is a fraction of the source in an export, and
+    // pixels here. Left out, the importer applies AE's default (the centre).
+    if let Some((_, w, h)) = source.filter(|(_, w, h)| *w > 0.0 && *h > 0.0) {
+        let frac = |v: &mut J| {
+            if let Some(a) = v.as_array_mut() {
+                for (i, k) in a.iter_mut().enumerate().take(2) {
+                    *k = json!(k.as_f64().unwrap_or(0.0) / if i == 0 { w } else { h });
+                }
+            }
+        };
+        for p in transform.iter_mut().filter(|p| p["matchName"] == "ADBE Anchor Point") {
+            frac(&mut p["value"]);
+            for k in p["keyframes"].as_array_mut().into_iter().flatten() {
+                frac(&mut k["value"]);
+            }
         }
     }
     o["transform"] = json!(transform);

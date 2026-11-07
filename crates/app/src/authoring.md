@@ -10,7 +10,7 @@ the JSON report and the PNG sheet, and repeat.
 - `layers[0]` draws **on top**, like layer 1 in AE.
 - Rotation is in degrees, opacity is 0-100, scale is a percent `[100, 100]`.
 - Colours are `"#rrggbb"` or `[r, g, b]` in 0..1.
-- Always set `transform.position` on a layer. Shape coordinates are relative to it.
+- Always set `transform.position` on shape and text layers. Shape coordinates are relative to it.
 - The first composition is rendered unless `--comp <index>` is passed.
 
 ## Values
@@ -24,7 +24,8 @@ Any animatable property takes one of these:
 
 ## Shape
 ```
-document     { compositions: [comp], assets?: [] }
+document     { compositions: [comp], assets?: [asset] }
+asset        { name, path }          // path is relative to the spec; size, fps and length are read from the file
 comp         { name, width, height, duration, fps?=24, backgroundColor?="#000000", layers: [layer] }
 layer        { name, type, startTime?=0, in?, out?, parent?: layerName, blendMode?: "Multiply" | "Screen" | "Add" | …,
                trackMatte?: { type: "Alpha"|"Alpha Inverted"|"Luma"|"Luma Inverted", target: layerName },
@@ -34,9 +35,13 @@ layer        { name, type, startTime?=0, in?, out?, parent?: layerName, blendMod
                shapes?: [shape],         // type "shape"
                text?: text,              // type "text"
                source?: compName,        // type "precomp"
+               source?: assetName,       // type "footage" (image or video)
+               color, width?, height?,   // type "solid" (size defaults to the comp's)
                effects?: [effect] }
-layer.type   shape | text | null | precomp | adjustment | camera | light
-             (solid / footage / audio are accepted but NOT drawn yet; use a shape rect for a solid)
+layer.type   shape | text | solid | footage | null | precomp | adjustment | camera | light
+             (audio is accepted but not supported yet)
+             footage and solid layers are anchored at their centre and placed at the comp centre
+             unless anchorPoint / position say otherwise (anchorPoint in source pixels)
 text         { string, font?="ArialMT", fontSize?=48, fillColor?, strokeColor?, strokeWidth?, tracking?,
                justification?: left|center|right, leading?, boxSize?: [w, h], applyFill?, applyStroke? }
 shape        group   { items: [shape], transform?: { anchorPoint, position, scale, rotation, opacity } }

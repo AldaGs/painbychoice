@@ -428,6 +428,7 @@ fn render(args: &[String]) -> Result<(), String> {
     // encoder, which is what lets a worker compress a frame while the writer
     // still holds the encoder mutably.
     let preparer = encoder.preparer();
+    let footage = motion_render::Footage::new(&project);
 
     let render_frame = |frame: i64| {
         // Warnings are collected per frame and merged by the writer rather than
@@ -435,7 +436,7 @@ fn render(args: &[String]) -> Result<(), String> {
         // record something that is nearly always identical across all of them.
         // With motion blur on, one frame is several sub-frame renders averaged;
         // off, `offsets` is just `[0.0]`.
-        let (pixels, notes) = agent::frame_pixels(&project, comp_id, frame, o.scale)?;
+        let (pixels, notes) = agent::frame_pixels(&project, &footage, comp_id, frame, o.scale)?;
         // Compression happens here, on the worker, not on the writer. For a PNG
         // sequence this is most of a frame's encoding cost and was the serial
         // fraction that capped the whole render; for an ffmpeg sidecar it is a
@@ -584,9 +585,10 @@ fn preview(args: &[String]) -> Result<bool, String> {
     let started = std::time::Instant::now();
 
     let mut notes: std::collections::BTreeMap<String, usize> = Default::default();
+    let footage = motion_render::Footage::new(&l.project);
     let mut cells = Vec::with_capacity(picked.len());
     for &f in &picked {
-        let (px, n) = agent::frame_pixels(&l.project, comp_id, f, scale)?;
+        let (px, n) = agent::frame_pixels(&l.project, &footage, comp_id, f, scale)?;
         for note in n {
             *notes.entry(note).or_default() += 1;
         }

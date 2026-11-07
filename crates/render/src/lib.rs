@@ -8,6 +8,7 @@
 pub mod audio;
 pub mod decode;
 pub mod encode;
+pub mod footage;
 pub mod fx;
 pub mod parallel;
 pub mod raster;
@@ -20,7 +21,8 @@ pub use encode::{
     Quality,
 };
 pub use parallel::{default_threads, render_in_order};
-pub use raster::{average_frames, output_size, rasterize, RasterError};
+pub use footage::Footage;
+pub use raster::{average_frames, output_size, rasterize, rasterize_with, RasterError};
 
 use kurbo::Shape as _;
 use motion_core::{Asset, BlendMode, Color, ComposeMode, Scene};

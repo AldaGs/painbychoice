@@ -63,10 +63,15 @@ pub struct Loaded {
 /// A spec with errors still loads, so the report can carry them all at once.
 pub fn load(path: &Path) -> Result<Loaded, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let doc: J = serde_json::from_str(&text).map_err(|e| format!("{}: not JSON: {e}", path.display()))?;
+    let mut doc: J = serde_json::from_str(&text).map_err(|e| format!("{}: not JSON: {e}", path.display()))?;
     let mut findings = Findings::default();
+    let mut text = text;
     if doc.get("compositions").is_some() {
         validate(&doc, &mut findings);
+        if findings.errors.is_empty() {
+            probe_assets(&mut doc, path.parent().unwrap_or(Path::new(".")), &mut findings);
+            text = doc.to_string();
+        }
     }
     if doc.get("compositions").is_some() || doc.get("root").is_some() {
         if !findings.errors.is_empty() {
@@ -80,17 +85,51 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     Ok(Loaded { project, findings, dropped: Default::default() })
 }
 
+/// Fill in each asset's absolute path, size, rate and length from the file,
+/// so a spec only has to name it. Values the spec gives win over the probe.
+fn probe_assets(doc: &mut J, base: &Path, f: &mut Findings) {
+    let registry = motion_render::default_registry();
+    let Some(assets) = doc["assets"].as_array_mut() else { return };
+    for (i, a) in assets.iter_mut().enumerate() {
+        let Some(rel) = a["path"].as_str() else { continue };
+        let path = base.join(rel);
+        // `absolute`, not `canonicalize`: the latter gives Windows `\?\` paths.
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let at = format!("assets[{i}].path");
+        let meta = match registry.open(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                f.err(&at, format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        a["path"] = json!(path.display().to_string());
+        let fps = if meta.fps > 0.0 { meta.fps } else { 0.0 };
+        for (k, v) in [
+            ("width", meta.width),
+            ("height", meta.height),
+            ("fps", fps),
+            ("duration", if fps > 0.0 { meta.frames as f64 / fps } else { 0.0 }),
+        ] {
+            if a[k].is_null() {
+                a[k] = json!(v);
+            }
+        }
+    }
+}
+
 // --- validation ------------------------------------------------------------
 
 const DOC_KEYS: &[&str] = &["$schema", "version", "file", "compositions", "assets"];
 const COMP_KEYS: &[&str] = &["name", "width", "height", "fps", "duration", "backgroundColor", "layers"];
+const ASSET_KEYS: &[&str] = &["name", "path", "width", "height", "fps", "duration"];
 const LAYER_KEYS: &[&str] = &[
-    "name", "type", "startTime", "in", "out", "source", "parent", "blendMode", "trackMatte", "transform", "text", "shapes",
+    "color", "width", "height", "name", "type", "startTime", "in", "out", "source", "parent", "blendMode", "trackMatte", "transform", "text", "shapes",
     "effects", "adjustment", "enabled", "threeD", "stretch", "masks", "jsx",
 ];
-const LAYER_TYPES: &[&str] = &["shape", "text", "null", "precomp", "adjustment", "camera", "light"];
+const LAYER_TYPES: &[&str] = &["shape", "text", "solid", "footage", "null", "precomp", "adjustment", "camera", "light"];
 /// Accepted by the format, not drawn by PBC yet.
-const DROPPED_TYPES: &[&str] = &["solid", "footage", "audio"];
+const DROPPED_TYPES: &[&str] = &["audio"];
 const TRANSFORM_KEYS: &[&str] = &[
     "anchorPoint", "position", "xPosition", "yPosition", "scale", "rotation", "zRotation", "xRotation", "yRotation",
     "orientation", "opacity",
@@ -130,6 +169,24 @@ fn validate(doc: &J, f: &mut Findings) {
         f.err("compositions", "needs at least one composition (the first is rendered)");
     }
     let comp_names: Vec<&str> = comps.iter().filter_map(|c| c["name"].as_str()).collect();
+    let mut asset_names = Vec::new();
+    match doc.get("assets") {
+        None | Some(J::Null) => {}
+        Some(J::Array(assets)) => {
+            for (i, a) in assets.iter().enumerate() {
+                let p = format!("assets[{i}]");
+                keys(a, &p, ASSET_KEYS, f);
+                match a["name"].as_str() {
+                    Some(n) => asset_names.push(n),
+                    None => f.err(&format!("{p}.name"), "required string (footage layers name it as their source)"),
+                }
+                if a["path"].as_str().is_none() {
+                    f.err(&format!("{p}.path"), "required file path, relative to this spec");
+                }
+            }
+        }
+        Some(_) => f.err("assets", "must be an array"),
+    }
     for (ci, c) in comps.iter().enumerate() {
         let p = format!("compositions[{ci}]");
         if !c.is_object() {
@@ -160,7 +217,7 @@ fn validate(doc: &J, f: &mut Findings) {
         let mut seen = HashMap::new();
         for (li, l) in layers.iter().enumerate() {
             let lp = format!("{p}.layers[{li}]");
-            layer(l, &lp, duration, &names, &comp_names, f);
+            layer(l, &lp, duration, &names, &comp_names, &asset_names, f);
             if let Some(n) = l["name"].as_str() {
                 if let Some(prev) = seen.insert(n, li) {
                     f.warn(&format!("{lp}.name"), format!("duplicate name '{n}' (also layers[{prev}]); parent/matte references hit the last one"));
@@ -170,7 +227,7 @@ fn validate(doc: &J, f: &mut Findings) {
     }
 }
 
-fn layer(l: &J, p: &str, duration: f64, names: &[&str], comps: &[&str], f: &mut Findings) {
+fn layer(l: &J, p: &str, duration: f64, names: &[&str], comps: &[&str], assets: &[&str], f: &mut Findings) {
     if !l.is_object() {
         return f.err(p, "must be an object");
     }
@@ -180,7 +237,7 @@ fn layer(l: &J, p: &str, duration: f64, names: &[&str], comps: &[&str], f: &mut 
     }
     let kind = l["type"].as_str().unwrap_or("");
     if DROPPED_TYPES.contains(&kind) {
-        f.warn(&format!("{p}.type"), format!("'{kind}' layers are not drawn yet; use a shape layer with a rect for a solid"));
+        f.warn(&format!("{p}.type"), format!("'{kind}' layers are not supported yet; ignored"));
     } else if !LAYER_TYPES.contains(&kind) {
         f.err(&format!("{p}.type"), format!("unknown layer type '{kind}'{}; expected one of {}", suggest(kind, LAYER_TYPES), LAYER_TYPES.join(", ")));
     }
@@ -205,6 +262,30 @@ fn layer(l: &J, p: &str, duration: f64, names: &[&str], comps: &[&str], f: &mut 
             Some(s) if comps.contains(&s) => {}
             Some(s) => f.err(&format!("{p}.source"), format!("no composition named '{s}'{}", suggest(s, comps))),
             None => f.err(&format!("{p}.source"), "a precomp layer needs the name of the composition it shows"),
+        }
+    }
+    match kind {
+        "footage" => match l["source"].as_str() {
+            Some(s) if assets.contains(&s) => {}
+            Some(s) => f.err(&format!("{p}.source"), format!("no asset named '{s}'{}", suggest(s, assets))),
+            None => f.err(&format!("{p}.source"), "a footage layer needs the name of an entry in assets"),
+        },
+        "solid" => {
+            if !is_color(&l["color"]) {
+                f.err(&format!("{p}.color"), "a solid needs a color, \"#rrggbb\" or [r, g, b] in 0..1");
+            }
+            for k in ["width", "height"] {
+                if !l[k].is_null() && !l[k].as_f64().is_some_and(|v| v > 0.0) {
+                    f.err(&format!("{p}.{k}"), "must be a positive number (default: the comp's)");
+                }
+            }
+        }
+        _ => {
+            for k in ["color", "width", "height"] {
+                if !l[k].is_null() {
+                    f.warn(&format!("{p}.{k}"), "only solid layers use this; ignored");
+                }
+            }
         }
     }
     if let Some(tm) = l.get("trackMatte").filter(|v| !v.is_null()) {
@@ -446,13 +527,19 @@ fn suggest(word: &str, candidates: &[&str]) -> String {
 // --- rendering ---------------------------------------------------------------
 
 /// One frame as straight RGBA at `scale`, with motion blur, plus its notes.
-pub fn frame_pixels(project: &Project, comp_id: CompId, frame: i64, scale: f64) -> Result<(Vec<u8>, Vec<String>), String> {
+pub fn frame_pixels(
+    project: &Project,
+    footage: &motion_render::Footage,
+    comp_id: CompId,
+    frame: i64,
+    scale: f64,
+) -> Result<(Vec<u8>, Vec<String>), String> {
     let comp = project.comp(comp_id).ok_or("no such composition")?;
     let (mut notes, mut samples) = (Vec::new(), Vec::new());
     for shutter in comp.motion_blur.offsets() {
         let scene = motion_core::evaluate_comp_sample(project, comp_id, frame as f64, shutter, motion_core::mat4::Mat4::IDENTITY);
         notes.extend(scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)));
-        let (px, r) = motion_render::rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, scale).map_err(|e| e.to_string())?;
+        let (px, r) = motion_render::rasterize_with(&scene, comp.width as u32, comp.height as u32, comp.bg, scale, Some(footage)).map_err(|e| e.to_string())?;
         samples.push(px);
         notes.extend(r);
     }
@@ -535,6 +622,21 @@ mod tests {
         assert!(w.message.contains("did you mean 'position'"), "{}", w.message);
         assert!(f.errors.iter().any(|e| e.path.ends_with(".type") && e.message.contains("'shape'")));
         assert!(f.errors.iter().any(|e| e.path.ends_with(".parent") && e.message.contains("'Box'")));
+    }
+
+    #[test]
+    fn footage_and_solids_check_their_sources() {
+        let mut d = spec();
+        d["assets"] = json!([{ "name": "logo", "path": "logo.png" }]);
+        d["compositions"][0]["layers"] = json!([
+            { "name": "A", "type": "footage", "source": "lgo" },
+            { "name": "B", "type": "solid" },
+            { "name": "C", "type": "solid", "color": "#112233", "width": 100 },
+        ]);
+        let f = findings(d);
+        assert!(f.errors.iter().any(|e| e.path == "compositions[0].layers[0].source" && e.message.contains("'logo'")));
+        assert!(f.errors.iter().any(|e| e.path == "compositions[0].layers[1].color"));
+        assert_eq!(f.errors.len(), 2, "layer C is fine");
     }
 
     #[test]
