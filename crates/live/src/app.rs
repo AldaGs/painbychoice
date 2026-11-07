@@ -4541,6 +4541,23 @@ impl App {
                             &mut canvas_edits,
                             &mut aid_edits,
                         );
+                        // The canvas has no area header (see `SWAPPABLE`), so its
+                        // pop-out lives here: it opens the preview window, the
+                        // canvas's second home — the vello target itself stays.
+                        if let Some(rect) = canvas_pts {
+                            let at = egui::Rect::from_min_size(
+                                egui::pos2(rect.max.x - 28.0, rect.min.y + 4.0),
+                                egui::vec2(24.0, 24.0),
+                            );
+                            let tip = if layout.preview_open { "Close the preview window" } else { "Pop out into a preview window" };
+                            if ui
+                                .put(at, egui::Button::new(icon::text(icon::OPEN)).selected(layout.preview_open))
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                layout.toggle_preview = true;
+                            }
+                        }
                         // Aids underneath everything: they orient the frame, and
                         // must never sit over the things you grab.
                         if let Some(rect) = canvas_pts {
@@ -4606,9 +4623,8 @@ impl App {
                     }
                 };
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            let mut next_id = 0;
             let mut path = Vec::new();
-            show_dock(dock, ui, &mut next_id, &mut path, true, &mut draw, &mut dock_cmd);
+            show_dock(dock, ui, &mut path, true, &mut draw, &mut dock_cmd);
         });
         let float_outputs: Vec<_> = self
             .popouts
@@ -4620,9 +4636,8 @@ impl App {
                     // No vello frame behind a floating window: fill what the
                     // panels leave bare, as the main window's canvas would.
                     ui.painter().rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
-                    let mut next_id = 0;
                     let mut path = Vec::new();
-                    show_dock(&mut p.dock, ui, &mut next_id, &mut path, false, &mut draw, &mut cmd);
+                    show_dock(&mut p.dock, ui, &mut path, false, &mut draw, &mut cmd);
                 });
                 (out, cmd)
             })

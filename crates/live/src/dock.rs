@@ -17,7 +17,7 @@ pub(crate) const COMP_H: f32 = 34.0;
 /// The canvas is one of these even though vello draws it, not egui: it has to
 /// occupy a leaf so the layout tree knows where the leftover space is. Its leaf
 /// draws nothing and merely reports its rect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum Editor {
     Canvas,
     Comp,
@@ -87,7 +87,7 @@ impl Editor {
 }
 
 /// Which edge of an area a split pins its first child to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum DockSide {
     Left,
     Right,
@@ -471,11 +471,6 @@ pub(crate) struct LayoutState {
 
 /// Render a layout tree into `ui`, calling `draw` for each leaf.
 ///
-/// `next_id` just hands every panel a distinct egui id; egui keys its persistent
-/// panel state (including the size a user dragged a splitter to) off that, so
-/// the ids must stay stable frame to frame — which they are, since the walk
-/// order is the tree's own structure.
-///
 /// `path` tracks the current leaf's address as the walk descends, and `cmd`
 /// collects at most one area-header interaction (split/join/retype) to be
 /// applied after the pass — the tree must not be restructured while its panels
@@ -486,7 +481,6 @@ pub(crate) struct LayoutState {
 pub(crate) fn show_dock(
     node: &mut Dock,
     ui: &mut egui::Ui,
-    next_id: &mut u32,
     path: &mut Vec<Branch>,
     can_pop: bool,
     draw: &mut dyn FnMut(Editor, &mut egui::Ui),
@@ -516,8 +510,27 @@ pub(crate) fn show_dock(
             }
         }
         Dock::Split { side, size, resizable, first, second } => {
-            let id = egui::Id::new(("dock", *next_id));
-            *next_id += 1;
+            // Keyed by this split's path *and* its subtree's shape, never a
+            // walk counter: closing or popping out an area shifted every later
+            // counter id, so egui handed each panel its neighbour's remembered
+            // size and the canvas got squeezed to nothing. Any restructure now
+            // yields fresh ids, which start from the tree's own `size`.
+            fn shape(d: &Dock, h: &mut impl std::hash::Hasher) {
+                use std::hash::Hash;
+                match d {
+                    Dock::Leaf(e) => e.hash(h),
+                    Dock::Split { side, first, second, .. } => {
+                        side.hash(h);
+                        shape(first, h);
+                        shape(second, h);
+                    }
+                }
+            }
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&(&*path, *side), &mut h);
+            shape(first, &mut h);
+            shape(second, &mut h);
+            let id = egui::Id::new(("dock", std::hash::Hasher::finish(&h)));
             let panel = match side {
                 DockSide::Left => egui::Panel::left(id),
                 DockSide::Right => egui::Panel::right(id),
@@ -531,7 +544,7 @@ pub(crate) fn show_dock(
             };
             let resp = panel.show(ui, |ui| {
                 path.push(Branch::First);
-                show_dock(first, ui, next_id, path, can_pop, draw, cmd);
+                show_dock(first, ui, path, can_pop, draw, cmd);
                 path.pop();
             });
             // Read the size back so the tree — not egui's private panel memory —
@@ -560,7 +573,7 @@ pub(crate) fn show_dock(
             // (rather than into a sibling panel) is what makes the nesting
             // depth-first and the geometry exact.
             path.push(Branch::Second);
-            show_dock(second, ui, next_id, path, can_pop, draw, cmd);
+            show_dock(second, ui, path, can_pop, draw, cmd);
             path.pop();
         }
     }
