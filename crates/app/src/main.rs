@@ -21,12 +21,14 @@
 //! GPU preview. Anything it cannot draw exactly is **printed**, never silently
 //! omitted.
 
+mod agent;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use motion_core::{demo::demo_document, Color, CompId, Project};
 use motion_render::{
-    is_video_container, output_size, rasterize, scene_to_svg_reporting, Encoder, FfmpegEncoder,
+    is_video_container, output_size, scene_to_svg_reporting, Encoder, FfmpegEncoder,
     OutputSpec, PngSequence, Quality,
 };
 
@@ -34,7 +36,10 @@ const USAGE: &str = "\
 motion — the headless PBC renderer
 
 USAGE:
-  motion render <project.pbc> --out <file|dir> [options]
+  motion render <project.pbc|spec.json> --out <file|dir> [options]
+  motion preview <project.pbc|spec.json> [--frames 0,30,60 | --count n] [--width px] [--out sheet.png]
+  motion check <project.pbc|spec.json>
+  motion schema      Prints the authoring JSON reference (start here).
   motion render --demo --out <file|dir> [options]
   motion demo [--out <dir>]
   motion import-ae <export.json|authoring.json> <out.pbc>
@@ -64,6 +69,8 @@ RENDER OPTIONS:
                      scales close to linearly; `--threads 1` is the sequential
                      path, for comparing against or debugging.
   -q, --quiet        Only report errors.
+  --json             Print one JSON report on stdout (ok, errors, warnings,
+                     dropped, notes) instead of progress text.
 
   motion demo        Writes the built-in demo document as SVG frames to ./out,
                      which is what this binary did before it could render.
@@ -79,6 +86,12 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("check") => exit(check(&args[1..])),
+        Some("preview") => exit(preview(&args[1..])),
+        Some("schema") => {
+            print!("{}", agent::REFERENCE);
+            ExitCode::SUCCESS
+        }
         Some("import-ae") => match import_ae(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -145,6 +158,7 @@ struct Opts {
     threads: Option<usize>,
     quiet: bool,
     demo: bool,
+    json: bool,
 }
 
 /// Hand-rolled rather than a `clap` dependency: the flag set is small and
@@ -163,6 +177,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         threads: None,
         quiet: false,
         demo: false,
+        json: false,
     };
     let mut positional = None;
     let mut i = 0;
@@ -202,6 +217,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 o.threads = Some(n);
             }
             "-q" | "--quiet" => o.quiet = true,
+            "--json" => {
+                o.json = true;
+                o.quiet = true;
+            }
             other if other.starts_with('-') => return Err(format!("unknown option '{other}'")),
             other => positional = Some(PathBuf::from(other)),
         }
@@ -312,14 +331,19 @@ fn mix_soundtrack(
 
 fn render(args: &[String]) -> Result<(), String> {
     let o = parse(args)?;
-    let project = match &o.project {
+    let (project, findings, dropped) = match &o.project {
         Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            Project::from_pbc(&text)?
+            let l = agent::load(path)?;
+            (l.project, l.findings, l.dropped)
         }
-        None => Project::single(demo_document()),
+        None => (Project::single(demo_document()), Default::default(), Default::default()),
     };
+    if !findings.errors.is_empty() {
+        if o.json {
+            println!("{}", report(&findings, &dropped, &Default::default(), serde_json::json!({})));
+        }
+        return Err(format!("{} error(s) in the spec; run `motion check` for the list", findings.errors.len()));
+    }
 
     let comp_id = o.comp.map(CompId).unwrap_or(project.root);
     let comp = project
@@ -411,34 +435,13 @@ fn render(args: &[String]) -> Result<(), String> {
         // record something that is nearly always identical across all of them.
         // With motion blur on, one frame is several sub-frame renders averaged;
         // off, `offsets` is just `[0.0]`.
-        let (mut warnings, mut report, mut samples) = (Vec::new(), Vec::new(), Vec::new());
-        for shutter in comp.motion_blur.offsets() {
-            let scene = motion_core::evaluate_comp_sample(
-                &project,
-                comp_id,
-                frame as f64,
-                shutter,
-                motion_core::mat4::Mat4::IDENTITY,
-            );
-            warnings.extend(scene.warnings.iter().map(|(id, msg)| format!("node {}: {msg}", id.0)));
-            let (px, r) =
-                rasterize(&scene, comp.width as u32, comp.height as u32, comp.bg, o.scale)
-                    .map_err(|e| e.to_string())?;
-            samples.push(px);
-            report.extend(r);
-        }
-        // Samples repeat the same notes; keep one each so counts stay per frame.
-        warnings.sort_unstable();
-        warnings.dedup();
-        report.sort_unstable();
-        report.dedup();
-        let pixels = motion_render::average_frames(&samples);
+        let (pixels, notes) = agent::frame_pixels(&project, comp_id, frame, o.scale)?;
         // Compression happens here, on the worker, not on the writer. For a PNG
         // sequence this is most of a frame's encoding cost and was the serial
         // fraction that capped the whole render; for an ffmpeg sidecar it is a
         // move and costs nothing.
         let prepared = preparer.prepare(pixels).map_err(|e| e.to_string())?;
-        Ok((prepared, warnings, report))
+        Ok((prepared, notes))
     };
 
     let mut written = 0i64;
@@ -446,8 +449,8 @@ fn render(args: &[String]) -> Result<(), String> {
         start..=end,
         threads,
         render_frame,
-        |frame, (prepared, warnings, report)| {
-            for note in warnings.into_iter().chain(report) {
+        |frame, (prepared, frame_notes)| {
+            for note in frame_notes {
                 *notes.entry(note).or_default() += 1;
             }
             encoder.write_prepared(prepared).map_err(|e| e.to_string())?;
@@ -466,6 +469,16 @@ fn render(args: &[String]) -> Result<(), String> {
         return Err(e);
     }
     encoder.finish().map_err(|e| e.to_string())?;
+    if o.json {
+        let extra = serde_json::json!({
+            "output": o.out.display().to_string(),
+            "frames": written,
+            "size": [w, h],
+            "seconds": started.elapsed().as_secs_f64(),
+        });
+        println!("{}", report(&findings, &dropped, &notes, extra));
+        return Ok(());
+    }
 
     if !o.quiet {
         let secs = started.elapsed().as_secs_f64();
@@ -481,6 +494,117 @@ fn render(args: &[String]) -> Result<(), String> {
         eprintln!("note: {note}{}", if *count > 1 { format!(" (×{count})") } else { String::new() });
     }
     Ok(())
+}
+
+fn exit(r: Result<bool, String>) -> ExitCode {
+    match r {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            // Still JSON: a caller parsing stdout must never get prose.
+            println!("{}", serde_json::json!({ "ok": false, "errors": [{ "path": "", "message": e }], "warnings": [] }));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The one report shape every agent command prints. `extra`'s keys are merged in.
+fn report(
+    findings: &agent::Findings,
+    dropped: &std::collections::BTreeMap<String, usize>,
+    notes: &std::collections::BTreeMap<String, usize>,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let (errors, warnings) = findings.to_json();
+    let mut r = serde_json::json!({
+        "ok": findings.errors.is_empty(),
+        "errors": errors,
+        "warnings": warnings,
+        "dropped": dropped,
+        "notes": notes,
+    });
+    if let serde_json::Value::Object(m) = extra {
+        r.as_object_mut().unwrap().extend(m);
+    }
+    r
+}
+
+fn comp_summary(project: &Project, id: CompId) -> serde_json::Value {
+    project.comp(id).map_or(serde_json::Value::Null, |c| {
+        serde_json::json!({
+            "id": id.0, "name": c.label(id), "width": c.width, "height": c.height,
+            "fps": c.fps, "frames": c.duration_frames,
+        })
+    })
+}
+
+/// `motion check`: validate and import, render nothing. Ok(false) on errors.
+fn check(args: &[String]) -> Result<bool, String> {
+    let [path] = args else { return Err("usage: motion check <project.pbc|spec.json>".into()) };
+    let l = agent::load(Path::new(path))?;
+    let ok = l.findings.errors.is_empty();
+    let comps: Vec<_> = if ok { l.project.comps.keys().map(|id| comp_summary(&l.project, *id)).collect() } else { Vec::new() };
+    println!("{}", report(&l.findings, &l.dropped, &Default::default(), serde_json::json!({ "comps": comps })));
+    Ok(ok)
+}
+
+/// `motion preview`: a handful of frames as one PNG grid, plus the report.
+fn preview(args: &[String]) -> Result<bool, String> {
+    let (mut input, mut out, mut frames, mut count, mut width, mut comp) = (None, None, None, 6usize, 480.0f64, None);
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let mut value = |name: &str| {
+            i += 1;
+            args.get(i).cloned().ok_or_else(|| format!("{name} needs a value"))
+        };
+        match a {
+            "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--frames" => frames = Some(value("--frames")?),
+            "--count" => count = value("--count")?.parse().map_err(|_| "--count wants a number")?,
+            "--width" => width = value("--width")?.parse().map_err(|_| "--width wants pixels")?,
+            "--comp" => comp = Some(CompId(value("--comp")?.parse().map_err(|_| "--comp wants a number")?)),
+            o if o.starts_with('-') => return Err(format!("unknown option '{o}'")),
+            p => input = Some(PathBuf::from(p)),
+        }
+        i += 1;
+    }
+    let input = input.ok_or("usage: motion preview <project.pbc|spec.json> [options]")?;
+    let out = out.unwrap_or_else(|| input.with_extension("preview.png"));
+    let l = agent::load(&input)?;
+    if !l.findings.errors.is_empty() {
+        println!("{}", report(&l.findings, &l.dropped, &Default::default(), serde_json::json!({})));
+        return Ok(false);
+    }
+    let comp_id = comp.unwrap_or(l.project.root);
+    let c = l.project.comp(comp_id).ok_or_else(|| format!("no composition {}", comp_id.0))?;
+    let picked = agent::pick_frames(frames.as_deref(), c.duration_frames - 1, count)?;
+    let scale = (width / c.width).min(1.0);
+    let (w, h) = output_size(c.width, c.height, scale);
+    let started = std::time::Instant::now();
+
+    let mut notes: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut cells = Vec::with_capacity(picked.len());
+    for &f in &picked {
+        let (px, n) = agent::frame_pixels(&l.project, comp_id, f, scale)?;
+        for note in n {
+            *notes.entry(note).or_default() += 1;
+        }
+        cells.push(px);
+    }
+    let cols = (picked.len() as f64).sqrt().ceil() as u32;
+    let (sheet, sw, sh) = agent::contact_sheet(&cells, w, h, cols);
+    image::save_buffer(&out, &sheet, sw, sh, image::ColorType::Rgba8).map_err(|e| format!("{}: {e}", out.display()))?;
+
+    let extra = serde_json::json!({
+        "output": out.display().to_string(),
+        "frames": picked,
+        "grid": { "cols": cols, "rows": (picked.len() as u32).div_ceil(cols), "cell": [w, h] },
+        "comp": comp_summary(&l.project, comp_id),
+        "seconds": started.elapsed().as_secs_f64(),
+    });
+    println!("{}", report(&l.findings, &l.dropped, &notes, extra));
+    Ok(true)
 }
 
 /// The built-in demo, as SVG frames. What this binary used to be, kept because

@@ -2234,6 +2234,7 @@ dependencies = [
 name = "motion-app"
 version = "0.0.1"
 dependencies = [
+ "image 0.25.10",
  "kurbo",
  "motion-core",
  "motion-render",
