@@ -313,11 +313,28 @@ impl Projector {
         crate::warp::homography_for(&(self.view() * *m), self.eye, self.distance)
     }
 
-    /// A layer at this depth is at or behind the eye. Nothing in front of the
-    /// camera can be seen through it, and the scale factor would be infinite or
-    /// negative (an inside-out layer), so it is culled instead.
+    /// The near plane: camera-space depth, in pixels in front of the eye, below
+    /// which nothing draws. A fraction of the lens rather than a constant, so
+    /// the worst magnification at the cut is the same for every lens
+    /// (`distance / near` = 50x) — close enough to read as "right up against the
+    /// camera" without flinging geometry to coordinates the rasterizer cannot
+    /// hold.
+    pub fn near(&self) -> f64 {
+        (self.distance * NEAR_FRACTION).max(EPSILON)
+    }
+
+    /// A screen-parallel layer at this depth is in front of the near plane or
+    /// not as a whole — every point of it shares the depth — so it is drawn or
+    /// culled whole. (A tipped layer is cut instead; see [`Self::project`].)
     fn is_culled(&self, depth: f64) -> bool {
-        self.distance + depth <= EPSILON
+        self.distance + depth < self.near()
+    }
+
+    /// Whether a world transform's origin is in front of the near plane — the
+    /// one point a layer that cannot be cut (footage, which paints into an
+    /// affine rectangle) is placed by.
+    pub fn origin_in_front(&self, xf: Xf) -> bool {
+        !self.is_culled((self.view() * xf.to_mat4()).0[14])
     }
 
     /// Project a world transform through this camera.
@@ -341,6 +358,14 @@ impl Projector {
         // space, depth included.
         let depth = m.0[14];
         if self.is_culled(depth) {
+            // A tipped layer can run from behind the camera to in front of it
+            // — a floor, a wall alongside — so its origin says nothing about
+            // whether any of it shows. It is not culled: the warp cuts its
+            // geometry at the near plane. The unscaled view is only a stand-in
+            // for the affine readers (overlay, hit-testing).
+            if m.as_affine_ignoring_depth().is_none() {
+                return Some(Xf::Spatial(m));
+            }
             return None;
         }
         let s = self.distance / (self.distance + depth);
@@ -385,6 +410,9 @@ fn deepen_distance(distance: Value<f64>) -> Value<Vec3> {
 /// Depths closer to the eye than this are treated as *at* it. Guards the divide
 /// without pretending a layer 0.0001px in front of the lens is meaningful.
 const EPSILON: f64 = 1e-6;
+
+/// The near plane as a fraction of the lens — see [`Projector::near`].
+const NEAR_FRACTION: f64 = 0.02;
 
 #[cfg(test)]
 mod tests {
@@ -633,8 +661,33 @@ mod tests {
     /// Anything behind the camera — in its own space, not the comp's — is culled.
     #[test]
     fn behind_a_turned_camera_is_culled() {
+        use kurbo::Shape as _;
         let mut cam = Camera::from_distance(1000.0);
         cam.rotation_y = Value::constant(180.0);
-        assert!(land(&cam, MID).is_none(), "the plane is behind a camera turned around");
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let v = cam.resolve(&mut ctx, 1920.0, 1080.0);
+        let layer = Mat4::translate(MID);
+        let square = kurbo::Rect::new(-100.0, -100.0, 100.0, 100.0).to_path(0.01);
+        assert!(crate::warp::warp_path(&square, &v.homography(&layer), v.near()).is_none());
     }
+
+    /// A floor running under and past the camera is cut at the near plane:
+    /// the part in front draws, nothing behind the eye does.
+    #[test]
+    fn a_floor_past_the_camera_is_cut_not_culled() {
+        use kurbo::Shape as _;
+        let cam = Camera::from_distance(1000.0);
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let v = cam.resolve(&mut ctx, 1920.0, 1080.0);
+        // Origin 1500 behind the eye, tipped flat, 4000 deep toward the scene.
+        let floor = Mat4::translate(Vec3::new(960.0, 800.0, -2500.0)) * Mat4::rotate_x(std::f64::consts::FRAC_PI_2);
+        let xf = Xf::Spatial(floor);
+        assert!(v.project(xf).is_some(), "not culled by its origin");
+        assert!(!v.origin_in_front(xf));
+        let rect = kurbo::Rect::new(-500.0, -4000.0, 500.0, 4000.0).to_path(0.01);
+        let cut = crate::warp::warp_path(&rect, &v.homography(&floor), v.near()).expect("the front part draws");
+        let b = cut.bounding_box();
+        assert!(b.y1 > 1080.0 && b.y0 > 540.0, "runs from below frame up toward the horizon: {b:?}");
+    }
+
 }

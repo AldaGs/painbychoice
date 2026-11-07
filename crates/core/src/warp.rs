@@ -22,6 +22,13 @@
 //! is the same bargain `kurbo::flatten` already makes for stroking, at the same
 //! kind of tolerance.
 //!
+//! # The near plane
+//!
+//! A layer that runs past the camera is cut, not dropped: camera depth is
+//! linear across a layer's plane, so the near plane is a straight line in the
+//! layer's own space and the path is clipped against it exactly before it is
+//! projected ([`clip_near`]).
+//!
 //! # What is still left out
 //!
 //! Raster layers. An image is painted by the backend into its rectangle under an
@@ -82,14 +89,22 @@ const FLATTEN_TOLERANCE: f64 = 0.25;
 /// which is far past visible.
 const MAX_DEPTH: u8 = 8;
 
-/// Push a path through a homography, in composition space.
+/// Push a path through a homography, in composition space, cut at the near
+/// plane.
 ///
-/// `None` when any part of the path falls at or behind the eye plane. That is a
-/// whole-path answer rather than a clipped one on purpose: a partially-crossing
-/// layer needs true near-plane clipping to draw correctly, and silently emitting
-/// the half that happens to project would put a torn shape on screen and call it
-/// a frame.
-pub fn warp_path(path: &BezPath, h: &Homography) -> Option<BezPath> {
+/// `near` is the camera-space depth (pixels in front of the eye) below which
+/// nothing is drawn. The part of the layer in front of it is kept and drawn
+/// exactly; the part behind is cut away along the plane — so a floor or wall
+/// that runs past the camera stays on screen up to where it passes it, instead
+/// of vanishing whole. See [`clip_near`].
+///
+/// `None` only when nothing is left: the whole layer is behind the near plane.
+pub fn warp_path(path: &BezPath, h: &Homography, near: f64) -> Option<BezPath> {
+    let clipped = clip_near(path, h, near);
+    let path = clipped.as_ref().unwrap_or(path);
+    if path.elements().is_empty() {
+        return None;
+    }
     let mut out = BezPath::new();
     // The current point in *source* space — the homography is applied per
     // emitted point, so the walk has to keep the pre-image around.
@@ -121,6 +136,140 @@ pub fn warp_path(path: &BezPath, h: &Homography) -> Option<BezPath> {
                 out.close_path();
                 cur = start;
             }
+        }
+    }
+    Some(out)
+}
+
+/// Cut a layer-local path to the part at least `near` in front of the eye.
+///
+/// Camera depth is the homography's denominator, `w = h6·x + h7·y + h8`, and it
+/// is **linear in layer-local space** — a layer is a plane, so its points at one
+/// depth form a straight line across it. Near-plane clipping is therefore a 2D
+/// half-plane clip, done on the source path *before* projecting, and done
+/// exactly: a Bézier's depth along it is a polynomial in `t` (the linear `w`
+/// applied to its control points), so each segment is split at the roots where
+/// it crosses the plane and only the pieces in front are kept.
+///
+/// Filled (closed) subpaths are rejoined along the cut — the two crossing points
+/// both lie on the plane, so the straight edge between them is the cut itself.
+/// Open subpaths (strokes) simply break there.
+///
+/// `None` when nothing crosses: the path is drawn as it is, with no copy.
+pub fn clip_near(path: &BezPath, h: &Homography, near: f64) -> Option<BezPath> {
+    use kurbo::{CubicBez, Line, ParamCurve, PathSeg, QuadBez};
+    let g = |p: Point| h.0[6] * p.x + h.0[7] * p.y + h.0[8] - near;
+    // A curve lies in its control points' hull and `g` is linear, so if every
+    // control point is in front, so is everything.
+    let all_in = path.elements().iter().all(|el| match *el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => g(p) >= 0.0,
+        PathEl::QuadTo(a, b) => g(a) >= 0.0 && g(b) >= 0.0,
+        PathEl::CurveTo(a, b, c) => g(a) >= 0.0 && g(b) >= 0.0 && g(c) >= 0.0,
+        PathEl::ClosePath => true,
+    });
+    if all_in {
+        return None;
+    }
+
+    // Subpaths as segment lists, with whether each is closed.
+    let mut subpaths: Vec<(Vec<PathSeg>, bool)> = Vec::new();
+    let (mut cur, mut start) = (Point::ZERO, Point::ZERO);
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                subpaths.push((Vec::new(), false));
+                cur = p;
+                start = p;
+            }
+            PathEl::ClosePath => {
+                if let Some((segs, closed)) = subpaths.last_mut() {
+                    if cur != start {
+                        segs.push(PathSeg::Line(Line::new(cur, start)));
+                    }
+                    *closed = true;
+                }
+                cur = start;
+            }
+            el => {
+                if subpaths.is_empty() {
+                    subpaths.push((Vec::new(), false));
+                }
+                let seg = match el {
+                    PathEl::LineTo(p) => PathSeg::Line(Line::new(cur, p)),
+                    PathEl::QuadTo(a, b) => PathSeg::Quad(QuadBez::new(cur, a, b)),
+                    PathEl::CurveTo(a, b, c) => PathSeg::Cubic(CubicBez::new(cur, a, b, c)),
+                    _ => unreachable!(),
+                };
+                cur = seg.end();
+                subpaths.last_mut().unwrap().0.push(seg);
+            }
+        }
+    }
+
+    let mut out = BezPath::new();
+    for (segs, closed) in subpaths {
+        // Whether the pen is down at an in-front point of this subpath.
+        let mut drawing = false;
+        let mut last = Point::ZERO;
+        for seg in segs {
+            // Roots of depth-minus-near along the segment, in power basis.
+            let mut ts: Vec<f64> = match seg {
+                PathSeg::Line(l) => {
+                    let (a, b) = (g(l.p0), g(l.p1));
+                    if (a < 0.0) != (b < 0.0) { vec![a / (a - b)] } else { vec![] }
+                }
+                PathSeg::Quad(q) => {
+                    let (b0, b1, b2) = (g(q.p0), g(q.p1), g(q.p2));
+                    kurbo::common::solve_quadratic(b0, 2.0 * (b1 - b0), b2 - 2.0 * b1 + b0).to_vec()
+                }
+                PathSeg::Cubic(c) => {
+                    let (b0, b1, b2, b3) = (g(c.p0), g(c.p1), g(c.p2), g(c.p3));
+                    kurbo::common::solve_cubic(
+                        b0,
+                        3.0 * (b1 - b0),
+                        3.0 * (b2 - 2.0 * b1 + b0),
+                        b3 - 3.0 * b2 + 3.0 * b1 - b0,
+                    )
+                    .to_vec()
+                }
+            };
+            ts.retain(|t| *t > 0.0 && *t < 1.0);
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut bounds = vec![0.0];
+            bounds.extend(ts);
+            bounds.push(1.0);
+            for w in bounds.windows(2) {
+                let (t0, t1) = (w[0], w[1]);
+                if t1 - t0 <= 1e-12 {
+                    continue;
+                }
+                let piece = seg.subsegment(t0..t1);
+                if g(piece.eval(0.5)) < 0.0 {
+                    // Behind: a stroke breaks here; a fill rejoins on re-entry.
+                    if !closed {
+                        drawing = false;
+                    }
+                    continue;
+                }
+                let p0 = piece.start();
+                if drawing {
+                    if last != p0 {
+                        out.line_to(p0);
+                    }
+                } else {
+                    out.move_to(p0);
+                    drawing = true;
+                }
+                match piece {
+                    PathSeg::Line(l) => out.line_to(l.p1),
+                    PathSeg::Quad(q) => out.quad_to(q.p1, q.p2),
+                    PathSeg::Cubic(c) => out.curve_to(c.p1, c.p2, c.p3),
+                }
+                last = piece.end();
+            }
+        }
+        if closed && drawing {
+            out.close_path();
         }
     }
     Some(out)
@@ -257,7 +406,7 @@ mod tests {
         // the flattening tolerance.
         const DIST: f64 = 300.0;
         let h = homography_for(&Mat4::rotate_y(ANGLE), EYE, DIST);
-        let warped = warp_path(&square(), &h).expect("in front of the eye");
+        let warped = warp_path(&square(), &h, 1e-9).expect("in front of the eye");
         let pts: Vec<Point> = warped
             .elements()
             .iter()
@@ -297,8 +446,8 @@ mod tests {
     #[test]
     fn a_distant_eye_flattens_toward_orthographic() {
         let m = Mat4::rotate_y(0.6);
-        let near = warp_path(&square(), &homography_for(&m, EYE, 500.0)).unwrap();
-        let far = warp_path(&square(), &homography_for(&m, EYE, 10_000_000.0)).unwrap();
+        let near = warp_path(&square(), &homography_for(&m, EYE, 500.0), 1e-9).unwrap();
+        let far = warp_path(&square(), &homography_for(&m, EYE, 10_000_000.0), 1e-9).unwrap();
         let h = |p: &BezPath| p.bounding_box().height();
         // A near eye foreshortens hard, so the trapezoid's tall edge exceeds the
         // orthographic height; a distant one barely differs from it.
@@ -313,7 +462,7 @@ mod tests {
         let mut line = BezPath::new();
         line.move_to(Point::new(-100.0, 0.0));
         line.line_to(Point::new(100.0, 0.0));
-        let w = warp_path(&line, &h).unwrap();
+        let w = warp_path(&line, &h, 1e-9).unwrap();
         let pts: Vec<Point> = w
             .elements()
             .iter()
@@ -330,12 +479,55 @@ mod tests {
         }
     }
 
-    /// A path crossing the eye plane yields nothing rather than a torn shape.
+    /// A path crossing the eye plane is cut there, not refused: what is in
+    /// front of the near plane still draws, finite and closed.
     #[test]
-    fn a_path_crossing_the_eye_plane_is_refused() {
+    fn a_path_crossing_the_eye_plane_is_cut() {
         // Tipped 90°: the layer is edge-on and runs from far behind the eye to
         // far in front of it.
-        let h = homography_for(&Mat4::rotate_y(std::f64::consts::FRAC_PI_2), EYE, 50.0);
-        assert!(warp_path(&square(), &h).is_none());
+        let h = homography_for(&Mat4::rotate_y(1.2), EYE, 50.0);
+        let cut = warp_path(&square(), &h, 5.0).expect("the front part survives");
+        let b = cut.bounding_box();
+        assert!([b.x0, b.y0, b.x1, b.y1].iter().all(|v| v.is_finite()), "{b:?}");
+        assert!(matches!(cut.elements().last(), Some(PathEl::ClosePath)), "still a fill");
+    }
+
+    /// Entirely behind the near plane: nothing to draw.
+    #[test]
+    fn a_path_wholly_behind_the_eye_is_refused() {
+        let h = homography_for(&Mat4::translate(Vec3::new(0.0, 0.0, -1000.0)), EYE, 50.0);
+        assert!(warp_path(&square(), &h, 5.0).is_none());
+    }
+
+    /// The cut is exact and in layer space: depth `w = x + 50` with the near
+    /// plane at 10 keeps exactly `x >= -40` — for straight edges and curves.
+    #[test]
+    fn the_near_cut_is_a_straight_line_across_the_layer() {
+        let h = Homography([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 50.0]);
+        let sq = clip_near(&square(), &h, 10.0).unwrap();
+        let b = sq.bounding_box();
+        assert!((b.x0 + 40.0).abs() < 1e-9 && b.x1 == 100.0, "{b:?}");
+        assert_eq!((b.y0, b.y1), (-100.0, 100.0));
+
+        let circle = kurbo::Circle::new((0.0, 0.0), 100.0).to_path(0.01);
+        let c = clip_near(&circle, &h, 10.0).unwrap();
+        let b = c.bounding_box();
+        assert!((b.x0 + 40.0).abs() < 1e-6 && (b.x1 - 100.0).abs() < 1e-6, "{b:?}");
+        // The cut ends where x = -40 meets the circle, y = ±√(100² − 40²)
+        // (to the circle's cubic approximation).
+        let half = (100f64.powi(2) - 40f64.powi(2)).sqrt();
+        let on_cut: Vec<f64> = c
+            .elements()
+            .iter()
+            .filter_map(|e| match *e {
+                PathEl::MoveTo(p) | PathEl::LineTo(p) | PathEl::CurveTo(_, _, p) if (p.x + 40.0).abs() < 1e-6 => Some(p.y),
+                _ => None,
+            })
+            .collect();
+        assert!(!on_cut.is_empty());
+        assert!(on_cut.iter().all(|y| (y.abs() - half).abs() < 0.05), "{on_cut:?} vs ±{half}");
+
+        // Nothing crossing: no copy.
+        assert!(clip_near(&square(), &h, -100.0).is_none());
     }
 }
