@@ -8,24 +8,25 @@
 //! there is no "is 3D enabled" boolean to get out of sync, because the absence
 //! of a camera *is* the absence of projection.
 //!
-//! # The projection, and what it does not do
+//! # The projection
 //!
-//! The camera sits on the composition's optical axis, `distance` pixels in front
-//! of the `z = 0` plane, looking down +Z. A layer at `z = 0` therefore renders at
-//! exactly 1:1 — every existing document is unmoved by switching a camera on,
-//! which is the property that makes this safe to add to a live project.
+//! A real camera: an eye at `position` (relative to the comp centre, `z`
+//! negative in front of the `z = 0` plane), turned by tilt / pan / roll, with
+//! a lens of `zoom` pixels. World → camera space is the inverse of that
+//! placement, so trucking slides the whole shot (nearer layers more) and a pan
+//! turns it about the eye. The default camera sits `zoom` in front of the plane
+//! on the axis, so a layer at `z = 0` renders at exactly 1:1 — switching a
+//! camera on moves nothing.
 //!
-//! Depth becomes a **uniform scale about the eye point**: a layer at `z = 200`
-//! with the camera 1000px back draws at 1000/1200 of its size and slides toward
-//! the centre of frame, exactly as it would if you walked away from it. Because
-//! that is a scale and a translation, a screen-parallel layer *stays an affine*
-//! after projection and keeps the whole fast path — see [`Camera::project`].
+//! Internally the camera is one matrix ([`Projector::camera`]) into a fixed
+//! "viewed space" with the eye on the axis at `(centre, -zoom)`. Everything
+//! downstream — [`Projector::project`], the homography warp for tipped layers,
+//! culling, the gizmo's ray — works in that space and never needs to know where
+//! the camera is.
 //!
-//! What this does **not** do is foreshorten a layer rotated about X or Y. That
-//! needs a homography, which no affine can express and which vello cannot draw;
-//! such a layer still projects its position and its apparent size correctly, but
-//! is drawn unturned in depth. It is the remaining half of the 2.5D story and it
-//! wants a render-to-texture pass of its own.
+//! A screen-parallel layer projects to a uniform scale about the frame centre,
+//! which stays an affine and keeps the fast path; a layer tipped relative to the
+//! camera is foreshortened exactly by `crate::warp`.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,12 +43,10 @@ pub struct Camera {
     /// Where the eye sits, as an **object in the composition** — not a lone
     /// setting.
     ///
-    /// `x`/`y` offset the viewpoint from the comp centre, so panning the camera
-    /// slides the vanishing point and pulls parallax between depths. `z` is the
-    /// dolly: it is *signed depth*, negative in front of the `z = 0` plane, and
-    /// `-z` is the eye-to-plane distance the perspective divides by. Pushing the
-    /// camera toward the plane (z → 0) strengthens perspective; pulling it far
-    /// back flattens toward orthographic.
+    /// `x`/`y` offset the eye from the comp centre — a truck, which slides the
+    /// shot and pulls parallax between depths. `z` is the dolly: *signed depth*,
+    /// negative in front of the `z = 0` plane. Pushing in at a fixed lens makes
+    /// things bigger and the perspective stronger; the lens is [`Self::zoom`].
     ///
     /// Every channel is animatable, so a dolly or a truck is a keyframed value
     /// like any other. The default sits the eye on the axis, `default_distance`
@@ -55,9 +54,8 @@ pub struct Camera {
     #[serde(default = "default_camera_position")]
     pub position: Value<Vec3>,
     /// The camera's orientation, euler degrees, default looking straight down
-    /// `+Z` at the composition. Rotating it pivots the whole scene about the
-    /// eye — the same operation the viewport orbit performs, but **part of the
-    /// document**: this one renders.
+    /// `+Z` at the composition. Turns the camera about its own eye, like a
+    /// tripod head. Unlike the editor's viewport orbit, this one renders.
     ///
     /// Three separate tracks, like a layer's: `rotation` is the roll (Z),
     /// `rotation_x` the tilt and `rotation_y` the pan, each keyed and eased on
@@ -69,6 +67,16 @@ pub struct Camera {
     /// deserialize into `position` (a number is not a vector), so it lands here
     /// and [`Camera::migrate_frames`] folds it into `position.z` as `-distance`.
     /// Never written back out.
+    /// The lens: focal length in composition pixels — how far from the eye the
+    /// image plane sits. Larger is more telephoto (narrower view, flatter
+    /// depth); smaller is wider. Independent of the dolly, so a push-in and a
+    /// zoom are different shots, and moving both at once is a dolly zoom.
+    ///
+    /// `None` is the pre-lens camera, kept for files written before the lens
+    /// existed: the focal length follows the dolly (`-position.z`), so the
+    /// `z = 0` plane always renders at 1:1 and those files frame as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<Value<f64>>,
     #[serde(default, rename = "distance", skip_serializing)]
     legacy_distance: Option<Value<f64>>,
 }
@@ -85,6 +93,8 @@ struct CameraRepr {
     rotation_x: Option<Value<f64>>,
     #[serde(default)]
     rotation_y: Option<Value<f64>>,
+    #[serde(default)]
+    zoom: Option<Value<f64>>,
     #[serde(default, rename = "distance")]
     legacy_distance: Option<Value<f64>>,
 }
@@ -102,6 +112,7 @@ impl From<CameraRepr> for Camera {
             rotation: z,
             rotation_x: r.rotation_x.unwrap_or(x),
             rotation_y: r.rotation_y.unwrap_or(y),
+            zoom: r.zoom,
             legacy_distance: r.legacy_distance,
         }
     }
@@ -132,13 +143,7 @@ impl Camera {
     }
 
     pub fn new(width: f64, height: f64) -> Self {
-        Self {
-            position: Value::constant(Vec3::new(0.0, 0.0, -Self::default_distance(width, height))),
-            rotation: zero_angle(),
-            rotation_x: zero_angle(),
-            rotation_y: zero_angle(),
-            legacy_distance: None,
-        }
+        Self::from_distance(Self::default_distance(width, height))
     }
 
     /// Fold a pre-object scalar `distance` into the position, and migrate every
@@ -155,6 +160,8 @@ impl Camera {
             rotation: zero_angle(),
             rotation_x: zero_angle(),
             rotation_y: zero_angle(),
+            // The lens matches the dolly, so the z = 0 plane starts at 1:1.
+            zoom: Some(Value::constant(distance)),
             legacy_distance: None,
         }
     }
@@ -167,6 +174,9 @@ impl Camera {
         self.rotation.migrate_frames(fps);
         self.rotation_x.migrate_frames(fps);
         self.rotation_y.migrate_frames(fps);
+        if let Some(z) = &mut self.zoom {
+            z.migrate_frames(fps);
+        }
     }
 
     pub(crate) fn retime(&mut self, ratio: f64) {
@@ -174,6 +184,9 @@ impl Camera {
         self.rotation.retime(ratio);
         self.rotation_x.retime(ratio);
         self.rotation_y.retime(ratio);
+        if let Some(z) = &mut self.zoom {
+            z.retime(ratio);
+        }
     }
 
     /// Resolve to the frame's actual projection.
@@ -197,22 +210,38 @@ impl Camera {
         orbit: Mat4,
     ) -> Projector {
         let pos = self.position.resolve(ctx);
-        let rot = Vec3::new(self.rotation_x.resolve(ctx), self.rotation_y.resolve(ctx), self.rotation.resolve(ctx));
-        // The camera's own rotation pivots the world about the eye — the very
-        // thing the editor orbit does, so it composes as one more orbit. The
-        // editor's is applied *outside* the camera's: you orbit around the shot
-        // the camera has already framed, not around a fixed axis.
-        let cam = Mat4::rotate_z(rot.z.to_radians())
-            * Mat4::rotate_y(rot.y.to_radians())
-            * Mat4::rotate_x(rot.x.to_radians());
-        Projector {
-            eye: kurbo::Point::new(width / 2.0 + pos.x, height / 2.0 + pos.y),
-            // `-z`, guarded: the eye is in front of the plane (negative z), so a
-            // positive distance is its negation. At or behind the plane the
-            // divide is meaningless; a hair of distance keeps a frame drawing
-            // rather than filling with NaNs while you drag the camera through.
-            distance: (-pos.z).max(1e-3),
-            orbit: orbit * cam,
+        let (rx, ry, rz) = (
+            self.rotation_x.resolve(ctx).to_radians(),
+            self.rotation_y.resolve(ctx).to_radians(),
+            self.rotation.resolve(ctx).to_radians(),
+        );
+        let focal = self.focal_length(ctx).max(1e-3);
+        let centre = kurbo::Point::new(width / 2.0, height / 2.0);
+        // A real camera: world → camera space is the inverse of the camera's
+        // own placement (translate to the eye, then rotate by the inverse of
+        // its orientation), so trucking slides the whole shot and a pan turns
+        // it about the eye — not about a point on the z = 0 plane.
+        //
+        // Then into the "viewed space" every consumer already speaks
+        // (`Projector::project`, the homography, the gizmo ray): eye on the
+        // axis at `(centre, -focal)`, image plane at z = 0. Expressing the
+        // camera as one more matrix ahead of that fixed projection is what
+        // keeps the rest of the pipeline untouched.
+        let eye = Vec3::new(centre.x + pos.x, centre.y + pos.y, pos.z);
+        let mut camera = Mat4::translate(Vec3::new(centre.x, centre.y, -focal));
+        if (rx, ry, rz) != (0.0, 0.0, 0.0) {
+            camera = camera * Mat4::rotate_x(-rx) * Mat4::rotate_y(-ry) * Mat4::rotate_z(-rz);
+        }
+        camera = camera * Mat4::translate(-eye);
+        Projector { eye: centre, distance: focal, orbit, camera }
+    }
+
+    /// The lens at this frame, in composition pixels: the stored zoom, or for a
+    /// pre-lens camera, the dolly distance (see [`Camera::zoom`]).
+    pub fn focal_length(&self, ctx: &mut EvalCtx) -> f64 {
+        match &self.zoom {
+            Some(z) => z.resolve(ctx),
+            None => -self.position.resolve(ctx).z,
         }
     }
 
@@ -251,6 +280,11 @@ pub struct Projector {
     /// unfortunate: tipped away from the viewer is exactly what those layers
     /// now are. At identity it costs nothing.
     pub orbit: Mat4,
+    /// The comp camera itself: composition space → viewed space (eye on the
+    /// axis at `(eye, -distance)`, looking down +Z). Identity for a camera
+    /// sitting on the axis with its lens equal to its dolly — every camera
+    /// from before the lens existed — so those still take the flat path.
+    pub camera: Mat4,
 }
 
 impl Projector {
@@ -264,10 +298,10 @@ impl Projector {
     /// the flat fast path.
     pub fn view(&self) -> Mat4 {
         if self.orbit == Mat4::IDENTITY {
-            return Mat4::IDENTITY;
+            return self.camera;
         }
         let e = Vec3::new(self.eye.x, self.eye.y, 0.0);
-        Mat4::translate(e) * self.orbit * Mat4::translate(-e)
+        Mat4::translate(e) * self.orbit * Mat4::translate(-e) * self.camera
     }
 
     /// The layer-local → screen projective map for a world matrix.
@@ -299,7 +333,7 @@ impl Projector {
         // A flat transform cannot carry depth by construction, so it projects
         // to itself — but only while the viewer is standing straight on. Orbit
         // and even a flat layer has been tipped away from them.
-        if let (Xf::Flat(a), true) = (xf, self.orbit == Mat4::IDENTITY) {
+        if let (Xf::Flat(a), true) = (xf, self.orbit == Mat4::IDENTITY && self.camera == Mat4::IDENTITY) {
             return Some(Xf::Flat(a));
         }
         let m = self.view() * xf.to_mat4();
@@ -361,6 +395,7 @@ mod tests {
             eye: kurbo::Point::new(960.0, 540.0),
             distance: 1000.0,
             orbit: Mat4::IDENTITY,
+            camera: Mat4::IDENTITY,
         }
     }
     const EYE: kurbo::Point = kurbo::Point::new(960.0, 540.0);
@@ -479,30 +514,15 @@ mod tests {
         assert_eq!(cam.eye_distance(&mut ctx), 800.0);
     }
 
-    /// Moving the camera in x/y slides the eye, so the vanishing point moves and
-    /// depths pull apart — parallax, the reason a camera is an object.
-    #[test]
-    fn panning_the_camera_moves_the_eye() {
-        let cam = Camera {
-            position: Value::constant(Vec3::new(120.0, -40.0, -1000.0)),
-            rotation: zero_angle(),
-            rotation_x: zero_angle(),
-            rotation_y: zero_angle(),
-            legacy_distance: None,
-        };
-        let mut ctx = crate::expr::EvalCtx::at(0.0);
-        let p = cam.resolve(&mut ctx, 1920.0, 1080.0);
-        assert_eq!(p.eye, kurbo::Point::new(960.0 + 120.0, 540.0 - 40.0));
-    }
-
-    /// Dollying the camera toward the plane shortens the eye-to-plane distance,
-    /// strengthening perspective; pulling back lengthens it.
     #[test]
     fn dollying_the_camera_changes_the_distance() {
         let mut ctx = crate::expr::EvalCtx::at(0.0);
         let near = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -300.0)), ..Camera::from_distance(1.0) };
         let far = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -3000.0)), ..Camera::from_distance(1.0) };
-        assert!(near.resolve(&mut ctx, 100.0, 100.0).distance < far.resolve(&mut ctx, 100.0, 100.0).distance);
+        // The lens stays put; the camera itself moves along its axis.
+        let (n, f) = (near.resolve(&mut ctx, 100.0, 100.0), far.resolve(&mut ctx, 100.0, 100.0));
+        assert_eq!(n.distance, f.distance, "a dolly is not a zoom");
+        assert!(n.camera.0[14] < f.camera.0[14], "the scene sits closer to the near camera");
     }
 
     /// A camera crossing the plane cannot divide by zero: the distance is
@@ -515,8 +535,9 @@ mod tests {
         assert!(cam.resolve(&mut ctx, 100.0, 100.0).distance > 0.0);
     }
 
-    /// The camera's own rotation renders, unlike the editor orbit: it is baked
-    /// into the projector's orbit, so a straight-on evaluate already sees it.
+    /// The camera's own rotation renders, unlike the editor orbit: it is part
+    /// of the camera matrix, so a straight-on evaluate already sees it, and
+    /// the editor's orbit stays the editor's.
     #[test]
     fn camera_rotation_is_part_of_the_projection() {
         let cam = Camera {
@@ -525,7 +546,9 @@ mod tests {
             ..Camera::from_distance(1.0)
         };
         let mut ctx = crate::expr::EvalCtx::at(0.0);
-        assert_ne!(cam.resolve(&mut ctx, 100.0, 100.0).orbit, Mat4::IDENTITY);
+        let p = cam.resolve(&mut ctx, 100.0, 100.0);
+        assert_ne!(p.camera, Mat4::IDENTITY);
+        assert_eq!(p.orbit, Mat4::IDENTITY);
     }
 
     /// A camera saved with one joined rotation loads as three channels, each
@@ -541,5 +564,77 @@ mod tests {
         );
         let back: Camera = serde_json::from_str(&serde_json::to_string(&cam).unwrap()).unwrap();
         assert_eq!(back, cam);
+    }
+
+    /// Where a layer origin at `p` (comp space) lands on screen.
+    fn land(cam: &Camera, p: Vec3) -> Option<(f64, f64)> {
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let v = cam.resolve(&mut ctx, 1920.0, 1080.0);
+        v.project(Xf::Spatial(Mat4::translate(p))).map(|x| {
+            let m = x.to_mat4();
+            ((m.0[12] * 1e6).round() / 1e6, (m.0[13] * 1e6).round() / 1e6)
+        })
+    }
+
+    const MID: Vec3 = Vec3 { x: 960.0, y: 540.0, z: 0.0 };
+    const FAR: Vec3 = Vec3 { x: 960.0, y: 540.0, z: 1000.0 };
+
+    /// Trucking moves the shot like a real camera: everything slides the other
+    /// way, the z = 0 plane by the full amount and farther layers by less.
+    #[test]
+    fn trucking_slides_the_whole_shot() {
+        let mut cam = Camera::from_distance(1000.0);
+        cam.position = Value::constant(Vec3::new(200.0, 0.0, -1000.0));
+        let (near, far) = (land(&cam, MID).unwrap(), land(&cam, FAR).unwrap());
+        assert_eq!(near, (760.0, 540.0), "the z = 0 plane moves the full truck");
+        assert_eq!(far, (860.0, 540.0), "twice as far, half the shift");
+    }
+
+    /// A pan turns the camera about its own eye: what was dead ahead swings
+    /// off to the side, and turning right moves the scene left.
+    #[test]
+    fn panning_turns_about_the_eye() {
+        let mut cam = Camera::from_distance(1000.0);
+        cam.rotation_y = Value::constant(10.0);
+        let (x, _) = land(&cam, MID).unwrap();
+        let expected = 960.0 - 1000.0 * 10f64.to_radians().tan();
+        assert!((x - expected).abs() < 1e-6, "{x} vs {expected}");
+    }
+
+    /// The lens is independent of the dolly: doubling the zoom doubles the
+    /// apparent size of the z = 0 plane without moving the camera, and a dolly
+    /// at a fixed lens now changes the size.
+    #[test]
+    fn zoom_and_dolly_are_separate() {
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let mut cam = Camera::from_distance(1000.0);
+        let off = Vec3::new(1060.0, 540.0, 0.0);
+        assert_eq!(land(&cam, off).unwrap().0, 1060.0, "default lens frames z = 0 at 1:1");
+        cam.zoom = Some(Value::constant(2000.0));
+        assert_eq!(land(&cam, off).unwrap().0, 1160.0, "2x lens, 2x size");
+        assert_eq!(cam.focal_length(&mut ctx), 2000.0);
+        let mut pushed = Camera::from_distance(1000.0);
+        pushed.position = Value::constant(Vec3::new(0.0, 0.0, -500.0));
+        assert_eq!(land(&pushed, off).unwrap().0, 1160.0, "half the distance, 2x size");
+    }
+
+    /// A camera from before the lens existed has no zoom: its lens follows the
+    /// dolly, so a keyed push-in still frames z = 0 at 1:1 as it did.
+    #[test]
+    fn a_pre_lens_camera_keeps_its_framing() {
+        let json = r#"{"position": {"Const": {"x": 0.0, "y": 0.0, "z": -500.0}}}"#;
+        let cam: Camera = serde_json::from_str(json).unwrap();
+        assert!(cam.zoom.is_none());
+        assert_eq!(land(&cam, Vec3::new(1060.0, 540.0, 0.0)).unwrap().0, 1060.0);
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        assert_eq!(cam.resolve(&mut ctx, 1920.0, 1080.0).camera, Mat4::IDENTITY, "still the flat path");
+    }
+
+    /// Anything behind the camera — in its own space, not the comp's — is culled.
+    #[test]
+    fn behind_a_turned_camera_is_culled() {
+        let mut cam = Camera::from_distance(1000.0);
+        cam.rotation_y = Value::constant(180.0);
+        assert!(land(&cam, MID).is_none(), "the plane is behind a camera turned around");
     }
 }

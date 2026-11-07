@@ -671,6 +671,10 @@ pub(crate) struct CompEdits {
     pub(crate) camera_key: Vec<crate::props::PropKind>,
     /// Select the camera, so the dopesheet and curve editor show its keys.
     pub(crate) camera_select: bool,
+    /// A new lens (focal length, composition pixels).
+    pub(crate) camera_zoom: Option<f64>,
+    /// The lens stopwatch was clicked.
+    pub(crate) camera_zoom_key: bool,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -718,6 +722,11 @@ pub(crate) struct CameraBar {
     pub(crate) rot_anim: [bool; 3],
     /// Whether the camera is the current selection (its keys are on the timeline).
     pub(crate) selected: bool,
+    /// The lens at this frame, composition pixels.
+    pub(crate) zoom: f64,
+    pub(crate) zoom_anim: bool,
+    /// Composition width, for the field-of-view readout.
+    pub(crate) width: f64,
 }
 
 /// The render bar's inputs and its reported intent, bundled so the composition
@@ -955,7 +964,7 @@ pub(crate) fn comp_ui(
         // object's editor rather than a lone field, behind a popup so the bar
         // stays a bar. The label doubles as a readout: the dolly is the number
         // you reach for most, so it rides on the button.
-        if let Some(CameraBar { pos, rot, pos_anim, rot_anim, selected }) = camera {
+        if let Some(CameraBar { pos, rot, pos_anim, rot_anim, selected, zoom, zoom_anim, width }) = camera {
             ui.menu_button(format!("Camera  eye {:.0}", -pos.2), |ui| {
                 ui.set_min_width(180.0);
                 ui.horizontal(|ui| {
@@ -995,6 +1004,26 @@ pub(crate) fn comp_ui(
                 {
                     out.camera_pos[2] = Some(-eye);
                 }
+
+                // The lens, apart from the dolly: zoom changes framing without
+                // moving the camera, so push-in and zoom are different shots.
+                ui.horizontal(|ui| {
+                    let mut z = zoom;
+                    let fov = 2.0 * (width / 2.0 / zoom.max(1e-3)).atan().to_degrees();
+                    if ui
+                        .add(crate::calc::num(&mut z).speed(10.0).range(1.0..=1_000_000.0).prefix("zoom "))
+                        .on_hover_text(format!(
+                            "Focal length in comp pixels ({fov:.1}° horizontal view). \
+                             Larger is more telephoto. Equal to eye frames z=0 at 1:1."
+                        ))
+                        .changed()
+                    {
+                        out.camera_zoom = Some(z);
+                    }
+                    if crate::props::key_button(ui, zoom_anim) {
+                        out.camera_zoom_key = true;
+                    }
+                });
 
                 // One row per axis, each with its own stopwatch: they are
                 // separate tracks, so a pan can ease while the roll holds.

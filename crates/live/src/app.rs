@@ -4203,6 +4203,9 @@ impl App {
                 pos_anim: c.position.is_animated(),
                 rot_anim: [c.rotation_x.is_animated(), c.rotation_y.is_animated(), c.rotation.is_animated()],
                 selected: self.selected == Some(CAMERA_ID),
+                zoom: c.focal_length(&mut ctx),
+                zoom_anim: c.zoom.as_ref().is_some_and(|z| z.is_animated()),
+                width: comp.width,
             }
         });
         let timebase = self.doc().timebase();
@@ -5037,6 +5040,24 @@ impl App {
                     }
                 })
                 .is_some();
+        }
+        // The lens. A pre-lens camera (no `zoom`) gets one seeded from the lens
+        // it was implicitly using, so the first edit or key starts from what
+        // is on screen rather than jumping.
+        if comp.camera_zoom.is_some() || comp.camera_zoom_key {
+            let doc = self.doc().clone();
+            if let Some(cam) = self.doc_mut().camera.as_mut() {
+                let mut ctx = EvalCtx::new(&doc, frame as f64);
+                let cur = cam.focal_length(&mut ctx);
+                let z = cam.zoom.get_or_insert_with(|| Value::constant(cur));
+                if let Some(v) = comp.camera_zoom {
+                    z.set_at(frame, v);
+                }
+                if comp.camera_zoom_key {
+                    z.insert_key(frame);
+                }
+                dirty = true;
+            }
         }
         if comp.camera_select && self.doc().camera.is_some() {
             self.selected = Some(CAMERA_ID);

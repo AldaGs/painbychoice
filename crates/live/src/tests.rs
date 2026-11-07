@@ -5372,6 +5372,7 @@ fn spatial_target(rot_xy: (f64, f64)) -> GizmoTarget {
             eye: Point::new(960.0, 540.0),
             distance: 1200.0,
             orbit: motion_core::Mat4::IDENTITY,
+            camera: motion_core::Mat4::IDENTITY,
         }),
     }
 }
@@ -5455,6 +5456,7 @@ fn on_axis_target(orbit: motion_core::Mat4) -> GizmoTarget {
             eye: Point::new(960.0, 540.0),
             distance: 4405.0,
             orbit,
+            camera: motion_core::Mat4::IDENTITY,
         }),
     }
 }
