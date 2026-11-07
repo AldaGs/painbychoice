@@ -1815,6 +1815,15 @@ pub(crate) enum PropKind {
     /// loudness rather than geometry.
     AudioLevel,
     AudioPan,
+    /// The comp camera's lens. Exists only on the camera's stand-in node
+    /// ([`crate::app::camera_proxy`]), where it rides as the reserved
+    /// [`CAMERA_ZOOM_PARAM`] number — so the dopesheet, curve editor and key
+    /// operations treat it like any scalar track. Never listed for a layer.
+    CameraZoom,
+    /// The comp camera's point of interest. Like [`PropKind::CameraZoom`],
+    /// only on the camera stand-in, where it rides in the stand-in's otherwise
+    /// unused anchor (and the plain Anchor row is withheld there).
+    CameraTarget,
     /// One numeric parameter of one effect in the layer's stack. **Indexed**
     /// like [`PropKind::PathPoint`], and discovered per node by
     /// [`prop_kinds_of`], because a stack's shape is data rather than a fixed
@@ -1915,6 +1924,8 @@ impl PropKind {
             PropKind::MaskSize => "Mask Size",
             PropKind::AudioLevel => "Level",
             PropKind::AudioPan => "Pan",
+            PropKind::CameraZoom => "Zoom",
+            PropKind::CameraTarget => "Point of Interest",
             // Intercepted by `label` before these are reached.
             PropKind::PathPoint { .. } => "Path Point",
             PropKind::Effect { .. } => "Effect",
@@ -2217,6 +2228,7 @@ impl PropRefMut<'_> {
 pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
     let tr = &node.transform;
     Some(match kind {
+        PropKind::Anchor if node.id == crate::app::CAMERA_ID => return None,
         PropKind::Anchor => PropRef::Vec3(&tr.anchor),
         PropKind::Position => PropRef::Vec3(&tr.position),
         PropKind::Rotation => PropRef::Num(&tr.rotation),
@@ -2256,6 +2268,14 @@ pub(crate) fn prop_of(node: &MNode, kind: PropKind) -> Option<PropRef<'_>> {
         // dopesheet.
         PropKind::AudioLevel => PropRef::Num(&node.audio.as_ref()?.level),
         PropKind::AudioPan => PropRef::Num(&node.audio.as_ref()?.pan),
+        PropKind::CameraTarget => {
+            camera_target_marker(node)?;
+            PropRef::Vec3(&tr.anchor)
+        }
+        PropKind::CameraZoom => match &camera_zoom_param(node)?.value {
+            motion_core::node::ParamValue::Num(v) => PropRef::Num(v),
+            _ => return None,
+        },
         PropKind::ShapeRadius => match node.shape.as_ref()? {
             MShape::Rect { radius, .. } => PropRef::Num(radius),
             _ => return None,
@@ -2314,6 +2334,12 @@ pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
             kinds.push(PropKind::TextAnim { index, sel, param });
         }
     }
+    if camera_zoom_param(node).is_some() {
+        kinds.push(PropKind::CameraZoom);
+    }
+    if camera_target_marker(node).is_some() {
+        kinds.push(PropKind::CameraTarget);
+    }
     if let Some(MShape::Vector { path }) = &node.shape {
         for index in 0..path.anchors.len() {
             for part in PathPart::ALL {
@@ -2324,11 +2350,30 @@ pub(crate) fn prop_kinds_of(node: &MNode) -> Vec<PropKind> {
     kinds
 }
 
+/// The reserved parameter the camera stand-in carries its lens in.
+pub(crate) const CAMERA_ZOOM_PARAM: &str = "camera_zoom";
+
+/// Marks a camera stand-in whose camera has a point of interest (the point
+/// itself rides in the stand-in's anchor). A marker rather than a value
+/// because params hold no 3-vector.
+pub(crate) const CAMERA_TARGET_PARAM: &str = "camera_target";
+
+fn camera_target_marker(node: &MNode) -> Option<&motion_core::node::Param> {
+    (node.id == crate::app::CAMERA_ID).then(|| node.param(CAMERA_TARGET_PARAM)).flatten()
+}
+
+/// The lens parameter, but only on the camera's stand-in: a layer that happens
+/// to have a param of that name is still just a layer.
+fn camera_zoom_param(node: &MNode) -> Option<&motion_core::node::Param> {
+    (node.id == crate::app::CAMERA_ID).then(|| node.param(CAMERA_ZOOM_PARAM)).flatten()
+}
+
 /// Mutable twin of [`prop_of`]. Kept adjacent on purpose: the two must agree on
 /// which properties exist, and they're only correct read together.
 pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut<'_>> {
     let tr = &mut node.transform;
     Some(match kind {
+        PropKind::Anchor if node.id == crate::app::CAMERA_ID => return None,
         PropKind::Anchor => PropRefMut::Vec3(&mut tr.anchor),
         PropKind::Position => PropRefMut::Vec3(&mut tr.position),
         PropKind::Rotation => PropRefMut::Num(&mut tr.rotation),
@@ -2358,6 +2403,21 @@ pub(crate) fn prop_of_mut(node: &mut MNode, kind: PropKind) -> Option<PropRefMut
         },
         PropKind::AudioLevel => PropRefMut::Num(&mut node.audio.as_mut()?.level),
         PropKind::AudioPan => PropRefMut::Num(&mut node.audio.as_mut()?.pan),
+        PropKind::CameraTarget => {
+            if node.id != crate::app::CAMERA_ID || !node.params.iter().any(|p| p.name == CAMERA_TARGET_PARAM) {
+                return None;
+            }
+            PropRefMut::Vec3(&mut tr.anchor)
+        }
+        PropKind::CameraZoom => {
+            if node.id != crate::app::CAMERA_ID {
+                return None;
+            }
+            match &mut node.params.iter_mut().find(|p| p.name == CAMERA_ZOOM_PARAM)?.value {
+                motion_core::node::ParamValue::Num(v) => PropRefMut::Num(v),
+                _ => return None,
+            }
+        }
         PropKind::ShapeRadius => match node.shape.as_mut()? {
             MShape::Rect { radius, .. } => PropRefMut::Num(radius),
             _ => return None,

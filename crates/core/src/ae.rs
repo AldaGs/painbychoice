@@ -37,6 +37,25 @@ impl ImportReport {
     }
 }
 
+/// Move a vector value by `d`: its constant or every key. A track's script and
+/// a driven value can't be shifted without rewriting them, so they are kept
+/// as they are and reported.
+fn shift_vec3(v: Value<Vec3>, d: Vec3, report: &mut ImportReport) -> Value<Vec3> {
+    match v {
+        Value::Const(c) => Value::Const(c + d),
+        Value::Keyframed(t) => {
+            if t.expr.is_some() {
+                report.drop("camera expression (kept in AE comp space)");
+            }
+            Value::Keyframed(t.map_value(|c| c + d))
+        }
+        e => {
+            report.drop("camera expression (kept in AE comp space)");
+            e
+        }
+    }
+}
+
 /// Parse an exported AE project, or an authoring document
 /// (`motion.schema.json`, what `json2jsx` builds an AE project from).
 pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
@@ -108,6 +127,7 @@ pub fn import(text: &str) -> Result<(Project, ImportReport), String> {
             footage: &footage,
             centred: HashMap::new(),
             comp_size: Vec2::new(num(c, "width", 1920.0), num(c, "height", 1080.0)),
+            has_camera: false,
             report: &mut report,
             next_id: 1,
             fps: num(c, "framerate", 30.0),
@@ -210,6 +230,9 @@ struct Importer<'a> {
     centred: HashMap<NodeId, Vec2>,
     /// The size of the comp being built, for AE's default layer position.
     comp_size: Vec2,
+    /// Whether this comp imported a camera: AE's 2D layers ignore it, which
+    /// PBC can't express, so they are reported.
+    has_camera: bool,
     report: &'a mut ImportReport,
     next_id: u64,
     fps: f64,
@@ -248,6 +271,14 @@ impl Importer<'_> {
             }
             k += 1;
         }
+        // The active camera is the topmost one (index order is top first);
+        // AE ignores the others while it is on, so they are reported.
+        let cameras: Vec<&J> = layers.iter().filter(|l| l["kind"].as_str() == Some("camera")).collect();
+        let camera = cameras.first().map(|l| self.camera(l));
+        for _ in cameras.iter().skip(1) {
+            self.report.drop("camera layer beyond the topmost (only one camera per comp)");
+        }
+        self.has_camera = camera.is_some();
         // AE parents and mattes name layers by their ldta id.
         let mut by_ae_id = HashMap::new();
         for (i, l) in layers.iter().enumerate().rev() {
@@ -278,6 +309,7 @@ impl Importer<'_> {
             }
         }
         let mut comp = Comp::new(num(c, "width", 1920.0), num(c, "height", 1080.0), root);
+        comp.camera = camera;
         comp.name = name(c);
         comp.fps = self.fps;
         comp.duration_frames = self.frame(num(c, "seconds", 0.0)).max(1);
@@ -294,7 +326,11 @@ impl Importer<'_> {
         self.expr_layer = l.clone();
         self.translated.clear();
         let layer_kind = l["kind"].as_str().unwrap_or("");
-        if matches!(layer_kind, "camera" | "light" | "model" | "mesh") {
+        // Cameras became the comp camera in `comp`.
+        if layer_kind == "camera" {
+            return None;
+        }
+        if matches!(layer_kind, "light" | "model" | "mesh") {
             self.report.drop(format!("{layer_kind} layer"));
             return None;
         }
@@ -368,8 +404,12 @@ impl Importer<'_> {
         }
         node.locked = flags["locked"] == J::Bool(true);
         node.adjustment = flags["adjustment"] == J::Bool(true);
-        if flags["3D"] == J::Bool(true) {
-            self.report.drop("3D layer (imported flat)");
+        match (flags["3D"] == J::Bool(true), self.has_camera) {
+            (true, false) => self.report.drop("3D layer (imported flat: the comp has no camera)"),
+            // AE draws a 2D layer straight to the frame, past the camera; here
+            // every layer goes through it, so this one moves with the camera.
+            (false, true) => self.report.drop("2D layer in a comp with a camera (drawn through the camera)"),
+            _ => {}
         }
 
         let source = l["sourceId"].as_u64().unwrap_or(0);
@@ -1065,6 +1105,81 @@ impl Importer<'_> {
         t
     }
 
+    /// An AE camera layer as the comp camera.
+    ///
+    /// AE places a camera in absolute comp space; PBC's camera is offset from
+    /// the comp centre, so position and point of interest shift by half the
+    /// comp. Zoom is the same quantity on both sides — the eye-to-image-plane
+    /// distance in comp pixels at which `z = 0` is 1:1 — so it comes across as
+    /// is. AE's point of interest is the camera's anchor point; a two-node
+    /// camera (the default) aims at it, a one-node camera does not.
+    fn camera(&mut self, l: &J) -> crate::camera::Camera {
+        self.expr_layer = l.clone();
+        let props = l["transform"].as_array().cloned().unwrap_or_default();
+        let (w, h) = (self.comp_size.x, self.comp_size.y);
+        let centre = Vec3::new(w / 2.0, h / 2.0, 0.0);
+        let options = l["cameraOptions"].as_array().cloned().unwrap_or_default();
+        let zoom_prop = prop(&options, "ADBE Camera Zoom").or_else(|| prop(&props, "ADBE Camera Zoom")).cloned();
+        // AE's default camera (the 50mm preset) frames z = 0 at 1:1 with a
+        // zoom of 2666.7 for a 1920-wide comp, so the exporter's omission
+        // means that, scaled to this comp.
+        let default_zoom = w * 2666.666_666_7 / 1920.0;
+        let zoom = self.scalar(zoom_prop.as_ref(), 1.0, default_zoom);
+
+        let has = |m: &str| prop(&props, m).is_some();
+        let position = if has("ADBE Position") || has("ADBE Position_0") || has("ADBE Position_1") {
+            self.position(&props, "ADBE Position")
+        } else {
+            Value::constant(Vec3::new(w / 2.0, h / 2.0, -default_zoom))
+        };
+        let poi = self.vec3(prop(&props, "ADBE Anchor Point"), 1.0, centre);
+        let one_node = l["cameraType"].as_str() == Some("oneNode")
+            || l["flags"]["autoOrient"] == J::Bool(false)
+            || l["flags"]["autoOrient"].as_str() == Some("off");
+
+        let mut cam = crate::camera::Camera::from_distance(default_zoom);
+        cam.position = shift_vec3(position, -centre, &mut self.report);
+        cam.point_of_interest = (!one_node).then(|| shift_vec3(poi, -centre, &mut self.report));
+        cam.zoom = Some(zoom);
+        cam.rotation_x = self.scalar(prop(&props, "ADBE Rotate X"), 1.0, 0.0);
+        cam.rotation_y = self.scalar(prop(&props, "ADBE Rotate Y"), 1.0, 0.0);
+        cam.rotation = self.scalar(prop(&props, "ADBE Rotate Z"), 1.0, 0.0);
+
+        // Orientation is a second, static XYZ rotation under the animated
+        // ones. It folds into them when they are still, or when only the
+        // axis it shares with them moves; anything else is reported.
+        if let Some(o) = prop(&props, "ADBE Orientation") {
+            let o = nums(&o["value"]);
+            let o = [0, 1, 2].map(|i| o.get(i).copied().unwrap_or(0.0));
+            let mut folded = true;
+            for (i, ch) in [&mut cam.rotation_x, &mut cam.rotation_y, &mut cam.rotation].into_iter().enumerate() {
+                if o[i] == 0.0 {
+                    continue;
+                }
+                match ch {
+                    Value::Const(v) => *v += o[i],
+                    Value::Keyframed(t) if o.iter().filter(|v| **v != 0.0).count() == 1 => {
+                        *t = t.clone().map_value(|v| v + o[i]);
+                    }
+                    _ => folded = false,
+                }
+            }
+            if !folded {
+                self.report.drop("camera orientation under animated rotation");
+            }
+        }
+        if l["parent"].as_u64().is_some() {
+            self.report.drop("camera parent (camera imported unparented)");
+        }
+        if options.iter().any(|p| {
+            matches!(p["matchName"].as_str(), Some("ADBE Camera Depth of Field" | "ADBE Camera Aperture" | "ADBE Camera Blur Level"))
+                && nums(&p["value"]).first().is_some_and(|v| *v != 0.0)
+        }) {
+            self.report.drop("camera depth of field");
+        }
+        cam
+    }
+
     /// Position, joined or separated. The export carries both forms; the
     /// separated X/Y win only when they are the ones animated.
     fn position(&mut self, props: &[J], joined: &str) -> Value<Vec3> {
@@ -1650,6 +1765,61 @@ mod tests {
     }
 
     #[test]
+    fn the_topmost_camera_becomes_the_comp_camera() {
+        // Two-node camera 1500 px back and 200 px right of centre, aiming at a
+        // point 300 px in; zoom keyed; a second camera below it; one 3D layer
+        // and one 2D layer.
+        let json = r##"{"root":{"id":0,"type":"Folder","children":[
+          {"id":1,"name":"Main","type":"Composition","width":1920,"height":1080,"framerate":24,"seconds":2,"layers":[
+            {"index":1,"name":"Cam","layerId":1,"kind":"camera","sourceId":0,"flags":{},
+             "cameraOptions":[{"matchName":"ADBE Camera Zoom","keyframes":[
+               {"time":0,"value":[2000],"outInterpolation":"Linear"},
+               {"time":1,"value":[3000],"inInterpolation":"Linear"}]}],
+             "transform":[
+               {"matchName":"ADBE Anchor Point","value":[960,540,300]},
+               {"matchName":"ADBE Position","value":[1160,540,-1500]},
+               {"matchName":"ADBE Orientation","value":[0,0,5]}]},
+            {"index":2,"name":"Cam 2","layerId":2,"kind":"camera","sourceId":0,"flags":{},"transform":[]},
+            {"index":3,"name":"Card","layerId":3,"kind":"null","sourceId":0,"flags":{"3D":true},"transform":[]},
+            {"index":4,"name":"Flat","layerId":4,"kind":"null","sourceId":0,"flags":{},"transform":[]}]}]}}"##;
+        let (p, report) = import(json).unwrap();
+        let c = p.root_comp();
+        let cam = c.camera.as_ref().expect("camera imported");
+        assert_eq!(cam.position, Value::constant(Vec3::new(200.0, 0.0, -1500.0)), "centre-relative");
+        assert_eq!(cam.point_of_interest, Some(Value::constant(Vec3::new(0.0, 0.0, 300.0))));
+        let Some(Value::Keyframed(z)) = &cam.zoom else { panic!("zoom keyed: {:?}", cam.zoom) };
+        assert_eq!(z.frames(), vec![0, 24]);
+        assert_eq!(cam.rotation, Value::constant(5.0), "orientation folded into the still rotation");
+        assert_eq!(c.root.children.len(), 2, "camera layers are not layers");
+        assert_eq!(report.dropped.get("camera layer beyond the topmost (only one camera per comp)"), Some(&1));
+        assert_eq!(report.dropped.get("2D layer in a comp with a camera (drawn through the camera)"), Some(&1));
+        assert!(!report.dropped.keys().any(|k| k.starts_with("3D layer")), "{:?}", report.dropped);
+
+        // The camera aims where AE's would: its point of interest is dead centre.
+        let mut ctx = crate::expr::EvalCtx::at(0.0);
+        let v = cam.resolve(&mut ctx, 1920.0, 1080.0);
+        let at = v.view().transform_point(Vec3::new(960.0, 540.0, 300.0));
+        let s = v.distance / (v.distance + at.z);
+        let (x, y) = (v.eye.x + (at.x - v.eye.x) * s, v.eye.y + (at.y - v.eye.y) * s);
+        assert!((x - 960.0).abs() < 1e-6 && (y - 540.0).abs() < 1e-6, "{x},{y}");
+    }
+
+    #[test]
+    fn a_one_node_camera_has_no_point_of_interest() {
+        let json = r##"{"root":{"id":0,"type":"Folder","children":[
+          {"id":1,"name":"Main","type":"Composition","width":1920,"height":1080,"framerate":24,"seconds":1,"layers":[
+            {"index":1,"name":"Cam","layerId":1,"kind":"camera","cameraType":"oneNode","sourceId":0,"flags":{},
+             "transform":[{"matchName":"ADBE Rotate Y","value":[20]}]}]}]}}"##;
+        let (p, _) = import(json).unwrap();
+        let cam = p.root_comp().camera.as_ref().unwrap();
+        assert!(cam.point_of_interest.is_none());
+        assert_eq!(cam.rotation_y, Value::constant(20.0));
+        // Defaults: AE's 50mm camera, on the axis, framing z = 0 at 1:1.
+        assert_eq!(cam.position, Value::constant(Vec3::new(0.0, 0.0, -2666.666_666_7)));
+        assert_eq!(cam.zoom, Some(Value::constant(2666.666_666_7)));
+    }
+
+    #[test]
     fn imports_a_minimal_project() {
         let json = r##"{"root":{"id":0,"type":"Folder","children":[
           {"id":1,"name":"Main","type":"Composition","width":100,"height":50,"framerate":24,"seconds":2,
@@ -1699,6 +1869,7 @@ mod tests {
             footage: &footage,
             centred: HashMap::new(),
             comp_size: Vec2::new(100.0, 100.0),
+            has_camera: false,
             report: &mut report,
             next_id: 1,
             fps: 10.0,
@@ -1767,6 +1938,7 @@ mod tests {
             footage: &footage,
             centred: HashMap::new(),
             comp_size: Vec2::new(100.0, 100.0),
+            has_camera: false,
             report: &mut report,
             next_id: 1,
             fps: 10.0,

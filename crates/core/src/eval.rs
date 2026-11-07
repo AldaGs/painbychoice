@@ -573,9 +573,13 @@ fn walk(
             // a tipped raster layer keeps the flat reading rather than growing
             // a shape its content does not match.
             let animated = !node.text_animators.is_empty() && matches!(shape, NodeShape::Text { .. });
-            let warped = warp.filter(|_| image.is_none() && !animated).map(|h| warp_path(&path, &h));
+            let near = view.map_or(0.0, |v| v.near());
+            let warped = warp.filter(|_| image.is_none() && !animated).map(|h| warp_path(&path, &h, near));
+            // What can't be cut (footage, per-glyph text's fallback) is placed
+            // by its origin; once that is behind the camera it has no place.
+            let placeable = warp.is_none() || view.is_none_or(|v| v.origin_in_front(xf));
             match warped {
-                // Crossed the eye plane: refused rather than drawn torn.
+                // Wholly behind the near plane.
                 Some(None) => {}
                 Some(Some(p)) => {
                     bounds = Some(p.bounding_box());
@@ -614,7 +618,7 @@ fn walk(
                         let (transform, path) = match (world_of(&t), view) {
                             // Through the camera: the exact projective map, drawn
                             // under the identity like a tipped layer.
-                            (Some(w), Some(v)) => match warp_path(&t.path, &v.homography(&w)) {
+                            (Some(w), Some(v)) => match warp_path(&t.path, &v.homography(&w), v.near()) {
                                 Some(p) => (Affine::IDENTITY, p),
                                 None => continue, // behind the eye
                             },
@@ -636,6 +640,8 @@ fn walk(
                         });
                     }
                 }
+                // Behind the camera and not cuttable: nothing to place.
+                None if !placeable => {}
                 None => {
                     bounds = Some((flat * path.clone()).bounding_box());
                     scene.items.push(RenderItem {

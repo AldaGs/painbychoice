@@ -5372,6 +5372,7 @@ fn spatial_target(rot_xy: (f64, f64)) -> GizmoTarget {
             eye: Point::new(960.0, 540.0),
             distance: 1200.0,
             orbit: motion_core::Mat4::IDENTITY,
+            camera: motion_core::Mat4::IDENTITY,
         }),
     }
 }
@@ -5455,6 +5456,7 @@ fn on_axis_target(orbit: motion_core::Mat4) -> GizmoTarget {
             eye: Point::new(960.0, 540.0),
             distance: 4405.0,
             orbit,
+            camera: motion_core::Mat4::IDENTITY,
         }),
     }
 }
@@ -6224,4 +6226,95 @@ fn stacked_selectors_get_their_own_rows_and_fold() {
     assert_eq!(a.mode, motion_core::node::SelectorMode::Intersect);
     // The last selector can't go.
     assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 0, op: SelOp::Remove }));
+}
+
+/// The camera rides the layer key machinery through a stand-in node: a
+/// stopwatch on one rotation axis starts a track on that axis only, the
+/// dopesheet shows it, a key move retimes it, and all of it lands back on the
+/// camera.
+#[test]
+fn camera_keys_go_through_the_layer_machinery() {
+    use crate::app::{camera_proxy, camera_write_back};
+    let mut cam = motion_core::Camera::from_distance(1000.0);
+    assert!(crate::timeline::dope_rows(&camera_proxy(&cam)).is_empty(), "a still camera has no rows");
+
+    // Stopwatch on pan (Y) at frame 0, then a second key at 20 with a new value.
+    let mut n = camera_proxy(&cam);
+    prop_of_mut(&mut n, PropKind::RotationY).unwrap().insert_key(0);
+    camera_write_back(&mut cam, n);
+    cam.rotation_y.set_at(20, 45.0);
+    assert!(cam.rotation_y.is_animated());
+    assert!(!cam.rotation_x.is_animated() && !cam.rotation.is_animated(), "only the pan keyed");
+
+    let rows = crate::timeline::dope_rows(&camera_proxy(&cam));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, PropKind::RotationY);
+    assert_eq!(rows[0].frames, vec![0, 20]);
+
+    // Moving the second key is the same code a layer's key move runs.
+    let mut n = camera_proxy(&cam);
+    assert!(crate::app::move_keys_in(&mut n, &[(PropKind::RotationY, vec![1])], 5, 100));
+    camera_write_back(&mut cam, n);
+    assert_eq!(cam.rotation_y.key_frames(), vec![0, 25]);
+}
+
+/// The lens gets its own row: keyed zoom shows in the dopesheet and curve
+/// editor as "Zoom", moves with the shared key code, and writes back to the
+/// camera. A pre-lens camera (zoom follows the dolly) has no row, and no
+/// ordinary layer ever gets one.
+#[test]
+fn camera_zoom_is_a_keyable_row() {
+    use crate::app::{camera_proxy, camera_write_back};
+    let mut cam = motion_core::Camera::from_distance(1000.0);
+    let mut n = camera_proxy(&cam);
+    prop_of_mut(&mut n, PropKind::CameraZoom).unwrap().insert_key(0);
+    camera_write_back(&mut cam, n);
+    cam.zoom.as_mut().unwrap().set_at(30, 2000.0);
+
+    let proxy = camera_proxy(&cam);
+    let rows = crate::timeline::dope_rows(&proxy);
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].kind, rows[0].label.as_str()), (PropKind::CameraZoom, "Zoom"));
+    assert_eq!(rows[0].frames, vec![0, 30]);
+    assert_eq!(crate::curves::curve_rows(&proxy).len(), 1, "plotted in the curve editor");
+
+    let mut n = camera_proxy(&cam);
+    assert!(crate::app::move_keys_in(&mut n, &[(PropKind::CameraZoom, vec![1])], 10, 100));
+    camera_write_back(&mut cam, n);
+    assert_eq!(cam.zoom.as_ref().unwrap().key_frames(), vec![0, 40]);
+
+    let mut legacy = motion_core::Camera::from_distance(1000.0);
+    legacy.zoom = None;
+    assert!(prop_of(&camera_proxy(&legacy), PropKind::CameraZoom).is_none());
+
+    let mut layer = MNode::group(5, "layer");
+    layer.set_param(crate::props::CAMERA_ZOOM_PARAM, motion_core::node::ParamValue::Num(Value::constant(1.0)));
+    assert!(prop_of(&layer, PropKind::CameraZoom).is_none(), "only the camera has a lens");
+}
+
+/// The point of interest is its own "Point of Interest" row on the camera,
+/// keyed and moved through the shared key code. The camera stand-in never
+/// shows a plain Anchor row, and a camera with no target has no row at all.
+#[test]
+fn camera_point_of_interest_is_a_keyable_row() {
+    use crate::app::{camera_proxy, camera_write_back};
+    let mut cam = motion_core::Camera::from_distance(1000.0);
+    assert!(prop_of(&camera_proxy(&cam), PropKind::CameraTarget).is_none(), "free camera: no target");
+
+    cam.point_of_interest = Some(Value::constant(motion_core::Vec3::ZERO));
+    let mut n = camera_proxy(&cam);
+    prop_of_mut(&mut n, PropKind::CameraTarget).unwrap().insert_key(0);
+    camera_write_back(&mut cam, n);
+    cam.point_of_interest.as_mut().unwrap().set_at(24, motion_core::Vec3::new(100.0, 0.0, 0.0));
+
+    let proxy = camera_proxy(&cam);
+    assert!(prop_of(&proxy, PropKind::Anchor).is_none(), "no stray Anchor row");
+    let rows = crate::timeline::dope_rows(&proxy);
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].kind, rows[0].label.as_str()), (PropKind::CameraTarget, "Point of Interest"));
+
+    let mut n = camera_proxy(&cam);
+    assert!(crate::app::move_keys_in(&mut n, &[(PropKind::CameraTarget, vec![1])], 6, 100));
+    camera_write_back(&mut cam, n);
+    assert_eq!(cam.point_of_interest.as_ref().unwrap().key_frames(), vec![0, 30]);
 }
