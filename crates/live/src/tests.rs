@@ -6257,3 +6257,37 @@ fn camera_keys_go_through_the_layer_machinery() {
     camera_write_back(&mut cam, n);
     assert_eq!(cam.rotation_y.key_frames(), vec![0, 25]);
 }
+
+/// The lens gets its own row: keyed zoom shows in the dopesheet and curve
+/// editor as "Zoom", moves with the shared key code, and writes back to the
+/// camera. A pre-lens camera (zoom follows the dolly) has no row, and no
+/// ordinary layer ever gets one.
+#[test]
+fn camera_zoom_is_a_keyable_row() {
+    use crate::app::{camera_proxy, camera_write_back};
+    let mut cam = motion_core::Camera::from_distance(1000.0);
+    let mut n = camera_proxy(&cam);
+    prop_of_mut(&mut n, PropKind::CameraZoom).unwrap().insert_key(0);
+    camera_write_back(&mut cam, n);
+    cam.zoom.as_mut().unwrap().set_at(30, 2000.0);
+
+    let proxy = camera_proxy(&cam);
+    let rows = crate::timeline::dope_rows(&proxy);
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].kind, rows[0].label.as_str()), (PropKind::CameraZoom, "Zoom"));
+    assert_eq!(rows[0].frames, vec![0, 30]);
+    assert_eq!(crate::curves::curve_rows(&proxy).len(), 1, "plotted in the curve editor");
+
+    let mut n = camera_proxy(&cam);
+    assert!(crate::app::move_keys_in(&mut n, &[(PropKind::CameraZoom, vec![1])], 10, 100));
+    camera_write_back(&mut cam, n);
+    assert_eq!(cam.zoom.as_ref().unwrap().key_frames(), vec![0, 40]);
+
+    let mut legacy = motion_core::Camera::from_distance(1000.0);
+    legacy.zoom = None;
+    assert!(prop_of(&camera_proxy(&legacy), PropKind::CameraZoom).is_none());
+
+    let mut layer = MNode::group(5, "layer");
+    layer.set_param(crate::props::CAMERA_ZOOM_PARAM, motion_core::node::ParamValue::Num(Value::constant(1.0)));
+    assert!(prop_of(&layer, PropKind::CameraZoom).is_none(), "only the camera has a lens");
+}

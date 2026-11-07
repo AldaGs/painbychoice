@@ -619,6 +619,11 @@ pub(crate) fn camera_proxy(cam: &motion_core::Camera) -> MNode {
     n.transform.rotation = cam.rotation.clone();
     n.transform.rotation_x = cam.rotation_x.clone();
     n.transform.rotation_y = cam.rotation_y.clone();
+    // Only a camera that has a lens of its own: a pre-lens camera's zoom
+    // follows the dolly and has nothing to key until it is given one.
+    if let Some(z) = &cam.zoom {
+        n.set_param(crate::props::CAMERA_ZOOM_PARAM, motion_core::node::ParamValue::Num(z.clone()));
+    }
     n
 }
 
@@ -629,6 +634,11 @@ pub(crate) fn camera_write_back(cam: &mut motion_core::Camera, n: MNode) {
     cam.rotation = tr.rotation;
     cam.rotation_x = tr.rotation_x;
     cam.rotation_y = tr.rotation_y;
+    if let Some(motion_core::node::ParamValue::Num(z)) =
+        n.params.into_iter().find(|p| p.name == crate::props::CAMERA_ZOOM_PARAM).map(|p| p.value)
+    {
+        cam.zoom = Some(z);
+    }
 }
 
 /// Apply `f` to a value's constant or to every key; an expression is left alone.
