@@ -6225,3 +6225,33 @@ fn stacked_selectors_get_their_own_rows_and_fold() {
     // The last selector can't go.
     assert!(!apply_text_anim_op(&mut node, 0, 30.0, &TextAnimOp::Selector { index: 0, sel: 0, op: SelOp::Remove }));
 }
+
+/// The camera rides the layer key machinery through a stand-in node: a
+/// stopwatch on one rotation axis starts a track on that axis only, the
+/// dopesheet shows it, a key move retimes it, and all of it lands back on the
+/// camera.
+#[test]
+fn camera_keys_go_through_the_layer_machinery() {
+    use crate::app::{camera_proxy, camera_write_back};
+    let mut cam = motion_core::Camera::from_distance(1000.0);
+    assert!(crate::timeline::dope_rows(&camera_proxy(&cam)).is_empty(), "a still camera has no rows");
+
+    // Stopwatch on pan (Y) at frame 0, then a second key at 20 with a new value.
+    let mut n = camera_proxy(&cam);
+    prop_of_mut(&mut n, PropKind::RotationY).unwrap().insert_key(0);
+    camera_write_back(&mut cam, n);
+    cam.rotation_y.set_at(20, 45.0);
+    assert!(cam.rotation_y.is_animated());
+    assert!(!cam.rotation_x.is_animated() && !cam.rotation.is_animated(), "only the pan keyed");
+
+    let rows = crate::timeline::dope_rows(&camera_proxy(&cam));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, PropKind::RotationY);
+    assert_eq!(rows[0].frames, vec![0, 20]);
+
+    // Moving the second key is the same code a layer's key move runs.
+    let mut n = camera_proxy(&cam);
+    assert!(crate::app::move_keys_in(&mut n, &[(PropKind::RotationY, vec![1])], 5, 100));
+    camera_write_back(&mut cam, n);
+    assert_eq!(cam.rotation_y.key_frames(), vec![0, 25]);
+}

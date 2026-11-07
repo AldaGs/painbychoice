@@ -72,7 +72,7 @@ struct TransformRepr {
 /// distinct (`{"Const": 1.5}` against `{"Const": {"x": …}}`).
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum RotationRepr {
+pub(crate) enum RotationRepr {
     Planar(Value<f64>),
     Joined(Value<Vec3>),
 }
@@ -101,7 +101,7 @@ impl From<TransformRepr> for Transform {
 /// easing and expression wiring, so an upgraded document animates identically.
 /// An axis whose keys are all zero collapses to a constant rather than
 /// carrying a row of meaningless keyframes.
-fn split_rotation(v: Value<Vec3>) -> (Value<f64>, Value<f64>, Value<f64>) {
+pub(crate) fn split_rotation(v: Value<Vec3>) -> (Value<f64>, Value<f64>, Value<f64>) {
     use crate::expr::Axis;
     match v {
         Value::Const(r) => (Value::Const(r.x), Value::Const(r.y), Value::Const(r.z)),

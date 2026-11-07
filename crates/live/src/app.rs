@@ -603,6 +603,34 @@ pub(crate) fn keep_position(pos: &mut Value<motion_core::Vec3>, target: Point, t
     }
 }
 
+/// The id the comp camera answers to when it is selected. Not a layer id — the
+/// counter that hands those out would take ~forever to reach it — so "the
+/// camera is selected" is just a selection no layer lookup can match.
+pub(crate) const CAMERA_ID: NodeId = NodeId(u64::MAX);
+
+/// The camera's channels dressed as a layer, so the dopesheet, curve editor,
+/// stopwatches and every key operation (move, ease, delete, copy/paste) work on
+/// it through the same `PropKind` machinery as a layer, with no camera-specific
+/// copy of any of them. Position is the camera position; the three rotation
+/// rows are its tilt (X), pan (Y) and roll (Z).
+pub(crate) fn camera_proxy(cam: &motion_core::Camera) -> MNode {
+    let mut n = MNode::group(CAMERA_ID.0, "Camera");
+    n.transform.position = cam.position.clone();
+    n.transform.rotation = cam.rotation.clone();
+    n.transform.rotation_x = cam.rotation_x.clone();
+    n.transform.rotation_y = cam.rotation_y.clone();
+    n
+}
+
+/// Write an edited [`camera_proxy`] back onto the camera.
+pub(crate) fn camera_write_back(cam: &mut motion_core::Camera, n: MNode) {
+    let tr = n.transform;
+    cam.position = tr.position;
+    cam.rotation = tr.rotation;
+    cam.rotation_x = tr.rotation_x;
+    cam.rotation_y = tr.rotation_y;
+}
+
 /// Apply `f` to a value's constant or to every key; an expression is left alone.
 pub(crate) fn remap(v: &mut Value<motion_core::Vec3>, f: impl Fn(motion_core::Vec3) -> motion_core::Vec3) {
     match v {
@@ -2430,10 +2458,28 @@ impl App {
     /// each returns whether it changed the document.
     fn with_prop(&mut self, kind: PropKind, f: impl FnOnce(PropRefMut<'_>)) -> bool {
         let Some(id) = self.selected else { return false };
-        let Some(node) = self.doc_mut().root.find_mut(id) else { return false };
-        let Some(p) = prop_of_mut(node, kind) else { return false };
-        f(p);
-        true
+        self.with_key_node(id, |node| prop_of_mut(node, kind).map(f).is_some()).unwrap_or(false)
+    }
+
+    /// Run `f` on the node whose keys are being edited: the layer `id`, or the
+    /// camera's stand-in when the camera is selected (written back after).
+    pub(crate) fn with_key_node<R>(&mut self, id: NodeId, f: impl FnOnce(&mut MNode) -> R) -> Option<R> {
+        if id == CAMERA_ID {
+            let cam = self.doc_mut().camera.as_mut()?;
+            let mut n = camera_proxy(cam);
+            let r = f(&mut n);
+            camera_write_back(cam, n);
+            return Some(r);
+        }
+        self.doc_mut().root.find_mut(id).map(f)
+    }
+
+    /// Read-only twin of [`Self::with_key_node`].
+    pub(crate) fn key_node(&self, id: NodeId) -> Option<std::borrow::Cow<'_, MNode>> {
+        if id == CAMERA_ID {
+            return self.doc().camera.as_ref().map(|c| std::borrow::Cow::Owned(camera_proxy(c)));
+        }
+        self.doc().root.find(id).map(std::borrow::Cow::Borrowed)
     }
 
     /// Apply the curve editor's key/tangent edits. Ordered deliberately:
@@ -2457,19 +2503,9 @@ impl App {
     }
 
     pub(crate) fn set_ease(&mut self, kind: PropKind, index: usize, p1: (f32, f32), p2: (f32, f32)) -> bool {
-        let Some(id) = self.selected else {
-            return false;
-        };
-        let Some(node) = self.doc_mut().root.find_mut(id) else {
-            return false;
-        };
         let out = Handle::new(p1.0 as f64, p1.1 as f64);
         let next_in = Handle::new(p2.0 as f64, p2.1 as f64);
-        let Some(mut p) = prop_of_mut(node, kind) else {
-            return false;
-        };
-        p.set_segment_handles(index, out, next_in);
-        true
+        self.with_prop(kind, |mut p| p.set_segment_handles(index, out, next_in))
     }
 
     /// Remove every dopesheet-selected keyframe (Delete). A track keeps at
@@ -2481,28 +2517,26 @@ impl App {
         if self.selected_keys.is_empty() {
             return false;
         }
-        // Reached through the field rather than `doc_mut()` on purpose: an
-        // accessor borrows all of `self`, and `selected_keys` is read below.
-        let Some(node) = self.project.comp_mut(self.current).unwrap().root.find_mut(id) else {
-            return false;
-        };
-        // Descending index order: removing a key shifts every later index
-        // down, so deleting from the back keeps the remaining ones valid.
-        for &(kind, index) in self.selected_keys.iter().rev() {
-            if let Some(mut p) = prop_of_mut(node, kind) {
-                p.remove_key(index);
+        let keys = std::mem::take(&mut self.selected_keys);
+        self.with_key_node(id, |node| {
+            // Descending index order: removing a key shifts every later index
+            // down, so deleting from the back keeps the remaining ones valid.
+            for &(kind, index) in keys.iter().rev() {
+                if let Some(mut p) = prop_of_mut(node, kind) {
+                    p.remove_key(index);
+                }
             }
-        }
-        self.selected_keys.clear();
-        true
+        })
+        .is_some()
     }
 
     /// Copy the selected keyframes (Ctrl+C). Whole keys — value and easing —
     /// so a paste reproduces the curve, not just the timing.
     pub(crate) fn copy_selected_keys(&mut self) -> bool {
-        let Some(node) = self.selected.and_then(|id| self.doc().root.find(id)) else {
+        let Some(node) = self.selected.and_then(|id| self.key_node(id)) else {
             return false;
         };
+        let node: &MNode = &node;
         if self.selected_keys.is_empty() {
             return false;
         }
@@ -2533,18 +2567,20 @@ impl App {
             return false;
         };
         let offset = self.current_frame() - clip.origin;
-        let Some(node) = self.doc_mut().root.find_mut(id) else {
+        let Some(landed) = self.with_key_node(id, |node| {
+            let mut landed = KeySelection::new();
+            for (kind, track) in &clip.tracks {
+                // Skipped when the paste target lacks the property entirely —
+                // copying an ellipse's Size and pasting onto a group, say.
+                let Some(mut p) = prop_of_mut(node, *kind) else { continue };
+                for i in p.insert_keys(track, offset) {
+                    landed.insert((*kind, i));
+                }
+            }
+            landed
+        }) else {
             return false;
         };
-        let mut landed = KeySelection::new();
-        for (kind, track) in &clip.tracks {
-            // Skipped when the paste target lacks the property entirely —
-            // copying an ellipse's Size and pasting onto a group, say.
-            let Some(mut p) = prop_of_mut(node, *kind) else { continue };
-            for i in p.insert_keys(track, offset) {
-                landed.insert((*kind, i));
-            }
-        }
         if landed.is_empty() {
             return false;
         }
@@ -2567,13 +2603,18 @@ impl App {
         }
         // Grouped before the mutable borrow: `doc_mut()` borrows all of `self`.
         let per_prop = group_selection_by_prop(&self.selected_keys);
-        let Some(node) = self.doc_mut().root.find_mut(id) else {
-            return false;
-        };
+        let last = self.doc().duration_frames.max(1);
+        self.with_key_node(id, |node| move_keys_in(node, &per_prop, delta, last)).unwrap_or(false)
+    }
+}
+
+/// The body of [`App::move_selected_keys`], on whichever node holds the keys.
+pub(crate) fn move_keys_in(node: &mut MNode, per_prop: &[(PropKind, Vec<usize>)], delta: i64, last: i64) -> bool {
+    {
 
         // Intersect the allowed delta across every affected track.
         let (mut lo, mut hi) = (i64::MIN, i64::MAX);
-        for (kind, idxs) in &per_prop {
+        for (kind, idxs) in per_prop {
             let Some(p) = prop_of(node, *kind) else { continue };
             if let Some((l, h)) = p.move_keys_limits(idxs) {
                 lo = lo.max(l);
@@ -2584,11 +2625,9 @@ impl App {
             return false; // the block is boxed in somewhere
         }
         // Also keep the whole selection inside the composition.
-        let last = self.doc().duration_frames.max(1);
-        let node = self.doc_mut().root.find_mut(id).expect("checked above");
         let mut min_frame = i64::MAX;
         let mut max_frame = i64::MIN;
-        for (kind, idxs) in &per_prop {
+        for (kind, idxs) in per_prop {
             let Some(p) = prop_of(node, *kind) else { continue };
             let frames = p.key_frames();
             for &i in idxs {
@@ -2610,14 +2649,16 @@ impl App {
         if applied == 0 {
             return false;
         }
-        for (kind, idxs) in &per_prop {
+        for (kind, idxs) in per_prop {
             if let Some(mut p) = prop_of_mut(node, *kind) {
                 p.move_keys(idxs, applied);
             }
         }
         true
     }
+}
 
+impl App {
     /// Reserve the next layer id and the look a new layer gets: centred in the
     /// comp, and the next colour off a rotating palette so successive shapes
     /// are visually distinct.
@@ -4087,10 +4128,16 @@ impl App {
             .filter(|(id, _)| !excluded.contains(id))
             .filter_map(|(_, p)| p.bounds)
             .collect();
-        let rows = sel_node.map(dope_rows).unwrap_or_default();
+        // With the camera selected there is no layer, but its stand-in has
+        // rows: the dopesheet and curve editor show the camera's keys.
+        let cam_proxy = (self.selected == Some(CAMERA_ID))
+            .then(|| self.doc().camera.as_ref().map(camera_proxy))
+            .flatten();
+        let key_node = sel_node.or(cam_proxy.as_ref());
+        let rows = key_node.map(dope_rows).unwrap_or_default();
         // The curve editor plots the same node the dopesheet rows come from,
         // one scalar track per numeric channel.
-        let curve_rows = sel_node.map(curve_rows).unwrap_or_default();
+        let curve_rows = key_node.map(curve_rows).unwrap_or_default();
         // Strips are per *comp*, not per selection: the whole point is seeing
         // every layer's window at once.
         let strip_rows = strip_rows(&self.doc().root, &self.project.assets);
@@ -4121,7 +4168,7 @@ impl App {
         } else {
             None
         };
-        let ease_info = match (sel_node, single_key) {
+        let ease_info = match (key_node, single_key) {
             (Some(node), Some((kind, idx))) => {
                 segment_handles_of(node, kind, idx).map(|(p1, p2)| EaseInfo {
                     p1: (p1.x as f32, p1.y as f32),
@@ -4149,8 +4196,14 @@ impl App {
             let comp = self.doc().clone();
             let mut ctx = EvalCtx::new(&comp, frame as f64);
             let p = c.position.resolve(&mut ctx);
-            let r = c.rotation.resolve(&mut ctx);
-            CameraBar { pos: (p.x, p.y, p.z), rot: (r.x, r.y, r.z) }
+            let r = (c.rotation_x.resolve(&mut ctx), c.rotation_y.resolve(&mut ctx), c.rotation.resolve(&mut ctx));
+            CameraBar {
+                pos: (p.x, p.y, p.z),
+                rot: r,
+                pos_anim: c.position.is_animated(),
+                rot_anim: [c.rotation_x.is_animated(), c.rotation_y.is_animated(), c.rotation.is_animated()],
+                selected: self.selected == Some(CAMERA_ID),
+            }
         });
         let timebase = self.doc().timebase();
         let view = self.view;
@@ -4964,7 +5017,31 @@ impl App {
         if let Some(add) = comp.camera_toggle {
             let (w, h) = (self.doc().width, self.doc().height);
             self.doc_mut().camera = add.then(|| motion_core::Camera::new(w, h));
+            // A removed camera can't stay selected: its keys are gone.
+            if !add && self.selected == Some(crate::app::CAMERA_ID) {
+                self.selected = None;
+                self.selected_keys.clear();
+            }
             dirty = true;
+        }
+        // Camera stopwatches: start (or add to) a track at the playhead, the
+        // same `insert_key` a layer's stopwatch runs, via the stand-in.
+        if !comp.camera_key.is_empty() {
+            let kinds = comp.camera_key.clone();
+            dirty |= self
+                .with_key_node(CAMERA_ID, |n| {
+                    for kind in kinds {
+                        if let Some(mut p) = prop_of_mut(n, kind) {
+                            p.insert_key(frame);
+                        }
+                    }
+                })
+                .is_some();
+        }
+        if comp.camera_select && self.doc().camera.is_some() {
+            self.selected = Some(CAMERA_ID);
+            self.selected_keys.clear();
+            self.shown_props.clear();
         }
         if comp.camera_reset {
             let (w, h) = (self.doc().width, self.doc().height);
@@ -4992,14 +5069,12 @@ impl App {
                     );
                     cam.position.set_at(f as i64, v);
                 }
-                if comp.camera_rot.iter().any(|e| e.is_some()) {
-                    let cur = cam.rotation.resolve(&mut ctx);
-                    let v = motion_core::Vec3::new(
-                        comp.camera_rot[0].unwrap_or(cur.x),
-                        comp.camera_rot[1].unwrap_or(cur.y),
-                        comp.camera_rot[2].unwrap_or(cur.z),
-                    );
-                    cam.rotation.set_at(f as i64, v);
+                // Separate tracks: an edit keys only its own axis.
+                let [rx, ry, rz] = comp.camera_rot;
+                for (edit, channel) in [(rx, &mut cam.rotation_x), (ry, &mut cam.rotation_y), (rz, &mut cam.rotation)] {
+                    if let Some(v) = edit {
+                        channel.set_at(f as i64, v);
+                    }
                 }
             }
             dirty = true;

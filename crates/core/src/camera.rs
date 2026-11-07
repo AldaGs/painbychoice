@@ -37,6 +37,7 @@ use crate::value::Value;
 /// A composition's camera. Present means the comp projects; absent means it is
 /// flat, and the engine behaves exactly as it did before depth existed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "CameraRepr")]
 pub struct Camera {
     /// Where the eye sits, as an **object in the composition** — not a lone
     /// setting.
@@ -57,14 +58,53 @@ pub struct Camera {
     /// `+Z` at the composition. Rotating it pivots the whole scene about the
     /// eye — the same operation the viewport orbit performs, but **part of the
     /// document**: this one renders.
-    #[serde(default = "zero_rotation")]
-    pub rotation: Value<Vec3>,
+    ///
+    /// Three separate tracks, like a layer's: `rotation` is the roll (Z),
+    /// `rotation_x` the tilt and `rotation_y` the pan, each keyed and eased on
+    /// its own. Applied Z · Y · X.
+    pub rotation: Value<f64>,
+    pub rotation_x: Value<f64>,
+    pub rotation_y: Value<f64>,
     /// A pre-object camera stored only a scalar `distance`. It cannot
     /// deserialize into `position` (a number is not a vector), so it lands here
     /// and [`Camera::migrate_frames`] folds it into `position.z` as `-distance`.
     /// Never written back out.
     #[serde(default, rename = "distance", skip_serializing)]
     legacy_distance: Option<Value<f64>>,
+}
+
+/// What a `.pbc` may hold for a camera: rotation as one joined 3-vector (before
+/// the axes were split) or as three channels. Split here, like a layer's.
+#[derive(Deserialize)]
+struct CameraRepr {
+    #[serde(default = "default_camera_position")]
+    position: Value<Vec3>,
+    #[serde(default)]
+    rotation: Option<crate::node::RotationRepr>,
+    #[serde(default)]
+    rotation_x: Option<Value<f64>>,
+    #[serde(default)]
+    rotation_y: Option<Value<f64>>,
+    #[serde(default, rename = "distance")]
+    legacy_distance: Option<Value<f64>>,
+}
+
+impl From<CameraRepr> for Camera {
+    fn from(r: CameraRepr) -> Self {
+        use crate::node::RotationRepr as R;
+        let (x, y, z) = match r.rotation {
+            None => (zero_angle(), zero_angle(), zero_angle()),
+            Some(R::Planar(z)) => (zero_angle(), zero_angle(), z),
+            Some(R::Joined(v)) => crate::node::split_rotation(v),
+        };
+        Self {
+            position: r.position,
+            rotation: z,
+            rotation_x: r.rotation_x.unwrap_or(x),
+            rotation_y: r.rotation_y.unwrap_or(y),
+            legacy_distance: r.legacy_distance,
+        }
+    }
 }
 
 /// The eye offset a camera falls back to when its `position` is missing — only
@@ -79,8 +119,8 @@ fn default_camera_position() -> Value<Vec3> {
 /// from [`Camera::default_distance`], which is sized to the comp.
 const FALLBACK_DISTANCE: f64 = 2000.0;
 
-fn zero_rotation() -> Value<Vec3> {
-    Value::constant(Vec3::ZERO)
+fn zero_angle() -> Value<f64> {
+    Value::constant(0.0)
 }
 
 impl Camera {
@@ -94,7 +134,9 @@ impl Camera {
     pub fn new(width: f64, height: f64) -> Self {
         Self {
             position: Value::constant(Vec3::new(0.0, 0.0, -Self::default_distance(width, height))),
-            rotation: Value::constant(Vec3::ZERO),
+            rotation: zero_angle(),
+            rotation_x: zero_angle(),
+            rotation_y: zero_angle(),
             legacy_distance: None,
         }
     }
@@ -110,7 +152,9 @@ impl Camera {
     pub fn from_distance(distance: f64) -> Self {
         Self {
             position: Value::constant(Vec3::new(0.0, 0.0, -distance)),
-            rotation: Value::constant(Vec3::ZERO),
+            rotation: zero_angle(),
+            rotation_x: zero_angle(),
+            rotation_y: zero_angle(),
             legacy_distance: None,
         }
     }
@@ -121,11 +165,15 @@ impl Camera {
         }
         self.position.migrate_frames(fps);
         self.rotation.migrate_frames(fps);
+        self.rotation_x.migrate_frames(fps);
+        self.rotation_y.migrate_frames(fps);
     }
 
     pub(crate) fn retime(&mut self, ratio: f64) {
         self.position.retime(ratio);
         self.rotation.retime(ratio);
+        self.rotation_x.retime(ratio);
+        self.rotation_y.retime(ratio);
     }
 
     /// Resolve to the frame's actual projection.
@@ -149,7 +197,7 @@ impl Camera {
         orbit: Mat4,
     ) -> Projector {
         let pos = self.position.resolve(ctx);
-        let rot = self.rotation.resolve(ctx);
+        let rot = Vec3::new(self.rotation_x.resolve(ctx), self.rotation_y.resolve(ctx), self.rotation.resolve(ctx));
         // The camera's own rotation pivots the world about the eye — the very
         // thing the editor orbit does, so it composes as one more orbit. The
         // editor's is applied *outside* the camera's: you orbit around the shot
@@ -437,7 +485,9 @@ mod tests {
     fn panning_the_camera_moves_the_eye() {
         let cam = Camera {
             position: Value::constant(Vec3::new(120.0, -40.0, -1000.0)),
-            rotation: Value::constant(Vec3::ZERO),
+            rotation: zero_angle(),
+            rotation_x: zero_angle(),
+            rotation_y: zero_angle(),
             legacy_distance: None,
         };
         let mut ctx = crate::expr::EvalCtx::at(0.0);
@@ -450,8 +500,8 @@ mod tests {
     #[test]
     fn dollying_the_camera_changes_the_distance() {
         let mut ctx = crate::expr::EvalCtx::at(0.0);
-        let near = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -300.0)), rotation: Value::constant(Vec3::ZERO), legacy_distance: None };
-        let far = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -3000.0)), rotation: Value::constant(Vec3::ZERO), legacy_distance: None };
+        let near = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -300.0)), ..Camera::from_distance(1.0) };
+        let far = Camera { position: Value::constant(Vec3::new(0.0, 0.0, -3000.0)), ..Camera::from_distance(1.0) };
         assert!(near.resolve(&mut ctx, 100.0, 100.0).distance < far.resolve(&mut ctx, 100.0, 100.0).distance);
     }
 
@@ -460,7 +510,7 @@ mod tests {
     /// NaNs.
     #[test]
     fn a_camera_on_the_plane_does_not_divide_by_zero() {
-        let cam = Camera { position: Value::constant(Vec3::ZERO), rotation: Value::constant(Vec3::ZERO), legacy_distance: None };
+        let cam = Camera { position: Value::constant(Vec3::ZERO), ..Camera::from_distance(1.0) };
         let mut ctx = crate::expr::EvalCtx::at(0.0);
         assert!(cam.resolve(&mut ctx, 100.0, 100.0).distance > 0.0);
     }
@@ -471,10 +521,25 @@ mod tests {
     fn camera_rotation_is_part_of_the_projection() {
         let cam = Camera {
             position: Value::constant(Vec3::new(0.0, 0.0, -1000.0)),
-            rotation: Value::constant(Vec3::new(0.0, 30.0, 0.0)),
-            legacy_distance: None,
+            rotation_y: Value::constant(30.0),
+            ..Camera::from_distance(1.0)
         };
         let mut ctx = crate::expr::EvalCtx::at(0.0);
         assert_ne!(cam.resolve(&mut ctx, 100.0, 100.0).orbit, Mat4::IDENTITY);
+    }
+
+    /// A camera saved with one joined rotation loads as three channels, each
+    /// keeping its own value, and saves back in the split form.
+    #[test]
+    fn a_joined_camera_rotation_splits_per_axis() {
+        let json = r#"{"position": {"Const": {"x": 0.0, "y": 0.0, "z": -900.0}},
+                       "rotation": {"Const": {"x": 10.0, "y": 20.0, "z": 30.0}}}"#;
+        let cam: Camera = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            (cam.rotation_x.clone(), cam.rotation_y.clone(), cam.rotation.clone()),
+            (Value::constant(10.0), Value::constant(20.0), Value::constant(30.0))
+        );
+        let back: Camera = serde_json::from_str(&serde_json::to_string(&cam).unwrap()).unwrap();
+        assert_eq!(back, cam);
     }
 }

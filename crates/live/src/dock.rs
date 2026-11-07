@@ -666,6 +666,11 @@ pub(crate) struct CompEdits {
     /// Return the camera to its default framing — the "return its position"
     /// half of treating it as an object you can move and put back.
     pub(crate) camera_reset: bool,
+    /// Camera stopwatches clicked: `Position`, `RotationX` (tilt), `RotationY`
+    /// (pan) or `Rotation` (roll). Keyed at the playhead like a layer's.
+    pub(crate) camera_key: Vec<crate::props::PropKind>,
+    /// Select the camera, so the dopesheet and curve editor show its keys.
+    pub(crate) camera_select: bool,
     /// Open a different composition. Everything comp-scoped (selection, the id
     /// counter, the timeline window) is rebuilt when this is applied.
     pub(crate) open: Option<CompId>,
@@ -706,7 +711,13 @@ pub(crate) struct LayoutEdits {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CameraBar {
     pub(crate) pos: (f64, f64, f64),
+    /// `(x, y, z)` rotation — tilt, pan, roll — each its own track.
     pub(crate) rot: (f64, f64, f64),
+    pub(crate) pos_anim: bool,
+    /// Whether each rotation axis is animated, `[x, y, z]`.
+    pub(crate) rot_anim: [bool; 3],
+    /// Whether the camera is the current selection (its keys are on the timeline).
+    pub(crate) selected: bool,
 }
 
 /// The render bar's inputs and its reported intent, bundled so the composition
@@ -944,11 +955,25 @@ pub(crate) fn comp_ui(
         // object's editor rather than a lone field, behind a popup so the bar
         // stays a bar. The label doubles as a readout: the dolly is the number
         // you reach for most, so it rides on the button.
-        if let Some(CameraBar { pos, rot }) = camera {
+        if let Some(CameraBar { pos, rot, pos_anim, rot_anim, selected }) = camera {
             ui.menu_button(format!("Camera  eye {:.0}", -pos.2), |ui| {
                 ui.set_min_width(180.0);
-                ui.strong("Camera");
-                ui.label("Position");
+                ui.horizontal(|ui| {
+                    ui.strong("Camera");
+                    if ui
+                        .selectable_label(selected, "Show keys")
+                        .on_hover_text("Select the camera, so its keys show in the dopesheet and curve editor")
+                        .clicked()
+                    {
+                        out.camera_select = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Position");
+                    if crate::props::key_button(ui, pos_anim) {
+                        out.camera_key.push(crate::props::PropKind::Position);
+                    }
+                });
                 ui.horizontal(|ui| {
                     let mut v = pos;
                     if ui.add(crate::calc::num(&mut v.0).speed(1.0).prefix("x ")).changed() {
@@ -971,19 +996,24 @@ pub(crate) fn comp_ui(
                     out.camera_pos[2] = Some(-eye);
                 }
 
+                // One row per axis, each with its own stopwatch: they are
+                // separate tracks, so a pan can ease while the roll holds.
                 ui.label("Rotation");
-                ui.horizontal(|ui| {
-                    let mut r = rot;
-                    if ui.add(crate::calc::num(&mut r.0).speed(0.5).prefix("x ").suffix("°")).changed() {
-                        out.camera_rot[0] = Some(r.0);
-                    }
-                    if ui.add(crate::calc::num(&mut r.1).speed(0.5).prefix("y ").suffix("°")).changed() {
-                        out.camera_rot[1] = Some(r.1);
-                    }
-                    if ui.add(crate::calc::num(&mut r.2).speed(0.5).prefix("z ").suffix("°")).changed() {
-                        out.camera_rot[2] = Some(r.2);
-                    }
-                });
+                let axes = [
+                    ("x ", "Tilt", rot.0, crate::props::PropKind::RotationX),
+                    ("y ", "Pan", rot.1, crate::props::PropKind::RotationY),
+                    ("z ", "Roll", rot.2, crate::props::PropKind::Rotation),
+                ];
+                for (i, (prefix, tip, mut v, kind)) in axes.into_iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.add(crate::calc::num(&mut v).speed(0.5).prefix(prefix).suffix("°")).on_hover_text(tip).changed() {
+                            out.camera_rot[i] = Some(v);
+                        }
+                        if crate::props::key_button(ui, rot_anim[i]) {
+                            out.camera_key.push(kind);
+                        }
+                    });
+                }
 
                 ui.separator();
                 if ui.button("Reset to default").clicked() {
