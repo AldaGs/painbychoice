@@ -1259,7 +1259,15 @@ impl App {
             node_registry: NodeRegistry::with_builtins(),
             ng_scope: NgScope::Project,
             ng_status: None,
-            footage: FootageCache::new(motion_render::default_registry()),
+            footage: {
+                #[allow(unused_mut)]
+                let mut cache = FootageCache::new(motion_render::default_registry());
+                #[cfg(feature = "libav")]
+                {
+                    cache.realtime = true;
+                }
+                cache
+            },
             project_path: None,
             autosaved: String::new(),
             autosave_at: Instant::now(),
@@ -3404,7 +3412,14 @@ impl App {
         };
         let handle = &self.context.devices[dev_id];
         let job = self.queue.active.as_mut().expect("checked above");
+        // A render reads the sidecar, never the realtime preview path.
+        #[cfg(feature = "libav")]
+        let realtime = std::mem::replace(&mut self.footage.realtime, false);
         let step = job.step(&handle.device, &handle.queue, renderer, &mut self.footage);
+        #[cfg(feature = "libav")]
+        {
+            self.footage.realtime = realtime;
+        }
         match step {
             crate::renderqueue::Step::Working => true,
             crate::renderqueue::Step::Done => {
@@ -5392,6 +5407,18 @@ impl App {
 
         let device_handle = &self.context.devices[surface.dev_id];
         let vrenderer = self.renderers[surface.dev_id].as_mut().unwrap();
+        // Every video clip in the scene just built gets its newest decoded
+        // frame converted on the GPU, before vello copies it into its atlas.
+        #[cfg(feature = "libav")]
+        {
+            self.footage.video.prepare(&device_handle.device, &device_handle.queue, vrenderer);
+            if self.playing && std::env::var_os("PBC_VIDEO_STATS").is_some() {
+                let s = self.footage.video.stats;
+                if s.wanted % 150 == 0 && s.wanted > 0 {
+                    eprintln!("video: {} wanted, {} dropped ({:.2}%), worst {:.0}ms", s.wanted, s.dropped, 100.0 * s.dropped as f64 / s.wanted as f64, s.worst_ms);
+                }
+            }
+        }
         vrenderer
             .render_to_texture(
                 &device_handle.device,

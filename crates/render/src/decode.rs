@@ -627,13 +627,20 @@ impl Decoder for FfmpegDecoder {
     }
 }
 
-/// Where in the file frame `n` sits, in seconds.
+/// Where to seek so that frame `n` is the first one ffmpeg emits, in seconds.
 ///
-/// Lands in the *middle* of the frame's own interval: asking for its exact
-/// start invites a rounding error to pick up the frame before it.
+/// ffmpeg's accurate seek keeps frames whose timestamp is **at or after** the
+/// seek point, so the point has to sit *before* frame `n` starts — half a frame
+/// before, so that rounding the number to six decimals can't push it past the
+/// frame's own timestamp and drop it.
+///
+/// This used to aim at the middle of frame `n`'s own interval, `(n + 0.5) /
+/// fps`, which is after its timestamp: every request came back one frame late
+/// and frame 0 of a clip was unreachable. Pinned against the in-process decoder
+/// by `libav::tests`, and against ffmpeg's own frame numbering below.
 fn seek_seconds(n: i64, meta: &AssetMeta) -> f64 {
     if meta.fps > 0.0 {
-        (n as f64 + 0.5) / meta.fps
+        (n as f64 - 0.5).max(0.0) / meta.fps
     } else {
         0.0
     }
@@ -814,7 +821,9 @@ mod tests {
             count += 1;
             assert_eq!(stream.next_index(), count, "the position advances by one");
         }
-        assert!(count >= 9, "a one-second 10fps clip has ~10 frames, got {count}");
+        // Exactly ten: nine was the old off-by-one, where the seek for frame 0
+        // landed past it and the stream began at frame 1.
+        assert_eq!(count, 10, "a one-second 10fps clip has 10 frames");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -10,6 +10,8 @@ pub mod decode;
 pub mod encode;
 pub mod footage;
 pub mod fx;
+#[cfg(feature = "libav")]
+pub mod libav;
 pub mod parallel;
 pub mod raster;
 pub mod transcribe;

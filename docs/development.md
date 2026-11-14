@@ -17,6 +17,25 @@ cargo run --bin motion     # offline: writes out/frame_00.svg .. frame_08.svg
 Windows note: the running `pbc.exe` locks the binary, so `cargo build` can't
 replace it while open. Kill it first: `taskkill //F //IM pbc.exe`.
 
+### Realtime video (`--features libav`)
+
+The realtime preview path ([ADR 0023](decisions/0023-in-process-libav-decode.md))
+links FFmpeg, so it is a feature rather than the default build:
+
+```bash
+export FFMPEG_DIR=<an FFmpeg shared SDK: include/, lib/, bin/>
+export LIBCLANG_PATH=<LLVM>/bin              # bindgen needs a real libclang
+export PATH="$PATH:$FFMPEG_DIR/bin"          # the DLLs, at run time
+cargo run -p motion-live --features libav
+cargo test -p motion-render -p motion-live --features libav
+```
+
+Append the SDK to `PATH`, don't prepend it: the tests generate their fixtures
+with whatever `ffmpeg` comes first, and an LGPL build has no `libx264`. They say
+`skipping:` when that happens — a run that prints it has checked nothing.
+`PBC_HWDEC=0` forces software decode; `PBC_VIDEO_STATS=1` prints drop counts
+while playing.
+
 Before pushing: `cargo test --workspace` and `cargo clippy --workspace
 --all-targets`. The test suite is fast (well under a second) — there is no
 excuse for not running it.

@@ -28,6 +28,7 @@ itself teaches nothing.
 | [0020](0020-the-render-job-is-stepped-not-threaded.md) | The GUI render job is stepped from the redraw loop, not threaded |
 | [0021](0021-audio-is-the-master-clock.md) | Audio is the master clock; the wall clock is the fallback |
 | [0022](0022-floating-windows-share-one-frame.md) | Floating windows and the preview window share the main window's frame |
+| [0023](0023-in-process-libav-decode.md) | In-process libav decode for the realtime preview (behind the `libav` feature; the sidecar stays the export reference) |
 
 ## Decided, not yet built
 

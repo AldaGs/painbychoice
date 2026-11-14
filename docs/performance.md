@@ -132,6 +132,55 @@ Three things fall out of that, and all three are actionable:
 without `--release`. This is the single most common way to arrive at a wrong
 conclusion about this codebase's speed.
 
+## Realtime video playback (Phase 0 spike)
+
+Measured 2026-11-14, release build, `--features libav`
+([ADR 0023](decisions/0023-in-process-libav-decode.md)). Windows 11, Intel
+i7-13620H (10 cores / 16 threads), 32GB, NVIDIA RTX 4060 Laptop (8GB, driver
+581.57), FFmpeg 9.0 shared LGPL build.
+
+**The composition.** Synthetic 4K clips, generated rather than committed:
+
+```bash
+ffmpeg -f lavfi -i "testsrc2=size=3840x2160:rate=30:duration=20,noise=alls=12:allf=t,hue=h=90" -c:v h264_nvenc -preset p5 -b:v 45M -g 30 -bf 2 -pix_fmt yuv420p h264_1.mp4
+```
+
+Three of those with different hues, plus one `hevc_nvenc -b:v 30M`. Each is
+drawn at 42% scale and 85% opacity, offset, into a 1920x1080 target — all of
+them overlapping. Played for 15s on a wall clock at 30fps with a redraw every
+1/60s, then scrubbed to twenty scattered frames:
+
+```bash
+PBC_BENCH_DIR=<clips> cargo test --release -p motion-live --features libav -- --ignored playback_bench --nocapture
+```
+
+| Clips | Decode | Dropped | Redraw median / p99 | Scrub to a frame, median / max | Scrub to the exact frame, median / max |
+| --- | --- | --- | --- | --- | --- |
+| 1 H.264 | D3D11VA | 0 / 449 | — | 48 / 141 ms | 98 / 343 ms |
+| 3 H.264 | D3D11VA | 0 / 1347 | 2.8 / 9.5 ms | **88 / 108 ms** | 221 / 360 ms |
+| 3 H.264 + 1 HEVC | D3D11VA | **0 / 1796** | 3.6 / 12.6 ms | 101 / 124 ms | 269 / 439 ms |
+| 3 H.264 + 1 HEVC | software | 0 / 1788 | 3.9 / 16.8 ms | 445 / 501 ms | 470 / 712 ms |
+
+"Dropped" counts frames the playhead asked a clip for and moved past before
+they were on screen. "A frame" is the keyframe the seek landed on; "the exact
+frame" is the one under the playhead. Scrub times are until *every* clip got
+there, so they are the slowest clip's.
+
+What this says:
+
+- **Playback has headroom.** Four 4K streams, no drops, and a redraw that uses
+  under a quarter of a 60Hz frame.
+- **Scrubbing is GOP-bound.** Reaching an exact frame means decoding from the
+  keyframe before it — fifteen frames on average here, at about 140 frames a
+  second per stream. No decoder design removes that; all-intra proxies do.
+- **Hardware decode pays on a seek** (4x sooner to a first frame, 1.7x to the
+  exact one, with four streams) and little during playback, where software
+  also keeps up on this CPU.
+
+What it does not say: this is a headless loop with no egui and no swapchain
+present, on one machine, with synthetic 8-bit footage and no sound. See
+[`phase-0-playback-spike.md`](phase-0-playback-spike.md).
+
 ## The structural advantages, and the one structural cost
 
 Worth knowing which of these is real before optimising anything.
