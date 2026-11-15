@@ -441,6 +441,55 @@ pub fn probe_sound(path: &Path) -> Result<AssetMeta, DecodeError> {
     Ok(AssetMeta::sound(sound.sample_rate, 2, sound.frames() as u64))
 }
 
+/// `meta` for a video, with its soundtrack attached when it has one. The
+/// video decoders report pictures only; this is where a clip's audio stream
+/// becomes something the mix knows about.
+pub fn with_soundtrack(meta: AssetMeta, path: &Path) -> AssetMeta {
+    if meta.kind != motion_core::AssetKind::Video || meta.sample_rate > 0 {
+        return meta;
+    }
+    match probe_sound(path) {
+        Ok(s) => meta.with_audio(s.sample_rate, s.channels, s.samples),
+        Err(_) => meta,
+    }
+}
+
+/// Give a project's video footage its sound: probe videos imported before
+/// soundtracks were read, and add a sound clip to every footage layer whose
+/// video has audio but that carries none. Returns whether anything changed.
+///
+/// Run on load, so a project saved silent plays with sound on reopen.
+pub fn attach_footage_sound(project: &mut motion_core::Project) -> bool {
+    let mut changed = false;
+    for a in project.assets.values_mut() {
+        if a.kind == motion_core::AssetKind::Video && a.sample_rate == 0 && a.path.exists() {
+            if let Ok(s) = probe_sound(&a.path) {
+                (a.sample_rate, a.channels, a.samples) = (s.sample_rate, s.channels, s.samples);
+                changed = true;
+            }
+        }
+    }
+    let sounding: std::collections::HashSet<motion_core::AssetId> =
+        project.assets.values().filter(|a| a.kind == motion_core::AssetKind::Video && a.has_audio()).map(|a| a.id).collect();
+    fn walk(n: &mut motion_core::Node, sounding: &std::collections::HashSet<motion_core::AssetId>, changed: &mut bool) {
+        if let (None, Some(motion_core::node::Shape::Image { asset, .. })) = (&n.audio, &n.shape) {
+            if sounding.contains(asset) {
+                n.audio = Some(motion_core::AudioClip::new(*asset));
+                *changed = true;
+            }
+        }
+        for c in &mut n.children {
+            walk(c, sounding, changed);
+        }
+    }
+    if !sounding.is_empty() {
+        for c in project.comps.values_mut() {
+            walk(&mut c.root, &sounding, &mut changed);
+        }
+    }
+    changed
+}
+
 /// Whether this path looks like something [`decode_sound`] should be handed.
 ///
 /// Extension-driven, like the container table in `encode.rs`, and for the same
@@ -1113,5 +1162,42 @@ mod mix_tests {
         };
         assert!(on(&["dlg"]) > 0.0);
         assert_eq!(on(&["mus"]), 0.0);
+    }
+
+    /// **The bug this exists for:** a video with a soundtrack played silent,
+    /// because import read only its pictures and its layer had no sound. A
+    /// project saved that way must play its sound once loaded.
+    #[test]
+    fn a_videos_soundtrack_reaches_the_mix() {
+        use motion_core::node::Shape;
+        let path = std::env::temp_dir().join(format!("pbc_av_{}.mp4", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=32x16:rate=24:duration=1"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&path)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("skipping: couldn't generate a fixture");
+            return;
+        }
+        // Imported the old way: pictures only, no sound on the layer.
+        let asset = motion_core::Asset::video(AssetId(1), &path, 32.0, 16.0, 24, 24.0);
+        assert!(!asset.has_audio());
+        let mut layer = Node::shape(1, "clip", Shape::Image { asset: AssetId(1), size: motion_core::Value::constant(kurbo::Vec2::new(32.0, 16.0)), time_remap: None });
+        layer.timing = Some(LayerTiming::new(0, 24));
+        let mut comp = Comp::new(32.0, 16.0, Node::group(0, "root").with_child(layer));
+        comp.fps = 24.0;
+        comp.duration_frames = 24;
+        let mut project = Project::single(comp);
+        project.assets.insert(AssetId(1), asset);
+
+        assert!(attach_footage_sound(&mut project));
+        assert!(project.assets[&AssetId(1)].has_audio(), "the soundtrack was probed");
+        let sounds: std::collections::HashMap<_, _> = [(AssetId(1), decode_sound(&path).unwrap())].into();
+        let mix = mix_comp(&project, project.root, 0, 23, 48_000, &sounds);
+        assert!(peak(&mix) > 0.05, "the tone is heard, peak {}", peak(&mix));
+        assert!(!attach_footage_sound(&mut project), "a second pass changes nothing");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -78,10 +78,12 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
             // Importing a broken spec would only add confusing knock-on errors.
             return Ok(Loaded { project: Project::single(motion_core::demo::demo_document()), findings, dropped: Default::default() });
         }
-        let (project, report) = motion_core::ae::import(&text)?;
+        let (mut project, report) = motion_core::ae::import(&text)?;
+        motion_render::attach_footage_sound(&mut project);
         return Ok(Loaded { project, findings, dropped: report.dropped });
     }
-    let project = Project::from_pbc(&text)?;
+    let mut project = Project::from_pbc(&text)?;
+    motion_render::attach_footage_sound(&mut project);
     Ok(Loaded { project, findings, dropped: Default::default() })
 }
 

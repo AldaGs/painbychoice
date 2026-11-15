@@ -72,6 +72,8 @@ pub(crate) fn rev_of(text: &str) -> u64 {
 pub(crate) fn parse(text: &str) -> Result<MProject, String> {
     let (mut project, _layout) = crate::app::parse_save(text)?;
     project.migrate();
+    // An agent that inserts footage by hand shouldn't have to wire its sound.
+    motion_render::attach_footage_sound(&mut project);
     if let Some((comp, id)) = duplicate_id(&project) {
         return Err(format!("comp {} has two layers with id {id}", comp.0));
     }

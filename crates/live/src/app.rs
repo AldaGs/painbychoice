@@ -592,6 +592,10 @@ pub(crate) fn footage_layer(
     if let Some(frames) = duration {
         node.timing = Some(motion_core::node::LayerTiming::new(0, frames));
     }
+    // A video with a soundtrack plays it: the sound rides on the same layer.
+    if a.is_some_and(|a| a.kind == motion_core::AssetKind::Video && a.has_audio()) {
+        node.audio = Some(motion_core::AudioClip::new(asset));
+    }
     node
 }
 
@@ -2936,7 +2940,18 @@ impl App {
             }
         };
         self.ng_status = None;
-        Some(self.project.add_asset(meta.into_asset(motion_core::AssetId(0), path)))
+        let has_audio = meta.sample_rate > 0;
+        let asset = self.project.add_asset(meta.into_asset(motion_core::AssetId(0), path.clone()));
+        // A video's soundtrack, decoded now like a sound file's, so its layer
+        // plays (and transcribes) without reopening the project.
+        // ponytail: the probe already decoded it once to count samples; keep that Sound if imports get slow.
+        if has_audio {
+            if let Ok(sound) = motion_render::decode_sound(&path) {
+                self.sounds.insert(asset, std::sync::Arc::new(sound));
+                self.refresh_peaks();
+            }
+        }
+        Some(asset)
     }
 
     /// Move a layer in the tree (a drag in the layers panel). A move to a new
@@ -2991,6 +3006,7 @@ impl App {
                     let seed = LayerSeed { id, transform: at_center, fill };
                     let node = footage_layer(&self.project, asset, seed, self.current);
                     self.push_layer(node, self.selected);
+                    self.publish_mix();
                 }
             }
             AssetDrag::Comp(comp) => {
@@ -3804,13 +3820,14 @@ impl App {
 
     /// Replace the project and layout with a `.pbc` file's text.
     fn open_text(&mut self, text: &str, path: Option<std::path::PathBuf>) -> bool {
-        let (project, layout) = match parse_save(text) {
+        let (mut project, layout) = match parse_save(text) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("parse failed: {e}");
                 return false;
             }
         };
+        motion_render::attach_footage_sound(&mut project);
         self.replace_project(project, path);
 
         // Restore the layout. Built-ins are always rebuilt from code; loaded user

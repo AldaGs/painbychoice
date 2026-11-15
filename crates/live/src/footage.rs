@@ -217,7 +217,7 @@ impl FootageCache {
         // Built fresh rather than borrowed from the worker: the registry lives
         // over there now, and probing is rare enough that constructing a few
         // decoders costs nothing next to reading the file.
-        motion_render::default_registry().open(path)
+        motion_render::default_registry().open(path).map(|m| motion_render::with_soundtrack(m, path))
     }
 
     /// Take delivery of everything the worker has finished.

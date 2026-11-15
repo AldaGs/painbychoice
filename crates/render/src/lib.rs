@@ -16,7 +16,7 @@ pub mod parallel;
 pub mod raster;
 pub mod transcribe;
 
-pub use audio::{decode_sound, is_audio_file, lufs, mix_comp, mix_stem, peak, probe_sound, write_wav, Peaks, Sound};
+pub use audio::{attach_footage_sound, with_soundtrack, decode_sound, is_audio_file, lufs, mix_comp, mix_stem, peak, probe_sound, write_wav, Peaks, Sound};
 pub use decode::{default_registry, FfmpegDecoder, ImageDecoder};
 pub use encode::{
     is_video_container, Encoder, EncodeError, FfmpegEncoder, OutputSpec, PngSequence, Preparer,
