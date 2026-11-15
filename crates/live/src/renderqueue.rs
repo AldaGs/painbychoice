@@ -584,6 +584,9 @@ pub(crate) struct RenderEdits {
     /// configured at all. This changes which known place it writes to; the
     /// default stays the guessable one beside the project.
     pub(crate) pick_draft_output: bool,
+    /// Write a stem as a WAV beside the project: an output or bus id, or
+    /// `Some(None)` for every one (ADR 0026).
+    pub(crate) stem: Option<Option<String>>,
 }
 
 /// A running job as the bar needs to show it — an owned snapshot, so the UI
@@ -716,6 +719,7 @@ pub(crate) fn render_menu(
     draft_out: &str,
     master_out: Option<&str>,
     range: Option<(i64, i64)>,
+    stems: &[(String, String)],
     out: &mut RenderEdits,
 ) {
     let scope = match range {
@@ -749,6 +753,44 @@ pub(crate) fn render_menu(
         out.pick_output = true;
         ui.close();
     }
+    if !stems.is_empty() {
+        ui.separator();
+        ui.menu_button(format!("Export Stems{scope}"), |ui| {
+            if ui.button("All").on_hover_text("One WAV per output (or per bus when there are no outputs), beside the project").clicked() {
+                out.stem = Some(None);
+                ui.close();
+            }
+            ui.separator();
+            for (id, label) in stems {
+                if ui.button(label).on_hover_text(format!("Writes <project>.{id}.wav")).clicked() {
+                    out.stem = Some(Some(id.clone()));
+                    ui.close();
+                }
+            }
+        });
+    }
+}
+
+/// Where a stem export writes: `<project>.<id>.wav` beside the project, or in
+/// the temp folder for one never saved.
+pub(crate) fn stem_path(project: Option<&Path>, id: &str) -> PathBuf {
+    let safe: String = id.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    match project.and_then(|p| Some((p.parent()?, p.file_stem()?.to_string_lossy().into_owned()))) {
+        Some((dir, stem)) => dir.join(format!("{stem}.{safe}.wav")),
+        None => std::env::temp_dir().join(format!("pbc.{safe}.wav")),
+    }
+}
+
+/// What a stem id names: an output's buses (`None` for a full-mix output) or
+/// a single bus. `Err` for an id that is neither.
+pub(crate) fn stem_buses(project: &MProject, id: &str) -> Result<Option<Vec<String>>, String> {
+    if let Some(o) = project.outputs.iter().find(|o| o.id == id) {
+        return Ok((!o.buses.is_empty()).then(|| o.buses.clone()));
+    }
+    if project.buses.iter().any(|b| b.id == id) {
+        return Ok(Some(vec![id.to_string()]));
+    }
+    Err(format!("no output or bus '{id}'"))
 }
 
 #[cfg(test)]
@@ -1057,6 +1099,25 @@ mod tests {
         let written = std::fs::read_dir(&dir).expect("the output directory").count();
         assert_eq!(written, 10, "one PNG per frame");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stem writes beside the project, named for its id, and an id resolves
+    /// to an output's buses, a single bus, or an error.
+    #[test]
+    fn stems_are_named_and_resolved() {
+        let p = Path::new("C:/work/promo.pbc");
+        assert_eq!(stem_path(Some(p), "dlg"), Path::new("C:/work").join("promo.dlg.wav"));
+        assert_eq!(stem_path(Some(p), "a/b").file_name().unwrap(), "promo.a_b.wav");
+        let mut project = MProject::single(motion_core::node::Comp::new(8.0, 8.0, motion_core::Node::group(0, "root")));
+        project.buses = vec![motion_core::Bus::new("dlg", "Dialogue")];
+        project.outputs = vec![
+            motion_core::Output { id: "mix".into(), buses: vec![] },
+            motion_core::Output { id: "voice".into(), buses: vec!["dlg".into()] },
+        ];
+        assert_eq!(stem_buses(&project, "mix"), Ok(None), "an empty output is the full mix");
+        assert_eq!(stem_buses(&project, "voice"), Ok(Some(vec!["dlg".to_string()])));
+        assert_eq!(stem_buses(&project, "dlg"), Ok(Some(vec!["dlg".to_string()])));
+        assert!(stem_buses(&project, "nope").is_err());
     }
 
     /// No range means the whole comp, **inclusive of the last frame**. The

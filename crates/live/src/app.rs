@@ -3440,6 +3440,38 @@ impl App {
     }
 
     /// Record a render that never got off the ground, so the bar can say so.
+    /// Write stems as WAVs beside the project: `which` names an output or bus,
+    /// or `None` for every output (every bus when there are none). Audio only,
+    /// so synchronous: a mixdown is quick next to a picture render.
+    pub(crate) fn export_stems(&mut self, which: Option<String>) {
+        let ids: Vec<String> = match which {
+            Some(id) => vec![id],
+            None if !self.project.outputs.is_empty() => self.project.outputs.iter().map(|o| o.id.clone()).collect(),
+            None => self.project.buses.iter().map(|b| b.id.clone()).collect(),
+        };
+        let Some(c) = self.project.comp(self.current) else { return };
+        let (start, end) = crate::renderqueue::clamp_range(self.render_range(), c.duration_frames);
+        for id in ids {
+            let out = crate::renderqueue::stem_path(self.project_path.as_deref(), &id);
+            let started = Instant::now();
+            let result = crate::renderqueue::stem_buses(&self.project, &id).and_then(|buses| {
+                let mix = motion_render::mix_stem(&self.project, self.current, start, end, 48_000, &self.sounds, buses.as_deref());
+                if mix.is_empty() {
+                    return Err("the comp has no sound".to_string());
+                }
+                motion_render::write_wav(&out, &mix, 48_000).map_err(|e| e.to_string())
+            });
+            self.queue.log.push(crate::renderqueue::RenderRecord {
+                out,
+                quality: Quality::Draft,
+                frames: if result.is_ok() { end - start + 1 } else { 0 },
+                seconds: started.elapsed().as_secs_f64(),
+                error: result.err(),
+                note: Some(format!("stem {id}")),
+            });
+        }
+    }
+
     fn report_render_failure(
         &mut self,
         out: std::path::PathBuf,
@@ -4425,6 +4457,13 @@ impl App {
         .display()
         .to_string();
         let render_range = self.render_range();
+        let stems: Vec<(String, String)> = self
+            .project
+            .outputs
+            .iter()
+            .map(|o| (o.id.clone(), format!("Output {}", o.id)))
+            .chain(self.project.buses.iter().map(|b| (b.id.clone(), format!("Bus {}", b.name))))
+            .collect();
         let (doc_w, doc_h, doc_fps) = (self.doc().width, self.doc().height, self.doc().fps);
         // Layout-preset menu: the names to list, the save-field buffer (taken so
         // the UI never borrows `self`, restored after), and the reported intent.
@@ -4536,6 +4575,7 @@ impl App {
                             draft_out: &draft_out,
                             master_out: master_out.as_deref(),
                             range: render_range,
+                            stems: &stems,
                             out: &mut render_edits,
                         },
                         doc_w,
@@ -5014,6 +5054,8 @@ impl App {
             self.pick_master_output();
         } else if render_edits.pick_draft_output {
             self.pick_draft_output();
+        } else if let Some(which) = render_edits.stem.take() {
+            self.export_stems(which);
         }
 
         if let Some(name) = comp.rename {

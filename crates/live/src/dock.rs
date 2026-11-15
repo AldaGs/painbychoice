@@ -780,6 +780,8 @@ pub(crate) struct RenderBar<'a> {
     /// The work area as an inclusive frame range, when one is set — what both
     /// buttons will render.
     pub(crate) range: Option<(i64, i64)>,
+    /// Outputs and buses a stem can be exported for, as (id, menu label).
+    pub(crate) stems: &'a [(String, String)],
     pub(crate) out: &'a mut crate::renderqueue::RenderEdits,
 }
 
@@ -835,7 +837,7 @@ pub(crate) fn comp_ui(
         let busy = render.active.is_some();
         ui.menu_button("Render", |ui| {
             ui.add_enabled_ui(!busy, |ui| {
-                crate::renderqueue::render_menu(ui, render.draft_out, render.master_out, render.range, render.out);
+                crate::renderqueue::render_menu(ui, render.draft_out, render.master_out, render.range, render.stems, render.out);
             });
             ui.separator();
             // Motion blur is a render setting, so it lives with the renders.
