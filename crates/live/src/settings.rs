@@ -53,8 +53,33 @@ impl Default for Settings {
     }
 }
 
-static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(load()));
+static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| {
+    let (s, note) = path().map_or((Settings::default(), None), |p| load_from(&p));
+    if let Some(n) = note {
+        // Show it: the dialog opens with the note on top.
+        *NOTE.write().unwrap() = Some(n);
+        OPEN.store(true, Ordering::Relaxed);
+    }
+    RwLock::new(s)
+});
 static OPEN: AtomicBool = AtomicBool::new(false);
+/// Changed but not yet written: saves wait for the pointer to let go.
+static DIRTY: AtomicBool = AtomicBool::new(false);
+/// What load had to recover from, shown at the top of the dialog.
+static NOTE: RwLock<Option<String>> = RwLock::new(None);
+
+impl Settings {
+    /// Pull hand-edited values back into range rather than reject the file.
+    fn clamp(mut self) -> Self {
+        self.autosave_secs = self.autosave_secs.min(3600);
+        self.ui_scale = if self.ui_scale.is_finite() { self.ui_scale.clamp(0.75, 2.0) } else { 1.0 };
+        self.labels.truncate(16);
+        for l in &mut self.labels {
+            l.name.truncate(l.name.char_indices().nth(64).map_or(l.name.len(), |(i, _)| i));
+        }
+        self
+    }
+}
 
 /// A copy of the current settings.
 pub(crate) fn get() -> Settings {
@@ -81,22 +106,55 @@ fn path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".pbc").join("settings.json"))
 }
 
-fn load() -> Settings {
-    // A missing or unreadable file is just the defaults; serde(default) fills
-    // anything an older file lacks.
-    path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn parse(p: &std::path::Path) -> Option<Settings> {
+    serde_json::from_str::<Settings>(&std::fs::read_to_string(p).ok()?).ok().map(Settings::clamp)
+}
+
+fn sibling(p: &std::path::Path, ext: &str) -> std::path::PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(ext);
+    s.into()
+}
+
+/// Read settings: the file, else its `.bak`, else the defaults. A file that
+/// exists but won't parse is kept as `.corrupt` for inspection, never
+/// overwritten. Returns a note when anything had to be recovered.
+fn load_from(p: &std::path::Path) -> (Settings, Option<String>) {
+    if !p.exists() {
+        return (parse(&sibling(p, ".bak")).unwrap_or_default(), None);
+    }
+    if let Some(s) = parse(p) {
+        return (s, None);
+    }
+    let _ = std::fs::copy(p, sibling(p, ".corrupt"));
+    match parse(&sibling(p, ".bak")) {
+        Some(s) => (s, Some("The settings file was unreadable; restored the last good copy. The broken file was kept as settings.json.corrupt.".into())),
+        None => (Settings::default(), Some("The settings file was unreadable and had no good backup; using defaults. The broken file was kept as settings.json.corrupt.".into())),
+    }
+}
+
+/// Write atomically: the current good file becomes `.bak`, the new text goes
+/// to `.tmp`, then a rename swaps it in, so a crash mid-save never leaves a
+/// half-written `settings.json`.
+fn save_to(p: &std::path::Path, s: &Settings) -> std::io::Result<()> {
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(s).map_err(std::io::Error::other)?;
+    let tmp = sibling(p, ".tmp");
+    std::fs::write(&tmp, text)?;
+    // Only a file that still parses is worth keeping as the fallback.
+    if parse(p).is_some() {
+        std::fs::copy(p, sibling(p, ".bak"))?;
+    }
+    std::fs::rename(tmp, p)
 }
 
 fn save(s: &Settings) {
-    let Some(p) = path() else { return };
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(s) {
-        let _ = std::fs::write(p, text);
+    if let Some(p) = path() {
+        if let Err(e) = save_to(&p, s) {
+            *NOTE.write().unwrap() = Some(format!("Couldn't save settings: {e}"));
+        }
     }
 }
 
@@ -143,6 +201,16 @@ pub(crate) fn window(ctx: &egui::Context) {
         .resizable(true)
         .default_size([520.0, 420.0])
         .show(ctx, |ui| {
+            let note = NOTE.read().unwrap().clone();
+            if let Some(n) = note {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(240, 150, 60), n);
+                    if ui.small_button("OK").clicked() {
+                        *NOTE.write().unwrap() = None;
+                    }
+                });
+                ui.separator();
+            }
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(110.0);
@@ -165,11 +233,16 @@ pub(crate) fn window(ctx: &egui::Context) {
     ctx.data_mut(|d| d.insert_temp(page_id, page));
     if s != before {
         let retheme = s.ui_base != before.ui_base || s.accent != before.accent || s.ui_scale != before.ui_scale;
-        *SETTINGS.write().unwrap() = s.clone();
-        save(&s);
+        *SETTINGS.write().unwrap() = s.clamp();
+        DIRTY.store(true, Ordering::Relaxed);
         if retheme {
             crate::theme::install(ctx);
         }
+    }
+    // Write once a drag or edit lets go (or the dialog closes), not every frame.
+    if DIRTY.load(Ordering::Relaxed) && (!ctx.input(|i| i.pointer.any_down()) || !open) {
+        DIRTY.store(false, Ordering::Relaxed);
+        save(&get());
     }
 }
 
@@ -230,5 +303,30 @@ mod tests {
         let s: super::Settings = serde_json::from_str(r#"{"autosave_secs": 5}"#).unwrap();
         assert_eq!(s.autosave_secs, 5);
         assert_eq!(s.labels.len(), 8);
+    }
+
+    #[test]
+    fn corrupt_file_falls_back_to_backup_and_is_kept() {
+        let dir = std::env::temp_dir().join(format!("pbc-settings-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("settings.json");
+        let mut a = super::Settings::default();
+        a.autosave_secs = 30;
+        super::save_to(&p, &a).unwrap();
+        let mut b = a.clone();
+        b.autosave_secs = 90;
+        super::save_to(&p, &b).unwrap(); // a is now the .bak
+        assert_eq!(super::load_from(&p), (b, None));
+
+        std::fs::write(&p, "{ \"autosave_secs\": 9 ").unwrap(); // truncated mid-write
+        let (got, note) = super::load_from(&p);
+        assert_eq!(got.autosave_secs, 30, "restored from .bak");
+        assert!(note.is_some());
+        assert!(super::sibling(&p, ".corrupt").exists());
+
+        std::fs::write(&p, r#"{"ui_scale": 50.0, "autosave_secs": 999999}"#).unwrap();
+        let (got, _) = super::load_from(&p);
+        assert_eq!((got.ui_scale, got.autosave_secs), (2.0, 3600), "hand edits are clamped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
