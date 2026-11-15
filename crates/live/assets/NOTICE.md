@@ -56,3 +56,30 @@ Single-quoted, and matching `u{…}` rather than the full `\u{…}`: inside doub
 quotes the shell eats the backslash and Python sees an invalid escape. Both
 lists should come back empty — a named codepoint that's absent renders as tofu,
 and one present but unnamed is dead weight in the file.
+
+## material-symbols.ttf, mdi.ttf
+
+The edit-tool icons (`src/material.rs`), **Apache License 2.0**:
+
+- `material-symbols.ttf`: Google **Material Symbols Outlined**
+  (google/material-design-icons, `variablefont/`), instanced at
+  `wght=400 FILL=0 GRAD=0 opsz=24` and subsetted to select, razor, ripple.
+- `mdi.ttf`: Pictogrammers **Material Design Icons** (`@mdi/font` 7.4.47),
+  subsetted to roll and magnet, which Material Symbols doesn't have.
+
+Regenerate with the codepoints in `src/material.rs` (the test
+`every_material_icon_is_in_the_bundled_fonts` fails if one is missing):
+
+```sh
+python -m fontTools.varLib.instancer "MaterialSymbolsOutlined[FILL,GRAD,opsz,wght].ttf" \
+  wght=400 FILL=0 GRAD=0 opsz=24 -o symbols_static.ttf
+python -m fontTools.subset symbols_static.ttf --unicodes=U+F82F,U+E14E,U+E31C \
+  --output-file=crates/live/assets/material-symbols.ttf \
+  --no-hinting --desubroutinize --drop-tables+=GSUB,GPOS
+python -m fontTools.subset materialdesignicons-webfont.ttf --unicodes=U+F093C,U+F0347 \
+  --output-file=crates/live/assets/mdi.ttf \
+  --no-hinting --desubroutinize --drop-tables+=GSUB,GPOS
+```
+
+Names → codepoints: Material Symbols' `.codepoints` file beside the font;
+MDI's `css/materialdesignicons.css` (`.mdi-magnet::before { content: "\F0347" }`).

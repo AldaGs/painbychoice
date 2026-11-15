@@ -2349,6 +2349,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "skrifa 0.43.2",
  "vello",
  "winit",
 ]

@@ -49,6 +49,7 @@ mod assets;
 mod calc;
 mod clips;
 mod headless;
+mod material;
 mod mixer;
 mod proxies;
 mod clock;

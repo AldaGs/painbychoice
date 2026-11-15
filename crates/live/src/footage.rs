@@ -529,6 +529,7 @@ impl FootageCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_for(&mut self, paint: ImagePaint) {
         let key = (paint.asset, paint.source_frame);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

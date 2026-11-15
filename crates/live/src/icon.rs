@@ -102,6 +102,7 @@ pub(crate) fn install(ctx: &egui::Context) {
     fonts
         .families
         .insert(egui::FontFamily::Name(FAMILY.into()), vec![FAMILY.to_owned()]);
+    crate::material::add(&mut fonts);
     ctx.set_fonts(fonts);
 }
 

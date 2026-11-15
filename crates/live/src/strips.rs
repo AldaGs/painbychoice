@@ -106,12 +106,12 @@ pub(crate) enum EditTool {
 }
 
 impl EditTool {
-    fn glyph(self) -> ToolCursor {
+    fn icon(self) -> &'static str {
         match self {
-            EditTool::Select => ToolCursor::Select,
-            EditTool::Razor => ToolCursor::Razor,
-            EditTool::Ripple => ToolCursor::Ripple { start: false },
-            EditTool::Roll => ToolCursor::Roll,
+            EditTool::Select => crate::material::SELECT,
+            EditTool::Razor => crate::material::RAZOR,
+            EditTool::Ripple => crate::material::RIPPLE,
+            EditTool::Roll => crate::material::ROLL,
         }
     }
 
@@ -410,15 +410,12 @@ const SNAP: egui::Color32 = egui::Color32::from_rgb(90, 230, 200);
 
 /// The pointer shapes egui has no icon for, drawn at the mouse with the system
 /// pointer hidden: a blade for the razor, a bracket for a ripple trim (open
-/// toward the clip, arrow the way it pushes), a double bracket for a roll. The
-/// palette's buttons draw the same shapes, plus a select arrow and a magnet.
+/// toward the clip, arrow the way it pushes), a double bracket for a roll.
 #[derive(Clone, Copy, PartialEq)]
 enum ToolCursor {
-    Select,
     Razor,
     Ripple { start: bool },
     Roll,
-    Magnet,
 }
 
 /// `kind`'s strokes around `p` at `scale` (1 = cursor size, ~20 px tall), and its color.
@@ -433,10 +430,6 @@ fn glyph(kind: ToolCursor, p: egui::Pos2, scale: f32) -> (Vec<[egui::Pos2; 2]>, 
         }
     };
     let color = match kind {
-        ToolCursor::Select => {
-            poly(&[(-4.0, -9.0), (-4.0, 6.0), (-0.5, 2.5), (2.0, 8.5), (4.0, 7.5), (1.5, 1.5), (6.0, 1.5)], true, &mut lines);
-            egui::Color32::from_gray(230)
-        }
         ToolCursor::Razor => {
             // A blade: the cutting edge down through the hotspot, a grip above.
             lines.push([v(0.0, -10.0), v(0.0, 10.0)]);
@@ -459,22 +452,6 @@ fn glyph(kind: ToolCursor, p: egui::Pos2, scale: f32) -> (Vec<[egui::Pos2; 2]>, 
             }
             ROLL
         }
-        ToolCursor::Magnet => {
-            // A horseshoe: two legs joined by a half circle, poles at the top.
-            let arc: Vec<(f32, f32)> = (0..=8)
-                .map(|i| {
-                    let a = std::f32::consts::PI * i as f32 / 8.0;
-                    (-6.0 * a.cos(), 1.0 + 6.0 * a.sin())
-                })
-                .collect();
-            let mut u = vec![(-6.0, -8.0)];
-            u.extend(arc);
-            u.push((6.0, -8.0));
-            poly(&u, false, &mut lines);
-            lines.push([v(-8.0, -5.0), v(-4.0, -5.0)]);
-            lines.push([v(4.0, -5.0), v(8.0, -5.0)]);
-            SNAP
-        }
     };
     (lines, color)
 }
@@ -494,29 +471,6 @@ fn tool_cursor(ui: &egui::Ui, kind: ToolCursor, p: egui::Pos2) {
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tool_cursor")));
     stroke_glyph(&painter, kind, p, 1.0, None);
-}
-
-/// A palette button: the tool's glyph, then its name. Drawn like a selectable
-/// label, so it sits with egui's own controls. Off, the glyph is grey.
-fn glyph_button(ui: &mut egui::Ui, on: bool, kind: ToolCursor, label: &str) -> egui::Response {
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, ui.visuals().text_color());
-    let pad = ui.spacing().button_padding;
-    let icon = 16.0;
-    let size = egui::vec2(pad.x * 2.0 + icon + 4.0 + galley.size().x, (galley.size().y + pad.y * 2.0).max(22.0));
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let vis = ui.style().interact_selectable(&resp, on);
-        if on || resp.hovered() {
-            ui.painter().rect(rect, vis.corner_radius, vis.weak_bg_fill, vis.bg_stroke, egui::StrokeKind::Inside);
-        }
-        let c = egui::pos2(rect.left() + pad.x + icon / 2.0, rect.center().y);
-        let tint = (!on).then(|| egui::Color32::from_gray(150));
-        stroke_glyph(ui.painter(), kind, c, 0.7, tint);
-        let text_pos = egui::pos2(c.x + icon / 2.0 + 4.0, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(text_pos, galley, vis.text_color());
-    }
-    resp
 }
 
 /// An on/off pill: a track with a knob that slides across, then the label.
@@ -798,13 +752,13 @@ pub(crate) fn strips_ui(
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         for t in EditTool::ALL {
-            if glyph_button(ui, tool == t, t.glyph(), t.label()).on_hover_text(t.hint()).clicked() {
+            if crate::material::toggle(ui, tool == t, t.icon()).on_hover_text(format!("{} — {}", t.label(), t.hint())).clicked() {
                 tool = t;
             }
         }
         ui.separator();
-        if glyph_button(ui, magnet, ToolCursor::Magnet, "Magnet")
-            .on_hover_text("Edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.")
+        if crate::material::toggle(ui, magnet, crate::material::MAGNET)
+            .on_hover_text("Magnet — edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.")
             .clicked()
         {
             magnet = !magnet;

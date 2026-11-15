@@ -29,3 +29,6 @@ png = "0.18"
 # Realtime video preview through linked libav (ADR 0023). Needs FFMPEG_DIR at
 # build time and FFmpeg's shared libraries on PATH at run time.
 libav = ["motion-render/libav"]
+
+[dev-dependencies]
+skrifa = "0.43"
