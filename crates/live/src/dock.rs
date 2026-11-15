@@ -832,6 +832,11 @@ pub(crate) fn comp_ui(
                     ui.close();
                 }
             }
+            ui.separator();
+            if ui.add(egui::Button::new("Settings…").shortcut_text("Ctrl+,")).clicked() {
+                crate::settings::open();
+                ui.close();
+            }
         });
         ui.menu_button("Layer", |ui| crate::layers::add_menu(ui, out));
         let busy = render.active.is_some();

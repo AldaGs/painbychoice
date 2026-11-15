@@ -382,6 +382,22 @@ pub fn apply(root: &mut MNode, patch: &Patch) {
     }
 }
 
+/// Duplicate layer `id` in place: a copy with fresh ids from `next`, named
+/// "<name> copy", stacked just above the original. Returns the copy's id, or
+/// `None` for the root or a missing id.
+pub fn duplicate(root: &mut MNode, id: NodeId, next: &mut u64) -> Option<NodeId> {
+    let parent = root.parent_of_mut(id)?;
+    let i = parent.children.iter().position(|n| n.id == id)?;
+    let mut copy = parent.children[i].clone();
+    reid(&mut copy, next);
+    copy.name = format!("{} copy", copy.name);
+    // A copy is its own clip, not a member of the original's sync group.
+    copy.sync = None;
+    let new = copy.id;
+    parent.children.insert(i + 1, copy);
+    Some(new)
+}
+
 /// Give `n` and everything inside it fresh ids from `next`.
 fn reid(n: &mut MNode, next: &mut u64) {
     n.id = NodeId(*next);
@@ -517,6 +533,18 @@ mod tests {
         let mut c = MNode::group(4, "c");
         c.timing = Some(lt(0, 40));
         MNode::group(0, "root").with_child(a).with_child(b).with_child(c)
+    }
+
+    #[test]
+    fn duplicate_stacks_a_reided_copy_above() {
+        let mut root = comp();
+        let mut next = 10;
+        let new = duplicate(&mut root, NodeId(1), &mut next).unwrap();
+        assert_eq!(new, NodeId(10));
+        assert_eq!(next, 12, "the child got a fresh id too");
+        let c = &root.children[1];
+        assert_eq!((c.name.as_str(), c.sync, c.children[0].id), ("a copy", None, NodeId(11)));
+        assert!(duplicate(&mut root, NodeId(0), &mut next).is_none(), "the root can't be duplicated");
     }
 
     #[test]

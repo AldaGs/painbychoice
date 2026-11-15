@@ -2102,8 +2102,8 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 self.render(&window);
-                // ponytail: fixed 60 s interval, make it a setting if anyone asks.
-                if self.autosave_at.elapsed() >= std::time::Duration::from_secs(60) {
+                let every = crate::settings::get().autosave_secs;
+                if every > 0 && self.autosave_at.elapsed() >= std::time::Duration::from_secs(every) {
                     self.autosave();
                 }
                 // Keep animating while playing; when paused, egui still asks
@@ -4786,6 +4786,7 @@ impl App {
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             let mut path = Vec::new();
             show_dock(dock, ui, &mut path, true, &mut draw, &mut dock_cmd);
+            crate::settings::window(ui.ctx());
         });
         let float_outputs: Vec<_> = self
             .popouts
@@ -4823,6 +4824,14 @@ impl App {
             tree_edits.delete = tree_edits
                 .delete
                 .or(self.selected.filter(|id| *id != root.id && !is_locked(root, *id)));
+        }
+        // Ctrl+D duplicates the selected layer; Ctrl+, opens Settings.
+        if self.shortcut(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+            let root = &self.doc().root;
+            tree_edits.duplicate = tree_edits.duplicate.or(self.selected.filter(|id| *id != root.id));
+        }
+        if self.shortcut(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
+            crate::settings::open();
         }
         let before = self.project.clone();
         let edit_label = edit_label(&tree_edits, &ng_edits, &dope, &comp, &aid_edits);
@@ -5391,6 +5400,21 @@ impl App {
         if let Some(id) = tree_edits.toggle_hidden {
             if let Some(n) = self.doc_mut().root.find_mut(id) {
                 n.hidden = !n.hidden;
+                dirty = true;
+            }
+        }
+        if let Some((id, l)) = tree_edits.label {
+            if let Some(n) = self.doc_mut().root.find_mut(id) {
+                n.label = l;
+                dirty = true;
+            }
+        }
+        if let Some(id) = tree_edits.duplicate {
+            let mut next = self.next_id;
+            if let Some(new) = motion_core::edit::duplicate(&mut self.doc_mut().root, id, &mut next) {
+                self.next_id = next;
+                self.selected = Some(new);
+                self.selected_keys.clear();
                 dirty = true;
             }
         }

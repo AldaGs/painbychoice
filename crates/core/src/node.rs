@@ -1436,6 +1436,10 @@ pub struct Node {
     /// the subtree, like `hidden`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
+    /// Editor colour label: an index into the user's label palette (After
+    /// Effects' label colours). `None` = the layer kind's own colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<u8>,
     /// Follow another layer's transform without nesting under it — After
     /// Effects parenting. Nesting a layer under its parent would also move it
     /// in the stack and make it inherit the parent's visibility, trim and
@@ -1499,6 +1503,7 @@ impl Node {
             subtitles: None,
             trim: None,
             locked: false,
+            label: None,
             link: None,
             sync: None,
             tags: Vec::new(),
@@ -1530,6 +1535,7 @@ impl Node {
             subtitles: None,
             trim: None,
             locked: false,
+            label: None,
             link: None,
             sync: None,
             tags: Vec::new(),
@@ -2400,6 +2406,9 @@ pub struct AssetFolder {
     /// top level; an id whose asset or comp is gone is skipped when listed.
     #[serde(default)]
     pub items: Vec<ProjectItem>,
+    /// Colour label, an index into the user's label palette.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<u8>,
 }
 
 /// A named export spec, saved in the `.pbc`.
@@ -2664,7 +2673,7 @@ mod tests {
         let old: Project = serde_json::from_value(json).unwrap();
         assert!(old.folders.is_empty());
 
-        p.folders = vec![AssetFolder { name: "a".into(), items: vec![] }, AssetFolder { name: "b".into(), items: vec![] }];
+        p.folders = vec![AssetFolder { name: "a".into(), items: vec![] , label: None }, AssetFolder { name: "b".into(), items: vec![] , label: None }];
         let item = ProjectItem::Comp(CompId(0));
         p.file_into(item, Some(0));
         p.file_into(item, Some(1));

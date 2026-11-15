@@ -77,6 +77,12 @@ pub(crate) fn edit_label(
             NewShape::Vector => "Add path",
         };
     }
+    if tree.duplicate.is_some() {
+        return "Duplicate layer";
+    }
+    if tree.label.is_some() {
+        return "Label layer";
+    }
     if tree.delete.is_some() {
         return "Delete layer";
     }

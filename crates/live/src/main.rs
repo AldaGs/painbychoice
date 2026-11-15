@@ -71,6 +71,7 @@ mod popout;
 mod props;
 mod renderqueue;
 mod scene;
+mod settings;
 mod strips;
 mod subtitles;
 mod textanim;

@@ -24,6 +24,8 @@ pub(crate) struct StripRow {
     /// which group.
     pub(crate) depth: usize,
     pub(crate) kind: crate::layers::RowKind,
+    /// The user's colour label, which wins over the kind's accent on the bar.
+    pub(crate) label: Option<u8>,
     /// `None` = live for the whole comp, which is what every layer is until
     /// someone gives it a range.
     pub(crate) timing: Option<LayerTiming>,
@@ -194,7 +196,7 @@ fn clip_bar(
             (true, false) => 0.42,
             (true, true) => 0.58,
         };
-        let fill = egui::Color32::from_gray(32).lerp_to_gamma(row.kind.accent(), tint);
+        let fill = egui::Color32::from_gray(32).lerp_to_gamma(crate::settings::label_color(row.label).unwrap_or(row.kind.accent()), tint);
         painter.rect_filled(bar, 3.0, fill);
         if is_sel {
             painter.rect_stroke(
@@ -599,6 +601,7 @@ pub(crate) fn strip_rows(
             name: node.name.clone(),
             depth,
             kind: crate::layers::RowKind::of(node),
+            label: node.label,
             timing: node.timing,
             keys,
             audio: node.audio.as_ref().map(|a| (a.asset, a.enabled)),

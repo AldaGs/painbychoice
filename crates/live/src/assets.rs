@@ -18,6 +18,8 @@ pub(crate) enum FolderEdit {
     Delete(usize),
     /// File an item into a folder, or out to the top level with `None`.
     File(AssetDrag, Option<usize>),
+    /// Set or clear a folder's colour label.
+    Label(usize, Option<u8>),
 }
 
 /// Apply a folder edit to the project.
@@ -25,7 +27,7 @@ pub(crate) fn apply_folder_edit(project: &mut MProject, edit: FolderEdit) {
     match edit {
         FolderEdit::New => {
             let name = format!("Folder {}", project.folders.len() + 1);
-            project.folders.push(motion_core::AssetFolder { name, items: Vec::new() });
+            project.folders.push(motion_core::AssetFolder { name, items: Vec::new() , label: None });
         }
         FolderEdit::Rename(i, name) => {
             if let Some(f) = project.folders.get_mut(i) {
@@ -38,6 +40,11 @@ pub(crate) fn apply_folder_edit(project: &mut MProject, edit: FolderEdit) {
             }
         }
         FolderEdit::File(item, to) => project.file_into(item, to),
+        FolderEdit::Label(i, label) => {
+            if let Some(f) = project.folders.get_mut(i) {
+                f.label = label;
+            }
+        }
     }
 }
 
@@ -119,14 +126,17 @@ fn kind_icon(ui: &mut egui::Ui, kind: AssetKind) {
 /// Returns whether the row was double-clicked.
 fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), name: &str, info: impl FnOnce(&mut egui::Ui), hover: String) -> bool {
     let id = egui::Id::new(("asset_row", payload));
+    let n = ui.data(|d| d.get_temp::<usize>(egui::Id::new("asset_zebra"))).unwrap_or(0);
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("asset_zebra"), n + 1));
     let resp = ui.dnd_drag_source(id, payload, |ui| {
-        ui.horizontal(|ui| {
-            icon(ui);
-            ui.vertical(|ui| {
-                ui.label(name);
-                info(ui);
-            });
-        });
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+        let hovered = ui.rect_contains_pointer(rect);
+        ui.painter().rect_filled(rect, 0.0, crate::layers::row_fill(ui, n, false, hovered));
+        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(4.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        row.style_mut().interaction.selectable_labels = false;
+        icon(&mut row);
+        row.label(name);
+        row.with_layout(egui::Layout::right_to_left(egui::Align::Center), info);
     })
     .response
     .on_hover_text(hover);
@@ -179,8 +189,15 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool
     if let Some(e) = proxy.2 {
         ui.colored_label(egui::Color32::from_rgb(240, 150, 60), e);
     }
-    ui.weak("Drag onto Layers to add, onto a folder to file · double-click a comp to open it");
-    ui.separator();
+    let search_id = egui::Id::new("asset_search");
+    let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
+    ui.add(egui::TextEdit::singleline(&mut search).hint_text("🔍 Search").desired_width(f32::INFINITY))
+        .on_hover_text("Drag onto Layers to add, onto a folder to file · double-click a comp to open it");
+    ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("asset_zebra"), 0usize));
+    let needle = search.trim().to_lowercase();
+    let matches = |item: &AssetDrag| needle.is_empty() || item_name(project, *item).to_lowercase().contains(&needle);
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     let rename_id = egui::Id::new("folder_rename");
     let mut renaming: Option<(usize, String)> = ui.data(|d| d.get_temp(rename_id));
@@ -190,14 +207,28 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool
     for (fi, folder) in project.folders.iter().enumerate() {
         // The header is one click target, allocated before its contents so
         // the rename box on top keeps its own clicks (as in the Layers panel).
+        let items: Vec<AssetDrag> = folder.items.iter().copied().filter(|i| matches(i)).collect();
+        if !needle.is_empty() && items.is_empty() {
+            continue;
+        }
         let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
-        let open = !folded.contains(&fi);
+        // A search opens every folder it finds something in.
+        let open = !folded.contains(&fi) || !needle.is_empty();
+        let n = ui.data(|d| d.get_temp::<usize>(egui::Id::new("asset_zebra"))).unwrap_or(0);
+        ui.data_mut(|d| d.insert_temp(egui::Id::new("asset_zebra"), n + 1));
+        ui.painter().rect_filled(rect, 0.0, crate::layers::row_fill(ui, n, false, r.hovered()));
         let mut row_ui = ui.new_child(
-            egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)),
+            egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(4.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
+        row_ui.style_mut().interaction.selectable_labels = false;
         {
             let ui = &mut row_ui;
-            ui.label(if open { "⏷" } else { "⏵" });
+            // The colour label swatch, Premiere-style; grey when unset.
+            let (sw, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            let c = crate::settings::label_color(folder.label).unwrap_or(egui::Color32::from_gray(90));
+            ui.painter().rect_filled(sw, 2.0, c);
+            let (ar, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+            crate::layers::fold_arrow(ui, ar, open, r.hovered());
             ui.label(icon::text(icon::GROUP));
             match renaming.as_mut().filter(|(i, _)| *i == fi) {
                 Some((_, buf)) => {
@@ -226,6 +257,9 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool
                 renaming = Some((fi, folder.name.clone()));
                 ui.close();
             }
+            if let Some(l) = crate::settings::label_menu(ui, folder.label) {
+                out.folder = Some(FolderEdit::Label(fi, l));
+            }
             if ui.button("Delete folder").on_hover_text("Its contents move back to the top level").clicked() {
                 out.folder = Some(FolderEdit::Delete(fi));
                 ui.close();
@@ -240,8 +274,8 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool
         }
         if open {
             ui.indent(("folder", fi), |ui| {
-                for item in &folder.items {
-                    item_row(ui, project, current, *item, out);
+                for item in items {
+                    item_row(ui, project, current, item, out);
                 }
             });
         }
@@ -263,9 +297,17 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool
         .keys()
         .map(|id| AssetDrag::Comp(*id))
         .chain(project.assets.keys().map(|id| AssetDrag::File(*id)))
-        .filter(|i| !filed.contains(i));
+        .filter(|i| !filed.contains(i) && matches(i));
     for item in loose {
         item_row(ui, project, current, item, out);
+    }
+}
+
+/// What a row is called, for search.
+fn item_name(project: &MProject, item: AssetDrag) -> String {
+    match item {
+        AssetDrag::Comp(id) => project.comps.get(&id).map(|c| c.label(id)).unwrap_or_default(),
+        AssetDrag::File(id) => project.assets.get(&id).map(|a| a.name.clone()).unwrap_or_default(),
     }
 }
 

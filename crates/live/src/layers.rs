@@ -85,6 +85,7 @@ pub(crate) struct TreeRow {
     pub(crate) children: usize,
     pub(crate) hidden: bool,
     pub(crate) locked: bool,
+    pub(crate) label: Option<u8>,
 }
 
 /// The icon a row shows.
@@ -119,6 +120,7 @@ fn push_rows(node: &motion_core::Node, depth: usize, parent: Option<NodeId>, ind
         children: node.children.len(),
         hidden: node.hidden,
         locked: node.locked,
+        label: node.label,
     });
     for (i, c) in node.children.iter().enumerate().rev() {
         push_rows(c, depth + 1, Some(node.id), i, out);
@@ -248,6 +250,10 @@ pub(crate) struct TreeEdits {
     pub(crate) ungroup: Option<NodeId>,
     /// Open the composition this precomp layer instances.
     pub(crate) open_comp: Option<CompId>,
+    /// Copy this layer (fresh ids) just above itself — Ctrl+D.
+    pub(crate) duplicate: Option<NodeId>,
+    /// Set or clear a layer's colour label.
+    pub(crate) label: Option<(NodeId, Option<u8>)>,
 }
 
 /// The top bar's Layer menu: every layer type you can add, plus import.
@@ -310,6 +316,32 @@ pub(crate) fn unfolded_rows<'a>(rows: &'a [TreeRow], folded: &std::collections::
         out.push(row);
     }
     out
+}
+
+/// A painted disclosure triangle: down when open, right when folded.
+pub(crate) fn fold_arrow(ui: &egui::Ui, rect: egui::Rect, open: bool, hovered: bool) {
+    let c = if hovered { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    let m = rect.center();
+    let pts = if open {
+        vec![m + egui::vec2(-4.0, -2.0), m + egui::vec2(4.0, -2.0), m + egui::vec2(0.0, 3.0)]
+    } else {
+        vec![m + egui::vec2(-2.0, -4.0), m + egui::vec2(3.0, 0.0), m + egui::vec2(-2.0, 4.0)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(pts, c, egui::Stroke::NONE));
+}
+
+/// Zebra fill for outline row `n`, or the hover / selection fill.
+pub(crate) fn row_fill(ui: &egui::Ui, n: usize, selected: bool, hovered: bool) -> egui::Color32 {
+    let v = ui.visuals();
+    if selected {
+        v.selection.bg_fill
+    } else if hovered {
+        v.widgets.hovered.bg_fill
+    } else if n % 2 == 0 {
+        v.faint_bg_color
+    } else {
+        v.panel_fill
+    }
 }
 
 /// A painted eye (open, or struck through) or padlock (shut, or open). Painted
@@ -375,15 +407,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
         }
         // A lifted row paints on a top layer that follows the pointer.
         let layer = if lifted { egui::LayerId::new(egui::Order::Tooltip, id) } else { ui.layer_id() };
-        let fill = if selected == Some(row.id) {
-            ui.visuals().selection.bg_fill
-        } else if lifted || ui.rect_contains_pointer(rect) {
-            egui::Color32::from_gray(132)
-        } else if n % 2 == 0 {
-            egui::Color32::from_gray(50)
-        } else {
-            egui::Color32::from_gray(60)
-        };
+        let fill = row_fill(ui, n, selected == Some(row.id), lifted || ui.rect_contains_pointer(rect));
         let mut row_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
@@ -391,6 +415,10 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         row_ui.painter().rect_filled(rect, 0.0, fill);
+        // The colour label: a stripe down the row's left edge.
+        if let Some(c) = crate::settings::label_color(row.label) {
+            row_ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())), 0.0, c);
+        }
         row_ui.style_mut().interaction.selectable_labels = false;
         {
             let ui = &mut row_ui;
@@ -405,14 +433,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::click());
             if row.children > 0 {
                 let open = !folded.contains(&row.id);
-                let c = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
-                let m = rect.center();
-                let pts = if open {
-                    vec![m + egui::vec2(-4.0, -2.0), m + egui::vec2(4.0, -2.0), m + egui::vec2(0.0, 3.0)]
-                } else {
-                    vec![m + egui::vec2(-2.0, -4.0), m + egui::vec2(3.0, 0.0), m + egui::vec2(-2.0, 4.0)]
-                };
-                ui.painter().add(egui::Shape::convex_polygon(pts, c, egui::Stroke::NONE));
+                fold_arrow(ui, rect, open, resp.hovered());
                 if resp.on_hover_text(if open { "Collapse" } else { "Expand" }).clicked() && !folded.remove(&row.id) {
                     folded.insert(row.id);
                 }
@@ -524,6 +545,13 @@ fn context_menu(resp: &egui::Response, row: &TreeRow, out: &mut TreeEdits) -> bo
         {
             out.split_shape = Some(row.id);
             ui.close();
+        }
+        if ui.add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
+            out.duplicate = Some(row.id);
+            ui.close();
+        }
+        if let Some(l) = crate::settings::label_menu(ui, row.label) {
+            out.label = Some((row.id, l));
         }
         if ui.button("Pre-compose").on_hover_text("Move this layer into a new comp and leave an instance in its place").clicked() {
             out.precompose = Some(row.id);
