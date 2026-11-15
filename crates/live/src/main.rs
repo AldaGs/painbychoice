@@ -48,6 +48,7 @@ mod app;
 mod assets;
 mod calc;
 mod clips;
+mod headless;
 mod mixer;
 mod proxies;
 mod clock;
@@ -100,6 +101,11 @@ use textanim::*;
 use timeline::*;
 
 fn main() {
+    // `pbc render ...`: the GPU export, no window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("render") {
+        std::process::exit(headless::render(&args[2..]));
+    }
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(demo_document());

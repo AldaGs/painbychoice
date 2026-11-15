@@ -506,6 +506,29 @@ impl FootageCache {
     /// or every layer whose footage hasn't decoded yet is silently missing
     /// from the file. Bounded so a stuck decoder fails a frame's footage
     /// rather than hanging the render forever.
+    /// Block until `asset`'s frame for `paint` is decoded (or failed) — what an
+    /// export needs. Asks again whenever the prefetch that promised the frame
+    /// stops short of it: a frame the cache believes promised is never
+    /// requested, and waiting alone would then sit out the whole deadline and
+    /// export the neighbour in its place.
+    pub(crate) fn decode_now(&mut self, asset: &Asset, paint: ImagePaint) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if self.image(asset, paint).is_some_and(|(_, exact)| exact) {
+                return;
+            }
+            let id = self.proxy_for(asset).map_or(asset.id, |p| p.id);
+            if self.failed.contains_key(&(id, paint.source_frame)) {
+                return;
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else { return };
+            match self.from_worker.recv_timeout(left) {
+                Ok(r) => self.take(r),
+                Err(_) => return,
+            }
+        }
+    }
+
     pub(crate) fn wait_for(&mut self, paint: ImagePaint) {
         let key = (paint.asset, paint.source_frame);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

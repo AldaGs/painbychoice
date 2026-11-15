@@ -217,8 +217,7 @@ impl FrameRenderer<'_> {
         // what it already has, and a render can't show a placeholder.
         for paint in scene.items.iter().filter_map(|i| i.image) {
             if let Some(asset) = project.assets.get(&paint.asset) {
-                self.footage.image(asset, paint);
-                self.footage.wait_for(paint);
+                self.footage.decode_now(asset, paint);
             }
         }
         // Blurred layers rasterized and filtered first, so `to_vello` can drop
@@ -259,14 +258,12 @@ impl FrameRenderer<'_> {
 /// that the channels come back RGBA — is invisible to a compile and untestable
 /// against a surface that needs a window. A headless device makes the whole
 /// path assertable in `cargo test`.
-#[cfg(test)]
 pub(crate) struct Headless {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) renderer: vello::Renderer,
 }
 
-#[cfg(test)]
 impl Headless {
     /// Returns `None` when the machine has no usable adapter — CI without a
     /// GPU, a software stack vello refuses. The tests skip rather than fail:
@@ -281,7 +278,7 @@ impl Headless {
         }))
         .ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("headless-test"),
+            label: Some("headless"),
             required_features: wgpu::Features::empty(),
             required_limits: adapter.limits(),
             memory_hints: wgpu::MemoryHints::default(),

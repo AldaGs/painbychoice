@@ -6430,3 +6430,21 @@ fn proxy_frames_never_stand_in_for_the_original() {
     assert!(cache.image(&asset, at(&asset, 0)).is_none(), "the original has nothing decoded yet");
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// **The export stall.** At 1080p the prefetch runs ~32 frames ahead while
+/// the cache counts 48 as promised; the first frame past the run-ahead was
+/// never requested, so an export waited out a 60 s deadline every window and
+/// wrote the previous frame in its place. Big fake frames reproduce the gap.
+#[test]
+fn an_export_never_waits_on_a_frame_nobody_asked_for() {
+    let side = 1600; // 10 MB frames: run-ahead ~25 < the 48 promised
+    let (mut cache, _) = fake_cache(side);
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), fake_file("pbc_export_gap.bin"), side as f64, side as f64, 1000, 24.0);
+    assert!(crate::footage::run_ahead(&asset.meta(), 1) < 48, "the fixture has to open the gap");
+    let started = std::time::Instant::now();
+    for frame in 0..40 {
+        cache.decode_now(&asset, at(&asset, frame));
+        assert!(cache.image(&asset, at(&asset, frame)).is_some_and(|(_, exact)| exact), "frame {frame} is the real frame");
+    }
+    assert!(started.elapsed().as_secs() < 20, "no deadline was waited out ({:?})", started.elapsed());
+}
