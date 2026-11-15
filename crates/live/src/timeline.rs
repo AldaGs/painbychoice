@@ -289,6 +289,8 @@ pub(crate) struct DopeEdits {
     /// `set_timing`, which always means *the selected layer* — the strips view
     /// edits any row, selected or not.
     pub(crate) set_layer_timing: Option<(NodeId, Option<LayerTiming>)>,
+    /// An edit-tool operation on the comp's top-level layers (ADR 0025).
+    pub(crate) clip_op: Option<crate::clips::Op>,
 }
 
 /// What the clip bar needs to draw the selected layer's time range.
@@ -711,7 +713,7 @@ pub(crate) fn timeline_header(
                     "— drag a key to move it in time and value, drag a tangent to                      reshape, or pick a tool for the selected keys"
                 }
                 TimelineMode::Strips => {
-                    "— drag a bar's end to trim, its body to slide, alt+drag to                      slip (the content moves, the window stays)"
+                    "— drag a bar's end to trim, its body to slide, alt+drag to                      slip; right-click a bar to split, ripple delete or sync-lock"
                 }
             });
         });

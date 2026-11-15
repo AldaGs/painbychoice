@@ -1441,6 +1441,15 @@ pub struct Node {
     /// which is how an AE import lays layers out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<NodeId>,
+    /// Sync-lock group (ADR 0025): top-level layers sharing this id are cut,
+    /// trimmed, moved and deleted together by the timeline's edit tools. Editor
+    /// semantics only; evaluation ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<u64>,
+    /// Free-form labels ("A-roll", "dialogue") the timeline targets and locks
+    /// by. Editor semantics only; evaluation ignores them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub children: Vec<Node>,
 }
 
@@ -1484,6 +1493,8 @@ impl Node {
             trim: None,
             locked: false,
             link: None,
+            sync: None,
+            tags: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -1513,6 +1524,8 @@ impl Node {
             trim: None,
             locked: false,
             link: None,
+            sync: None,
+            tags: Vec::new(),
             children: Vec::new(),
         }
     }

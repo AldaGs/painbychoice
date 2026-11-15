@@ -132,6 +132,14 @@ pub(crate) fn edit_label(
     if ng.create_layer.is_some() {
         return "Create layer from node";
     }
+    if let Some(op) = &dope.clip_op {
+        return match op {
+            crate::clips::Op::Razor(..) => "Split layer",
+            crate::clips::Op::RippleDelete(_) => "Ripple delete",
+            crate::clips::Op::Sync(..) | crate::clips::Op::Unsync(_) => "Sync-lock",
+            crate::clips::Op::Patch(_) => "Edit clip",
+        };
+    }
     if dope.move_by.is_some() {
         return "Move keyframes";
     }

@@ -13,6 +13,7 @@
 //! a time.
 
 use crate::*;
+use crate::clips::{Clip, Op, Patch, Side};
 
 /// One layer's row: who it is, and its window in comp frames.
 pub(crate) struct StripRow {
@@ -52,6 +53,8 @@ pub(crate) struct StripRow {
     pub(crate) footage: Option<(motion_core::Asset, bool)>,
     /// How many layers sit directly inside this one; above zero it folds.
     pub(crate) children: usize,
+    /// The layer's sync-lock group, if any.
+    pub(crate) sync: Option<u64>,
 }
 
 /// The rows left showing when only the rows in `open` show what is inside
@@ -92,6 +95,263 @@ pub(crate) fn visible_rows<'a>(
 
 /// Flatten a comp's layers into strip rows.
 ///
+/// The edit tools. Slip stays alt+drag in every tool, as it was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EditTool {
+    #[default]
+    Select,
+    Razor,
+    Ripple,
+    Roll,
+}
+
+impl EditTool {
+    const ALL: [EditTool; 4] = [EditTool::Select, EditTool::Razor, EditTool::Ripple, EditTool::Roll];
+    fn label(self) -> &'static str {
+        match self {
+            EditTool::Select => "Select",
+            EditTool::Razor => "Razor",
+            EditTool::Ripple => "Ripple",
+            EditTool::Roll => "Roll",
+        }
+    }
+    fn hint(self) -> &'static str {
+        match self {
+            EditTool::Select => "Trim, slide, alt+drag to slip",
+            EditTool::Razor => "Click a bar to cut it there",
+            EditTool::Ripple => "Trims push or pull the rest of the row",
+            EditTool::Roll => "Drag a cut between two touching bars: one grows, the other shrinks",
+        }
+    }
+}
+
+/// One clip bar, drawn into `track` (the row owns its background and the
+/// playhead), with `resp` the interaction covering it. Shared by the per-layer
+/// and packed views so a bar behaves the same in both. Returns whether it is
+/// being dragged.
+#[allow(clippy::too_many_arguments)]
+fn clip_bar(
+    ui: &mut egui::Ui,
+    track: egui::Rect,
+    resp: &egui::Response,
+    row: &StripRow,
+    selected: Option<NodeId>,
+    axis: &Axis,
+    tb: motion_core::Timebase,
+    frame: f64,
+    last_frame: i64,
+    peaks: &std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Peaks>>,
+    cached: &std::collections::HashSet<crate::footage::Key>,
+    tool: EditTool,
+    clips: &[Clip],
+    out: &mut DopeEdits,
+) -> bool {
+    let is_sel = selected == Some(row.id);
+    let accent = egui::Color32::from_rgb(255, 216, 51);
+    let mut drag = false;
+    let dragging = &mut drag;
+    let painter = ui.painter_at(track);
+
+    // The bar. A layer with no range is drawn as a faint full-width
+    // band rather than nothing: "alive the whole time" is a real state
+    // and should look like one, not like a missing layer.
+    let timing = row.timing;
+    let (x0, x1) = match timing {
+        Some(t) => (
+            axis.frame_to_x(t.in_ as f64),
+            axis.frame_to_x(t.out as f64),
+        ),
+        None => (track.left(), track.right()),
+    };
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(x0.max(track.left()), track.top() + 3.0),
+        egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
+    );
+    if bar.width() > 0.0 {
+        // Tinted with the layer type's accent: faint when it has no
+        // range, stronger when it does, strongest when selected.
+        let tint = match (timing.is_some(), is_sel) {
+            (false, _) => 0.18,
+            (true, false) => 0.42,
+            (true, true) => 0.58,
+        };
+        let fill = egui::Color32::from_gray(32).lerp_to_gamma(row.kind.accent(), tint);
+        painter.rect_filled(bar, 3.0, fill);
+        if is_sel {
+            painter.rect_stroke(
+                bar,
+                3.0,
+                egui::Stroke::new(1.0, accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // Where local frame 0 sits — the only feedback a slip gives,
+        // since the bar itself doesn't move under one.
+        if let Some(t) = timing {
+            let sx = axis.frame_to_x(t.start as f64);
+            if sx > bar.left() && sx < bar.right() {
+                painter.line_segment(
+                    [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
+                );
+            }
+        }
+    }
+
+    // The waveform, inside the bar and under the keyframe ticks. It
+    // is drawn from the layer's *own* time, so trimming the head
+    // scrolls the sound within the bar exactly as it scrolls the
+    // picture of a trimmed video layer — the whole reason this view
+    // makes sync editable rather than merely visible.
+    if let Some((asset, on)) = row.audio {
+        if let Some(pk) = peaks.get(&asset) {
+            let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
+            waveform(&painter, bar, &axis, tb.fps(), start, pk, on);
+        }
+    }
+
+    // Which of this layer's frames are decoded and ready. A remapped
+    // layer gets the empty gutter and nothing in it: its source frame
+    // comes from a curve resolved against the whole project, and a bar
+    // drawn from the natural mapping would be confidently wrong about
+    // every frame — worse than no bar, because it would be believed.
+    if let Some((asset, remapped)) = &row.footage {
+        let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
+        if !remapped {
+            cache_bar(&painter, bar, &axis, tb.fps(), start, asset, cached);
+        }
+    }
+
+    // Keyframe ticks, clipped to the bar: a key outside the layer's
+    // window never plays, so drawing it on the strip would advertise
+    // motion that can't happen.
+    for &kf in &row.keys {
+        let kx = axis.frame_to_x(kf as f64);
+        if kx < bar.left() || kx > bar.right() {
+            continue;
+        }
+        painter.line_segment(
+            [
+                egui::pos2(kx, bar.top() + 2.0),
+                egui::pos2(kx, bar.bottom() - 2.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(205)),
+        );
+    }
+
+
+    // Clicking a strip selects its layer — the row *is* the layer, so
+    // anywhere on it should work, not only the name.
+    let at = |x: f32| axis.x_to_frame(x).clamp(0, last_frame);
+    if resp.clicked() {
+        if tool == EditTool::Razor {
+            if let Some(p) = resp.interact_pointer_pos() {
+                out.clip_op = Some(Op::Razor(row.id, at(p.x)));
+            }
+        } else if !is_sel {
+            out.select_layer = Some(row.id);
+        }
+    }
+    if row.depth == 0 {
+        resp.context_menu(|ui| {
+            if ui.button("Split at playhead").clicked() {
+                out.clip_op = Some(Op::Razor(row.id, frame.round() as i64));
+                ui.close();
+            }
+            if ui.button("Ripple delete").clicked() {
+                out.clip_op = Some(Op::RippleDelete(row.id));
+                ui.close();
+            }
+            if let Some(sel) = selected.filter(|s| *s != row.id) {
+                if ui
+                    .button("Sync-lock with selected")
+                    .on_hover_text("Edit tools move, trim and cut them together")
+                    .clicked()
+                {
+                    out.clip_op = Some(Op::Sync(row.id, sel));
+                    ui.close();
+                }
+            }
+            if row.sync.is_some() && ui.button("Remove sync-lock").clicked() {
+                out.clip_op = Some(Op::Unsync(row.id));
+                ui.close();
+            }
+        });
+    }
+    if tool == EditTool::Razor {
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        return false;
+    }
+
+    // Drag: trim an edge, slide the body, alt-drag to slip. The grab
+    // mode and the timing it started from are latched at press, so
+    // applying the *total* delta to the original (not an incremental
+    // delta to the current) lets a drag that clamped at 0 spring back.
+    // A layer with no range has nothing to drag.
+    let Some(timing) = timing else { return false };
+    let drag_id = ui.id().with(("strip_drag", row.id));
+    if resp.drag_started() {
+        // `press_origin`, not `interact_pointer_pos`: egui only fires
+        // `drag_started` once the pointer crosses its threshold, by
+        // which point the pointer has already left the handle it
+        // grabbed — which would read every trim as a slide.
+        if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+            let alt = ui.input(|i| i.modifiers.alt);
+            let grab = clip_grab_at(p.x, bar.left(), bar.right(), HANDLE_W, alt);
+            let anchor = axis.x_to_frame(p.x);
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(drag_id, (grab, anchor, timing));
+                // Ripple and roll act on the row as it stood at the press.
+                d.insert_temp(drag_id.with("clips"), clips.to_vec());
+            });
+        }
+    }
+    if resp.dragged() {
+        let latched: Option<(ClipGrab, i64, LayerTiming)> =
+            ui.ctx().data(|d| d.get_temp(drag_id));
+        if let (Some((grab, anchor, orig)), Some(p)) =
+            (latched, resp.interact_pointer_pos())
+        {
+            let d = axis.x_to_frame(p.x) - anchor;
+            let snap: Vec<Clip> = ui.ctx().data(|m| m.get_temp(drag_id.with("clips"))).unwrap_or_default();
+            let side = match grab {
+                ClipGrab::TrimIn => Some(Side::Start),
+                ClipGrab::TrimOut => Some(Side::End),
+                _ => None,
+            };
+            let patch = match (tool, side) {
+                (EditTool::Ripple, Some(side)) if row.depth == 0 => {
+                    Some(crate::clips::ripple_trim(&snap, row.id, side, d))
+                }
+                (EditTool::Roll, Some(side)) if row.depth == 0 => crate::clips::roll(&snap, row.id, side, d),
+                _ => {
+                    let next = drag_clip(orig, grab, d);
+                    (next != timing).then(|| Patch::from([(row.id, next)]))
+                }
+            };
+            match patch {
+                // A nested layer has no row and no sync group: a plain edit.
+                Some(p) if row.depth > 0 => out.set_layer_timing = p.get(&row.id).map(|t| (row.id, Some(*t))),
+                Some(p) if !p.is_empty() => out.clip_op = Some(Op::Patch(p)),
+                _ => {}
+            }
+        }
+        *dragging = true;
+    }
+    clip_cursor(ui, resp, drag_id, bar.left(), bar.right(), HANDLE_W);
+    drag
+}
+
+fn playhead(ui: &egui::Ui, track: egui::Rect, axis: &Axis, frame: f64, col: egui::Color32) {
+    let px = axis.frame_to_x(frame);
+    ui.painter_at(track).line_segment(
+        [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
+        egui::Stroke::new(1.5, col),
+    );
+}
+
 /// The comp **root is skipped**: it is the composition itself, not a layer in
 /// it, and offering to trim the thing that defines the time axis would be a
 /// control with no coherent meaning.
@@ -124,6 +384,7 @@ pub(crate) fn strip_rows(
                 _ => None,
             },
             children: node.children.len(),
+            sync: node.sync,
         });
         // Front-most first, matching the layers panel — the two are the same
         // list of layers and must not disagree about their order.
@@ -281,7 +542,36 @@ pub(crate) fn strips_ui(
     let label_w = clamp_label_w(label_w, ui.max_rect().width());
     timeline_header(ui, TimelineMode::Strips, frame, last_frame, view, out);
 
-    let accent = egui::Color32::from_rgb(255, 216, 51);
+    // Tool palette and row packing. View state, kept for the session.
+    let (tool_id, packed_id) = (egui::Id::new("strip_tool"), egui::Id::new("strip_packed"));
+    let (mut tool, mut packed): (EditTool, bool) =
+        ui.data(|d| (d.get_temp(tool_id).unwrap_or_default(), d.get_temp(packed_id).unwrap_or(false)));
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        for t in EditTool::ALL {
+            if ui.selectable_label(tool == t, t.label()).on_hover_text(t.hint()).clicked() {
+                tool = t;
+            }
+        }
+        ui.separator();
+        ui.checkbox(&mut packed, "Packed rows")
+            .on_hover_text("Layers that don't overlap share a row, like clips on a track");
+    });
+    ui.data_mut(|d| {
+        d.insert_temp(tool_id, tool);
+        d.insert_temp(packed_id, packed);
+    });
+    // The top-level layers as clips, back to front, packed into rows.
+    let clips: Vec<Clip> = {
+        let whole = LayerTiming::new(0, last_frame + 1);
+        let top: Vec<&StripRow> = rows.iter().filter(|r| r.depth == 0).rev().collect();
+        let win: Vec<(i64, i64)> = top.iter().map(|r| r.timing.map_or((0, last_frame + 1), |t| (t.in_, t.out))).collect();
+        top.iter()
+            .zip(crate::clips::pack(&win))
+            .map(|(r, row)| Clip { id: r.id, row, t: r.timing.unwrap_or(whole) })
+            .collect()
+    };
+
     let playhead_col = egui::Color32::from_rgb(240, 90, 90);
     let mut dragging = false;
     let columns_top = ui.cursor().top();
@@ -312,6 +602,42 @@ pub(crate) fn strips_ui(
         if rows.is_empty() {
             ui.add_space(8.0);
             ui.weak("This composition has no layers yet.");
+        }
+
+        if packed {
+            let n = clips.iter().map(|c| c.row + 1).max().unwrap_or(0);
+            // Highest row on top: later rows hold what was stacked over earlier.
+            for r in (0..n).rev() {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let cell = label_cell(ui, label_w, ROW_H);
+                    label_text(ui, cell, &format!("Row {}", r + 1), true);
+                    ui.add_space(SPLIT_W);
+                    let (track, _) =
+                        ui.allocate_exact_size(egui::vec2(ui.available_width() - 8.0, ROW_H), egui::Sense::hover());
+                    ui.painter_at(track).rect_filled(track, 3.0, egui::Color32::from_gray(32));
+                    for c in clips.iter().filter(|c| c.row == r) {
+                        let Some(row) = rows.iter().find(|x| x.id == c.id) else { continue };
+                        let bar = egui::Rect::from_min_max(
+                            egui::pos2(axis.frame_to_x(c.t.in_ as f64).max(track.left()), track.top()),
+                            egui::pos2(axis.frame_to_x(c.t.out as f64).min(track.right()), track.bottom()),
+                        );
+                        if bar.width() <= 0.0 {
+                            continue;
+                        }
+                        let resp =
+                            ui.interact(bar, ui.id().with(("strip_packed", c.id)), egui::Sense::click_and_drag());
+                        dragging |= clip_bar(
+                            ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips,
+                            out,
+                        );
+                        let name = egui::Rect::from_min_max(bar.min + egui::vec2(4.0, 0.0), bar.max);
+                        label_text(ui, name, &row.name, selected != Some(row.id));
+                    }
+                    playhead(ui, track, &axis, frame, playhead_col);
+                });
+            }
+            return;
         }
 
         // Rows opened by hand, by id. View state for the session, not saved.
@@ -406,141 +732,11 @@ pub(crate) fn strips_ui(
                     egui::vec2(ui.available_width() - 8.0, ROW_H),
                     egui::Sense::click_and_drag(),
                 );
-                let painter = ui.painter_at(track);
-                painter.rect_filled(track, 3.0, egui::Color32::from_gray(32));
-
-                // The bar. A layer with no range is drawn as a faint full-width
-                // band rather than nothing: "alive the whole time" is a real state
-                // and should look like one, not like a missing layer.
-                let timing = row.timing;
-                let (x0, x1) = match timing {
-                    Some(t) => (
-                        axis.frame_to_x(t.in_ as f64),
-                        axis.frame_to_x(t.out as f64),
-                    ),
-                    None => (track.left(), track.right()),
-                };
-                let bar = egui::Rect::from_min_max(
-                    egui::pos2(x0.max(track.left()), track.top() + 3.0),
-                    egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
+                ui.painter_at(track).rect_filled(track, 3.0, egui::Color32::from_gray(32));
+                dragging |= clip_bar(
+                    ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips, out,
                 );
-                if bar.width() > 0.0 {
-                    // Tinted with the layer type's accent: faint when it has no
-                    // range, stronger when it does, strongest when selected.
-                    let tint = match (timing.is_some(), is_sel) {
-                        (false, _) => 0.18,
-                        (true, false) => 0.42,
-                        (true, true) => 0.58,
-                    };
-                    let fill = egui::Color32::from_gray(32).lerp_to_gamma(row.kind.accent(), tint);
-                    painter.rect_filled(bar, 3.0, fill);
-                    if is_sel {
-                        painter.rect_stroke(
-                            bar,
-                            3.0,
-                            egui::Stroke::new(1.0, accent),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    // Where local frame 0 sits — the only feedback a slip gives,
-                    // since the bar itself doesn't move under one.
-                    if let Some(t) = timing {
-                        let sx = axis.frame_to_x(t.start as f64);
-                        if sx > bar.left() && sx < bar.right() {
-                            painter.line_segment(
-                                [egui::pos2(sx, bar.top()), egui::pos2(sx, bar.bottom())],
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(170)),
-                            );
-                        }
-                    }
-                }
-
-                // The waveform, inside the bar and under the keyframe ticks. It
-                // is drawn from the layer's *own* time, so trimming the head
-                // scrolls the sound within the bar exactly as it scrolls the
-                // picture of a trimmed video layer — the whole reason this view
-                // makes sync editable rather than merely visible.
-                if let Some((asset, on)) = row.audio {
-                    if let Some(pk) = peaks.get(&asset) {
-                        let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
-                        waveform(&painter, bar, &axis, tb.fps(), start, pk, on);
-                    }
-                }
-
-                // Which of this layer's frames are decoded and ready. A remapped
-                // layer gets the empty gutter and nothing in it: its source frame
-                // comes from a curve resolved against the whole project, and a bar
-                // drawn from the natural mapping would be confidently wrong about
-                // every frame — worse than no bar, because it would be believed.
-                if let Some((asset, remapped)) = &row.footage {
-                    let start = timing.map(|t| t.start as f64).unwrap_or(0.0);
-                    if !remapped {
-                        cache_bar(&painter, bar, &axis, tb.fps(), start, asset, cached);
-                    }
-                }
-
-                // Keyframe ticks, clipped to the bar: a key outside the layer's
-                // window never plays, so drawing it on the strip would advertise
-                // motion that can't happen.
-                for &kf in &row.keys {
-                    let kx = axis.frame_to_x(kf as f64);
-                    if kx < bar.left() || kx > bar.right() {
-                        continue;
-                    }
-                    painter.line_segment(
-                        [
-                            egui::pos2(kx, bar.top() + 2.0),
-                            egui::pos2(kx, bar.bottom() - 2.0),
-                        ],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(205)),
-                    );
-                }
-
-                let px = axis.frame_to_x(frame);
-                painter.line_segment(
-                    [egui::pos2(px, track.top()), egui::pos2(px, track.bottom())],
-                    egui::Stroke::new(1.5, playhead_col),
-                );
-
-                // Clicking a strip selects its layer — the row *is* the layer, so
-                // anywhere on it should work, not only the name.
-                if resp.clicked() && !is_sel {
-                    out.select_layer = Some(row.id);
-                }
-
-                // Drag: trim an edge, slide the body, alt-drag to slip. The grab
-                // mode and the timing it started from are latched at press, so
-                // applying the *total* delta to the original (not an incremental
-                // delta to the current) lets a drag that clamped at 0 spring back.
-                // A layer with no range has nothing to drag.
-                let Some(timing) = timing else { return };
-                let drag_id = ui.id().with(("strip_drag", row.id));
-                if resp.drag_started() {
-                    // `press_origin`, not `interact_pointer_pos`: egui only fires
-                    // `drag_started` once the pointer crosses its threshold, by
-                    // which point the pointer has already left the handle it
-                    // grabbed — which would read every trim as a slide.
-                    if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-                        let alt = ui.input(|i| i.modifiers.alt);
-                        let grab = clip_grab_at(p.x, bar.left(), bar.right(), HANDLE_W, alt);
-                        let anchor = axis.x_to_frame(p.x);
-                        ui.ctx().data_mut(|d| d.insert_temp(drag_id, (grab, anchor, timing)));
-                    }
-                }
-                if resp.dragged() {
-                    let latched: Option<(ClipGrab, i64, LayerTiming)> =
-                        ui.ctx().data(|d| d.get_temp(drag_id));
-                    if let (Some((grab, anchor, orig)), Some(p)) =
-                        (latched, resp.interact_pointer_pos())
-                    {
-                        let next = drag_clip(orig, grab, axis.x_to_frame(p.x) - anchor);
-                        if next != timing {
-                            out.set_layer_timing = Some((row.id, Some(next)));
-                        }
-                    }
-                    dragging = true;
-                }
-                clip_cursor(ui, &resp, drag_id, bar.left(), bar.right(), HANDLE_W);
+                playhead(ui, track, &axis, frame, playhead_col);
             });
         }
         ui.data_mut(|d| d.insert_temp(open_id, open));

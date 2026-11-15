@@ -4973,6 +4973,17 @@ impl App {
             }
         }
 
+        // Edit tools (razor, ripple, roll, sync-lock) on top-level layers.
+        if let Some(op) = dope.clip_op.take() {
+            let structural = matches!(op, crate::clips::Op::Razor(..) | crate::clips::Op::RippleDelete(_));
+            if crate::clips::run(&mut self.project, self.current, op, &mut self.next_id) {
+                if structural {
+                    self.after_history_jump();
+                }
+                window.request_redraw();
+            }
+        }
+
         // Layer strips: the same edit as the clip bar, but naming its layer
         // instead of implying the selected one.
         if let Some((id, timing)) = dope.set_layer_timing {

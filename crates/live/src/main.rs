@@ -47,6 +47,7 @@ mod aids;
 mod app;
 mod assets;
 mod calc;
+mod clips;
 mod clock;
 mod curves;
 mod dock;
