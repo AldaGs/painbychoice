@@ -45,9 +45,25 @@ pub(crate) struct MixState {
     pub(crate) playing: bool,
 }
 
-/// The shared handle between the UI thread and the audio callback.
+/// Meter slots: the mix, then the first [`METERS`]` - 1` buses.
+pub(crate) const METERS: usize = 17;
+
+/// Peaks the callback has heard since the UI last looked, as `f32` bits. For
+/// non-negative floats the bit order is the numeric order, so `fetch_max` on
+/// the bits keeps the loudest without a lock.
+pub(crate) type Meters = [std::sync::atomic::AtomicU32; METERS];
+
+/// The shared handle between the UI thread and the audio callback, and the
+/// meters the callback writes back.
 #[derive(Clone, Default)]
-pub(crate) struct SharedMix(Arc<Mutex<Arc<MixState>>>);
+pub(crate) struct SharedMix(Arc<Mutex<Arc<MixState>>>, pub(crate) Arc<Meters>);
+
+impl SharedMix {
+    /// The peaks since the last call, resetting them.
+    pub(crate) fn take_meters(&self) -> [f32; METERS] {
+        std::array::from_fn(|i| f32::from_bits(self.1[i].swap(0, std::sync::atomic::Ordering::Relaxed)))
+    }
+}
 
 impl SharedMix {
     /// Publish a new mix. Called from the UI thread whenever the document, the
@@ -124,7 +140,8 @@ impl MixEngine {
         let sounds = &state.sounds;
         let rate = self.sample_rate;
         let scratch = &mut self.scratch;
-        motion_core::mix_into(out, scratch, pos, &state.sources, |asset, from, buf| {
+        let mut peaks = [0.0f32; METERS];
+        motion_core::mix_into_metered(out, scratch, pos, &state.sources, |asset, from, buf| {
             match sounds.get(&asset) {
                 Some(sound) => {
                     sound.read_into(from, buf, rate);
@@ -133,7 +150,10 @@ impl MixEngine {
                 // Not imported yet, or failed to decode: silence, never a stall.
                 None => false,
             }
-        });
+        }, &mut peaks);
+        for (slot, p) in self.shared.1.iter().zip(peaks) {
+            slot.fetch_max(p.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
 
         self.position.set(pos + frames as i64);
     }

@@ -9,12 +9,17 @@ use crate::props::db_label;
 
 /// Draw the mixer. `out` is set to the edited buses and outputs when anything changed.
 /// `frame` is where a fader move writes when the gain is keyframed.
-pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], frame: i64, out: &mut Option<(Vec<Bus>, Vec<Output>)>) {
+/// `meters`: the mix's level, then each bus's (linear peaks).
+pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], frame: i64, meters: &[f32], out: &mut Option<(Vec<Bus>, Vec<Output>)>) {
     let (mut b, mut o) = (buses.to_vec(), outputs.to_vec());
     let mut changed = false;
     let ids: Vec<(String, String)> = b.iter().map(|x| (x.id.clone(), x.name.clone())).collect();
     let name_of = |id: &str| ids.iter().find(|(i, _)| i == id).map_or(id.to_string(), |(_, n)| n.clone());
 
+    ui.horizontal(|ui| {
+        ui.label("Mix");
+        meter(ui, meters.first().copied().unwrap_or(0.0));
+    });
     ui.heading("Buses");
     if b.is_empty() {
         ui.weak("No buses: every sound goes straight to the mix.");
@@ -22,7 +27,10 @@ pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], fra
     let mut remove = None;
     egui::Grid::new("mixer_buses").num_columns(7).striped(true).show(ui, |ui| {
         for (i, bus) in b.iter_mut().enumerate() {
-            changed |= ui.add(egui::TextEdit::singleline(&mut bus.name).desired_width(90.0)).changed();
+            ui.vertical(|ui| {
+                changed |= ui.add(egui::TextEdit::singleline(&mut bus.name).desired_width(90.0)).changed();
+                meter(ui, meters.get(1 + i).copied().unwrap_or(0.0));
+            });
             ui.horizontal(|ui| {
                 let mut g = bus.gain.resolve(&mut motion_core::expr::EvalCtx::at(frame as f64));
                 if ui.add(egui::Slider::new(&mut g, 0.0..=2.0).show_value(false)).changed() {
@@ -113,6 +121,25 @@ pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], fra
     if changed {
         *out = Some((b, o));
     }
+}
+
+/// A level meter: -60..0 dBFS across, green, then amber past -12, red past -3.
+fn meter(ui: &mut egui::Ui, level: f32) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(90.0, 6.0), egui::Sense::hover());
+    let db = 20.0 * level.max(1e-6).log10();
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+    let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    if frac > 0.0 {
+        let color = match db {
+            d if d > -3.0 => egui::Color32::from_rgb(235, 80, 70),
+            d if d > -12.0 => egui::Color32::from_rgb(240, 190, 60),
+            _ => egui::Color32::from_rgb(90, 200, 110),
+        };
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height()));
+        p.rect_filled(fill, 2.0, color);
+    }
+    resp.on_hover_text(if level > 1e-6 { format!("{db:.1} dBFS") } else { "silent".into() });
 }
 
 /// `prefix1`, `prefix2`, … — the first not already taken.

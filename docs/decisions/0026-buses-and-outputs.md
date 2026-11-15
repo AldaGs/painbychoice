@@ -38,8 +38,10 @@ ducked music per item; here ducking moves to the bus.
   through them; when transcripts land (Phase 4) the key spans can be word
   ranges instead, which is what Sonant did.
 - Peak is sample peak, not true peak (no oversampling).
-- No live meters in the Mixer panel, and the editor's render queue still
-  exports only the full mix; stems are a CLI feature for now.
+- The Mixer has live meters: the callback raises lock-free per-bus and mix
+  peaks (`mix_into_metered`), the UI reads and resets them each frame. A bus
+  meter is the loudest of its sources, not their sum. Stems export from the
+  Render menu as well as the CLI.
 - Bus gain is a `Value<f64>` (keyframes, like a layer's level), resolved once
   per `evaluate_audio` at the top-level comp's frame; a plain number from an
   older file loads as a constant. During playback the editor republishes the

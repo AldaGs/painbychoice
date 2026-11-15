@@ -286,7 +286,27 @@ pub fn mix_into<F>(
     scratch: &mut [f32],
     origin: i64,
     sources: &[AudioSource],
+    fetch: F,
+) where
+    F: FnMut(AssetId, i64, &mut [f32]) -> bool,
+{
+    mix_into_metered(out, scratch, origin, sources, fetch, &mut []);
+}
+
+/// [`mix_into`], also raising `meters` to the block's peaks: `meters[0]` is
+/// the mix, `meters[1 + b]` bus `b` (slots past the slice's end are skipped).
+/// Never lowered: the caller decides when a meter falls.
+///
+/// A bus's peak is the loudest of its sources' contributions, not of their
+/// sum. ponytail: two overlapping sources on one bus read a little low; a
+/// per-bus scratch buffer would make it exact.
+pub fn mix_into_metered<F>(
+    out: &mut [f32],
+    scratch: &mut [f32],
+    origin: i64,
+    sources: &[AudioSource],
     mut fetch: F,
+    meters: &mut [f32],
 ) where
     F: FnMut(AssetId, i64, &mut [f32]) -> bool,
 {
@@ -321,15 +341,26 @@ pub fn mix_into<F>(
             continue;
         }
         let dest = (from - origin) as usize;
+        let mut peak = 0.0f32;
         for i in 0..take {
             let d = src.duck.map_or(1.0, |d| duck_gain(sources, d, from + i as i64));
-            out[(dest + i) * 2] += window[i * 2] * src.gain.0 * d;
-            out[(dest + i) * 2 + 1] += window[i * 2 + 1] * src.gain.1 * d;
+            let (l, r) = (window[i * 2] * src.gain.0 * d, window[i * 2 + 1] * src.gain.1 * d);
+            out[(dest + i) * 2] += l;
+            out[(dest + i) * 2 + 1] += r;
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+        if let Some(m) = src.bus.and_then(|b| meters.get_mut(1 + b as usize)) {
+            *m = m.max(peak);
         }
     }
 
+    let mut peak = 0.0f32;
     for s in out.iter_mut() {
         *s = s.clamp(-1.0, 1.0);
+        peak = peak.max(s.abs());
+    }
+    if let Some(m) = meters.first_mut() {
+        *m = m.max(peak);
     }
 }
 
@@ -573,6 +604,20 @@ mod tests {
         });
         assert_eq!(&out[0..4], &[1.0, 1.0, 1.0, 1.0]);
         assert_eq!(&out[4..8], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// Meters read the mix and each bus's peak.
+    #[test]
+    fn meters_read_the_mix_and_each_bus() {
+        let src = |bus, g| AudioSource { asset: AssetId(1), start: 0, end: 4, offset: 0, gain: (g, g), bus, duck: None };
+        let mut out = vec![0.0; 8];
+        let mut scratch = vec![0.0; 8];
+        let mut meters = [0.0f32; 3];
+        mix_into_metered(&mut out, &mut scratch, 0, &[src(Some(0), 0.5), src(Some(1), 0.25)], |_, _, b| {
+            b.fill(1.0);
+            true
+        }, &mut meters);
+        assert_eq!(meters, [0.75, 0.5, 0.25]);
     }
 
     /// The buffer is cleared before mixing, so a reused block does not play the

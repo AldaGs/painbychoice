@@ -250,6 +250,8 @@ pub(crate) struct App {
     pub(crate) audio_out: Option<crate::playback::AudioOut>,
     /// What the audio callback reads. Republished whenever the mix changes.
     pub(crate) shared_mix: crate::playback::SharedMix,
+    /// What the Mixer's meters show: each peak, falling back between them.
+    pub(crate) meter_levels: [f32; crate::playback::METERS],
     /// Decoded sounds, by asset. The audio counterpart of `footage` — and, like
     /// it, outside the document entirely.
     pub(crate) sounds: std::collections::HashMap<motion_core::AssetId, std::sync::Arc<motion_render::Sound>>,
@@ -1260,6 +1262,7 @@ impl App {
             clock: crate::clock::MasterClock::new(),
             audio_out: None,
             shared_mix: crate::playback::SharedMix::default(),
+            meter_levels: [0.0; crate::playback::METERS],
             sounds: std::collections::HashMap::new(),
             peaks: std::collections::HashMap::new(),
             history: History::default(),
@@ -4435,6 +4438,17 @@ impl App {
         let mut subs_state = std::mem::take(&mut self.subs_ui);
         let mut subs_edits = crate::subtitles::SubsEdits::default();
         let mut mixer_edit = None;
+        // Meters jump to a new peak and fall ~20 dB a second between peaks.
+        let heard = self.shared_mix.take_meters();
+        for (level, peak) in self.meter_levels.iter_mut().zip(heard) {
+            *level = peak.max(*level * 0.85);
+        }
+        // Stopped, nothing more will be heard and an idle editor won't repaint
+        // to let them fall, so they drop at once.
+        if !self.playing {
+            self.meter_levels = [0.0; crate::playback::METERS];
+        }
+        let meters = self.meter_levels;
         let subs_view = crate::subtitles::SubsView {
             layer: self.selected.and_then(|id| self.project.comp(self.current)?.root.find(id)).filter(|n| matches!(n.shape, Some(MShape::Text { .. }))).map(|n| {
                 (n.subtitles.as_ref(), n.timing.map_or(0, |t| t.start), crate::subtitles::karaoke_of(n))
@@ -4564,7 +4578,7 @@ impl App {
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Assets => assets_ui(ui, &self.project, current_comp, (self.proxies.on, self.proxies.pending(), self.proxies.status.as_deref()), &mut tree_edits),
                     Editor::Subtitles => crate::subtitles::subs_ui(ui, &subs_view, &mut subs_state, &mut subs_edits),
-                    Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, frame, &mut mixer_edit),
+                    Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, frame, &meters, &mut mixer_edit),
                     Editor::Transport => transport_ui(
                         ui,
                         frame,
