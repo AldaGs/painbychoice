@@ -2359,6 +2359,13 @@ pub struct Project {
     /// them. `#[serde(default)]` so a file written before folders still loads.
     #[serde(default)]
     pub folders: Vec<AssetFolder>,
+    /// The mixer: named buses a layer's sound is sent to (ADR 0026). Empty
+    /// means every sound goes straight to the mix, as before buses existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buses: Vec<crate::audio::Bus>,
+    /// What an export can write: the full mix, or stems of chosen buses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<crate::audio::Output>,
 }
 
 /// Something listed in the Assets panel: an imported file or a composition.
@@ -2449,6 +2456,8 @@ impl Project {
             render_presets: Vec::new(),
             draft_out: None,
             folders: Vec::new(),
+            buses: Vec::new(),
+            outputs: Vec::new(),
         }
     }
 

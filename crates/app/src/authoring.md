@@ -105,3 +105,13 @@ The editor watches its file and takes your write as one undo step (ADR 0024).
 - Re-read just before writing; if `rev` moved, re-derive your change from the new file.
 - A new layer needs an `id` unused in its comp (largest id + 1). A duplicate is refused.
 - An invalid or half-written file is ignored until the next write; the editor keeps its document.
+
+## Buses, ducking and stems (in a `.pbc`)
+The authoring JSON has no sound yet; route sound by editing the `.pbc` (ADR 0026).
+- Project `"buses": [{ "id": "dlg", "name": "Dialogue" }, { "id": "mus", "name": "Music", "duckBy": "dlg", "duckLevel": 0.25 }]`.
+  Optional: `gain` (linear, 1), `mute`, `solo`. A ducked bus dips to `duckLevel` while its key bus sounds, with 0.25s fades.
+- A layer's sound: `"audio": { ..., "bus": "dlg" }`. No `bus`, or an unknown one, goes straight to the mix.
+- Project `"outputs": [{ "id": "stem_dlg", "buses": ["dlg"] }]`; empty `buses` is the full mix.
+- `motion render x.pbc --out dlg.wav --output stem_dlg` writes that stem (`--output` also takes a bus id).
+  `.wav` writes sound only; a video takes the stem as its soundtrack.
+- `motion preview` reports `audio.mix` and `audio.buses[]`: `lufs`, `peakDb`, `clipped`, `silent`.

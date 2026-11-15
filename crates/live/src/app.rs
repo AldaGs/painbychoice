@@ -2235,6 +2235,10 @@ impl App {
                 clip.enabled = on;
                 changed = true;
             }
+            if let Some(bus) = e.audio_bus.clone() {
+                clip.bus = bus;
+                changed = true;
+            }
         }
         // Plain data, so a direct assignment rather than `set_at`: there is no
         // interpolating between Multiply and Screen, so no track to key into.
@@ -4154,6 +4158,9 @@ impl App {
         if let (Some(info), Some(id)) = (sel_info.as_mut(), self.selected) {
             info.matte_source = layer_above(&self.doc().root, id).map(|n| n.name.clone());
         }
+        if let Some(a) = sel_info.as_mut().and_then(|i| i.audio.as_mut()) {
+            a.buses = self.project.buses.iter().map(|b| (b.id.clone(), b.name.clone())).collect();
+        }
         let sel_info = sel_info;
         // The gizmo needs the selected layer's *world* matrix, which only the
         // evaluated scene knows (it is the whole parent chain multiplied out).
@@ -4367,6 +4374,7 @@ impl App {
         let mut comp_name_buf = std::mem::take(&mut self.comp_name_buf);
         let mut subs_state = std::mem::take(&mut self.subs_ui);
         let mut subs_edits = crate::subtitles::SubsEdits::default();
+        let mut mixer_edit = None;
         let subs_view = crate::subtitles::SubsView {
             layer: self.selected.and_then(|id| self.project.comp(self.current)?.root.find(id)).filter(|n| matches!(n.shape, Some(MShape::Text { .. }))).map(|n| {
                 (n.subtitles.as_ref(), n.timing.map_or(0, |t| t.start), crate::subtitles::karaoke_of(n))
@@ -4493,6 +4501,7 @@ impl App {
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Assets => assets_ui(ui, &self.project, current_comp, &mut tree_edits),
                     Editor::Subtitles => crate::subtitles::subs_ui(ui, &subs_view, &mut subs_state, &mut subs_edits),
+                    Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, &mut mixer_edit),
                     Editor::Transport => transport_ui(
                         ui,
                         frame,
@@ -5361,6 +5370,11 @@ impl App {
         }
         dirty |= replaced;
         dirty |= self.apply_subs(subs_edits);
+        if let Some((buses, outputs)) = mixer_edit {
+            (self.project.buses, self.project.outputs) = (buses, outputs);
+            self.publish_mix();
+            dirty = true;
+        }
         if let Some(edit) = tree_edits.folder.take() {
             crate::assets::apply_folder_edit(&mut self.project, edit);
             dirty = true;

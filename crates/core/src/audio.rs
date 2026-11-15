@@ -42,6 +42,111 @@ pub struct AudioClip {
     /// rather than removed, like a disabled effect.
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// The [`Bus`] this sound is sent to, by id. `None`, or an id no bus has,
+    /// goes straight to the mix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<String>,
+}
+
+/// A mixer channel that layers send their sound to (ADR 0026).
+///
+/// Gain, mute and solo fold into each source's gain, so a bus costs nothing in
+/// the mix itself. Ducking is the one thing that needs the timeline: a ducked
+/// bus dips while any sound on its key bus is playing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Bus {
+    /// What layers and outputs name it by, e.g. `"dlg"`.
+    pub id: String,
+    pub name: String,
+    /// Linear, like a layer's level.
+    #[serde(default = "unity")]
+    pub gain: f64,
+    #[serde(default)]
+    pub mute: bool,
+    /// Any soloed bus silences every bus that is not, and unrouted sound too.
+    #[serde(default)]
+    pub solo: bool,
+    /// Duck under this bus: while it sounds, this one drops to `duck_level`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "duckBy")]
+    pub duck_by: Option<String>,
+    /// Linear gain while ducked.
+    #[serde(default = "duck_default", rename = "duckLevel")]
+    pub duck_level: f64,
+}
+
+fn unity() -> f64 {
+    1.0
+}
+fn duck_default() -> f64 {
+    0.25
+}
+
+impl Bus {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Bus { id: id.into(), name: name.into(), gain: 1.0, mute: false, solo: false, duck_by: None, duck_level: duck_default() }
+    }
+}
+
+/// Something an export can write: the whole mix, or a stem of some buses.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Output {
+    pub id: String,
+    /// Bus ids to include. Empty means everything — the full mix.
+    #[serde(default)]
+    pub buses: Vec<String>,
+}
+
+/// How long a duck takes to go down and come back up, in seconds. Sonant's
+/// default; fades finish as the key starts and begin as it ends.
+pub const DUCK_FADE: f64 = 0.25;
+
+/// A source's ducking: dip to `level` while a source on bus `key` sounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Duck {
+    pub key: u16,
+    pub level: f32,
+    /// Fade length in sample frames.
+    pub fade: i64,
+}
+
+/// Where a sound sent to `bus` lands: the bus index, the gain factor the bus
+/// applies (its gain, or 0 when muted or soloed out), and its ducking.
+pub fn route(buses: &[Bus], bus: Option<&str>, sample_rate: u32) -> (Option<u16>, f32, Option<Duck>) {
+    let index = |id: &str| buses.iter().position(|b| b.id == id).map(|i| i as u16);
+    let solo = buses.iter().any(|b| b.solo);
+    let Some(i) = bus.and_then(index) else {
+        return (None, if solo { 0.0 } else { 1.0 }, None);
+    };
+    let b = &buses[i as usize];
+    let gain = if b.mute || (solo && !b.solo) { 0.0 } else { b.gain.max(0.0) as f32 };
+    let duck = b.duck_by.as_deref().and_then(index).filter(|k| *k != i).map(|key| Duck {
+        key,
+        level: b.duck_level.clamp(0.0, 1.0) as f32,
+        fade: (DUCK_FADE * sample_rate as f64).round() as i64,
+    });
+    (Some(i), gain, duck)
+}
+
+/// Gain at sample position `t` for a source ducked by `duck`: `level` while a
+/// key source sounds, 1 elsewhere, with linear fades either side (Sonant's
+/// `duckGain`, over the key bus's live spans).
+pub fn duck_gain(sources: &[AudioSource], duck: Duck, t: i64) -> f32 {
+    let mut g = 1.0f32;
+    for k in sources.iter().filter(|s| s.bus == Some(duck.key)) {
+        let (a, b) = (k.start, k.end);
+        if t < a - duck.fade || t > b + duck.fade {
+            continue;
+        }
+        let k = if t < a {
+            (a - t) as f32 / duck.fade.max(1) as f32
+        } else if t > b {
+            (t - b) as f32 / duck.fade.max(1) as f32
+        } else {
+            0.0
+        };
+        g = g.min(duck.level + (1.0 - duck.level) * k);
+    }
+    g
 }
 
 fn yes() -> bool {
@@ -56,6 +161,7 @@ impl AudioClip {
             level: Value::constant(1.0),
             pan: Value::constant(0.0),
             enabled: true,
+            bus: None,
         }
     }
 }
@@ -78,8 +184,13 @@ pub struct AudioSource {
     /// Not always zero: a layer trimmed at its head starts partway into its
     /// source, exactly as a trimmed video layer shows a later frame.
     pub offset: i64,
-    /// Per-channel gain, already folded from level and pan.
+    /// Per-channel gain, already folded from level, pan and the bus's gain,
+    /// mute and solo.
     pub gain: (f32, f32),
+    /// Index into the project's buses, `None` when unrouted. Kept even when the
+    /// gain is zero, so a muted key bus still ducks.
+    pub bus: Option<u16>,
+    pub duck: Option<Duck>,
 }
 
 /// Constant-power stereo panning.
@@ -196,8 +307,9 @@ pub fn mix_into<F>(
         }
         let dest = (from - origin) as usize;
         for i in 0..take {
-            out[(dest + i) * 2] += window[i * 2] * src.gain.0;
-            out[(dest + i) * 2 + 1] += window[i * 2 + 1] * src.gain.1;
+            let d = src.duck.map_or(1.0, |d| duck_gain(sources, d, from + i as i64));
+            out[(dest + i) * 2] += window[i * 2] * src.gain.0 * d;
+            out[(dest + i) * 2 + 1] += window[i * 2 + 1] * src.gain.1 * d;
         }
     }
 
@@ -296,6 +408,8 @@ mod tests {
             end: 2000,
             offset: 0,
             gain: (1.0, 1.0),
+            bus: None,
+            duck: None,
         };
         let mut scratch = vec![0.0; 64];
         mix_into(&mut out, &mut scratch, 0, &[src], |_, _, buf| {
@@ -320,6 +434,8 @@ mod tests {
             end: 102,
             offset: 50,
             gain: (1.0, 1.0),
+            bus: None,
+            duck: None,
         };
         let mut scratch = vec![0.0; 64];
         mix_into(&mut out, &mut scratch, 100, &[src], |_, from, buf| {
@@ -344,6 +460,8 @@ mod tests {
             end: 2,
             offset: 0,
             gain: (0.25, 0.75),
+            bus: None,
+            duck: None,
         };
         let mut scratch = vec![0.0; 64];
         mix_into(&mut out, &mut scratch, 0, &[src], |_, _, buf| {
@@ -364,6 +482,8 @@ mod tests {
             end: 2,
             offset: 0,
             gain: (0.4, 0.4),
+            bus: None,
+            duck: None,
         };
         let mut scratch = vec![0.0; 64];
         mix_into(&mut out, &mut scratch, 0, &[src(1), src(2)], |_, _, buf| {
@@ -384,6 +504,8 @@ mod tests {
             end: 1,
             offset: 0,
             gain: (1.0, 1.0),
+            bus: None,
+            duck: None,
         };
         let mut scratch = vec![0.0; 64];
         mix_into(&mut out, &mut scratch, 0, &[src(1), src(2), src(3)], |_, _, buf| {
@@ -404,6 +526,8 @@ mod tests {
             end: 2,
             offset: 0,
             gain: (1.0, 1.0),
+            bus: None,
+            duck: None,
         };
         let mut scratch = vec![0.0; 64];
         mix_into(&mut out, &mut scratch, 0, &[src], |_, _, _| false);
@@ -421,6 +545,8 @@ mod tests {
             end: 4,
             offset: 0,
             gain: (1.0, 1.0),
+            bus: None,
+            duck: None,
         };
         // Asked for 4 sample frames, only 2 come back.
         // The caller's scratch only covers two sample frames, so only two are
@@ -568,5 +694,61 @@ mod walk_tests {
             Node::group(0, "root").with_child(instance);
         // Terminating at all is the assertion.
         let _ = evaluate_audio(&project, id, 0.0, 48_000);
+    }
+
+    fn two_buses() -> Project {
+        let mut dlg = sounding(1, LayerTiming::new(48, 96));
+        dlg.audio.as_mut().unwrap().bus = Some("dlg".into());
+        let mut mus = sounding(2, LayerTiming::new(0, 240));
+        mus.audio.as_mut().unwrap().bus = Some("mus".into());
+        let mut p = comp_with(dlg);
+        p.comps.get_mut(&p.root).unwrap().root.children.push(mus);
+        let mut music = crate::Bus::new("mus", "Music");
+        music.duck_by = Some("dlg".into());
+        music.duck_level = 0.5;
+        p.buses = vec![crate::Bus::new("dlg", "Dialogue"), music];
+        p
+    }
+
+    /// Bus gain, mute and solo fold into the source's gain; unrouted sound
+    /// goes straight to the mix unless something is soloed.
+    #[test]
+    fn a_bus_scales_mutes_and_solos_its_sources() {
+        let mut p = two_buses();
+        let gain = |p: &Project, i: usize| evaluate_audio(p, p.root, 0.0, 48_000)[i].gain.0;
+        let unity = gain(&p, 0);
+        p.buses[0].gain = 0.5;
+        assert!((gain(&p, 0) - unity * 0.5).abs() < 1e-6);
+        p.buses[0].mute = true;
+        assert_eq!(gain(&p, 0), 0.0);
+        assert_eq!(evaluate_audio(&p, p.root, 0.0, 48_000).len(), 2, "muted sources stay, to key ducking");
+        p.buses[0].mute = false;
+        p.buses[1].solo = true;
+        assert_eq!(gain(&p, 0), 0.0, "soloing music silences dialogue");
+        assert!(gain(&p, 1) > 0.0);
+    }
+
+    /// Music ducks to its level under dialogue, with Sonant's fades either side.
+    #[test]
+    fn a_ducked_bus_dips_while_its_key_sounds() {
+        let p = two_buses();
+        let srcs = evaluate_audio(&p, p.root, 0.0, 48_000);
+        let duck = srcs[1].duck.expect("music is ducked");
+        // Dialogue is frames 48..96 at 24fps = samples 96_000..192_000; fade 12_000.
+        assert_eq!(crate::audio::duck_gain(&srcs, duck, 0), 1.0);
+        assert_eq!(crate::audio::duck_gain(&srcs, duck, 150_000), 0.5);
+        assert!((crate::audio::duck_gain(&srcs, duck, 90_000) - 0.75).abs() < 1e-6, "halfway down");
+        assert!((crate::audio::duck_gain(&srcs, duck, 198_000) - 0.75).abs() < 1e-6, "halfway up");
+        assert_eq!(crate::audio::duck_gain(&srcs, duck, 210_000), 1.0);
+    }
+
+    /// Buses and outputs are skipped when empty, so an old file stays byte-stable.
+    #[test]
+    fn a_project_without_buses_writes_none() {
+        let p = comp_with(sounding(1, LayerTiming::new(0, 48)));
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("buses") && !json.contains("outputs") && !json.contains("\"bus\""));
+        let back: Project = serde_json::from_str(&serde_json::to_string(&two_buses()).unwrap()).unwrap();
+        assert_eq!(back.buses, two_buses().buses);
     }
 }

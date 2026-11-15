@@ -868,7 +868,25 @@ pub fn mix_comp<S: std::borrow::Borrow<Sound>>(
     sample_rate: u32,
     sounds: &std::collections::HashMap<motion_core::AssetId, S>,
 ) -> Vec<f32> {
+    mix_stem(project, comp, start, end, sample_rate, sounds, None)
+}
+
+/// [`mix_comp`] restricted to the sound sent to `buses` (bus ids) — a stem.
+/// `None` is the full mix. Sources left out are silenced rather than dropped,
+/// so a stem still ducks under a key bus it does not contain (ADR 0026).
+pub fn mix_stem<S: std::borrow::Borrow<Sound>>(
+    project: &motion_core::Project,
+    comp: motion_core::CompId,
+    start: i64,
+    end: i64,
+    sample_rate: u32,
+    sounds: &std::collections::HashMap<motion_core::AssetId, S>,
+    buses: Option<&[String]>,
+) -> Vec<f32> {
     use motion_core::audio::frames_to_sample_frames as to_sf;
+    let keep: Option<Vec<u16>> = buses.map(|ids| {
+        ids.iter().filter_map(|id| project.buses.iter().position(|b| &b.id == id).map(|i| i as u16)).collect()
+    });
 
     let Some(c) = project.comp(comp) else { return Vec::new() };
     let fps = c.timebase().fps();
@@ -888,7 +906,12 @@ pub fn mix_comp<S: std::borrow::Borrow<Sound>>(
         let origin = from + done as i64;
         // The frame this block starts on, for resolving level and pan.
         let at_frame = motion_core::audio::sample_frames_to_frames(origin, fps, sample_rate);
-        let sources = motion_core::evaluate_audio(project, comp, at_frame, sample_rate);
+        let mut sources = motion_core::evaluate_audio(project, comp, at_frame, sample_rate);
+        if let Some(keep) = &keep {
+            for src in sources.iter_mut().filter(|s| !s.bus.is_some_and(|b| keep.contains(&b))) {
+                src.gain = (0.0, 0.0);
+            }
+        }
         motion_core::mix_into(
             &mut out[done * 2..(done + block) * 2],
             &mut scratch,
@@ -905,6 +928,67 @@ pub fn mix_comp<S: std::borrow::Borrow<Sound>>(
         done += block;
     }
     out
+}
+
+/// Integrated loudness (ITU-R BS.1770 / EBU R128) of interleaved stereo, in
+/// LUFS: K-weighted, 400ms blocks at 75% overlap, absolute then relative gate.
+/// `None` for silence. Ported from Sonant's `lufs`, with its reference test.
+pub fn lufs(stereo: &[f32], sample_rate: u32) -> Option<f64> {
+    let sr = sample_rate as f64;
+    let biquad = |x: &[f64], b: [f64; 3], a: [f64; 2]| {
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+        x.iter()
+            .map(|&v| {
+                let y = b[0] * v + b[1] * x1 + b[2] * x2 - a[0] * y1 - a[1] * y2;
+                (x2, x1, y2, y1) = (x1, v, y1, y);
+                y
+            })
+            .collect::<Vec<f64>>()
+    };
+    let k_weight = |x: Vec<f64>| {
+        // Stage 1: high shelf, +4dB above ~1.7kHz.
+        let (f0, g, q) = (1681.974450955533, 3.999843853973347, 0.7071752369554196);
+        let k = (std::f64::consts::PI * f0 / sr).tan();
+        let vh = 10f64.powf(g / 20.0);
+        let vb = vh.powf(0.4996667741545416);
+        let a0 = 1.0 + k / q + k * k;
+        let s1 = biquad(
+            &x,
+            [(vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0],
+            [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0],
+        );
+        // Stage 2: high pass, ~38Hz.
+        let (f0, q) = (38.13547087602444, 0.5003270373238773);
+        let k = (std::f64::consts::PI * f0 / sr).tan();
+        let a0 = 1.0 + k / q + k * k;
+        biquad(&s1, [1.0, -2.0, 1.0], [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0])
+    };
+    let channels: Vec<Vec<f64>> =
+        (0..2).map(|c| k_weight(stereo.iter().skip(c).step_by(2).map(|&v| v as f64).collect())).collect();
+    let n = channels[0].len();
+    let (block, hop) = ((0.4 * sr).round() as usize, (0.1 * sr).round() as usize);
+    if block == 0 || hop == 0 {
+        return None;
+    }
+    let z: Vec<f64> = (0..)
+        .map(|i| i * hop)
+        .take_while(|s| s + block <= n)
+        .map(|s| channels.iter().map(|c| c[s..s + block].iter().map(|v| v * v).sum::<f64>() / block as f64).sum())
+        .collect();
+    let l = |p: f64| -0.691 + 10.0 * p.log10();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let abs: Vec<f64> = z.into_iter().filter(|p| l(*p) > -70.0).collect();
+    if abs.is_empty() {
+        return None;
+    }
+    let rel = l(mean(&abs)) - 10.0;
+    let gated: Vec<f64> = abs.into_iter().filter(|p| l(*p) > rel).collect();
+    Some(l(mean(&gated)))
+}
+
+/// Largest absolute sample.
+pub fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0, |m, s| m.max(s.abs()))
 }
 
 /// How many sample frames share one resolution of level and pan.
@@ -1000,5 +1084,34 @@ mod mix_tests {
         let (project, sounds) = project_with_sound(48);
         assert!(mix_comp(&project, project.root, 20, 10, 48_000, &sounds).is_empty());
         assert!(mix_comp(&project, project.root, 0, 23, 0, &sounds).is_empty());
+    }
+
+    /// BS.1770 reference (Sonant's test): a 0dBFS 1kHz sine on one channel
+    /// reads -3.01 LUFS. Silence has no loudness.
+    #[test]
+    fn a_full_scale_sine_on_one_channel_is_minus_three_lufs() {
+        let sr = 48_000;
+        let mut x = vec![0.0f32; sr as usize * 5 * 2];
+        for i in 0..sr as usize * 5 {
+            x[i * 2] = (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / sr as f64).sin() as f32;
+        }
+        let l = lufs(&x, sr).unwrap();
+        assert!((l + 3.01).abs() < 0.05, "{l}");
+        assert_eq!(lufs(&vec![0.0; 96_000], sr), None);
+    }
+
+    /// A stem keeps only its buses' sound.
+    #[test]
+    fn a_stem_holds_only_its_buses() {
+        let (mut project, sounds) = project_with_sound(48);
+        project.buses = vec![motion_core::Bus::new("dlg", "Dialogue")];
+        let layer = project.comps.get_mut(&project.root).unwrap().root.find_mut(motion_core::NodeId(1)).unwrap();
+        layer.audio.as_mut().unwrap().bus = Some("dlg".into());
+        let on = |ids: &[&str]| {
+            let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+            peak(&mix_stem(&project, project.root, 0, 23, 48_000, &sounds, Some(&ids)))
+        };
+        assert!(on(&["dlg"]) > 0.0);
+        assert_eq!(on(&["mus"]), 0.0);
     }
 }

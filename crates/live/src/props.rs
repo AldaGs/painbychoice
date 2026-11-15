@@ -134,6 +134,10 @@ pub(crate) struct AudioInfo {
     pub(crate) enabled: bool,
     pub(crate) level_anim: bool,
     pub(crate) pan_anim: bool,
+    /// The bus it is sent to, and the project's buses as `(id, name)` —
+    /// filled in by the caller, which sees the project.
+    pub(crate) bus: Option<String>,
+    pub(crate) buses: Vec<(String, String)>,
 }
 
 /// One row of the properties panel's effect stack: what the effect is, whether
@@ -534,6 +538,8 @@ impl NodeInfo {
                 enabled: a.enabled,
                 level_anim: a.level.is_animated(),
                 pan_anim: a.pan.is_animated(),
+                bus: a.bus.clone(),
+                buses: Vec::new(),
             }),
             text: match node.shape.as_ref() {
                 Some(MShape::Text { content, family, weight, italic, size, tracking, leading, align, max_width }) => Some(TextInfo {
@@ -648,6 +654,8 @@ pub(crate) struct PropEdits {
     pub(crate) audio_level: Option<f64>,
     pub(crate) audio_pan: Option<f64>,
     pub(crate) audio_enabled: Option<bool>,
+    /// Send to this bus id, or to the mix directly with `None`.
+    pub(crate) audio_bus: Option<Option<String>>,
     /// Turn a group into a compound path, pick its boolean op, or (`Some(None)`)
     /// make it an ordinary group again.
     #[allow(clippy::option_option)]
@@ -725,6 +733,7 @@ impl PropEdits {
         self.audio_level.is_some()
             || self.audio_pan.is_some()
             || self.audio_enabled.is_some()
+            || self.audio_bus.is_some()
             || self.key.contains(&PropKind::AudioLevel)
             || self.key.contains(&PropKind::AudioPan)
     }
@@ -1427,6 +1436,23 @@ pub(crate) fn properties_ui(
                 edits.key.insert(PropKind::AudioPan);
             }
             ui.end_row();
+
+            if !a.buses.is_empty() {
+                ui.label("Bus");
+                let name = |id: &Option<String>| {
+                    id.as_ref().map_or("Mix".to_string(), |id| {
+                        a.buses.iter().find(|(b, _)| b == id).map_or(format!("{id} (missing)"), |(_, n)| n.clone())
+                    })
+                };
+                egui::ComboBox::from_id_salt("audio_bus").selected_text(name(&a.bus)).show_ui(ui, |ui| {
+                    for choice in std::iter::once(None).chain(a.buses.iter().map(|(id, _)| Some(id.clone()))) {
+                        if ui.selectable_label(a.bus == choice, name(&choice)).clicked() && a.bus != choice {
+                            edits.audio_bus = Some(choice);
+                        }
+                    }
+                });
+                ui.end_row();
+            }
         }
 
         // --- Effects. An ordered stack of pixel operations on the layer's

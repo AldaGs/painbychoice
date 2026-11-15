@@ -62,7 +62,7 @@ pub use raise::{raise, raise_geometry, RaiseShapeError};
 pub use registry::{
     builtin_descriptors, NodeCategory, NodeDescriptor, NodeRegistry, RegisterError,
 };
-pub use audio::{gains, mix_into, pan_gains, AudioClip, AudioSource};
+pub use audio::{gains, mix_into, pan_gains, AudioClip, AudioSource, Bus, Output};
 pub use eval::evaluate_audio;
 pub use camera::{Camera, Projector};
 pub use mat4::{Mat4, Xf};

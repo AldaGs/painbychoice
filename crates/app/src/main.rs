@@ -64,6 +64,9 @@ RENDER OPTIONS:
   --demo             Render the built-in demo document instead of a file.
                      The way to check that rendering works on a machine with
                      no project to hand.
+  --output <id>      Export one of the project's outputs, or a single bus, as
+                     the soundtrack instead of the full mix (a stem). With
+                     --out x.wav, writes only the sound.
   --threads <n>      Render this many frames at once. Default: one per core.
                      Frames are independent and evaluation is pure, so this
                      scales close to linearly; `--threads 1` is the sequential
@@ -159,6 +162,8 @@ struct Opts {
     quiet: bool,
     demo: bool,
     json: bool,
+    /// An output or bus id: export that stem instead of the full mix.
+    output: Option<String>,
 }
 
 /// Hand-rolled rather than a `clap` dependency: the flag set is small and
@@ -178,6 +183,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         quiet: false,
         demo: false,
         json: false,
+        output: None,
     };
     let mut positional = None;
     let mut i = 0;
@@ -199,6 +205,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--scale" => {
                 o.scale = value("--scale")?.parse().map_err(|_| "--scale wants a number")?
             }
+            "--output" => o.output = Some(value("--output")?),
             "--fps" => o.fps = Some(value("--fps")?.parse().map_err(|_| "--fps wants a rate")?),
             "--arg" => o.ffmpeg_args.push(value("--arg")?),
             "--quality" => {
@@ -258,6 +265,79 @@ impl Drop for TempAudio {
     }
 }
 
+/// 48kHz regardless of what the sources are: the mix has to land on one
+/// grid, and picking the highest common broadcast rate means a 44.1kHz
+/// source is resampled up rather than everything else being dragged down.
+const RATE: u32 = 48_000;
+
+/// Every sound the project imports, decoded. Failures are reported and skipped.
+fn decode_sounds(project: &Project, quiet: bool) -> std::collections::HashMap<motion_core::AssetId, motion_render::Sound> {
+    let mut sounds = std::collections::HashMap::new();
+    for asset in project.assets.values().filter(|a| a.has_audio()) {
+        match motion_render::decode_sound(&asset.path) {
+            Ok(sound) => {
+                sounds.insert(asset.id, sound);
+            }
+            // A sound that will not decode is reported and skipped, exactly as
+            // unrenderable footage is: a render that fails outright because one
+            // layer's file moved is worse than one that says so.
+            Err(e) => {
+                if !quiet {
+                    eprintln!("note: {}: {e}", asset.path.display());
+                }
+            }
+        }
+    }
+    sounds
+}
+
+/// The bus ids `--output <id>` names: an output's buses (`None` when it is the
+/// full mix), or a single bus.
+fn stem_buses(project: &Project, id: &str) -> Result<Option<Vec<String>>, String> {
+    if let Some(o) = project.outputs.iter().find(|o| o.id == id) {
+        return Ok((!o.buses.is_empty()).then(|| o.buses.clone()));
+    }
+    if project.buses.iter().any(|b| b.id == id) {
+        return Ok(Some(vec![id.to_string()]));
+    }
+    let known: Vec<&str> = project.outputs.iter().map(|o| o.id.as_str()).chain(project.buses.iter().map(|b| b.id.as_str())).collect();
+    Err(format!("no output or bus '{id}' (have: {})", if known.is_empty() { "none".into() } else { known.join(", ") }))
+}
+
+/// Loudness per bus and for the full mix, for an agent that cannot listen.
+/// `null` when the comp is silent.
+fn audio_report(project: &Project, comp: CompId) -> serde_json::Value {
+    let Some(c) = project.comp(comp) else { return serde_json::Value::Null };
+    if !project_has_audio(project, comp) {
+        return serde_json::Value::Null;
+    }
+    let sounds = decode_sounds(project, true);
+    let end = c.duration_frames - 1;
+    // ponytail: one full mixdown per bus; cache sources if long comps make this slow.
+    let measure = |buses: Option<&[String]>| {
+        let mix = motion_render::mix_stem(project, comp, 0, end, RATE, &sounds, buses);
+        let peak = motion_render::peak(&mix);
+        let lufs = motion_render::lufs(&mix, RATE);
+        serde_json::json!({
+            "lufs": lufs.map(|l| (l * 10.0).round() / 10.0),
+            "peakDb": (peak > 0.0).then(|| (20.0 * (peak as f64).log10() * 10.0).round() / 10.0),
+            "clipped": peak >= 0.999,
+            "silent": lufs.is_none(),
+        })
+    };
+    let buses: Vec<_> = project
+        .buses
+        .iter()
+        .map(|b| {
+            let mut m = measure(Some(std::slice::from_ref(&b.id)));
+            m["id"] = b.id.clone().into();
+            m["name"] = b.name.clone().into();
+            m
+        })
+        .collect();
+    serde_json::json!({ "mix": measure(None), "buses": buses })
+}
+
 /// Whether this comp has anything to hear.
 fn project_has_audio(project: &Project, comp: CompId) -> bool {
     !motion_core::evaluate_audio(project, comp, 0.0, 48_000).is_empty()
@@ -277,27 +357,7 @@ fn mix_soundtrack(
     if !project_has_audio(project, comp) {
         return Ok(None);
     }
-    // 48kHz regardless of what the sources are: the mix has to land on one
-    // grid, and picking the highest common broadcast rate means a 44.1kHz
-    // source is resampled up rather than everything else being dragged down.
-    const RATE: u32 = 48_000;
-
-    let mut sounds = std::collections::HashMap::new();
-    for asset in project.assets.values().filter(|a| a.has_audio()) {
-        match motion_render::decode_sound(&asset.path) {
-            Ok(sound) => {
-                sounds.insert(asset.id, sound);
-            }
-            // A sound that will not decode is reported and skipped, exactly as
-            // unrenderable footage is: a render that fails outright because one
-            // layer's file moved is worse than one that says so.
-            Err(e) => {
-                if !o.quiet {
-                    eprintln!("note: {}: {e}", asset.path.display());
-                }
-            }
-        }
-    }
+    let sounds = decode_sounds(project, o.quiet);
 
     // A layer that names a sound nobody could decode is reported, not silently
     // mixed as silence. Without this an export whose asset had moved produced a
@@ -319,7 +379,8 @@ fn mix_soundtrack(
         }
     }
 
-    let mix = motion_render::mix_comp(project, comp, start, end, RATE, &sounds);
+    let buses = o.output.as_deref().map(|id| stem_buses(project, id)).transpose()?.flatten();
+    let mix = motion_render::mix_stem(project, comp, start, end, RATE, &sounds, buses.as_deref());
     if mix.is_empty() {
         return Ok(None);
     }
@@ -357,6 +418,18 @@ fn render(args: &[String]) -> Result<(), String> {
     let end = o.end.unwrap_or(last).min(last);
     if end < start {
         return Err(format!("empty range: frames {start} to {end}"));
+    }
+
+    // A .wav is the soundtrack alone — the full mix, or the `--output` stem.
+    if o.out.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")) {
+        let temp = mix_soundtrack(&project, comp_id, start, end, &o)?.ok_or("the comp has no sound to export")?;
+        std::fs::copy(temp.path(), &o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
+        if o.json {
+            println!("{}", report(&findings, &dropped, &Default::default(), serde_json::json!({ "output": o.out.display().to_string() })));
+        } else if !o.quiet {
+            eprintln!("wrote {}", o.out.display());
+        }
+        return Ok(());
     }
 
     let (w, h) = output_size(comp.width, comp.height, o.scale);
@@ -603,6 +676,7 @@ fn preview(args: &[String]) -> Result<bool, String> {
         "frames": picked,
         "grid": { "cols": cols, "rows": (picked.len() as u32).div_ceil(cols), "cell": [w, h] },
         "comp": comp_summary(&l.project, comp_id),
+        "audio": audio_report(&l.project, comp_id),
         "seconds": started.elapsed().as_secs_f64(),
     });
     println!("{}", report(&l.findings, &l.dropped, &notes, extra));

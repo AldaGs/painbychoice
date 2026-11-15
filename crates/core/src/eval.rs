@@ -3319,6 +3319,8 @@ fn collect_audio_node(
             };
             let level = clip.level.resolve(ctx);
             let pan = clip.pan.resolve(ctx);
+            let (bus, bus_gain, duck) = crate::audio::route(&project.buses, clip.bus.as_deref(), sample_rate);
+            let (l, r) = crate::audio::gains(level, pan);
             out.push(crate::audio::AudioSource {
                 asset: clip.asset,
                 start: shift + to_sf(in_, fps, sample_rate),
@@ -3327,7 +3329,9 @@ fn collect_audio_node(
                 // its head starts partway into its own sound, exactly as a
                 // trimmed video layer shows a later frame.
                 offset: to_sf(in_ - start, fps, sample_rate),
-                gain: crate::audio::gains(level, pan),
+                gain: (l * bus_gain, r * bus_gain),
+                bus,
+                duck,
             });
         }
     }
