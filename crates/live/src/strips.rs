@@ -144,6 +144,7 @@ fn clip_bar(
     cached: &std::collections::HashSet<crate::footage::Key>,
     tool: EditTool,
     clips: &[Clip],
+    snap: &Magnet,
     out: &mut DopeEdits,
 ) -> bool {
     let is_sel = selected == Some(row.id);
@@ -242,7 +243,11 @@ fn clip_bar(
 
     // Clicking a strip selects its layer — the row *is* the layer, so
     // anywhere on it should work, not only the name.
-    let at = |x: f32| axis.x_to_frame(x).clamp(0, last_frame);
+    let snap_on = snap.active(ui);
+    let at = |x: f32| {
+        let f = axis.x_to_frame(x).clamp(0, last_frame);
+        if snap_on { snap.to(f, row.id, axis).unwrap_or(f) } else { f }
+    };
     if resp.clicked() {
         if tool == EditTool::Razor {
             if let Some(p) = resp.interact_pointer_pos() {
@@ -279,8 +284,11 @@ fn clip_bar(
         });
     }
     if tool == EditTool::Razor {
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        if let Some(p) = resp.hover_pos().filter(|p| p.x >= bar.left() && p.x <= bar.right()) {
+            // Where the cut will land (snapped), across the bar.
+            let x = axis.frame_to_x(at(p.x) as f64);
+            painter.line_segment([egui::pos2(x, bar.top()), egui::pos2(x, bar.bottom())], egui::Stroke::new(1.5, RAZOR));
+            tool_cursor(ui, ToolCursor::Razor, p);
         }
         return false;
     }
@@ -314,7 +322,28 @@ fn clip_bar(
         if let (Some((grab, anchor, orig)), Some(p)) =
             (latched, resp.interact_pointer_pos())
         {
-            let d = axis.x_to_frame(p.x) - anchor;
+            let mut d = axis.x_to_frame(p.x) - anchor;
+            // The magnet: pull whichever edge is moving onto the nearest target.
+            if snap_on {
+                let edge = |f: i64| snap.to(f + d, row.id, axis).map(|t| (t - (f + d), t));
+                let pick = match grab {
+                    ClipGrab::TrimIn => edge(orig.in_),
+                    ClipGrab::TrimOut => edge(orig.out),
+                    ClipGrab::Slide => match (edge(orig.in_), edge(orig.out)) {
+                        (Some(a), Some(b)) => Some(if a.0.abs() <= b.0.abs() { a } else { b }),
+                        (a, b) => a.or(b),
+                    },
+                    ClipGrab::Slip => None,
+                };
+                if let Some((shift, target)) = pick {
+                    d += shift;
+                    let x = axis.frame_to_x(target as f64);
+                    ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("snap_line"))).line_segment(
+                        [egui::pos2(x, track.top() - ROW_H), egui::pos2(x, track.bottom() + ROW_H)],
+                        egui::Stroke::new(1.0, SNAP),
+                    );
+                }
+            }
             let snap: Vec<Clip> = ui.ctx().data(|m| m.get_temp(drag_id.with("clips"))).unwrap_or_default();
             let side = match grab {
                 ClipGrab::TrimIn => Some(Side::Start),
@@ -340,8 +369,129 @@ fn clip_bar(
         }
         *dragging = true;
     }
-    clip_cursor(ui, resp, drag_id, bar.left(), bar.right(), HANDLE_W);
+    match tool {
+        EditTool::Ripple | EditTool::Roll if row.depth == 0 => {
+            let held: Option<(ClipGrab, i64, LayerTiming)> = ui.ctx().data(|d| d.get_temp(drag_id));
+            let alt = ui.input(|i| i.modifiers.alt);
+            let pos = if resp.dragged() { resp.interact_pointer_pos() } else { resp.hover_pos() };
+            let grab = match (resp.dragged(), held, pos) {
+                (true, Some(h), _) => Some(h.0),
+                (false, _, Some(p)) if p.x > bar.left() - HANDLE_W && p.x < bar.right() + HANDLE_W => {
+                    Some(clip_grab_at(p.x, bar.left(), bar.right(), HANDLE_W, alt))
+                }
+                _ => None,
+            };
+            match (grab, pos) {
+                (Some(g @ (ClipGrab::TrimIn | ClipGrab::TrimOut)), Some(p)) => {
+                    let start = g == ClipGrab::TrimIn;
+                    tool_cursor(ui, if tool == EditTool::Ripple { ToolCursor::Ripple { start } } else { ToolCursor::Roll }, p);
+                }
+                _ => clip_cursor(ui, resp, drag_id, bar.left(), bar.right(), HANDLE_W),
+            }
+        }
+        _ => clip_cursor(ui, resp, drag_id, bar.left(), bar.right(), HANDLE_W),
+    }
     drag
+}
+
+const RAZOR: egui::Color32 = egui::Color32::from_rgb(255, 96, 96);
+const RIPPLE: egui::Color32 = egui::Color32::from_rgb(255, 216, 51);
+const ROLL: egui::Color32 = egui::Color32::from_rgb(110, 200, 255);
+const SNAP: egui::Color32 = egui::Color32::from_rgb(90, 230, 200);
+
+/// The pointer shapes egui has no icon for, drawn at the mouse with the system
+/// pointer hidden: a blade for the razor, a bracket for a ripple trim (open
+/// toward the clip, arrow the way it pushes), a double bracket for a roll.
+#[derive(Clone, Copy, PartialEq)]
+enum ToolCursor {
+    Razor,
+    Ripple { start: bool },
+    Roll,
+}
+
+fn tool_cursor(ui: &egui::Ui, kind: ToolCursor, p: egui::Pos2) {
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tool_cursor")));
+    let v = |x: f32, y: f32| p + egui::vec2(x, y);
+    let mut lines: Vec<[egui::Pos2; 2]> = Vec::new();
+    let color = match kind {
+        ToolCursor::Razor => {
+            // A blade: the cutting edge down through the hotspot, a grip above.
+            lines.extend([[v(0.0, -10.0), v(0.0, 10.0)], [v(-4.0, -10.0), v(4.0, -10.0)], [v(-4.0, -10.0), v(-4.0, -4.0)], [v(4.0, -10.0), v(4.0, -4.0)], [v(-4.0, -4.0), v(4.0, -4.0)]]);
+            RAZOR
+        }
+        ToolCursor::Ripple { start } => {
+            let s = if start { 1.0 } else { -1.0 }; // caps point into the clip
+            lines.extend([[v(0.0, -9.0), v(0.0, 9.0)], [v(0.0, -9.0), v(4.0 * s, -9.0)], [v(0.0, 9.0), v(4.0 * s, 9.0)]]);
+            let tip = v(-10.0 * s, 0.0);
+            lines.extend([[v(-2.0 * s, 0.0), tip], [tip, v(-6.0 * s, -4.0)], [tip, v(-6.0 * s, 4.0)]]);
+            RIPPLE
+        }
+        ToolCursor::Roll => {
+            for s in [-1.0f32, 1.0] {
+                let x = 2.5 * s;
+                lines.extend([[v(x, -9.0), v(x, 9.0)], [v(x, -9.0), v(x - 4.0 * s, -9.0)], [v(x, 9.0), v(x - 4.0 * s, 9.0)]]);
+                let tip = v(12.0 * s, 0.0);
+                lines.extend([[v(x + 2.0 * s, 0.0), tip], [tip, v(8.0 * s, -4.0)], [tip, v(8.0 * s, 4.0)]]);
+            }
+            ROLL
+        }
+    };
+    // Dark halo first so the shape reads on any bar or waveform.
+    for l in &lines {
+        painter.line_segment(*l, egui::Stroke::new(3.5, egui::Color32::from_black_alpha(200)));
+    }
+    for l in &lines {
+        painter.line_segment(*l, egui::Stroke::new(1.5, color));
+    }
+}
+
+/// The magnet: frames an edit snaps to, and whether it is on. Hold Ctrl to
+/// flip it for one gesture.
+struct Magnet {
+    on: bool,
+    /// Clip edges (with the layer they belong to, so a clip ignores its own),
+    /// the playhead, the comp's ends and the work area.
+    targets: Vec<(Option<NodeId>, i64)>,
+}
+
+/// Within this many pixels an edge is pulled onto a target.
+const SNAP_PX: f32 = 8.0;
+
+impl Magnet {
+    fn active(&self, ui: &egui::Ui) -> bool {
+        self.on != ui.input(|i| i.modifiers.ctrl)
+    }
+
+    /// The nearest target to frame `f` within [`SNAP_PX`], not counting layer `own`'s edges.
+    fn to(&self, f: i64, own: NodeId, axis: &Axis) -> Option<i64> {
+        nearest(&self.targets, f, own, |a, b| (axis.frame_to_x(a as f64) - axis.frame_to_x(b as f64)).abs(), SNAP_PX)
+    }
+}
+
+fn nearest(targets: &[(Option<NodeId>, i64)], f: i64, own: NodeId, dist: impl Fn(i64, i64) -> f32, max: f32) -> Option<i64> {
+    targets
+        .iter()
+        .filter(|(id, _)| *id != Some(own))
+        .map(|(_, t)| (dist(*t, f), *t))
+        .filter(|(d, _)| *d <= max)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, t)| t)
+}
+
+#[cfg(test)]
+mod snap_tests {
+    /// The magnet takes the closest target in range and never a clip's own edges.
+    #[test]
+    fn snapping_takes_the_nearest_target_but_not_your_own_edges() {
+        use super::NodeId;
+        let t = [(Some(NodeId(1)), 10), (Some(NodeId(2)), 14), (None, 30)];
+        let px = |a: i64, b: i64| (a - b).abs() as f32; // one pixel per frame
+        assert_eq!(super::nearest(&t, 12, NodeId(9), px, 8.0), Some(10), "10 and 14 tie; first wins");
+        assert_eq!(super::nearest(&t, 13, NodeId(9), px, 8.0), Some(14));
+        assert_eq!(super::nearest(&t, 11, NodeId(1), px, 8.0), Some(14), "own edge skipped");
+        assert_eq!(super::nearest(&t, 50, NodeId(9), px, 8.0), None, "out of range");
+    }
 }
 
 fn playhead(ui: &egui::Ui, track: egui::Rect, axis: &Axis, frame: f64, col: egui::Color32) {
@@ -543,9 +693,11 @@ pub(crate) fn strips_ui(
     timeline_header(ui, TimelineMode::Strips, frame, last_frame, view, out);
 
     // Tool palette and row packing. View state, kept for the session.
-    let (tool_id, packed_id) = (egui::Id::new("strip_tool"), egui::Id::new("strip_packed"));
-    let (mut tool, mut packed): (EditTool, bool) =
-        ui.data(|d| (d.get_temp(tool_id).unwrap_or_default(), d.get_temp(packed_id).unwrap_or(false)));
+    let (tool_id, packed_id, magnet_id) =
+        (egui::Id::new("strip_tool"), egui::Id::new("strip_packed"), egui::Id::new("strip_magnet"));
+    let (mut tool, mut packed, mut magnet): (EditTool, bool, bool) = ui.data(|d| {
+        (d.get_temp(tool_id).unwrap_or_default(), d.get_temp(packed_id).unwrap_or(false), d.get_temp(magnet_id).unwrap_or(true))
+    });
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         for t in EditTool::ALL {
@@ -556,10 +708,14 @@ pub(crate) fn strips_ui(
         ui.separator();
         ui.checkbox(&mut packed, "Packed rows")
             .on_hover_text("Layers that don't overlap share a row, like clips on a track");
+        ui.separator();
+        ui.toggle_value(&mut magnet, "Magnet")
+            .on_hover_text("Edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.");
     });
     ui.data_mut(|d| {
         d.insert_temp(tool_id, tool);
         d.insert_temp(packed_id, packed);
+        d.insert_temp(magnet_id, magnet);
     });
     // The top-level layers as clips, back to front, packed into rows.
     let clips: Vec<Clip> = {
@@ -570,6 +726,19 @@ pub(crate) fn strips_ui(
             .zip(crate::clips::pack(&win))
             .map(|(r, row)| Clip { id: r.id, row, t: r.timing.unwrap_or(whole) })
             .collect()
+    };
+
+    let snap = {
+        let mut targets: Vec<(Option<NodeId>, i64)> = rows
+            .iter()
+            .filter_map(|r| r.timing.map(|t| (r.id, t)))
+            .flat_map(|(id, t)| [(Some(id), t.in_), (Some(id), t.out)])
+            .collect();
+        targets.extend([(None, frame.round() as i64), (None, 0), (None, last_frame + 1)]);
+        if let Some(w) = work_area {
+            targets.extend([(None, w.start), (None, w.end)]);
+        }
+        Magnet { on: magnet, targets }
     };
 
     let playhead_col = egui::Color32::from_rgb(240, 90, 90);
@@ -629,7 +798,7 @@ pub(crate) fn strips_ui(
                             ui.interact(bar, ui.id().with(("strip_packed", c.id)), egui::Sense::click_and_drag());
                         dragging |= clip_bar(
                             ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips,
-                            out,
+                            &snap, out,
                         );
                         let name = egui::Rect::from_min_max(bar.min + egui::vec2(4.0, 0.0), bar.max);
                         label_text(ui, name, &row.name, selected != Some(row.id));
@@ -734,7 +903,7 @@ pub(crate) fn strips_ui(
                 );
                 ui.painter_at(track).rect_filled(track, 3.0, egui::Color32::from_gray(32));
                 dragging |= clip_bar(
-                    ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips, out,
+                    ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips, &snap, out,
                 );
                 playhead(ui, track, &axis, frame, playhead_col);
             });
