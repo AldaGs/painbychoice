@@ -21,6 +21,8 @@ pub(crate) enum Op {
     /// Remove comp frames `a..b` from every top-level layer and close the gap
     /// (text-based cutting, ADR 0027).
     RemoveRange(i64, i64),
+    /// Put back the comp's cut at this index.
+    RestoreCut(usize),
 }
 
 /// Apply `op` to comp `comp`. Returns whether the document changed.
@@ -65,17 +67,8 @@ pub(crate) fn run(project: &mut crate::MProject, comp: crate::CompId, op: Op, ne
             hit
         }
         Op::Unsync(id) => root.children.iter_mut().find(|n| n.id == id).is_some_and(|n| n.sync.take().is_some()),
-        Op::RemoveRange(a, b) => {
-            let fps = c.fps;
-            let gone = remove_range(root, frames, fps, a, b, next_id);
-            if b > a {
-                c.duration_frames = (frames - (b - a)).max(1);
-            }
-            for id in &gone {
-                crate::app::delete_layer(project, comp, *id);
-            }
-            b > a
-        }
+        Op::RemoveRange(a, b) => cut_range(project, comp, a, b, next_id),
+        Op::RestoreCut(i) => restore_cut(project, comp, i),
     }
 }
 

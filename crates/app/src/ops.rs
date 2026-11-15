@@ -91,9 +91,10 @@ pub fn query(path: &Path, words: bool) -> Result<J, String> {
                     l
                 })
                 .collect();
+            let cuts: Vec<J> = c.cuts.iter().enumerate().map(|(i, x)| json!({ "cut": i, "at": x.at, "frames": x.len, "said": x.text })).collect();
             json!({
                 "id": id.0, "name": c.label(*id), "width": c.width, "height": c.height,
-                "fps": fps, "frames": c.duration_frames, "layers": layers,
+                "fps": fps, "frames": c.duration_frames, "layers": layers, "cuts": cuts,
             })
         })
         .collect();
@@ -282,14 +283,22 @@ fn run(p: &mut Project, op: &J) -> Result<J, String> {
             if b <= a {
                 return Err("`to` must be after `from`".into());
             }
-            let fps = c.fps;
-            let gone = motion_core::edit::remove_range(&mut c.root, frames, fps, a, b, &mut next);
-            c.duration_frames = (frames - (b - a)).max(1);
-            let left = c.duration_frames;
-            for id in &gone {
-                p.delete_layer(comp, *id);
+            let _ = c;
+            motion_core::edit::cut_range(p, comp, a, b, &mut next);
+            let c = p.comp(comp).unwrap();
+            let cut = c.cuts.last().unwrap();
+            json!({
+                "removed": cut.removed.iter().map(|(_, n)| n.id.0).collect::<Vec<_>>(),
+                "said": cut.text, "cut": c.cuts.len() - 1, "frames": c.duration_frames,
+            })
+        }
+        "restore" => {
+            let i = op["cut"].as_u64().ok_or("`cut` must be the index `query` lists")? as usize;
+            let _ = c;
+            if !motion_core::edit::restore_cut(p, comp, i) {
+                return Err(format!("no cut {i}"));
             }
-            json!({ "removed": gone.iter().map(|k| k.0).collect::<Vec<_>>(), "frames": left })
+            json!({ "frames": p.comp(comp).unwrap().duration_frames })
         }
         "preset" => {
             let want = op["name"].as_str().ok_or("missing `name`")?;
@@ -322,6 +331,7 @@ const OPS: &[(&str, &str, &str)] = &[
     ("op.delete", "Remove a layer and everything inside it.", r#"{"op":"delete","layer":4}"#),
     ("op.razor", "Split a layer (and its sync group) at comp frame `at`.", r#"{"op":"razor","layer":4,"at":60}"#),
     ("op.cut", "Remove comp frames from..to from every layer and close the gap; captions lose those words.", r#"{"op":"cut","from":120,"to":150}"#),
+    ("op.restore", "Put back a cut (index from `query`'s `cuts`): time, layers and words return.", r#"{"op":"restore","cut":0}"#),
     ("op.preset", "Bake a caption preset into a text layer.", r#"{"op":"preset","layer":7,"name":"Viral pop"}"#),
 ];
 
@@ -415,6 +425,23 @@ mod tests {
         let cfg = &p.graph.node(sink).unwrap().config;
         assert!(cfg.out_target.is_none() && cfg.out_comp.is_none(), "the sink no longer names layer 1");
         assert!(p.graph.bindings().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A cut is listed by `query` and `restore` puts the timeline back.
+    #[test]
+    fn a_cut_can_be_restored() {
+        let path = file("restore");
+        let before = query(&path, false).unwrap()["comps"][0]["layers"].clone();
+        apply(&path, &json!([{ "op": "cut", "from": 40, "to": 50 }])).unwrap();
+        let q = query(&path, false).unwrap();
+        assert_eq!(q["comps"][0]["frames"], 90);
+        assert_eq!(q["comps"][0]["cuts"][0]["frames"], 10);
+        apply(&path, &json!([{ "op": "restore", "cut": 0 }])).unwrap();
+        let q = query(&path, false).unwrap();
+        assert_eq!(q["comps"][0]["frames"], 100);
+        assert_eq!(q["comps"][0]["layers"], before, "the same layer, the same timing");
+        assert!(apply(&path, &json!([{ "op": "restore", "cut": 0 }])).is_err(), "nothing left to restore");
         let _ = std::fs::remove_file(&path);
     }
 

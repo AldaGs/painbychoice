@@ -31,6 +31,8 @@ pub(crate) struct SubsEdits {
     pub(crate) preset: Option<motion_core::captions::CaptionStyle>,
     /// Comp frame ranges to cut out of the whole comp, in order.
     pub(crate) cut: Vec<(i64, i64)>,
+    /// Put back the comp's cut at this index.
+    pub(crate) restore: Option<usize>,
 }
 
 /// A transcription running on its own thread.
@@ -69,6 +71,8 @@ pub(crate) struct SubsView<'a> {
     pub(crate) playing: bool,
     /// Built-in caption looks, then the project's own.
     pub(crate) presets: Vec<motion_core::captions::CaptionStyle>,
+    /// The comp's cuts, oldest first: (comp frame, frames removed, what was said).
+    pub(crate) cuts: Vec<(i64, i64, String)>,
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(70, 140, 255);
@@ -109,6 +113,21 @@ pub(crate) fn subs_ui(ui: &mut egui::Ui, v: &SubsView, st: &mut SubsUi, out: &mu
     }
     if !st.status.is_empty() {
         ui.label(egui::RichText::new(&st.status).small().weak());
+    }
+    if !v.cuts.is_empty() {
+        egui::CollapsingHeader::new(format!("Cuts ({})", v.cuts.len())).id_salt("subs_cuts").show(ui, |ui| {
+            // Newest first: the one you most likely want back.
+            for (i, (at, len, said)) in v.cuts.iter().enumerate().rev() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Restore").on_hover_text("Put this time back: footage, captions and words").clicked() {
+                        out.restore = Some(i);
+                    }
+                    ui.label(egui::RichText::new(v.timebase.timecode(*at as f64)).monospace().weak());
+                    let words = if said.is_empty() { format!("{len} frames") } else { said.clone() };
+                    ui.label(egui::RichText::new(words).strikethrough());
+                });
+            }
+        });
     }
     let Some((Some(s), start, karaoke)) = v.layer else { return };
     ui.separator();
@@ -435,8 +454,9 @@ impl App {
                 Err(m) => self.subs_ui.status = m,
             }
         }
-        for (a, b) in e.cut {
-            if crate::clips::run(&mut self.project, self.current, crate::clips::Op::RemoveRange(a, b), &mut self.next_id) {
+        let ops = e.cut.into_iter().map(|(a, b)| crate::clips::Op::RemoveRange(a, b)).chain(e.restore.map(crate::clips::Op::RestoreCut));
+        for op in ops {
+            if crate::clips::run(&mut self.project, self.current, op, &mut self.next_id) {
                 self.after_history_jump();
                 self.publish_mix();
                 dirty = true;

@@ -4458,6 +4458,7 @@ impl App {
             progress: self.subs_job.as_ref().map(|j| j.progress.load(std::sync::atomic::Ordering::Relaxed)),
             playing: self.playing,
             no_model: (self.model_dl.is_some() || !motion_render::transcribe::has_model()).then_some(self.model_dl.is_some()),
+            cuts: self.doc().cuts.iter().map(|c| (c.at, c.len, c.text.clone())).collect(),
             presets: motion_core::captions::builtin().iter().cloned().chain(self.project.caption_presets.iter().cloned()).collect(),
         };
         // Comps for the switcher, in id order (which is creation order).

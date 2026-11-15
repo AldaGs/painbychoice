@@ -19,7 +19,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::node::{LayerTiming, Node as MNode, NodeId};
+use serde::{Deserialize, Serialize};
+
+use crate::node::{CompId, LayerTiming, Node as MNode, NodeId, Project};
+use crate::subs::Word;
 
 /// Shortest clip an edit may leave, in frames.
 pub const MIN: i64 = 1;
@@ -193,14 +196,35 @@ pub fn synced(root: &MNode, id: NodeId) -> Vec<NodeId> {
 
 // --- the op the strips view reports ------------------------------------------
 
+/// Time taken out of a comp by [`cut_range`], kept so it can be put back
+/// ([`restore_cut`]) after other edits, not only by undo.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cut {
+    /// Comp frame the cut starts at, in the timeline as it is now.
+    pub at: i64,
+    /// Frames removed.
+    pub len: i64,
+    /// The layers that were wholly inside, with their place in the stack.
+    pub removed: Vec<(usize, MNode)>,
+    /// Razor cuts made at the edges, (left, right), in the order made.
+    pub joins: Vec<(NodeId, NodeId)>,
+    /// Words taken from each subtitled layer, at their original times.
+    pub words: Vec<(NodeId, Vec<Word>)>,
+    /// Each subtitled layer's timing before the cut.
+    pub timings: Vec<(NodeId, Option<LayerTiming>)>,
+    /// What was said in the cut, for a list to show.
+    pub text: String,
+}
+
 /// Cut comp frames `a..b` out of every top-level layer and pull what follows
 /// left by `b - a`. Layers crossing an edge are razored there; a subtitled
 /// layer is not split but loses the words spoken in the range, later words
-/// moving up. Returns the layers now wholly inside the range, for the caller
-/// to delete.
-pub fn remove_range(root: &mut MNode, frames: i64, fps: f64, a: i64, b: i64, next: &mut u64) -> Vec<NodeId> {
+/// moving up. Layers now wholly inside are taken out (into the returned
+/// [`Cut`]); the caller deletes them from the project's graph too.
+pub fn remove_range(root: &mut MNode, frames: i64, fps: f64, a: i64, b: i64, next: &mut u64) -> Cut {
+    let mut cut = Cut { at: a, len: (b - a).max(0), removed: Vec::new(), joins: Vec::new(), words: Vec::new(), timings: Vec::new(), text: String::new() };
     if b <= a {
-        return Vec::new();
+        return cut;
     }
     let d = b - a;
     let window = |n: &MNode| n.timing.unwrap_or(LayerTiming::new(0, frames));
@@ -211,17 +235,22 @@ pub fn remove_range(root: &mut MNode, frames: i64, fps: f64, a: i64, b: i64, nex
             .filter(|n| n.subtitles.is_none() && window(n).in_ < f && f < window(n).out)
             .map(|n| n.id)
             .collect();
-        razor(root, frames, &ids, f, next);
+        cut.joins.extend(razor_pairs(root, frames, &ids, f, next));
     }
-    let mut gone = Vec::new();
+    let mut said = Vec::new();
     for n in root.children.iter_mut() {
         if let Some(s) = n.subtitles.as_mut() {
             let start = n.timing.map_or(0, |t| t.start);
             let (la, lb) = ((a - start) as f64 / fps, (b - start) as f64 / fps);
-            s.transcript.words.retain(|w| !((la..lb).contains(&((w.start + w.end) / 2.0))));
+            let inside = |w: &Word| (la..lb).contains(&((w.start + w.end) / 2.0));
+            let taken: Vec<Word> = s.transcript.words.iter().filter(|w| inside(w)).cloned().collect();
+            s.transcript.words.retain(|w| !inside(w));
             for w in s.transcript.words.iter_mut().filter(|w| w.start >= lb) {
                 (w.start, w.end) = (w.start - (lb - la), w.end - (lb - la));
             }
+            said.extend(taken.iter().map(|w| w.text.clone()));
+            cut.words.push((n.id, taken));
+            cut.timings.push((n.id, n.timing));
             if let Some(t) = n.timing.as_mut() {
                 if t.in_ >= b {
                     *t = shift(*t, -d);
@@ -232,13 +261,114 @@ pub fn remove_range(root: &mut MNode, frames: i64, fps: f64, a: i64, b: i64, nex
             continue;
         }
         let t = window(n);
-        if t.in_ >= a && t.out <= b {
-            gone.push(n.id);
-        } else if t.in_ >= b {
+        if t.in_ >= b {
             n.timing = Some(shift(t, -d));
         }
     }
-    gone
+    let mut i = 0;
+    while i < root.children.len() {
+        let n = &root.children[i];
+        let t = window(n);
+        if n.subtitles.is_none() && t.in_ >= a && t.out <= b {
+            cut.removed.push((i, root.children.remove(i)));
+        } else {
+            i += 1;
+        }
+    }
+    cut.text = said.join(" ");
+    cut
+}
+
+/// Put cut `cut` back into `root`: later content moves right again, removed
+/// layers return to their places, razor halves are joined, captions get
+/// their words and timing back. Layers edited away since are skipped.
+pub fn restore_range(root: &mut MNode, frames: i64, fps: f64, cut: &Cut) {
+    let (a, d) = (cut.at, cut.len);
+    let window = |n: &MNode| n.timing.unwrap_or(LayerTiming::new(0, frames));
+    for n in root.children.iter_mut() {
+        if let Some(s) = n.subtitles.as_mut() {
+            let start = n.timing.map_or(0, |t| t.start);
+            let (la, dl) = ((a - start) as f64 / fps, d as f64 / fps);
+            for w in s.transcript.words.iter_mut().filter(|w| w.start >= la) {
+                (w.start, w.end) = (w.start + dl, w.end + dl);
+            }
+            if let Some((_, words)) = cut.words.iter().find(|(id, _)| *id == n.id) {
+                s.transcript.words.extend(words.iter().cloned());
+                s.transcript.words.sort_by(|x, y| x.start.total_cmp(&y.start));
+            }
+            if let Some((_, t)) = cut.timings.iter().find(|(id, _)| *id == n.id) {
+                n.timing = *t;
+            }
+            continue;
+        }
+        let t = window(n);
+        if t.in_ >= a {
+            n.timing = Some(shift(t, d));
+        }
+    }
+    for (i, n) in &cut.removed {
+        let at = (*i).min(root.children.len());
+        root.children.insert(at, n.clone());
+    }
+    for (l, r) in cut.joins.iter().rev() {
+        let Some(rt) = root.children.iter().find(|n| n.id == *r).and_then(|n| n.timing) else { continue };
+        let Some(left) = root.children.iter_mut().find(|n| n.id == *l) else { continue };
+        if let Some(lt) = left.timing.as_mut() {
+            lt.out = rt.out;
+            root.children.retain(|n| n.id != *r);
+        }
+    }
+}
+
+/// Text-based cutting on a project: cut frames `a..b` from `comp`, record the
+/// cut, and delete what was inside from the graph too. Whether anything changed.
+pub fn cut_range(project: &mut Project, comp: CompId, a: i64, b: i64, next: &mut u64) -> bool {
+    let Some(c) = project.comps.get_mut(&comp) else { return false };
+    if b <= a {
+        return false;
+    }
+    let (frames, fps) = (c.duration_frames, c.fps);
+    let cut = remove_range(&mut c.root, frames, fps, a, b, next);
+    let d = cut.len;
+    c.duration_frames = (frames - d).max(1);
+    // ponytail: positions of older cuts are kept consistent for the common
+    // case (restoring newest first); interleaved restores at one spot are approximate.
+    for other in &mut c.cuts {
+        if other.at > a {
+            other.at = (other.at - d).max(a);
+        }
+    }
+    fn ids(n: &MNode, out: &mut Vec<NodeId>) {
+        out.push(n.id);
+        n.children.iter().for_each(|c| ids(c, out));
+    }
+    let mut gone = Vec::new();
+    cut.removed.iter().for_each(|(_, n)| ids(n, &mut gone));
+    // Reserved while the cut can be restored, so no new layer takes one.
+    c.removed_id_floor = c.removed_id_floor.max(gone.iter().map(|i| i.0 + 1).max().unwrap_or(0)).max(*next);
+    c.cuts.push(cut);
+    // Already out of the tree; the graph still has to forget them. Their ids
+    // stay reserved by the cut, which may put them back.
+    project.graph.forget_layers(comp, &gone);
+    true
+}
+
+/// Put back cut `index` of `comp`. Whether it existed.
+pub fn restore_cut(project: &mut Project, comp: CompId, index: usize) -> bool {
+    let Some(c) = project.comps.get_mut(&comp) else { return false };
+    if index >= c.cuts.len() {
+        return false;
+    }
+    let cut = c.cuts.remove(index);
+    let (frames, fps) = (c.duration_frames + cut.len, c.fps);
+    restore_range(&mut c.root, frames, fps, &cut);
+    c.duration_frames += cut.len;
+    for other in &mut c.cuts {
+        if other.at >= cut.at {
+            other.at += cut.len;
+        }
+    }
+    true
 }
 
 // --- applying ------------------------------------------------------------------
@@ -266,6 +396,12 @@ fn reid(n: &mut MNode, next: &mut u64) {
 /// a fresh sync id when the original had one, so cut pairs stay paired.
 /// Returns the right halves' ids.
 pub fn razor(root: &mut MNode, frames: i64, ids: &[NodeId], f: i64, next: &mut u64) -> Vec<NodeId> {
+    razor_pairs(root, frames, ids, f, next).into_iter().map(|(_, r)| r).collect()
+}
+
+/// [`razor`], returning each cut as (left half, right half) — what a
+/// [`Cut`] needs to join them again.
+pub fn razor_pairs(root: &mut MNode, frames: i64, ids: &[NodeId], f: i64, next: &mut u64) -> Vec<(NodeId, NodeId)> {
     let mut made = Vec::new();
     let mut groups: BTreeMap<u64, u64> = BTreeMap::new();
     let fresh_sync = root.children.iter().filter_map(|n| n.sync).max().map_or(1, |m| m + 1);
@@ -282,7 +418,7 @@ pub fn razor(root: &mut MNode, frames: i64, ids: &[NodeId], f: i64, next: &mut u
                 right.sync = Some(*groups.entry(g).or_insert(fresh_sync + k));
             }
             root.children[i].timing = Some(l);
-            made.push(right.id);
+            made.push((root.children[i].id, right.id));
             // Above the original in the stack (children draw back to front).
             root.children.insert(i + 1, right);
             i += 1;
@@ -432,8 +568,10 @@ mod tests {
         });
         root.children = vec![a, b, cap];
         let mut next = 10;
-        let gone = remove_range(&mut root, 100, 10.0, 20, 30, &mut next);
+        let cut = remove_range(&mut root, 100, 10.0, 20, 30, &mut next);
+        let gone: Vec<NodeId> = cut.removed.iter().map(|(_, n)| n.id).collect();
         assert_eq!(gone, vec![NodeId(10)], "a's middle piece is wholly inside");
+        assert_eq!(cut.text, "cut");
         assert_eq!(root.children[0].timing.unwrap().out, 20);
         let tail = root.children.iter().find(|n| n.id == NodeId(11)).unwrap().timing.unwrap();
         assert_eq!((tail.in_, tail.out, tail.start), (20, 40, -10), "content keeps its place in the source");
@@ -441,5 +579,41 @@ mod tests {
         let words = &root.children.iter().find(|n| n.id == NodeId(3)).unwrap().subtitles.as_ref().unwrap().transcript.words;
         assert_eq!(words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), ["keep", "moved"]);
         assert_eq!(words[1].start, 3.0);
+    }
+
+    /// Restoring a cut gives back exactly the timeline before it: the same
+    /// layers with the same timing, and the words where they were.
+    #[test]
+    fn a_restored_cut_is_the_timeline_before_it() {
+        use crate::subs::{Subtitles, Transcript, Word};
+        let word = |t: &str, s: f64, e: f64| Word { text: t.into(), start: s, end: e, p: None, brk: Default::default(), locked: false };
+        let mut a = MNode::group(1, "a");
+        a.timing = Some(lt(0, 50));
+        let mut b = MNode::group(2, "b");
+        b.timing = Some(lt(40, 20));
+        let mut cap = MNode::group(3, "cap");
+        cap.subtitles = Some(Subtitles {
+            transcript: Transcript { language: None, words: vec![word("keep", 0.0, 1.0), word("cut", 2.0, 3.0), word("moved", 4.0, 5.0)] },
+            rules: Default::default(),
+            uppercase: false,
+        });
+        let mut comp = crate::node::Comp::new(10.0, 10.0, MNode::group(0, "root").with_child(a).with_child(b).with_child(cap));
+        comp.fps = 10.0;
+        comp.duration_frames = 100;
+        let mut p = Project::single(comp);
+        let before = p.comps[&p.root].root.clone();
+        let mut next = 10;
+        let root = p.root;
+        assert!(cut_range(&mut p, root, 20, 30, &mut next));
+        assert_eq!(p.comps[&p.root].duration_frames, 90);
+        assert_eq!(p.comps[&p.root].cuts[0].text, "cut");
+        assert!(restore_cut(&mut p, root, 0));
+        let after = &p.comps[&p.root].root;
+        assert_eq!(p.comps[&p.root].duration_frames, 100);
+        assert!(p.comps[&p.root].cuts.is_empty());
+        let shape = |r: &MNode| r.children.iter().map(|n| (n.id, n.timing)).collect::<Vec<_>>();
+        assert_eq!(shape(after), shape(&before), "same layers, same timing");
+        let words = |r: &MNode| r.children[2].subtitles.as_ref().unwrap().transcript.words.clone();
+        assert_eq!(words(after), words(&before));
     }
 }

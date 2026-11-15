@@ -1830,6 +1830,10 @@ pub struct Comp {
     /// they exist to do.
     #[serde(default)]
     pub aids: ViewAids,
+    /// Time cut out by text-based editing, newest last, each restorable
+    /// ([`crate::edit::restore_cut`], ADR 0027).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<crate::edit::Cut>,
     /// The comp's camera, or `None` for a flat composition.
     ///
     /// **This is the 2.5D switch.** Absent means depth is stored but never
@@ -2105,6 +2109,7 @@ impl Comp {
             passepartout: Self::DEFAULT_PASSEPARTOUT,
             motion_path_range: Self::DEFAULT_MOTION_PATH_RANGE,
             aids: ViewAids::default(),
+            cuts: Vec::new(),
             root,
         }
     }

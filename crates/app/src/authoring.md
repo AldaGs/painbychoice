@@ -124,7 +124,7 @@ The authoring JSON has no sound yet; route sound by editing the `.pbc` (ADR 0026
 ## Editing an existing `.pbc` cheaply: query and apply
 - `motion query x.pbc [--words]` gives comps, top-level layers (`id`, `kind`, `in`/`out`/`start` in comp frames, `bus`, `sync`, `subtitles`), buses and outputs. `--words` adds `[text, from, to]` frames per word.
 - `motion apply x.pbc ops.json` takes an array of ops, run in order. All succeed or nothing is written; `rev` goes up by one.
-  `set` (JSON pointer on a layer, or on the project without `layer`), `trim`, `move`, `insert`, `delete`, `razor`, `cut` (removes frames from..to from the whole comp; captions lose those words), `preset` (caption look).
+  `set` (JSON pointer on a layer, or on the project without `layer`), `trim`, `move`, `insert`, `delete`, `razor`, `cut` (removes frames from..to from the whole comp; captions lose those words), `restore` (puts a cut back; `query` lists each comp's `cuts`), `preset` (caption look).
   `motion describe op` lists them with examples. Optional `"comp": id` on any op; the default is the root.
 - `motion proxy x.pbc [--all]` makes the editor's preview proxies (540p, all-intra) for heavy video; `query` lists each asset's `proxy`. Export always reads originals.
 - `pbc render x.pbc --out x.mp4 [--quality master]` exports through the editor's GPU renderer (the preview's own pixels) with no window. `motion render` is the CPU reference.
