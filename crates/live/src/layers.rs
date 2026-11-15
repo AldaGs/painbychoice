@@ -215,6 +215,8 @@ pub(crate) enum NewShape {
 #[derive(Default)]
 pub(crate) struct TreeEdits {
     pub(crate) select: Option<NodeId>,
+    /// Preview from proxies, or from the originals.
+    pub(crate) proxies: Option<bool>,
     /// Move this layer's own shape into a child layer, so it can be stacked
     /// against its siblings like any other layer.
     pub(crate) split_shape: Option<NodeId>,

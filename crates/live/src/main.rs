@@ -49,6 +49,7 @@ mod assets;
 mod calc;
 mod clips;
 mod mixer;
+mod proxies;
 mod clock;
 mod curves;
 mod dock;

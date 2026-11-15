@@ -97,7 +97,14 @@ pub fn query(path: &Path, words: bool) -> Result<J, String> {
             })
         })
         .collect();
-    let assets: Vec<J> = p.assets.values().map(|a| json!({ "id": a.id.0, "name": a.name, "path": a.path.display().to_string() })).collect();
+    let assets: Vec<J> = p
+        .assets
+        .values()
+        .map(|a| {
+            let proxy = motion_render::proxy::existing(&a.path).map(|p| p.display().to_string());
+            json!({ "id": a.id.0, "name": a.name, "path": a.path.display().to_string(), "proxy": proxy })
+        })
+        .collect();
     Ok(json!({
         "ok": true,
         "rev": file["rev"].as_u64().unwrap_or(0),
@@ -107,6 +114,26 @@ pub fn query(path: &Path, words: bool) -> Result<J, String> {
         "outputs": p.outputs,
         "assets": assets,
     }))
+}
+
+/// `motion proxy`: make the preview proxies the editor would make for this
+/// project's video (ADR 0029). `all` includes footage too small to want one.
+pub fn proxy(path: &Path, all: bool) -> Result<J, String> {
+    let (_, p) = open(path)?;
+    let mut made = Vec::new();
+    for a in p.assets.values().filter(|a| a.kind == motion_core::AssetKind::Video) {
+        if !all && !motion_render::proxy::wanted(a.width, a.height) {
+            continue;
+        }
+        let had = motion_render::proxy::existing(&a.path).is_some();
+        let r = motion_render::proxy::make(&a.path);
+        made.push(match r {
+            Ok(proxy) => json!({ "asset": a.id.0, "source": a.path.display().to_string(), "proxy": proxy.display().to_string(), "new": !had }),
+            Err(e) => json!({ "asset": a.id.0, "source": a.path.display().to_string(), "error": e }),
+        });
+    }
+    let ok = made.iter().all(|m| m.get("error").is_none());
+    Ok(json!({ "ok": ok, "proxies": made }))
 }
 
 /// `motion apply`: run `ops` against the file, then write it with `rev + 1`.

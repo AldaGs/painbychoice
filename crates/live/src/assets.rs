@@ -135,12 +135,14 @@ fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), 
     resp.hovered() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
 }
 
-pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut TreeEdits) {
+/// `proxy`: whether the preview reads proxies, how many are being made, and
+/// the last proxy error.
+pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool, usize, Option<&str>), out: &mut TreeEdits) {
     // The whole panel takes drops too: an item released outside every folder
     // goes back to the top level. Folder headers claim theirs first.
     let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
         ui.set_min_width(ui.available_width());
-        panel_ui(ui, project, current, out);
+        panel_ui(ui, project, current, proxy, out);
         ui.allocate_space(egui::vec2(ui.available_width(), ui.available_height().max(40.0)));
     });
     if let Some(item) = dropped {
@@ -150,7 +152,7 @@ pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, 
     }
 }
 
-fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut TreeEdits) {
+fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool, usize, Option<&str>), out: &mut TreeEdits) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.heading("Assets");
@@ -161,6 +163,22 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, out: &mut Tr
             out.folder = Some(FolderEdit::New);
         }
     });
+    ui.horizontal(|ui| {
+        let mut on = proxy.0;
+        if crate::strips::pill(ui, &mut on, "Preview proxies")
+            .on_hover_text("Play and scrub heavy video from small all-intra copies. Export always reads the originals.")
+            .changed()
+        {
+            out.proxies = Some(on);
+        }
+        if proxy.1 > 0 {
+            ui.spinner();
+            ui.weak(format!("making {}", proxy.1));
+        }
+    });
+    if let Some(e) = proxy.2 {
+        ui.colored_label(egui::Color32::from_rgb(240, 150, 60), e);
+    }
     ui.weak("Drag onto Layers to add, onto a folder to file · double-click a comp to open it");
     ui.separator();
 

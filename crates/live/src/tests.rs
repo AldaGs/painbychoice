@@ -6402,3 +6402,31 @@ fn an_agent_edit_while_the_editor_is_open_loses_nothing() {
     assert!(!livelink::take(&mut history, &mut project, agent));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// **Export never sees a proxy.** The preview and an export share one footage
+/// cache; a frame decoded from a proxy is cached under the proxy's own id, so
+/// with proxies off (as an export runs) the original has no frame yet.
+#[test]
+fn proxy_frames_never_stand_in_for_the_original() {
+    let work = std::env::temp_dir().join(format!("pbc_live_proxy_{}", std::process::id()));
+    std::fs::create_dir_all(&work).unwrap();
+    std::env::set_var("PBC_PROXY_DIR", work.join("cache"));
+    let src = work.join("clip.mp4");
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x36:rate=24:duration=1", "-c:v", "mpeg4"])
+        .arg(&src)
+        .status();
+    if !matches!(made, Ok(s) if s.success()) || motion_render::proxy::make(&src).is_err() {
+        eprintln!("skipping: couldn't generate a fixture");
+        return;
+    }
+    let asset = motion_core::Asset::video(motion_core::AssetId(1), &src, 64.0, 36.0, 24, 24.0);
+    let (mut cache, _) = fake_cache(4);
+    cache.proxies = true;
+    cache.image(&asset, at(&asset, 0));
+    cache.wait_for(motion_core::ImagePaint { asset: crate::footage::proxy_id(asset.id), source_frame: 0 });
+    assert!(cache.image(&asset, at(&asset, 0)).is_some_and(|(_, exact)| exact), "the preview has the proxy frame");
+    cache.proxies = false;
+    assert!(cache.image(&asset, at(&asset, 0)).is_none(), "the original has nothing decoded yet");
+    let _ = std::fs::remove_dir_all(&work);
+}

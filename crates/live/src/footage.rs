@@ -144,6 +144,13 @@ struct Promised {
     until: i64,
 }
 
+/// Set on the id a proxy's frames are cached under (ADR 0029).
+const PROXY_BIT: u64 = 1 << 63;
+
+pub(crate) fn proxy_id(id: AssetId) -> AssetId {
+    AssetId(id.0 | PROXY_BIT)
+}
+
 /// Decoded footage frames, keyed by source and frame number.
 pub(crate) struct FootageCache {
     to_worker: Sender<Request>,
@@ -163,6 +170,12 @@ pub(crate) struct FootageCache {
     promised: HashMap<AssetId, Promised>,
     /// Frame requests sent to the worker, to tell a stale `PrefetchEnded`.
     sent: u64,
+    /// Read proxies instead of originals where they exist (ADR 0029). Off for
+    /// an export's own cache, which must read the originals.
+    pub(crate) proxies: bool,
+    /// Each video's proxy as an asset to decode in its place (path and size
+    /// swapped), or `None` when it has none. Looked up once per asset.
+    proxy_of: HashMap<AssetId, Option<Asset>>,
     /// The frame each footage is currently being *drawn* at — recorded on every
     /// [`FootageCache::image`] call, so it is the playhead as the scene sees it
     /// rather than the last request, which a long prefetch run leaves stale.
@@ -198,6 +211,8 @@ impl FootageCache {
             inflight: HashSet::new(),
             promised: HashMap::new(),
             sent: 0,
+            proxies: false,
+            proxy_of: HashMap::new(),
             wanted: HashMap::new(),
             bytes: 0,
             epoch: 0,
@@ -283,6 +298,12 @@ impl FootageCache {
     /// `None` means there is genuinely nothing to show: no frame of this
     /// footage has ever decoded.
     pub(crate) fn image(&mut self, asset: &Asset, paint: ImagePaint) -> Option<(&ImageData, bool)> {
+        // ponytail: clones the proxy's Asset per draw; borrow it if a profile ever shows it.
+        let swapped = self.proxy_for(asset);
+        let asset = swapped.as_ref().unwrap_or(asset);
+        // A proxy's frames are cached under its own id, so an export (which
+        // reads originals through this same cache) can never be handed one.
+        let paint = ImagePaint { asset: asset.id, ..paint };
         #[cfg(feature = "libav")]
         if self.realtime && asset.kind == motion_core::asset::AssetKind::Video {
             use crate::video::Lookup;
@@ -357,6 +378,29 @@ impl FootageCache {
     /// so `AssetId(3)` in the file just loaded is a different piece of footage
     /// from `AssetId(3)` in the one being closed — keeping the cache would draw
     /// the old project's pixels under the new project's layers.
+    /// The asset to decode for `asset` in the preview: its proxy, if proxies
+    /// are on and one exists.
+    fn proxy_for(&mut self, asset: &Asset) -> Option<Asset> {
+        if !self.proxies || asset.kind != motion_core::asset::AssetKind::Video {
+            return None;
+        }
+        self.proxy_of
+            .entry(asset.id)
+            .or_insert_with(|| {
+                let path = motion_render::proxy::existing(&asset.path)?;
+                let meta = motion_render::default_registry().open(&path).ok()?;
+                Some(Asset { id: proxy_id(asset.id), path, width: meta.width, height: meta.height, ..asset.clone() })
+            })
+            .clone()
+    }
+
+    /// Proxies appeared, or were switched on or off: look them up again and
+    /// drop every frame decoded from the other file.
+    pub(crate) fn forget_proxies(&mut self) {
+        self.proxy_of.clear();
+        self.clear();
+    }
+
     pub(crate) fn clear(&mut self) {
         self.frames.clear();
         self.failed.clear();

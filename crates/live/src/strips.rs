@@ -520,7 +520,7 @@ fn glyph_button(ui: &mut egui::Ui, on: bool, kind: ToolCursor, label: &str) -> e
 }
 
 /// An on/off pill: a track with a knob that slides across, then the label.
-fn pill(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+pub(crate) fn pill(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
     let h = ui.spacing().interact_size.y * 0.8;
     let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(h * 1.8, h), egui::Sense::click());
     if resp.clicked() {

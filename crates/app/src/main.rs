@@ -46,6 +46,9 @@ USAGE:
   motion query <project.pbc> [--words]
                                      Compact JSON summary: comps, layers with
                                      timing, buses, outputs, subtitles.
+  motion proxy <project.pbc> [--all]
+                                     Make the editor's preview proxies for the
+                                     project's heavy video (--all: every video).
   motion apply <project.pbc> <ops.json>
                                      Run a batch of edit ops atomically and bump
                                      rev; an open editor takes it as one undo step.
@@ -104,6 +107,11 @@ fn main() -> ExitCode {
             [path] => ops::query(Path::new(path), false),
             [path, w] if w == "--words" => ops::query(Path::new(path), true),
             _ => Err("usage: motion query <project.pbc> [--words]".into()),
+        }),
+        Some("proxy") => json_out(match &args[1..] {
+            [path] => ops::proxy(Path::new(path), false),
+            [path, a] if a == "--all" => ops::proxy(Path::new(path), true),
+            _ => Err("usage: motion proxy <project.pbc> [--all]".into()),
         }),
         Some("apply") => json_out(match &args[1..] {
             [path, ops] => std::fs::read_to_string(ops)
@@ -172,13 +180,18 @@ fn banner() -> String {
 /// be carried across — see `motion_core::ae`.
 fn import_ae(args: &[String]) -> Result<(), String> {
     let [input, output] = args else { return Err("usage: motion import-ae <export.json|authoring.json> <out.pbc>".into()) };
-    let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
-    let (project, report) = motion_core::ae::import(&text)?;
+    // Through the same loader as render/check/preview, so assets are probed
+    // (absolute path, size, rate, soundtrack) rather than stored as typed.
+    let l = agent::load(Path::new(input))?;
+    if !l.findings.errors.is_empty() {
+        return Err(format!("{} error(s) in the spec; run `motion check` for the list", l.findings.errors.len()));
+    }
+    let (project, dropped) = (l.project, l.dropped);
     let json = serde_json::to_string_pretty(&serde_json::json!({ "project": project }))
         .map_err(|e| e.to_string())?;
     std::fs::write(output, json).map_err(|e| format!("{output}: {e}"))?;
     println!("{} comps -> {output}", project.comps.len());
-    for (what, n) in &report.dropped {
+    for (what, n) in &dropped {
         println!("  dropped {n:>6}  {what}");
     }
     Ok(())

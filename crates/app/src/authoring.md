@@ -126,3 +126,4 @@ The authoring JSON has no sound yet; route sound by editing the `.pbc` (ADR 0026
 - `motion apply x.pbc ops.json` takes an array of ops, run in order. All succeed or nothing is written; `rev` goes up by one.
   `set` (JSON pointer on a layer, or on the project without `layer`), `trim`, `move`, `insert`, `delete`, `razor`, `cut` (removes frames from..to from the whole comp; captions lose those words), `preset` (caption look).
   `motion describe op` lists them with examples. Optional `"comp": id` on any op; the default is the root.
+- `motion proxy x.pbc [--all]` makes the editor's preview proxies (540p, all-intra) for heavy video; `query` lists each asset's `proxy`. Export always reads originals.

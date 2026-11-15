@@ -13,6 +13,7 @@ pub mod fx;
 #[cfg(feature = "libav")]
 pub mod libav;
 pub mod parallel;
+pub mod proxy;
 pub mod raster;
 pub mod transcribe;
 

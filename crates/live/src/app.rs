@@ -103,6 +103,8 @@ pub(crate) struct App {
     pub(crate) subs_job: Option<crate::subtitles::SubsJob>,
     /// A whisper model downloading on its own thread.
     pub(crate) model_dl: Option<std::thread::JoinHandle<Result<std::path::PathBuf, String>>>,
+    /// Background proxy jobs and the preview's proxy switch (ADR 0029).
+    pub(crate) proxies: crate::proxies::Proxies,
     /// Every system font family, gathered once at startup. Enumerating the
     /// system collection is far too slow to redo per frame, and the list can't
     /// system collection is far too slow to redo per frame, and the list can't
@@ -1251,6 +1253,7 @@ impl App {
             subs_ui: Default::default(),
             subs_job: None,
             model_dl: None,
+            proxies: Default::default(),
             canvas_rect: None,
             nav: CanvasNav::default(),
             pan_drag: None,
@@ -1282,6 +1285,7 @@ impl App {
                 {
                     cache.realtime = true;
                 }
+                cache.proxies = true;
                 cache
             },
             project_path: None,
@@ -1949,8 +1953,19 @@ impl ApplicationHandler for App {
     /// The live link's heartbeat: an idle editor sleeps (`ControlFlow::Wait`),
     /// so with a file open it wakes every 250ms to look at it.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Proxies land in the background; nothing else would wake an idle editor.
+        let making = self.proxies.pending() > 0;
+        if making && self.poll_proxies() {
+            if let RenderState::Active { window, .. } = &self.state {
+                window.request_redraw();
+            }
+        }
         if self.project_path.is_none() {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop.set_control_flow(if making {
+                ControlFlow::WaitUntil(Instant::now() + std::time::Duration::from_millis(250))
+            } else {
+                ControlFlow::Wait
+            });
             return;
         }
         if self.poll_disk() {
@@ -3465,11 +3480,14 @@ impl App {
         // A render reads the sidecar, never the realtime preview path.
         #[cfg(feature = "libav")]
         let realtime = std::mem::replace(&mut self.footage.realtime, false);
+        // Nor proxies: an export reads the originals.
+        let proxies = std::mem::replace(&mut self.footage.proxies, false);
         let step = job.step(&handle.device, &handle.queue, renderer, &mut self.footage);
         #[cfg(feature = "libav")]
         {
             self.footage.realtime = realtime;
         }
+        self.footage.proxies = proxies;
         match step {
             crate::renderqueue::Step::Working => true,
             crate::renderqueue::Step::Done => {
@@ -3761,6 +3779,7 @@ impl App {
         // see. After `current` is set, because it republishes the mix and the
         // mix is one comp's.
         self.reload_sounds();
+        self.queue_proxies();
         self.seek_frame(0);
     }
 
@@ -4541,7 +4560,7 @@ impl App {
                         redo_label,
                     ),
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
-                    Editor::Assets => assets_ui(ui, &self.project, current_comp, &mut tree_edits),
+                    Editor::Assets => assets_ui(ui, &self.project, current_comp, (self.proxies.on, self.proxies.pending(), self.proxies.status.as_deref()), &mut tree_edits),
                     Editor::Subtitles => crate::subtitles::subs_ui(ui, &subs_view, &mut subs_state, &mut subs_edits),
                     Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, &mut mixer_edit),
                     Editor::Transport => transport_ui(
@@ -5430,6 +5449,13 @@ impl App {
         if tree_edits.import_to_library {
             dirty |= self.import_files(false);
         }
+        if let Some(on) = tree_edits.proxies.take() {
+            self.set_proxies(on);
+        }
+        if dirty {
+            // An import may have brought heavy video.
+            self.queue_proxies();
+        }
         // --- Undo: close the phase opened by `before`. ---------------------
         // One comparison covers every edit above. `PartialEq` on the document
         // early-outs at the first difference, so an idle frame costs a few
@@ -5633,9 +5659,13 @@ impl App {
         // frozen, which is the one thing the incremental design exists to
         // avoid. Still running means ask for another redraw — otherwise a
         // `ControlFlow::Wait` loop with no input would stall the job forever.
+        if self.poll_proxies() {
+            window.request_redraw();
+        }
         if self.step_render() || self.subs_job.is_some() {
             window.request_redraw();
         }
+
     }
 }
 
