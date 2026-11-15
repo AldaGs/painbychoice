@@ -122,7 +122,11 @@ enum Response {
     /// Without this the UI could wait forever for a frame that is never
     /// coming: it deliberately does *not* re-request frames the prefetch has
     /// promised, so it has to be told when that promise lapses.
-    PrefetchEnded { epoch: Epoch },
+    ///
+    /// `served` is how many requests the worker had taken when it said so. A
+    /// notice that predates the cache's latest request is stale: that request
+    /// opened a new promise this notice knows nothing about.
+    PrefetchEnded { epoch: Epoch, served: u64 },
 }
 
 /// Frames the worker has already promised to deliver.
@@ -157,6 +161,8 @@ pub(crate) struct FootageCache {
     /// What the running prefetches have already promised, per footage — one
     /// entry per open stream, since the worker runs several. See [`Promised`].
     promised: HashMap<AssetId, Promised>,
+    /// Frame requests sent to the worker, to tell a stale `PrefetchEnded`.
+    sent: u64,
     /// The frame each footage is currently being *drawn* at — recorded on every
     /// [`FootageCache::image`] call, so it is the playhead as the scene sees it
     /// rather than the last request, which a long prefetch run leaves stale.
@@ -183,6 +189,7 @@ impl FootageCache {
             failed: HashMap::new(),
             inflight: HashSet::new(),
             promised: HashMap::new(),
+            sent: 0,
             wanted: HashMap::new(),
             bytes: 0,
             epoch: 0,
@@ -216,9 +223,10 @@ impl FootageCache {
             // From a project that is no longer open: this key names different
             // footage now, so keeping the pixels would draw the old project's
             // content under the new one's layers.
-            Response::Frame { epoch, .. } | Response::PrefetchEnded { epoch }
+            Response::Frame { epoch, .. } | Response::PrefetchEnded { epoch, .. }
                 if epoch != self.epoch => {}
-            Response::PrefetchEnded { .. } => self.promised.clear(),
+            Response::PrefetchEnded { served, .. } if served == self.sent => self.promised.clear(),
+            Response::PrefetchEnded { .. } => {}
             Response::Frame { key, result, .. } => {
                 self.inflight.remove(&key);
                 match result {
@@ -279,6 +287,7 @@ impl FootageCache {
                 path: asset.path.clone(),
                 meta: asset.meta(),
             });
+            self.sent += 1;
             self.promised.insert(
                 paint.asset,
                 Promised {
@@ -472,6 +481,8 @@ fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Resp
     // cancel the very first promise before its frames arrived, and the
     // requester would then ask again for frames the stream had already passed.
     let mut promise_open = false;
+    // Frame requests taken, echoed in `PrefetchEnded`.
+    let mut served = 0u64;
 
     loop {
         // Real work first; only run ahead when the queue is empty.
@@ -494,7 +505,7 @@ fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Resp
                 // re-requesting frames the prefetch promised, so it has to
                 // learn when there is nothing more coming.
                 if std::mem::take(&mut promise_open)
-                    && tx.send(Response::PrefetchEnded { epoch }).is_err()
+                    && tx.send(Response::PrefetchEnded { epoch, served }).is_err()
                 {
                     return;
                 }
@@ -514,6 +525,7 @@ fn decode_loop(decoders: DecoderRegistry, rx: Receiver<Request>, tx: Sender<Resp
                 promise_open = false;
             }
             Some(Request::Frame { epoch: e, key, path, meta }) => {
+                served += 1;
                 let result = serve(&decoders, &mut sessions, key, &path, &meta);
                 epoch = e;
                 promise_open = true;
