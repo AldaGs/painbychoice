@@ -22,6 +22,7 @@
 //! omitted.
 
 mod agent;
+mod ops;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,6 +41,14 @@ USAGE:
   motion preview <project.pbc|spec.json> [--frames 0,30,60 | --count n] [--width px] [--out sheet.png]
   motion check <project.pbc|spec.json>
   motion schema      Prints the authoring JSON reference (start here).
+  motion describe [id]               Every capability (ops, effects, nodes, caption
+                                     presets), or one in full with an example.
+  motion query <project.pbc> [--words]
+                                     Compact JSON summary: comps, layers with
+                                     timing, buses, outputs, subtitles.
+  motion apply <project.pbc> <ops.json>
+                                     Run a batch of edit ops atomically and bump
+                                     rev; an open editor takes it as one undo step.
   motion render --demo --out <file|dir> [options]
   motion demo [--out <dir>]
   motion import-ae <export.json|authoring.json> <out.pbc>
@@ -91,6 +100,23 @@ fn main() -> ExitCode {
         },
         Some("check") => exit(check(&args[1..])),
         Some("preview") => exit(preview(&args[1..])),
+        Some("query") => json_out(match &args[1..] {
+            [path] => ops::query(Path::new(path), false),
+            [path, w] if w == "--words" => ops::query(Path::new(path), true),
+            _ => Err("usage: motion query <project.pbc> [--words]".into()),
+        }),
+        Some("apply") => json_out(match &args[1..] {
+            [path, ops] => std::fs::read_to_string(ops)
+                .map_err(|e| format!("reading {ops}: {e}"))
+                .and_then(|t| serde_json::from_str(&t).map_err(|e| format!("{ops}: {e}")))
+                .and_then(|j| ops::apply(Path::new(path), &j)),
+            _ => Err("usage: motion apply <project.pbc> <ops.json>".into()),
+        }),
+        Some("describe") => {
+            let id = args.get(1).filter(|a| !a.ends_with(".pbc"));
+            let project = args.iter().skip(1).find(|a| a.ends_with(".pbc")).and_then(|p| Project::from_pbc(&std::fs::read_to_string(p).ok()?).ok());
+            json_out(ops::describe(id.map(String::as_str), project.as_ref()))
+        }
         Some("schema") => {
             print!("{}", agent::REFERENCE);
             ExitCode::SUCCESS
@@ -112,6 +138,20 @@ fn main() -> ExitCode {
         }
         Some(other) => {
             eprintln!("error: unknown command '{other}'\n\n{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print a command's JSON, or `{ok:false, errors:[...]}` and fail.
+fn json_out(r: Result<serde_json::Value, String>) -> ExitCode {
+    match r {
+        Ok(v) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("{}", serde_json::json!({ "ok": false, "errors": [e] }));
             ExitCode::FAILURE
         }
     }

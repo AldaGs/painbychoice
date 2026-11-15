@@ -120,3 +120,9 @@ The authoring JSON has no sound yet; route sound by editing the `.pbc` (ADR 0026
 - A caption is a text layer with `"subtitles": { "transcript": { "words": [{ "text", "start", "end" }] }, "rules": {...}, "uppercase": true }`. Word times are seconds from the layer's start.
 - Word-time animation: a text animator with `"selector": { "Karaoke": { "cumulative": true, "ramp": 0.3 } }` and `"mode": "Subtract"` holds unspoken words at its offsets (e.g. `"opacity": 0`, `"scale": [40, 40]`) and eases each in over `ramp` seconds as it is said.
 - Presets: project `"captionPresets": [{ "name", "family", "weight", "size", "color", "highlight", "stroke", "outline", "uppercase", "animation", "duration", "y" }]` (Sonant's style fields; sizes are fractions of comp height). Built-ins: `crates/core/src/caption_presets.json`.
+
+## Editing an existing `.pbc` cheaply: query and apply
+- `motion query x.pbc [--words]` gives comps, top-level layers (`id`, `kind`, `in`/`out`/`start` in comp frames, `bus`, `sync`, `subtitles`), buses and outputs. `--words` adds `[text, from, to]` frames per word.
+- `motion apply x.pbc ops.json` takes an array of ops, run in order. All succeed or nothing is written; `rev` goes up by one.
+  `set` (JSON pointer on a layer, or on the project without `layer`), `trim`, `move`, `insert`, `delete`, `razor`, `cut` (removes frames from..to from the whole comp; captions lose those words), `preset` (caption look).
+  `motion describe op` lists them with examples. Optional `"comp": id` on any op; the default is the root.

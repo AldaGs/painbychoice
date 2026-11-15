@@ -3544,6 +3544,11 @@ impl App {
                     // Only on success: a failed save leaves the project where
                     // it was, and a Draft must not aim at a file that isn't
                     // there.
+                    // The entry point an agent finds without being told
+                    // (ADR 0028). Never overwrites one already there.
+                    if let Some(agents) = path.parent().map(|d| d.join("AGENTS.md")).filter(|a| !a.exists()) {
+                        let _ = std::fs::write(agents, include_str!("../../../docs/AGENTS.template.md"));
+                    }
                     self.disk = crate::livelink::Disk::synced(&path, json.clone());
                     self.disk_project = Some(self.project.clone());
                     self.project_path = Some(path);

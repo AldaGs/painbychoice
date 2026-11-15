@@ -17,6 +17,7 @@ pub mod camera;
 pub mod captions;
 pub mod composite;
 pub mod demo;
+pub mod edit;
 pub mod effect;
 pub mod eval;
 pub mod expr;
