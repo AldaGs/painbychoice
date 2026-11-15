@@ -106,6 +106,15 @@ pub(crate) enum EditTool {
 }
 
 impl EditTool {
+    fn glyph(self) -> ToolCursor {
+        match self {
+            EditTool::Select => ToolCursor::Select,
+            EditTool::Razor => ToolCursor::Razor,
+            EditTool::Ripple => ToolCursor::Ripple { start: false },
+            EditTool::Roll => ToolCursor::Roll,
+        }
+    }
+
     const ALL: [EditTool; 4] = [EditTool::Select, EditTool::Razor, EditTool::Ripple, EditTool::Roll];
     fn label(self) -> &'static str {
         match self {
@@ -401,49 +410,137 @@ const SNAP: egui::Color32 = egui::Color32::from_rgb(90, 230, 200);
 
 /// The pointer shapes egui has no icon for, drawn at the mouse with the system
 /// pointer hidden: a blade for the razor, a bracket for a ripple trim (open
-/// toward the clip, arrow the way it pushes), a double bracket for a roll.
+/// toward the clip, arrow the way it pushes), a double bracket for a roll. The
+/// palette's buttons draw the same shapes, plus a select arrow and a magnet.
 #[derive(Clone, Copy, PartialEq)]
 enum ToolCursor {
+    Select,
     Razor,
     Ripple { start: bool },
     Roll,
+    Magnet,
 }
 
-fn tool_cursor(ui: &egui::Ui, kind: ToolCursor, p: egui::Pos2) {
-    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tool_cursor")));
-    let v = |x: f32, y: f32| p + egui::vec2(x, y);
+/// `kind`'s strokes around `p` at `scale` (1 = cursor size, ~20 px tall), and its color.
+fn glyph(kind: ToolCursor, p: egui::Pos2, scale: f32) -> (Vec<[egui::Pos2; 2]>, egui::Color32) {
+    let v = |x: f32, y: f32| p + egui::vec2(x, y) * scale;
     let mut lines: Vec<[egui::Pos2; 2]> = Vec::new();
+    let poly = |pts: &[(f32, f32)], closed: bool, lines: &mut Vec<[egui::Pos2; 2]>| {
+        let n = pts.len();
+        for i in 0..if closed { n } else { n - 1 } {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            lines.push([v(a.0, a.1), v(b.0, b.1)]);
+        }
+    };
     let color = match kind {
+        ToolCursor::Select => {
+            poly(&[(-4.0, -9.0), (-4.0, 6.0), (-0.5, 2.5), (2.0, 8.5), (4.0, 7.5), (1.5, 1.5), (6.0, 1.5)], true, &mut lines);
+            egui::Color32::from_gray(230)
+        }
         ToolCursor::Razor => {
             // A blade: the cutting edge down through the hotspot, a grip above.
-            lines.extend([[v(0.0, -10.0), v(0.0, 10.0)], [v(-4.0, -10.0), v(4.0, -10.0)], [v(-4.0, -10.0), v(-4.0, -4.0)], [v(4.0, -10.0), v(4.0, -4.0)], [v(-4.0, -4.0), v(4.0, -4.0)]]);
+            lines.push([v(0.0, -10.0), v(0.0, 10.0)]);
+            poly(&[(-4.0, -10.0), (4.0, -10.0), (4.0, -4.0), (-4.0, -4.0)], true, &mut lines);
             RAZOR
         }
         ToolCursor::Ripple { start } => {
             let s = if start { 1.0 } else { -1.0 }; // caps point into the clip
-            lines.extend([[v(0.0, -9.0), v(0.0, 9.0)], [v(0.0, -9.0), v(4.0 * s, -9.0)], [v(0.0, 9.0), v(4.0 * s, 9.0)]]);
-            let tip = v(-10.0 * s, 0.0);
-            lines.extend([[v(-2.0 * s, 0.0), tip], [tip, v(-6.0 * s, -4.0)], [tip, v(-6.0 * s, 4.0)]]);
+            poly(&[(4.0 * s, -9.0), (0.0, -9.0), (0.0, 9.0), (4.0 * s, 9.0)], false, &mut lines);
+            lines.push([v(-2.0 * s, 0.0), v(-10.0 * s, 0.0)]);
+            poly(&[(-6.0 * s, -4.0), (-10.0 * s, 0.0), (-6.0 * s, 4.0)], false, &mut lines);
             RIPPLE
         }
         ToolCursor::Roll => {
             for s in [-1.0f32, 1.0] {
                 let x = 2.5 * s;
-                lines.extend([[v(x, -9.0), v(x, 9.0)], [v(x, -9.0), v(x - 4.0 * s, -9.0)], [v(x, 9.0), v(x - 4.0 * s, 9.0)]]);
-                let tip = v(12.0 * s, 0.0);
-                lines.extend([[v(x + 2.0 * s, 0.0), tip], [tip, v(8.0 * s, -4.0)], [tip, v(8.0 * s, 4.0)]]);
+                poly(&[(x - 4.0 * s, -9.0), (x, -9.0), (x, 9.0), (x - 4.0 * s, 9.0)], false, &mut lines);
+                lines.push([v(x + 2.0 * s, 0.0), v(12.0 * s, 0.0)]);
+                poly(&[(8.0 * s, -4.0), (12.0 * s, 0.0), (8.0 * s, 4.0)], false, &mut lines);
             }
             ROLL
         }
+        ToolCursor::Magnet => {
+            // A horseshoe: two legs joined by a half circle, poles at the top.
+            let arc: Vec<(f32, f32)> = (0..=8)
+                .map(|i| {
+                    let a = std::f32::consts::PI * i as f32 / 8.0;
+                    (-6.0 * a.cos(), 1.0 + 6.0 * a.sin())
+                })
+                .collect();
+            let mut u = vec![(-6.0, -8.0)];
+            u.extend(arc);
+            u.push((6.0, -8.0));
+            poly(&u, false, &mut lines);
+            lines.push([v(-8.0, -5.0), v(-4.0, -5.0)]);
+            lines.push([v(4.0, -5.0), v(8.0, -5.0)]);
+            SNAP
+        }
     };
+    (lines, color)
+}
+
+fn stroke_glyph(painter: &egui::Painter, kind: ToolCursor, p: egui::Pos2, scale: f32, color: Option<egui::Color32>) {
+    let (lines, c) = glyph(kind, p, scale);
     // Dark halo first so the shape reads on any bar or waveform.
     for l in &lines {
-        painter.line_segment(*l, egui::Stroke::new(3.5, egui::Color32::from_black_alpha(200)));
+        painter.line_segment(*l, egui::Stroke::new(3.5 * scale, egui::Color32::from_black_alpha(200)));
     }
     for l in &lines {
-        painter.line_segment(*l, egui::Stroke::new(1.5, color));
+        painter.line_segment(*l, egui::Stroke::new(1.5 * scale.max(0.8), color.unwrap_or(c)));
     }
+}
+
+fn tool_cursor(ui: &egui::Ui, kind: ToolCursor, p: egui::Pos2) {
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tool_cursor")));
+    stroke_glyph(&painter, kind, p, 1.0, None);
+}
+
+/// A palette button: the tool's glyph, then its name. Drawn like a selectable
+/// label, so it sits with egui's own controls. Off, the glyph is grey.
+fn glyph_button(ui: &mut egui::Ui, on: bool, kind: ToolCursor, label: &str) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, ui.visuals().text_color());
+    let pad = ui.spacing().button_padding;
+    let icon = 16.0;
+    let size = egui::vec2(pad.x * 2.0 + icon + 4.0 + galley.size().x, (galley.size().y + pad.y * 2.0).max(22.0));
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let vis = ui.style().interact_selectable(&resp, on);
+        if on || resp.hovered() {
+            ui.painter().rect(rect, vis.corner_radius, vis.weak_bg_fill, vis.bg_stroke, egui::StrokeKind::Inside);
+        }
+        let c = egui::pos2(rect.left() + pad.x + icon / 2.0, rect.center().y);
+        let tint = (!on).then(|| egui::Color32::from_gray(150));
+        stroke_glyph(ui.painter(), kind, c, 0.7, tint);
+        let text_pos = egui::pos2(c.x + icon / 2.0 + 4.0, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, vis.text_color());
+    }
+    resp
+}
+
+/// An on/off pill: a track with a knob that slides across, then the label.
+fn pill(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let h = ui.spacing().interact_size.y * 0.8;
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(h * 1.8, h), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+        let vis = ui.style().interact_selectable(&resp, *on);
+        let r = rect.height() / 2.0;
+        ui.painter().rect(rect, r, vis.bg_fill, vis.bg_stroke, egui::StrokeKind::Inside);
+        let x = egui::lerp((rect.left() + r)..=(rect.right() - r), t);
+        ui.painter().circle(egui::pos2(x, rect.center().y), r * 0.75, vis.fg_stroke.color, egui::Stroke::NONE);
+    }
+    let text = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
+    if text.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp | text
 }
 
 /// The magnet: frames an edit snaps to, and whether it is on. Hold Ctrl to
@@ -701,16 +798,19 @@ pub(crate) fn strips_ui(
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         for t in EditTool::ALL {
-            if ui.selectable_label(tool == t, t.label()).on_hover_text(t.hint()).clicked() {
+            if glyph_button(ui, tool == t, t.glyph(), t.label()).on_hover_text(t.hint()).clicked() {
                 tool = t;
             }
         }
         ui.separator();
-        ui.checkbox(&mut packed, "Packed rows")
-            .on_hover_text("Layers that don't overlap share a row, like clips on a track");
+        if glyph_button(ui, magnet, ToolCursor::Magnet, "Magnet")
+            .on_hover_text("Edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.")
+            .clicked()
+        {
+            magnet = !magnet;
+        }
         ui.separator();
-        ui.toggle_value(&mut magnet, "Magnet")
-            .on_hover_text("Edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.");
+        pill(ui, &mut packed, "Packed rows").on_hover_text("Layers that don't overlap share a row, like clips on a track");
     });
     ui.data_mut(|d| {
         d.insert_temp(tool_id, tool);
