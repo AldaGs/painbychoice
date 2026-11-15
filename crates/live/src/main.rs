@@ -73,6 +73,8 @@ mod subtitles;
 mod textanim;
 mod theme;
 mod timeline;
+#[cfg(feature = "libav")]
+mod video;
 #[cfg(test)]
 mod tests;
 

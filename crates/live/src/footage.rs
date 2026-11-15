@@ -171,6 +171,14 @@ pub(crate) struct FootageCache {
     wanted: HashMap<AssetId, i64>,
     bytes: usize,
     epoch: Epoch,
+    /// Whether video is served by the realtime path in [`crate::video`]
+    /// instead of this cache. On for the editor's preview, off for a render
+    /// and for every test that builds a cache of its own — an export reads the
+    /// sidecar, which is the reference the realtime decoder is pinned to.
+    #[cfg(feature = "libav")]
+    pub(crate) realtime: bool,
+    #[cfg(feature = "libav")]
+    pub(crate) video: crate::video::VideoPlayback,
 }
 
 impl FootageCache {
@@ -193,6 +201,10 @@ impl FootageCache {
             wanted: HashMap::new(),
             bytes: 0,
             epoch: 0,
+            #[cfg(feature = "libav")]
+            realtime: false,
+            #[cfg(feature = "libav")]
+            video: Default::default(),
         }
     }
 
@@ -253,6 +265,10 @@ impl FootageCache {
     /// re-requested, so if the UI stopped redrawing it would sit on a stale
     /// picture with nothing scheduled to replace it.
     pub(crate) fn is_busy(&self) -> bool {
+        #[cfg(feature = "libav")]
+        if self.video.is_busy() {
+            return true;
+        }
         !self.inflight.is_empty() || !self.promised.is_empty()
     }
 
@@ -267,6 +283,18 @@ impl FootageCache {
     /// `None` means there is genuinely nothing to show: no frame of this
     /// footage has ever decoded.
     pub(crate) fn image(&mut self, asset: &Asset, paint: ImagePaint) -> Option<(&ImageData, bool)> {
+        #[cfg(feature = "libav")]
+        if self.realtime && asset.kind == motion_core::asset::AssetKind::Video {
+            use crate::video::Lookup;
+            // Looked up twice because a borrow returned from one match arm
+            // would otherwise pin `self` for the fallback below.
+            if !matches!(self.video.image(asset, paint), Lookup::Unavailable) {
+                return match self.video.image(asset, paint) {
+                    Lookup::Ready(image, exact) => Some((image, exact)),
+                    _ => None,
+                };
+            }
+        }
         let key = (paint.asset, paint.source_frame);
         self.wanted.insert(paint.asset, paint.source_frame);
 
@@ -340,6 +368,11 @@ impl FootageCache {
         self.wanted.clear();
         self.epoch += 1;
         self.bytes = 0;
+        // ponytail: the vello overrides of the dropped clips are left behind
+        // (one small map entry and a texture each, per project opened). Pass
+        // the renderer down here if that ever shows up in a profile.
+        #[cfg(feature = "libav")]
+        self.video.clear(None);
         let _ = self.to_worker.send(Request::Reset);
     }
 

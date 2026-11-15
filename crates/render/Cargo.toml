@@ -27,3 +27,10 @@ symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "flac", "vo
 psd = "0.3.5"
 hayro = "0.8.0"
 lopdf = "0.46.0"
+# In-process libav, for realtime preview decode (ADR 0023). Optional: it links
+# FFmpeg's shared libraries, so a build needs FFMPEG_DIR pointing at an FFmpeg
+# SDK and a run needs its DLLs on PATH. Everything else still uses the sidecar.
+ffmpeg-next = { version = "9.1", optional = true, default-features = false, features = ["codec", "format", "software-scaling"] }
+
+[features]
+libav = ["dep:ffmpeg-next"]
