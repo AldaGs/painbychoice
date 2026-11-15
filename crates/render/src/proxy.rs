@@ -48,7 +48,54 @@ pub fn path_for(src: &Path) -> Option<PathBuf> {
 
 /// The proxy for `src`, if one has been made.
 pub fn existing(src: &Path) -> Option<PathBuf> {
-    path_for(src).filter(|p| p.exists())
+    let p = path_for(src).filter(|p| p.exists())?;
+    // Marked used, so pruning drops the proxies nobody has opened longest.
+    let _ = std::fs::File::options().write(true).open(&p).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    Some(p)
+}
+
+/// How much the proxy folder may hold: `PBC_PROXY_MAX_GB`, default 20 GB.
+pub fn budget() -> u64 {
+    let gb = std::env::var("PBC_PROXY_MAX_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(20.0);
+    (gb.max(0.0) * 1e9) as u64
+}
+
+/// Delete the least recently used proxies until the folder fits in
+/// `max_bytes`, plus any half-made `.part` files. Returns (files, bytes) freed.
+/// Nothing else lives in the folder, so nothing else is touched.
+pub fn prune(max_bytes: u64) -> (usize, u64) {
+    let Some(entries) = dir().and_then(|d| std::fs::read_dir(d).ok()) else { return (0, 0) };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let m = e.metadata().ok()?;
+            let ok = m.is_file() && e.path().extension().is_some_and(|x| x == "mov");
+            ok.then_some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    let (mut n, mut freed) = (0, 0);
+    // Half-made files never become proxies; they are only ever litter.
+    files.retain(|(_, len, p)| {
+        let part = p.to_string_lossy().ends_with(".part.mov");
+        if part && std::fs::remove_file(p).is_ok() {
+            n += 1;
+            freed += len;
+        }
+        !part
+    });
+    files.sort();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    for (_, len, p) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total -= len;
+            n += 1;
+            freed += len;
+        }
+    }
+    (n, freed)
 }
 
 /// Whether footage this size is worth a proxy.
@@ -82,6 +129,7 @@ pub fn make(src: &Path) -> Result<PathBuf, String> {
         match cmd.output() {
             Ok(o) if o.status.success() => {
                 std::fs::rename(&part, &out).map_err(|e| e.to_string())?;
+                prune(budget());
                 return Ok(out);
             }
             Ok(o) => last = String::from_utf8_lossy(&o.stderr).trim().to_string(),
@@ -123,6 +171,11 @@ mod tests {
         assert_eq!(b.width, 960.0);
         assert_eq!(a.frames, b.frames, "frame N of the source is frame N of the proxy");
         assert!(wanted(1920.0, 1080.0) && !wanted(960.0, 540.0));
+        // A budget of nothing prunes it, and a stray half-made file with it.
+        std::fs::write(proxy.with_extension("part.mov"), b"x").unwrap();
+        let (n, freed) = prune(0);
+        assert_eq!(n, 2);
+        assert!(freed > 1 && existing(&src).is_none());
         let _ = std::fs::remove_dir_all(&work);
     }
 }

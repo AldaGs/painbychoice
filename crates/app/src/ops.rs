@@ -118,6 +118,14 @@ pub fn query(path: &Path, words: bool) -> Result<J, String> {
 
 /// `motion proxy`: make the preview proxies the editor would make for this
 /// project's video (ADR 0029). `all` includes footage too small to want one.
+/// `motion proxy --prune [GB]`: shrink the proxy folder to `gb` (default:
+/// the usual budget), least recently used first.
+pub fn prune_proxies(gb: Option<f64>) -> Result<J, String> {
+    let max = gb.map_or(motion_render::proxy::budget(), |g| (g.max(0.0) * 1e9) as u64);
+    let (files, bytes) = motion_render::proxy::prune(max);
+    Ok(json!({ "ok": true, "removed": files, "freedBytes": bytes, "dir": motion_render::proxy::dir().map(|d| d.display().to_string()) }))
+}
+
 pub fn proxy(path: &Path, all: bool) -> Result<J, String> {
     let (_, p) = open(path)?;
     let mut made = Vec::new();

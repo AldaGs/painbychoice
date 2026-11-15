@@ -49,6 +49,8 @@ USAGE:
   motion proxy <project.pbc> [--all]
                                      Make the editor's preview proxies for the
                                      project's heavy video (--all: every video).
+  motion proxy --prune [GB]          Shrink the proxy cache to GB (default 20,
+                                     or PBC_PROXY_MAX_GB), least recently used first.
   motion apply <project.pbc> <ops.json>
                                      Run a batch of edit ops atomically and bump
                                      rev; an open editor takes it as one undo step.
@@ -109,6 +111,8 @@ fn main() -> ExitCode {
             _ => Err("usage: motion query <project.pbc> [--words]".into()),
         }),
         Some("proxy") => json_out(match &args[1..] {
+            [p] if p == "--prune" => ops::prune_proxies(None),
+            [p, gb] if p == "--prune" => gb.parse().map_err(|_| "--prune wants gigabytes".to_string()).and_then(|g| ops::prune_proxies(Some(g))),
             [path] => ops::proxy(Path::new(path), false),
             [path, a] if a == "--all" => ops::proxy(Path::new(path), true),
             _ => Err("usage: motion proxy <project.pbc> [--all]".into()),

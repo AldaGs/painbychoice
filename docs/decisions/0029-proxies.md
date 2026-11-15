@@ -35,5 +35,7 @@ background; preview from the proxy, export from the original.
 
 ## Consequences
 
-- Proxies are never cleaned up; delete the cache folder to reclaim space.
+- The folder is capped (20 GB, `PBC_PROXY_MAX_GB`): after each new proxy the
+  least recently used go first, and opening a proxy marks it used. Half-made
+  `.part` files are swept too. `motion proxy --prune [GB]` does the same on demand.
 - A proxy failure is shown in the Assets panel; the original keeps playing.
