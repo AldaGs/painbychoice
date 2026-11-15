@@ -493,6 +493,7 @@ pub(crate) fn loop_bounds(work_area: Option<WorkArea>, total_frames: i64) -> (i6
 /// Fold an absolute playback time `raw` into a loop span `[lo, hi)` (any unit,
 /// here seconds). This is what makes playback cycle within the work area; a
 /// span that collapsed to zero holds at `lo` rather than dividing by it.
+#[cfg(test)]
 pub(crate) fn wrap_into(raw: f64, lo: f64, hi: f64) -> f64 {
     let span = hi - lo;
     if span > 0.0 {

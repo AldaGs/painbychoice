@@ -545,6 +545,7 @@ pub(crate) fn create_layer_from_geometry(
 ///
 /// Free-standing, like [`create_layer_from_geometry`], so the document work is
 /// testable without a window; the caller parents and selects the node.
+#[cfg(test)]
 pub(crate) fn import_footage(
     project: &mut MProject,
     meta: motion_core::AssetMeta,

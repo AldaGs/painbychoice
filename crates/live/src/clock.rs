@@ -34,7 +34,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Where the current time comes from.
 ///
@@ -62,6 +61,7 @@ impl AudioPosition {
 
     /// Called from the **audio callback**. Must stay allocation-free and
     /// lock-free; see the module docs.
+    #[cfg(test)]
     pub(crate) fn advance(&self, sample_frames: i64) {
         self.position.fetch_add(sample_frames, Ordering::Relaxed);
     }

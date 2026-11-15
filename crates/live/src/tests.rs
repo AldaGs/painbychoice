@@ -3,6 +3,7 @@
 //!
 //! Moved verbatim out of `main.rs` when it was split by concern.
 
+use motion_core::Guides;
 use crate::*;
 use motion_core::BinOp;
 
@@ -1031,7 +1032,7 @@ fn one_layer_project() -> (MProject, CompId, NodeId) {
         },
     );
     let comp = Comp::new(100.0, 100.0, MNode::group(0, "root").with_child(child));
-    let mut project = MProject::single(comp);
+    let project = MProject::single(comp);
     let comp_id = project.comps.keys().next().copied().unwrap();
     (project, comp_id, NodeId(1))
 }
