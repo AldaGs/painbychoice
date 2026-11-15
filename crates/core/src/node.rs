@@ -2488,6 +2488,23 @@ impl Project {
         self.comps.get(&id)
     }
 
+    /// Remove layer `id` (and everything inside it) from `comp`: the comp's id
+    /// floor rises past the removed ids and the graph forgets them, so no id is
+    /// reused while something could still name it. The removed layer, if any.
+    pub fn delete_layer(&mut self, comp: CompId, id: NodeId) -> Option<Node> {
+        fn ids(n: &Node, out: &mut Vec<NodeId>) {
+            out.push(n.id);
+            n.children.iter().for_each(|c| ids(c, out));
+        }
+        let c = self.comps.get_mut(&comp)?;
+        let gone = c.root.remove(id)?;
+        let mut all = Vec::new();
+        ids(&gone, &mut all);
+        c.removed_id_floor = c.removed_id_floor.max(all.iter().map(|i| i.0).max().unwrap_or(0) + 1);
+        self.graph.forget_layers(comp, &all);
+        Some(gone)
+    }
+
     pub fn comp_mut(&mut self, id: CompId) -> Option<&mut Comp> {
         self.comps.get_mut(&id)
     }

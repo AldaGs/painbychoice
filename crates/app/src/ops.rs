@@ -258,8 +258,7 @@ fn run(p: &mut Project, op: &J) -> Result<J, String> {
         }
         "delete" => {
             let id = need()?;
-            let gone = c.root.remove(id).ok_or("no such layer")?;
-            c.removed_id_floor = c.removed_id_floor.max(max_id(&gone) + 1);
+            p.delete_layer(comp, id).ok_or("no such layer")?;
             json!({})
         }
         "razor" => {
@@ -277,13 +276,12 @@ fn run(p: &mut Project, op: &J) -> Result<J, String> {
             }
             let fps = c.fps;
             let gone = motion_core::edit::remove_range(&mut c.root, frames, fps, a, b, &mut next);
-            for id in &gone {
-                if let Some(g) = c.root.remove(*id) {
-                    c.removed_id_floor = c.removed_id_floor.max(max_id(&g) + 1);
-                }
-            }
             c.duration_frames = (frames - (b - a)).max(1);
-            json!({ "removed": gone.iter().map(|k| k.0).collect::<Vec<_>>(), "frames": c.duration_frames })
+            let left = c.duration_frames;
+            for id in &gone {
+                p.delete_layer(comp, *id);
+            }
+            json!({ "removed": gone.iter().map(|k| k.0).collect::<Vec<_>>(), "frames": left })
         }
         "preset" => {
             let want = op["name"].as_str().ok_or("missing `name`")?;
@@ -360,13 +358,13 @@ pub fn describe(id: Option<&str>, project: Option<&Project>) -> Result<J, String
 mod tests {
     use super::*;
 
-    fn file() -> std::path::PathBuf {
+    fn file(name: &str) -> std::path::PathBuf {
         let mut a = Node::group(1, "a");
         a.timing = Some(LayerTiming::new(0, 100));
         let mut c = motion_core::node::Comp::new(64.0, 64.0, Node::group(0, "root").with_child(a));
         c.duration_frames = 100;
         let p = Project::single(c);
-        let path = std::env::temp_dir().join(format!("pbc_ops_{}.pbc", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pbc_ops_{name}_{}.pbc", std::process::id()));
         std::fs::write(&path, json!({ "project": p, "rev": 3 }).to_string()).unwrap();
         path
     }
@@ -375,7 +373,7 @@ mod tests {
     /// writes nothing.
     #[test]
     fn apply_is_atomic_and_bumps_rev() {
-        let path = file();
+        let path = file("atomic");
         let ops = json!([
             { "op": "razor", "layer": 1, "at": 40 },
             { "op": "set", "layer": 1, "path": "/name", "value": "left" },
@@ -392,6 +390,23 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
         assert!(apply(&path, &json!([{ "op": "set", "layer": 1, "path": "/name", "value": "x" }, { "op": "delete", "layer": 99 }])).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "nothing written");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `apply delete` leaves no graph node naming the deleted layer, as the
+    /// editor's delete doesn't.
+    #[test]
+    fn delete_untargets_the_graph() {
+        let path = file("delete");
+        let (_, mut p) = open(&path).unwrap();
+        let osc = p.graph.add_node("osc", kurbo::Vec2::ZERO);
+        let sink = p.graph.bind_output(motion_core::graph::Endpoint::new(osc, "value"), p.root, NodeId(1), motion_core::expr::PropPath::Rotation);
+        std::fs::write(&path, json!({ "project": p, "rev": 0 }).to_string()).unwrap();
+        apply(&path, &json!([{ "op": "delete", "layer": 1 }])).unwrap();
+        let (_, p) = open(&path).unwrap();
+        let cfg = &p.graph.node(sink).unwrap().config;
+        assert!(cfg.out_target.is_none() && cfg.out_comp.is_none(), "the sink no longer names layer 1");
+        assert!(p.graph.bindings().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

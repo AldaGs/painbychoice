@@ -24,9 +24,9 @@ agents find on their own.
    takes it as one undo step (ADR 0024).
 3. **Timeline edits moved to `motion_core::edit`.** Razor, ripple, roll,
    sync and range removal are pure functions over a comp root, so the CLI and
-   the editor share one implementation. The editor keeps only its `Op` enum,
-   whose deletes also untarget node-graph sinks. **`apply delete` does not**
-   untarget them; a dangling target resolves to nothing.
+   the editor share one implementation. The editor keeps only its `Op` enum.
+   Deleting a layer is `Project::delete_layer` for both, which also raises the
+   id floor and untargets node-graph sinks and refs that named it.
 4. **`motion describe` is generated, not written**: edit ops (with an
    example), every effect (`EffectType::ALL` with its seed as the example),
    every graph node (`NodeRegistry`), and the caption presets, including a

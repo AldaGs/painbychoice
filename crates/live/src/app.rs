@@ -356,14 +356,7 @@ pub(crate) fn retarget_ref(
     comp: CompId,
     target: Option<(NodeId, PropPath, f64)>,
 ) {
-    let Some(n) = graph.node_mut(id) else { return };
-    let before = n.config.ref_target.map(|(_, p, _)| p);
-    n.config.ref_target = target;
-    n.config.ref_comp = target.map(|_| comp);
-    let kind_of = |p: Option<PropPath>| p.map(|p| p.socket_type());
-    if kind_of(before) != kind_of(target.map(|(_, p, _)| p)) {
-        graph.disconnect_output(&Endpoint::new(id, "value"));
-    }
+    graph.retarget_ref(id, comp, target);
 }
 
 /// Lowering is frame-independent (it builds the recipe, it doesn't sample it),
@@ -1148,13 +1141,7 @@ pub(crate) fn fresh_id(comp: &Comp) -> u64 {
 /// Returns whether anything was removed. A free fn, like [`split_shape`], so
 /// it's testable without a window.
 pub(crate) fn delete_layer(project: &mut MProject, comp: CompId, id: NodeId) -> bool {
-    let Some(c) = project.comps.get_mut(&comp) else { return false };
-    let Some(gone) = c.root.remove(id) else { return false };
-    c.removed_id_floor = c.removed_id_floor.max(max_id(&gone) + 1);
-    let mut ids = Vec::new();
-    crate::gizmo::collect_ids(&gone, &mut ids);
-    forget_layers(&mut project.graph, comp, &ids);
-    true
+    project.delete_layer(comp, id).is_some()
 }
 
 /// Untarget every sink and ref in `graph` that names one of `ids` in `comp`.
@@ -1162,33 +1149,7 @@ pub(crate) fn delete_layer(project: &mut MProject, comp: CompId, id: NodeId) -> 
 /// sink's socket is typed by its property, so its input wire is dropped, and a
 /// ref goes through [`retarget_ref`].
 fn forget_layers(graph: &mut NodeGraph, comp: CompId, ids: &[NodeId]) {
-    let named = |t: NodeId| ids.contains(&t);
-    let mut outs = Vec::new();
-    let mut refs = Vec::new();
-    for n in &mut graph.nodes {
-        let c = &mut n.config;
-        if c.out_comp == Some(comp) {
-            if c.out_target.is_some_and(|(t, _)| named(t)) {
-                c.out_target = None;
-                outs.push(n.id);
-            }
-            if c.out_shape.is_some_and(named) {
-                c.out_shape = None;
-            }
-            if c.out_target.is_none() && c.out_shape.is_none() {
-                c.out_comp = None;
-            }
-        }
-        if c.ref_comp == Some(comp) && c.ref_target.is_some_and(|(t, _, _)| named(t)) {
-            refs.push(n.id);
-        }
-    }
-    for id in outs {
-        graph.disconnect_input(&Endpoint::new(id, "value"));
-    }
-    for id in refs {
-        retarget_ref(graph, id, comp, None);
-    }
+    graph.forget_layers(comp, ids);
 }
 
 impl App {

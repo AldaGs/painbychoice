@@ -444,6 +444,53 @@ pub struct NodeGraph {
 }
 
 impl NodeGraph {
+    /// Point ref node `id` at `target` in `comp` (or at nothing). Its output
+    /// wire goes when the property's socket type changes, since the wire was
+    /// typed by the old one.
+    pub fn retarget_ref(&mut self, id: GraphNodeId, comp: CompId, target: Option<(NodeId, PropPath, f64)>) {
+        let Some(n) = self.node_mut(id) else { return };
+        let before = n.config.ref_target.map(|(_, p, _)| p);
+        n.config.ref_target = target;
+        n.config.ref_comp = target.map(|_| comp);
+        let kind_of = |p: Option<PropPath>| p.map(|p| p.socket_type());
+        if kind_of(before) != kind_of(target.map(|(_, p, _)| p)) {
+            self.disconnect_output(&Endpoint::new(id, "value"));
+        }
+    }
+
+    /// Untarget every sink and ref that names one of `ids` in `comp` — the
+    /// graph's half of deleting layers, so no node goes on naming an id that
+    /// could later be handed to something else.
+    pub fn forget_layers(&mut self, comp: CompId, ids: &[NodeId]) {
+        let named = |t: NodeId| ids.contains(&t);
+        let mut outs = Vec::new();
+        let mut refs = Vec::new();
+        for n in &mut self.nodes {
+            let c = &mut n.config;
+            if c.out_comp == Some(comp) {
+                if c.out_target.is_some_and(|(t, _)| named(t)) {
+                    c.out_target = None;
+                    outs.push(n.id);
+                }
+                if c.out_shape.is_some_and(named) {
+                    c.out_shape = None;
+                }
+                if c.out_target.is_none() && c.out_shape.is_none() {
+                    c.out_comp = None;
+                }
+            }
+            if c.ref_comp == Some(comp) && c.ref_target.is_some_and(|(t, _, _)| named(t)) {
+                refs.push(n.id);
+            }
+        }
+        for id in outs {
+            self.disconnect_input(&Endpoint::new(id, "value"));
+        }
+        for id in refs {
+            self.retarget_ref(id, comp, None);
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
