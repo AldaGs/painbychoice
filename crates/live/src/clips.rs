@@ -207,6 +207,9 @@ pub(crate) enum Op {
     Sync(NodeId, NodeId),
     /// Take a layer out of its sync group.
     Unsync(NodeId),
+    /// Remove comp frames `a..b` from every top-level layer and close the gap
+    /// (text-based cutting, ADR 0027).
+    RemoveRange(i64, i64),
 }
 
 /// Apply `op` to comp `comp`. Returns whether the document changed.
@@ -251,7 +254,66 @@ pub(crate) fn run(project: &mut crate::MProject, comp: crate::CompId, op: Op, ne
             hit
         }
         Op::Unsync(id) => root.children.iter_mut().find(|n| n.id == id).is_some_and(|n| n.sync.take().is_some()),
+        Op::RemoveRange(a, b) => {
+            let fps = c.fps;
+            let gone = remove_range(root, frames, fps, a, b, next_id);
+            if b > a {
+                c.duration_frames = (frames - (b - a)).max(1);
+            }
+            for id in &gone {
+                crate::app::delete_layer(project, comp, *id);
+            }
+            b > a
+        }
     }
+}
+
+/// Cut comp frames `a..b` out of every top-level layer and pull what follows
+/// left by `b - a`. Layers crossing an edge are razored there; a subtitled
+/// layer is not split but loses the words spoken in the range, later words
+/// moving up. Returns the layers now wholly inside the range, for the caller
+/// to delete.
+pub(crate) fn remove_range(root: &mut MNode, frames: i64, fps: f64, a: i64, b: i64, next: &mut u64) -> Vec<NodeId> {
+    if b <= a {
+        return Vec::new();
+    }
+    let d = b - a;
+    let window = |n: &MNode| n.timing.unwrap_or(LayerTiming::new(0, frames));
+    for f in [a, b] {
+        let ids: Vec<NodeId> = root
+            .children
+            .iter()
+            .filter(|n| n.subtitles.is_none() && window(n).in_ < f && f < window(n).out)
+            .map(|n| n.id)
+            .collect();
+        razor(root, frames, &ids, f, next);
+    }
+    let mut gone = Vec::new();
+    for n in root.children.iter_mut() {
+        if let Some(s) = n.subtitles.as_mut() {
+            let start = n.timing.map_or(0, |t| t.start);
+            let (la, lb) = ((a - start) as f64 / fps, (b - start) as f64 / fps);
+            s.transcript.words.retain(|w| !((la..lb).contains(&((w.start + w.end) / 2.0))));
+            for w in s.transcript.words.iter_mut().filter(|w| w.start >= lb) {
+                (w.start, w.end) = (w.start - (lb - la), w.end - (lb - la));
+            }
+            if let Some(t) = n.timing.as_mut() {
+                if t.in_ >= b {
+                    *t = shift(*t, -d);
+                } else if t.out > a {
+                    t.out = (t.out - d).max(a.max(t.in_ + MIN));
+                }
+            }
+            continue;
+        }
+        let t = window(n);
+        if t.in_ >= a && t.out <= b {
+            gone.push(n.id);
+        } else if t.in_ >= b {
+            n.timing = Some(shift(t, -d));
+        }
+    }
+    gone
 }
 
 // --- applying ------------------------------------------------------------------
@@ -445,5 +507,36 @@ mod tests {
         assert!(r.children[0].sync.is_some() && r.children[0].sync == r.children[1].sync);
         assert!(run(&mut project, id, Op::Unsync(NodeId(4)), &mut next));
         assert!(!run(&mut project, id, Op::Unsync(NodeId(4)), &mut next));
+    }
+
+    /// Cutting frames 20..30 razors the layers crossing them, drops the piece
+    /// inside, pulls later content left, and takes the words out of a
+    /// subtitled layer without splitting it.
+    #[test]
+    fn removing_a_range_cuts_everything_and_the_words() {
+        use motion_core::subs::{Subtitles, Transcript, Word};
+        let word = |t: &str, s: f64, e: f64| Word { text: t.into(), start: s, end: e, p: None, brk: Default::default(), locked: false };
+        let mut root = MNode::group(0, "root");
+        let mut a = MNode::group(1, "a");
+        a.timing = Some(lt(0, 50));
+        let mut b = MNode::group(2, "b");
+        b.timing = Some(lt(40, 20));
+        let mut cap = MNode::group(3, "cap");
+        cap.subtitles = Some(Subtitles {
+            transcript: Transcript { language: None, words: vec![word("keep", 0.0, 1.0), word("cut", 2.0, 3.0), word("moved", 4.0, 5.0)] },
+            rules: Default::default(),
+            uppercase: false,
+        });
+        root.children = vec![a, b, cap];
+        let mut next = 10;
+        let gone = remove_range(&mut root, 100, 10.0, 20, 30, &mut next);
+        assert_eq!(gone, vec![NodeId(10)], "a's middle piece is wholly inside");
+        assert_eq!(root.children[0].timing.unwrap().out, 20);
+        let tail = root.children.iter().find(|n| n.id == NodeId(11)).unwrap().timing.unwrap();
+        assert_eq!((tail.in_, tail.out, tail.start), (20, 40, -10), "content keeps its place in the source");
+        assert_eq!(root.children.iter().find(|n| n.id == NodeId(2)).unwrap().timing.unwrap().in_, 30);
+        let words = &root.children.iter().find(|n| n.id == NodeId(3)).unwrap().subtitles.as_ref().unwrap().transcript.words;
+        assert_eq!(words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), ["keep", "moved"]);
+        assert_eq!(words[1].start, 3.0);
     }
 }

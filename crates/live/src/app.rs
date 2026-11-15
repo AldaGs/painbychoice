@@ -101,6 +101,8 @@ pub(crate) struct App {
     pub(crate) subs_ui: crate::subtitles::SubsUi,
     /// A transcription running in the background.
     pub(crate) subs_job: Option<crate::subtitles::SubsJob>,
+    /// A whisper model downloading on its own thread.
+    pub(crate) model_dl: Option<std::thread::JoinHandle<Result<std::path::PathBuf, String>>>,
     /// Every system font family, gathered once at startup. Enumerating the
     /// system collection is far too slow to redo per frame, and the list can't
     /// system collection is far too slow to redo per frame, and the list can't
@@ -1244,6 +1246,7 @@ impl App {
             comp_name_buf: String::new(),
             subs_ui: Default::default(),
             subs_job: None,
+            model_dl: None,
             canvas_rect: None,
             nav: CanvasNav::default(),
             pan_drag: None,
@@ -1314,7 +1317,7 @@ impl App {
     /// index: a selected layer the step deletes, a comp that no longer exists,
     /// the id counter, and keyframe references (a `KeyRef` is an index, so a
     /// step that adds or merges keys shifts what it names).
-    fn after_history_jump(&mut self) {
+    pub(crate) fn after_history_jump(&mut self) {
         // An open comp that the step removes would leave `doc()` panicking, so
         // fall back to the root rather than to the missing id.
         if self.project.comp(self.current).is_none() {
@@ -4383,6 +4386,8 @@ impl App {
             timebase: self.doc().timebase(),
             progress: self.subs_job.as_ref().map(|j| j.progress.load(std::sync::atomic::Ordering::Relaxed)),
             playing: self.playing,
+            no_model: (self.model_dl.is_some() || !motion_render::transcribe::has_model()).then_some(self.model_dl.is_some()),
+            presets: motion_core::captions::builtin().iter().cloned().chain(self.project.caption_presets.iter().cloned()).collect(),
         };
         // Comps for the switcher, in id order (which is creation order).
         let comp_entries: Vec<CompEntry> = self

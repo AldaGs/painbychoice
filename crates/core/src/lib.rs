@@ -14,6 +14,7 @@ pub mod asset;
 mod author;
 pub mod audio;
 pub mod camera;
+pub mod captions;
 pub mod composite;
 pub mod demo;
 pub mod effect;

@@ -343,7 +343,7 @@ impl SelectorKind {
                 script: "selectorValue * textIndex / textTotal".to_string(),
                 amount: Value::constant(100.0),
             },
-            SelectorKind::Karaoke => TextSelector::Karaoke { cumulative: false },
+            SelectorKind::Karaoke => TextSelector::Karaoke { cumulative: false, ramp: 0.0 },
         }
     }
 }
@@ -524,6 +524,7 @@ pub(crate) enum SelOp {
     Seed(u32),
     Correlation(f64),
     Cumulative(bool),
+    Ramp(f64),
     Stagger { step: f64, shift: f64, reverse: bool },
     Script(String),
     Remove,
@@ -677,8 +678,12 @@ fn edit_selector(a: &mut TextAnimator, k: usize, op: &SelOp) -> bool {
             TextSelector::Wiggly { correlation, .. } => *correlation = c.clamp(0.0, 100.0),
             _ => return false,
         },
+        &SelOp::Ramp(r) => match s {
+            TextSelector::Karaoke { ramp, .. } => *ramp = r.max(0.0),
+            _ => return false,
+        },
         &SelOp::Cumulative(c) => match s {
-            TextSelector::Karaoke { cumulative } => *cumulative = c,
+            TextSelector::Karaoke { cumulative, .. } => *cumulative = c,
             _ => return false,
         },
         &SelOp::Stagger { step: st, shift: sh, reverse: r } => match s {
@@ -947,11 +952,18 @@ fn selector_settings(ui: &mut egui::Ui, i: usize, k: usize, sel: &TextSelector, 
             ui.label("");
             ui.end_row();
         }
-        TextSelector::Karaoke { cumulative } => {
+        TextSelector::Karaoke { cumulative, ramp } => {
             ui.label("  Cumulative");
             let mut c = *cumulative;
             if ui.checkbox(&mut c, "").on_hover_text("Keep every word spoken so far selected").changed() {
                 set(edits, SelOp::Cumulative(c));
+            }
+            ui.label("");
+            ui.end_row();
+            ui.label("  Ramp");
+            let mut r = *ramp;
+            if ui.add(egui::DragValue::new(&mut r).range(0.0..=2.0).speed(0.01).suffix(" s")).on_hover_text("Each word eases in over this long from when it is spoken; 0 is a step").changed() {
+                set(edits, SelOp::Ramp(r));
             }
             ui.label("");
             ui.end_row();

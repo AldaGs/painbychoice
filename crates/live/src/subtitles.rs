@@ -18,6 +18,8 @@ use crate::*;
 #[derive(Default)]
 pub(crate) struct SubsEdits {
     pub(crate) transcribe: bool,
+    /// Fetch the base whisper model.
+    pub(crate) download: bool,
     pub(crate) cancel: bool,
     pub(crate) rules: Option<Rules>,
     pub(crate) words: Option<Vec<Word>>,
@@ -25,6 +27,10 @@ pub(crate) struct SubsEdits {
     pub(crate) karaoke: Option<([f32; 3], bool)>,
     /// Comp frame.
     pub(crate) seek: Option<i64>,
+    /// Bake this caption look into the layer.
+    pub(crate) preset: Option<motion_core::captions::CaptionStyle>,
+    /// Comp frame ranges to cut out of the whole comp, in order.
+    pub(crate) cut: Vec<(i64, i64)>,
 }
 
 /// A transcription running on its own thread.
@@ -43,6 +49,9 @@ pub(crate) struct SubsUi {
     /// The subtitle lit last frame, to scroll only when it changes.
     shown: Option<usize>,
     pub(crate) status: String,
+    /// Cut mode: clicking a word picks it instead of seeking.
+    cutting: bool,
+    picked: std::collections::BTreeSet<usize>,
 }
 
 /// What the panel reads.
@@ -53,9 +62,13 @@ pub(crate) struct SubsView<'a> {
     pub(crate) frame: i64,
     pub(crate) timebase: Timebase,
     pub(crate) progress: Option<u32>,
+    /// No whisper model is installed; `true` while one downloads.
+    pub(crate) no_model: Option<bool>,
     /// Follow the lit subtitle only while playing: a click that seeks must not
     /// scroll the list out from under a double-click.
     pub(crate) playing: bool,
+    /// Built-in caption looks, then the project's own.
+    pub(crate) presets: Vec<motion_core::captions::CaptionStyle>,
 }
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(70, 140, 255);
@@ -81,6 +94,18 @@ pub(crate) fn subs_ui(ui: &mut egui::Ui, v: &SubsView, st: &mut SubsUi, out: &mu
                 .on_hover_text("Runs whisper on the comp's mixed audio. With a text layer selected, it fills that layer; otherwise it makes a new one.")
                 .clicked();
         }
+    }
+    match v.no_model {
+        Some(true) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Downloading the whisper model…");
+            });
+        }
+        Some(false) => {
+            out.download |= ui.button("Download whisper model (base, 142 MB)").on_hover_text("Into %APPDATA%\\ae-autosubs-whisper\\models. Larger models (small, large-v3-turbo) are better; drop them in the same folder.").clicked();
+        }
+        None => {}
     }
     if !st.status.is_empty() {
         ui.label(egui::RichText::new(&st.status).small().weak());
@@ -114,6 +139,23 @@ pub(crate) fn subs_ui(ui: &mut egui::Ui, v: &SubsView, st: &mut SubsUi, out: &mu
     if r != s.rules {
         out.rules = Some(r);
     }
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("caption_preset").selected_text("Caption look…").show_ui(ui, |ui| {
+            for p in &v.presets {
+                if ui.selectable_label(false, &p.name).on_hover_text(format!("{} · {}", p.family, p.animation)).clicked() {
+                    out.preset = Some(p.clone());
+                }
+            }
+        });
+        if ui.selectable_label(st.cutting, "✂ Cut words").on_hover_text("Pick words, then cut: that time leaves the whole comp, footage included. Undo restores it.").clicked() {
+            st.cutting = !st.cutting;
+            st.picked.clear();
+        }
+        if st.cutting && !st.picked.is_empty() && ui.button(format!("Cut {} word(s)", st.picked.len())).clicked() {
+            out.cut = cut_ranges(&s.transcript.words, &st.picked, start, &v.timebase);
+            st.picked.clear();
+        }
+    });
     if let Some((mut rgb, mut cumulative)) = karaoke {
         ui.horizontal(|ui| {
             ui.label("Highlight");
@@ -168,13 +210,19 @@ fn block(ui: &mut egui::Ui, v: &SubsView, st: &mut SubsUi, out: &mut SubsEdits, 
                 for i in line.clone() {
                     let w = &words[i];
                     let mut t = egui::RichText::new(&w.text);
-                    if active == Some(i) {
+                    if st.picked.contains(&i) {
+                        t = t.strikethrough().color(egui::Color32::from_rgb(240, 80, 80));
+                    } else if active == Some(i) {
                         t = t.color(egui::Color32::BLACK).background_color(KARAOKE);
                     } else if w.p.is_some_and(|p| p < 0.5) {
                         t = t.color(SHAKY).underline();
                     }
                     let r = ui.add(egui::Label::new(t).sense(egui::Sense::click()));
-                    if r.clicked() {
+                    if r.clicked() && st.cutting {
+                        if !st.picked.remove(&i) {
+                            st.picked.insert(i);
+                        }
+                    } else if r.clicked() {
                         out.seek = Some(start + v.timebase.seconds_to_frames(w.start));
                     }
                     open |= r.double_clicked();
@@ -242,10 +290,25 @@ fn editor(ui: &mut egui::Ui, st: &mut SubsUi, out: &mut SubsEdits, words: &[Word
     }
 }
 
+/// Picked words as comp frame ranges, last first so cutting one leaves the
+/// earlier ones where they are. A run reaches the next word's start, so the
+/// pause after it goes too.
+fn cut_ranges(words: &[Word], picked: &std::collections::BTreeSet<usize>, start: i64, tb: &Timebase) -> Vec<(i64, i64)> {
+    let f = |s: f64| start + tb.seconds_to_frames(s);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &i in picked.iter().filter(|&&i| i < words.len()) {
+        match runs.last_mut() {
+            Some(r) if r.1 + 1 == i => r.1 = i,
+            _ => runs.push((i, i)),
+        }
+    }
+    runs.iter().rev().map(|&(a, b)| (f(words[a].start), words.get(b + 1).map_or(f(words[b].end), |n| f(n.start)))).collect()
+}
+
 /// The color and cumulative of a layer's first Karaoke animator.
 pub(crate) fn karaoke_of(node: &MNode) -> Option<([f32; 3], bool)> {
     node.text_animators.iter().find_map(|a| match (&a.selector, &a.fill) {
-        (motion_core::node::TextSelector::Karaoke { cumulative }, Some(f)) => {
+        (motion_core::node::TextSelector::Karaoke { cumulative, .. }, Some(f)) => {
             let c = f.resolve(&mut motion_core::expr::EvalCtx::at(0.0));
             Some(([c.r as f32, c.g as f32, c.b as f32], *cumulative))
         }
@@ -257,7 +320,7 @@ pub(crate) fn karaoke_of(node: &MNode) -> Option<([f32; 3], bool)> {
 pub(crate) fn set_karaoke(node: &mut MNode, rgb: [f32; 3], cumulative: bool) {
     use motion_core::node::{TextAnimator, TextSelector, TextUnit};
     let fill = Some(Value::constant(motion_core::Color::rgb(rgb[0] as f64, rgb[1] as f64, rgb[2] as f64)));
-    let selector = TextSelector::Karaoke { cumulative };
+    let selector = TextSelector::Karaoke { cumulative, ramp: 0.0 };
     match node.text_animators.iter_mut().find(|a| matches!(a.selector, TextSelector::Karaoke { .. })) {
         Some(a) => (a.selector, a.fill) = (selector, fill),
         None => node.text_animators.push(TextAnimator { selector, fill, ..TextAnimator::new(TextUnit::Words) }),
@@ -324,6 +387,16 @@ impl App {
                 j.cancel.store(true, Ordering::Relaxed);
             }
         }
+        if e.download && self.model_dl.is_none() {
+            self.model_dl = Some(std::thread::spawn(|| motion_render::transcribe::download_model("base")));
+        }
+        if self.model_dl.as_ref().is_some_and(|h| h.is_finished()) {
+            self.subs_ui.status = match self.model_dl.take().unwrap().join() {
+                Ok(Ok(p)) => format!("Model saved to {}", p.display()),
+                Ok(Err(m)) => m,
+                Err(_) => "the download thread panicked".into(),
+            };
+        }
         if e.transcribe && self.subs_job.is_none() {
             // Into the selected text layer, else a new one at the top.
             let text = self.selected.filter(|id| matches!(self.doc().root.find(*id).and_then(|n| n.shape.as_ref()), Some(MShape::Text { .. })));
@@ -355,15 +428,27 @@ impl App {
                     self.subs_ui.status = format!("{} words{}", t.words.len(), t.language.as_ref().map_or(String::new(), |l| format!(" · {l}")));
                     if let Some(n) = self.doc_mut().root.find_mut(id) {
                         let rules = n.subtitles.take().map(|s| s.rules).unwrap_or_default();
-                        n.subtitles = Some(Subtitles { transcript: t, rules });
+                        n.subtitles = Some(Subtitles { transcript: t, rules, uppercase: false });
                         dirty = true;
                     }
                 }
                 Err(m) => self.subs_ui.status = m,
             }
         }
+        for (a, b) in e.cut {
+            if crate::clips::run(&mut self.project, self.current, crate::clips::Op::RemoveRange(a, b), &mut self.next_id) {
+                self.after_history_jump();
+                self.publish_mix();
+                dirty = true;
+            }
+        }
+        let (w, h) = (self.doc().width, self.doc().height);
         let Some(id) = self.selected else { return dirty };
         let Some(n) = self.doc_mut().root.find_mut(id) else { return dirty };
+        if let Some(style) = &e.preset {
+            motion_core::captions::apply(n, style, w, h);
+            dirty = true;
+        }
         if let Some((rgb, cumulative)) = e.karaoke {
             set_karaoke(n, rgb, cumulative);
             dirty = true;
@@ -379,5 +464,21 @@ impl App {
             }
         }
         dirty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Adjacent picks join into one run that takes the pause after it; runs
+    /// come back last first.
+    #[test]
+    fn picked_words_become_frame_ranges() {
+        let w = |s: f64, e: f64| super::Word { text: "w".into(), start: s, end: e, p: None, brk: Default::default(), locked: false };
+        let words = [w(0.0, 0.5), w(1.0, 1.5), w(2.0, 2.5), w(3.0, 3.5)];
+        let picked = [1, 2, 3].into_iter().collect();
+        let r = super::cut_ranges(&words, &picked, 0, &super::Timebase::new(10.0));
+        assert_eq!(r, vec![(10, 35)]);
+        let picked = [0, 2].into_iter().collect();
+        assert_eq!(super::cut_ranges(&words, &picked, 0, &super::Timebase::new(10.0)), vec![(20, 30), (0, 10)]);
     }
 }

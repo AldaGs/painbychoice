@@ -236,20 +236,35 @@ pub struct Subtitles {
     pub transcript: Transcript,
     #[serde(default)]
     pub rules: Rules,
+    /// Show the words in capitals; the transcript keeps its own case.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uppercase: bool,
 }
 
 impl Subtitles {
     /// The text on screen at local `frame` (empty between subtitles), and the
     /// karaoke word's index within it.
     pub fn at(&self, frame: f64, fps: f64) -> (String, Option<usize>) {
+        let (text, active, _) = self.shown(frame, fps);
+        (text, active)
+    }
+
+    /// [`Self::at`], plus how long ago (seconds) each shown word was spoken —
+    /// negative for one still to come. What a word-time selector ramps on.
+    pub fn shown(&self, frame: f64, fps: f64) -> (String, Option<usize>, Vec<f64>) {
         let tb = Timebase::new(fps);
         let words = &self.transcript.words;
         // ponytail: lays out the whole transcript every frame, O(words); cache on (words, rules, fps) if long ones get slow
         let subs = layout(words, &self.rules, &tb);
         let frame = frame.floor() as i64;
+        let t = frame as f64 / fps.max(1e-9);
         match at(&subs, frame) {
-            Some(s) => (s.text(words), s.active_word(words, frame, &tb).map(|i| i - s.words.start)),
-            None => (String::new(), None),
+            Some(s) => (
+                if self.uppercase { s.text(words).to_uppercase() } else { s.text(words) },
+                s.active_word(words, frame, &tb).map(|i| i - s.words.start),
+                words[s.words.clone()].iter().map(|w| t - w.start).collect(),
+            ),
+            None => (String::new(), None, Vec::new()),
         }
     }
 }

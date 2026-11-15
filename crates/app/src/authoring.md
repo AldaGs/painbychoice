@@ -115,3 +115,8 @@ The authoring JSON has no sound yet; route sound by editing the `.pbc` (ADR 0026
 - `motion render x.pbc --out dlg.wav --output stem_dlg` writes that stem (`--output` also takes a bus id).
   `.wav` writes sound only; a video takes the stem as its soundtrack.
 - `motion preview` reports `audio.mix` and `audio.buses[]`: `lufs`, `peakDb`, `clipped`, `silent`.
+
+## Captions (in a `.pbc`)
+- A caption is a text layer with `"subtitles": { "transcript": { "words": [{ "text", "start", "end" }] }, "rules": {...}, "uppercase": true }`. Word times are seconds from the layer's start.
+- Word-time animation: a text animator with `"selector": { "Karaoke": { "cumulative": true, "ramp": 0.3 } }` and `"mode": "Subtract"` holds unspoken words at its offsets (e.g. `"opacity": 0`, `"scale": [40, 40]`) and eases each in over `ramp` seconds as it is said.
+- Presets: project `"captionPresets": [{ "name", "family", "weight", "size", "color", "highlight", "stroke", "outline", "uppercase", "animation", "duration", "y" }]` (Sonant's style fields; sizes are fractions of comp height). Built-ins: `crates/core/src/caption_presets.json`.

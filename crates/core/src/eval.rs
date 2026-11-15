@@ -536,10 +536,10 @@ fn walk(
     if let Some(shape) = &node.shape {
         // A subtitled text layer shows this frame's subtitle in place of its
         // content, and remembers which word is being spoken for karaoke.
-        let sub = node.subtitles.as_ref().filter(|_| matches!(shape, NodeShape::Text { .. })).map(|s| s.at(ctx.frame, ctx.comp_fps()));
+        let sub = node.subtitles.as_ref().filter(|_| matches!(shape, NodeShape::Text { .. })).map(|s| s.shown(ctx.frame, ctx.comp_fps()));
         let subbed;
         let shape = match (&sub, shape) {
-            (Some((text, _)), NodeShape::Text { .. }) => {
+            (Some((text, _, _)), NodeShape::Text { .. }) => {
                 let mut s = shape.clone();
                 if let NodeShape::Text { content, .. } = &mut s {
                     *content = crate::value::Value::constant(text.clone());
@@ -549,7 +549,8 @@ fn walk(
             }
             _ => shape,
         };
-        let active = sub.and_then(|s| s.1);
+        let active = sub.as_ref().and_then(|s| s.1);
+        let spoken = sub.map(|s| s.2).unwrap_or_default();
         let path = trimmed(node, shape.to_path(ctx), ctx);
         let image = shape.image_paint(ctx);
         let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
@@ -595,7 +596,7 @@ fn walk(
                     });
                 }
                 None if animated => {
-                    let mut pieces = animated_text(node, shape, ctx, active, fill, stroke);
+                    let mut pieces = animated_text(node, shape, ctx, active, &spoken, fill, stroke);
                     // Per-character 3D: each glyph's world matrix, and its
                     // depth in view space, so far glyphs draw first.
                     // A tipped layer projects every glyph, 3D or not.
@@ -960,6 +961,16 @@ struct TextPiece {
     stroke: Option<(Color, f64)>,
 }
 
+/// A Karaoke selector's value for word `i`: `active` the spoken word,
+/// `since` how long ago word `i` was spoken (seconds).
+fn karaoke(active: Option<usize>, since: Option<f64>, i: usize, cumulative: bool, ramp: f64) -> f64 {
+    let on = matches!(active, Some(w) if i == w || (cumulative && i < w));
+    match since {
+        Some(t) if on && ramp > 0.0 => (t / ramp).clamp(0.0, 1.0),
+        _ => f64::from(u8::from(on)),
+    }
+}
+
 /// A text shape with text animators, as runs of consecutive glyphs that share
 /// one transform, opacity, fill and stroke: each is drawn as its own item.
 /// `active` is the subtitle's karaoke word; `fill` and `stroke` the layer's own.
@@ -968,6 +979,7 @@ fn animated_text(
     shape: &NodeShape,
     ctx: &mut EvalCtx,
     active: Option<usize>,
+    spoken: &[f64],
     fill: Option<Color>,
     stroke: Option<(Color, f64)>,
 ) -> Vec<TextPiece> {
@@ -1071,9 +1083,8 @@ fn animated_text(
     for (gi, g) in glyphs.iter().enumerate() {
         for (ai, a) in node.text_animators.iter().enumerate() {
             let Some(i) = unit_of(g, a.based_on) else { continue };
-            let s = a.selection(i, count(a.based_on), ctx, |cumulative| match active {
-                Some(w) if i == w || (cumulative && i < w) => 1.0,
-                _ => 0.0,
+            let s = a.selection(i, count(a.based_on), ctx, |cumulative, ramp| {
+                karaoke(active, spoken.get(i).copied(), i, cumulative, ramp)
             });
             sel[gi][ai] = s;
             extra[gi] += props[ai].tracking * s * size / 1000.0;
@@ -2664,10 +2675,11 @@ mod tests {
         layer.subtitles = Some(Subtitles {
             transcript: Transcript { language: None, words: vec![word("hello", 0.0, 0.5), word("world.", 0.5, 1.0), word("later", 5.0, 6.0)] },
             rules: Default::default(),
+            uppercase: false,
         });
         let yellow = Color::rgb(1.0, 1.0, 0.0);
         layer.text_animators.push(TextAnimator {
-            selector: TextSelector::Karaoke { cumulative: false },
+            selector: TextSelector::Karaoke { cumulative: false, ramp: 0.0 },
             fill: Some(Value::constant(yellow)),
             ..TextAnimator::new(TextUnit::Words)
         });
@@ -3381,5 +3393,20 @@ mod motion_blur_tests {
         assert!((x(0.0, 1) - x(0.0, 2)).abs() < 1e-9, "no shutter, same place");
         assert!(x(0.5, 1) > x(0.0, 1), "the switched layer moves with the shutter");
         assert_eq!(x(0.5, 2), x(0.0, 2), "the unswitched one stays at the centre");
+    }
+}
+
+#[cfg(test)]
+mod word_time_tests {
+    /// A word-time selector rises over `ramp` from the word's start, holds
+    /// once in (cumulative), and is a plain step without a ramp.
+    #[test]
+    fn a_word_ramps_in_from_when_it_is_spoken() {
+        let k = super::karaoke;
+        assert_eq!(k(Some(1), Some(0.05), 1, true, 0.1), 0.5, "halfway through its ramp");
+        assert_eq!(k(Some(2), Some(1.0), 1, true, 0.1), 1.0, "an earlier word stays in");
+        assert_eq!(k(Some(1), Some(-0.2), 2, true, 0.1), 0.0, "a later word is not in yet");
+        assert_eq!(k(Some(1), Some(0.05), 1, false, 0.0), 1.0, "no ramp: a step");
+        assert_eq!(k(Some(2), Some(1.0), 1, false, 0.1), 0.0, "not cumulative: only the active word");
     }
 }

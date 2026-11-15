@@ -6,8 +6,9 @@
 //! goes in as a 16 kHz WAV written by [`write_wav`] — whatever the caller
 //! mixed, so a comp mix comes back timed in comp time.
 //!
-//! Installs are found where the AE autoSUBS panel puts them; there is no
-//! downloader yet.
+//! Installs are found where the AE autoSUBS panel puts them. Models can be
+//! fetched there with [`download_model`]; the exe still comes from autoSUBS,
+//! a whisper.cpp release (`whisper-cli.exe` in that folder) or `PBC_WHISPER`.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -38,17 +39,50 @@ impl Whisper {
     /// Prefers the CUDA build when an NVIDIA driver is present, and the largest
     /// model the install has.
     pub fn find() -> Option<Self> {
-        let root = PathBuf::from(std::env::var_os("APPDATA")?).join("ae-autosubs-whisper");
+        let root = whisper_root()?;
         let models = root.join("models");
         let exe = std::env::var_os("PBC_WHISPER").map(PathBuf::from).or_else(|| {
             let cuda = root.join("cuda").join("whisper-cli.exe");
             let nvidia = Path::new(&std::env::var_os("SystemRoot").unwrap_or("C:\\Windows".into())).join("System32\\nvcuda.dll");
-            (cuda.exists() && nvidia.exists()).then_some(cuda)
+            let cpu = root.join("whisper-cli.exe");
+            (cuda.exists() && nvidia.exists()).then_some(cuda).or(cpu.exists().then_some(cpu))
         })?;
         let model = ["large-v3-turbo", "small", "base"].iter().map(|m| models.join(format!("ggml-{m}.bin"))).find(|p| p.exists())?;
         let vad = Some(models.join("ggml-silero-v5.1.2.bin")).filter(|p| p.exists());
         Some(Self { exe, model, vad, cpu: false })
     }
+}
+
+/// The autoSUBS whisper folder, where models and the exe live.
+pub fn whisper_root() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("ae-autosubs-whisper"))
+}
+
+/// Whether a whisper model is installed.
+pub fn has_model() -> bool {
+    whisper_root().is_some_and(|r| ["large-v3-turbo", "small", "base"].iter().any(|m| r.join("models").join(format!("ggml-{m}.bin")).exists()))
+}
+
+/// Fetch `ggml-<name>.bin` (e.g. `"base"`, ~142 MB) from the whisper.cpp
+/// model repo into the models folder. Blocking; run it on a thread. Uses the
+/// system `curl`, so no HTTP stack is linked for one download.
+pub fn download_model(name: &str) -> Result<PathBuf, String> {
+    let dir = whisper_root().ok_or("APPDATA is not set")?.join("models");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let file = dir.join(format!("ggml-{name}.bin"));
+    let part = file.with_extension("bin.part");
+    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-L", "--fail", "--silent", "--show-error", "-o"]).arg(&part).arg(&url);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // CREATE_NO_WINDOW
+    let out = cmd.output().map_err(|e| format!("starting curl: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("download failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    std::fs::rename(&part, &file).map_err(|e| e.to_string())?;
+    Ok(file)
 }
 
 /// Transcribe interleaved stereo `samples` at [`RATE`]. `language` is a

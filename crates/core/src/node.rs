@@ -704,11 +704,11 @@ impl TextAnimator {
 
     /// How much of unit `i` of `n` the whole selector stack selects, -1..1.
     /// `karaoke` answers a Karaoke selector (it needs the subtitle's word).
-    pub fn selection(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx, karaoke: impl Fn(bool) -> f64) -> f64 {
+    pub fn selection(&self, i: usize, n: usize, ctx: &mut crate::expr::EvalCtx, karaoke: impl Fn(bool, f64) -> f64) -> f64 {
         let mut acc = 0.0;
         for (k, (mode, sel)) in self.selectors().enumerate() {
             let s = match sel {
-                TextSelector::Karaoke { cumulative } => karaoke(*cumulative),
+                TextSelector::Karaoke { cumulative, ramp } => karaoke(*cumulative, *ramp),
                 _ => sel.select(i, n, ctx, acc),
             };
             acc = if k == 0 && mode == SelectorMode::Subtract { 1.0 - s } else { mode.combine(acc, s) };
@@ -889,9 +889,16 @@ pub enum TextSelector {
     /// The word being spoken in the layer's [`crate::subs::Subtitles`] — or,
     /// `cumulative`, every word of the subtitle spoken so far. Selects nothing
     /// on a layer without subtitles. Only meaningful with [`TextUnit::Words`].
+    ///
+    /// `ramp` (seconds) makes it a **word-time selector**: each word's
+    /// selection rises from 0 to 1 over `ramp` from the moment it is spoken,
+    /// so an animator can pop or slide words in as they are said (ADR 0027).
+    /// 0 is a step.
     Karaoke {
         #[serde(default)]
         cumulative: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        ramp: f64,
     },
     /// AE's Expression selector: `script` runs once per unit with
     /// `textIndex` (1-based), `textTotal` and `selectorValue` (the selection
@@ -2366,6 +2373,10 @@ pub struct Project {
     /// What an export can write: the full mix, or stems of chosen buses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<crate::audio::Output>,
+    /// Caption looks authored for this project, beside the built-ins
+    /// ([`crate::captions::builtin`]). Same JSON shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "captionPresets")]
+    pub caption_presets: Vec<crate::captions::CaptionStyle>,
 }
 
 /// Something listed in the Assets panel: an imported file or a composition.
@@ -2458,6 +2469,7 @@ impl Project {
             folders: Vec::new(),
             buses: Vec::new(),
             outputs: Vec::new(),
+            caption_presets: Vec::new(),
         }
     }
 
@@ -2679,7 +2691,7 @@ mod tests {
         // First half of 4 units, then the middle half folded in.
         let mut a = TextAnimator::new(TextUnit::Chars);
         a.selector = rng(0.0, 50.0, 100.0, RangeShape::Square);
-        let sel = |a: &TextAnimator, ctx: &mut EvalCtx| -> Vec<f64> { (0..4).map(|i| a.selection(i, 4, ctx, |_| 0.0)).collect() };
+        let sel = |a: &TextAnimator, ctx: &mut EvalCtx| -> Vec<f64> { (0..4).map(|i| a.selection(i, 4, ctx, |_, _| 0.0)).collect() };
         a.more_selectors.push(ExtraSelector { mode: SelectorMode::Intersect, selector: rng(25.0, 75.0, 100.0, RangeShape::Square) });
         assert_eq!(sel(&a, &mut ctx), vec![0.0, 1.0, 0.0, 0.0]);
         a.more_selectors[0].mode = SelectorMode::Add;
@@ -2703,7 +2715,7 @@ mod tests {
             mode: SelectorMode::Intersect,
             selector: TextSelector::Expression { script: "selectorValue * textIndex / textTotal".into(), amount: Value::constant(100.0) },
         });
-        let got: Vec<f64> = (0..4).map(|i| a.selection(i, 4, &mut ctx, |_| 0.0)).collect();
+        let got: Vec<f64> = (0..4).map(|i| a.selection(i, 4, &mut ctx, |_, _| 0.0)).collect();
         assert_eq!(got, vec![0.25, 0.5, 0.75, 1.0]);
         // A broken script selects nothing rather than failing the frame.
         let bad = TextSelector::Expression { script: "nope(".into(), amount: Value::constant(100.0) };
@@ -3297,4 +3309,8 @@ mod knob_tests {
         mb.shutter_angle = 360.0;
         assert_eq!(mb.offsets(), vec![-0.375, -0.125, 0.125, 0.375]);
     }
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
