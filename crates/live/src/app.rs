@@ -5832,7 +5832,8 @@ impl App {
         self.contexts().any(|c| !c.egui_wants_keyboard_input() && c.input(&f))
     }
 
-    /// The bare-key shortcuts (space, Tab, arrows, R, B, N) from whichever
+    /// The bare-key shortcuts (space, Tab, arrows, R, B, N, and V C Q W S for
+    /// the strips view's tools and magnet) from whichever
     /// window has focus. The caller has already let egui have the key first,
     /// so typing into a field never seeks or plays.
     fn plain_key(&mut self, _event_loop: &ActiveEventLoop, key: &Key) {
@@ -5866,6 +5867,24 @@ impl App {
             }
             Key::Character(s) if s == "n" || s == "N" => {
                 self.set_work_end(self.current_frame());
+            }
+            // The strips view's edit tools and its magnet (ADR 0025).
+            Key::Character(s) if matches!(s.to_lowercase().as_str(), "v" | "c" | "q" | "w") => {
+                use crate::strips::EditTool;
+                let tool = match s.to_lowercase().as_str() {
+                    "v" => EditTool::Select,
+                    "c" => EditTool::Razor,
+                    "q" => EditTool::Ripple,
+                    _ => EditTool::Roll,
+                };
+                for c in self.contexts() {
+                    crate::strips::set_tool(c, tool);
+                    c.request_repaint();
+                }
+            }
+            Key::Character(s) if s == "s" || s == "S" => {
+                crate::strips::toggle_magnet(&self.egui_ctx);
+                self.egui_ctx.request_repaint();
             }
             _ => {}
         }

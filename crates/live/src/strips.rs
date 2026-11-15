@@ -124,6 +124,15 @@ impl EditTool {
             EditTool::Roll => "Roll",
         }
     }
+    /// Its bare-key shortcut (handled in `App::plain_key`).
+    fn key(self) -> &'static str {
+        match self {
+            EditTool::Select => "V",
+            EditTool::Razor => "C",
+            EditTool::Ripple => "Q",
+            EditTool::Roll => "W",
+        }
+    }
     fn hint(self) -> &'static str {
         match self {
             EditTool::Select => "Trim, slide, alt+drag to slip",
@@ -407,6 +416,21 @@ const RAZOR: egui::Color32 = egui::Color32::from_rgb(255, 96, 96);
 const RIPPLE: egui::Color32 = egui::Color32::from_rgb(255, 216, 51);
 const ROLL: egui::Color32 = egui::Color32::from_rgb(110, 200, 255);
 const SNAP: egui::Color32 = egui::Color32::from_rgb(90, 230, 200);
+
+/// Pick the strips view's edit tool from a key press: the palette reads it
+/// from egui memory on its next draw.
+pub(crate) fn set_tool(ctx: &egui::Context, tool: EditTool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("strip_tool"), tool));
+}
+
+/// Flip the magnet from a key press.
+pub(crate) fn toggle_magnet(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        let id = egui::Id::new("strip_magnet");
+        let on = d.get_temp(id).unwrap_or(true);
+        d.insert_temp(id, !on);
+    });
+}
 
 /// The pointer shapes egui has no icon for, drawn at the mouse with the system
 /// pointer hidden: a blade for the razor, a bracket for a ripple trim (open
@@ -752,13 +776,13 @@ pub(crate) fn strips_ui(
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         for t in EditTool::ALL {
-            if crate::material::toggle(ui, tool == t, t.icon()).on_hover_text(format!("{} — {}", t.label(), t.hint())).clicked() {
+            if crate::material::toggle(ui, tool == t, t.icon()).on_hover_text(format!("{} ({}) — {}", t.label(), t.key(), t.hint())).clicked() {
                 tool = t;
             }
         }
         ui.separator();
         if crate::material::toggle(ui, magnet, crate::material::MAGNET)
-            .on_hover_text("Magnet — edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.")
+            .on_hover_text("Magnet (S) — edges, slides and razor cuts snap to clip edges, the playhead and the work area. Hold Ctrl to flip it for one drag.")
             .clicked()
         {
             magnet = !magnet;
