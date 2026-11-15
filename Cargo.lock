@@ -2238,6 +2238,7 @@ dependencies = [
  "kurbo",
  "motion-core",
  "motion-render",
+ "serde",
  "serde_json",
 ]
 
