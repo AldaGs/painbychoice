@@ -8,7 +8,8 @@ use motion_core::{Bus, Output};
 use crate::props::db_label;
 
 /// Draw the mixer. `out` is set to the edited buses and outputs when anything changed.
-pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], out: &mut Option<(Vec<Bus>, Vec<Output>)>) {
+/// `frame` is where a fader move writes when the gain is keyframed.
+pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], frame: i64, out: &mut Option<(Vec<Bus>, Vec<Output>)>) {
     let (mut b, mut o) = (buses.to_vec(), outputs.to_vec());
     let mut changed = false;
     let ids: Vec<(String, String)> = b.iter().map(|x| (x.id.clone(), x.name.clone())).collect();
@@ -19,13 +20,22 @@ pub(crate) fn mixer_ui(ui: &mut egui::Ui, buses: &[Bus], outputs: &[Output], out
         ui.weak("No buses: every sound goes straight to the mix.");
     }
     let mut remove = None;
-    egui::Grid::new("mixer_buses").num_columns(6).striped(true).show(ui, |ui| {
+    egui::Grid::new("mixer_buses").num_columns(7).striped(true).show(ui, |ui| {
         for (i, bus) in b.iter_mut().enumerate() {
             changed |= ui.add(egui::TextEdit::singleline(&mut bus.name).desired_width(90.0)).changed();
             ui.horizontal(|ui| {
-                changed |= ui.add(egui::Slider::new(&mut bus.gain, 0.0..=2.0).show_value(false)).changed();
-                ui.weak(db_label(bus.gain));
+                let mut g = bus.gain.resolve(&mut motion_core::expr::EvalCtx::at(frame as f64));
+                if ui.add(egui::Slider::new(&mut g, 0.0..=2.0).show_value(false)).changed() {
+                    // A keyframed gain gets a key here; a constant just moves.
+                    bus.gain.set_at(frame, g);
+                    changed = true;
+                }
+                ui.weak(db_label(g));
             });
+            if crate::props::key_button(ui, bus.gain.is_animated()) {
+                bus.gain.insert_key(frame);
+                changed = true;
+            }
             changed |= ui.toggle_value(&mut bus.mute, "M").on_hover_text("Mute").changed();
             changed |= ui.toggle_value(&mut bus.solo, "S").on_hover_text("Solo").changed();
             ui.horizontal(|ui| {

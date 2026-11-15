@@ -40,4 +40,8 @@ ducked music per item; here ducking moves to the bus.
 - Peak is sample peak, not true peak (no oversampling).
 - No live meters in the Mixer panel, and the editor's render queue still
   exports only the full mix; stems are a CLI feature for now.
-- Automation of bus gain is not keyframable (plain `f64`), unlike a layer's level.
+- Bus gain is a `Value<f64>` (keyframes, like a layer's level), resolved once
+  per `evaluate_audio` at the top-level comp's frame; a plain number from an
+  older file loads as a constant. During playback the editor republishes the
+  mix every frame, so layer and bus automation is heard live in ~16 ms steps
+  (exports resolve it per 21 ms block).

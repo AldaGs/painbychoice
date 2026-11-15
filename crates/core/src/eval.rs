@@ -3274,6 +3274,21 @@ pub fn evaluate_audio(
         return out;
     }
     collect_audio(project, comp, at_frame, 0, &mut Vec::new(), sample_rate, &mut out);
+    // Bus gains are project-wide and keyframed on the top-level comp's frames,
+    // so they're resolved once here rather than inside each nested comp.
+    let gains: Vec<f32> = project
+        .buses
+        .iter()
+        .map(|b| {
+            let g = b.gain.resolve(&mut EvalCtx::at(at_frame));
+            if g.is_finite() { g.max(0.0) as f32 } else { 0.0 }
+        })
+        .collect();
+    for s in &mut out {
+        if let Some(g) = s.bus.and_then(|b| gains.get(b as usize)) {
+            s.gain = (s.gain.0 * g, s.gain.1 * g);
+        }
+    }
     out
 }
 

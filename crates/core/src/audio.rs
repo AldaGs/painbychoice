@@ -58,9 +58,10 @@ pub struct Bus {
     /// What layers and outputs name it by, e.g. `"dlg"`.
     pub id: String,
     pub name: String,
-    /// Linear, like a layer's level.
-    #[serde(default = "unity")]
-    pub gain: f64,
+    /// Linear, like a layer's level, and keyframeable like it. A plain number
+    /// (files before automation) still loads as a constant.
+    #[serde(default = "unity_value", deserialize_with = "de_gain")]
+    pub gain: Value<f64>,
     #[serde(default)]
     pub mute: bool,
     /// Any soloed bus silences every bus that is not, and unrouted sound too.
@@ -74,8 +75,21 @@ pub struct Bus {
     pub duck_level: f64,
 }
 
-fn unity() -> f64 {
-    1.0
+fn unity_value() -> Value<f64> {
+    Value::constant(1.0)
+}
+
+fn de_gain<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Value<f64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Value(Value<f64>),
+        Legacy(f64),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::Value(v) => v,
+        Either::Legacy(g) => Value::constant(g),
+    })
 }
 fn duck_default() -> f64 {
     0.25
@@ -83,7 +97,7 @@ fn duck_default() -> f64 {
 
 impl Bus {
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        Bus { id: id.into(), name: name.into(), gain: 1.0, mute: false, solo: false, duck_by: None, duck_level: duck_default() }
+        Bus { id: id.into(), name: name.into(), gain: unity_value(), mute: false, solo: false, duck_by: None, duck_level: duck_default() }
     }
 }
 
@@ -109,8 +123,9 @@ pub struct Duck {
     pub fade: i64,
 }
 
-/// Where a sound sent to `bus` lands: the bus index, the gain factor the bus
-/// applies (its gain, or 0 when muted or soloed out), and its ducking.
+/// Where a sound sent to `bus` lands: the bus index, whether the bus lets it
+/// through (0 when muted or soloed out, else 1) and its ducking. The bus's
+/// own gain is applied by `evaluate_audio`, which resolves it once per call.
 pub fn route(buses: &[Bus], bus: Option<&str>, sample_rate: u32) -> (Option<u16>, f32, Option<Duck>) {
     let index = |id: &str| buses.iter().position(|b| b.id == id).map(|i| i as u16);
     let solo = buses.iter().any(|b| b.solo);
@@ -118,7 +133,7 @@ pub fn route(buses: &[Bus], bus: Option<&str>, sample_rate: u32) -> (Option<u16>
         return (None, if solo { 0.0 } else { 1.0 }, None);
     };
     let b = &buses[i as usize];
-    let gain = if b.mute || (solo && !b.solo) { 0.0 } else { b.gain.max(0.0) as f32 };
+    let gain = if b.mute || (solo && !b.solo) { 0.0 } else { 1.0 };
     let duck = b.duck_by.as_deref().and_then(index).filter(|k| *k != i).map(|key| Duck {
         key,
         level: b.duck_level.clamp(0.0, 1.0) as f32,
@@ -717,7 +732,7 @@ mod walk_tests {
         let mut p = two_buses();
         let gain = |p: &Project, i: usize| evaluate_audio(p, p.root, 0.0, 48_000)[i].gain.0;
         let unity = gain(&p, 0);
-        p.buses[0].gain = 0.5;
+        p.buses[0].gain = crate::Value::constant(0.5);
         assert!((gain(&p, 0) - unity * 0.5).abs() < 1e-6);
         p.buses[0].mute = true;
         assert_eq!(gain(&p, 0), 0.0);
@@ -750,5 +765,20 @@ mod walk_tests {
         assert!(!json.contains("buses") && !json.contains("outputs") && !json.contains("\"bus\""));
         let back: Project = serde_json::from_str(&serde_json::to_string(&two_buses()).unwrap()).unwrap();
         assert_eq!(back.buses, two_buses().buses);
+    }
+
+    /// Bus gain keyframes like a layer's level, and a file from before
+    /// automation (a plain number) still loads.
+    #[test]
+    fn bus_gain_is_automatable_and_old_files_load() {
+        let mut p = two_buses();
+        p.buses[0].gain = crate::Value::Keyframed(crate::value::Track::new(vec![
+            crate::value::Keyframe::linear(0, 1.0),
+            crate::value::Keyframe::linear(48, 0.0),
+        ]));
+        let at = |f: f64| evaluate_audio(&p, p.root, f, 48_000)[0].gain.0;
+        assert!(at(24.0) < at(0.0) * 0.6 && at(24.0) > at(0.0) * 0.4, "halfway down at frame 24");
+        let old: crate::Bus = serde_json::from_str(r#"{"id":"dlg","name":"Dialogue","gain":0.5}"#).unwrap();
+        assert_eq!(old.gain, crate::Value::constant(0.5));
     }
 }

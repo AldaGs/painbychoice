@@ -4564,7 +4564,7 @@ impl App {
                     Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
                     Editor::Assets => assets_ui(ui, &self.project, current_comp, (self.proxies.on, self.proxies.pending(), self.proxies.status.as_deref()), &mut tree_edits),
                     Editor::Subtitles => crate::subtitles::subs_ui(ui, &subs_view, &mut subs_state, &mut subs_edits),
-                    Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, &mut mixer_edit),
+                    Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, frame, &mut mixer_edit),
                     Editor::Transport => transport_ui(
                         ui,
                         frame,
@@ -5656,6 +5656,13 @@ impl App {
             p.paint(&self.context, out);
         }
         self.paint_preview(&scene, previewing.as_ref(), frame);
+        // Automation is heard live: the callback mixes a snapshot of gains, so
+        // while playing it gets a fresh one each frame (~16 ms steps). Exports
+        // resolve per 21 ms block either way.
+        // ponytail: republishes even with nothing keyframed; gate on "any audio value animated" if it shows in a profile.
+        if self.playing {
+            self.publish_mix();
+        }
 
         // A slice of the active export, after the frame the user is watching
         // has been presented. Rendering export frames *before* the present
