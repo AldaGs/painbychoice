@@ -227,6 +227,15 @@ pub(crate) struct App {
     autosaved: String,
     /// When the autosave timer last fired.
     autosave_at: Instant,
+    /// The project file as the editor last read or wrote it — the baseline the
+    /// live link compares against (ADR 0024).
+    disk: crate::livelink::Disk,
+    /// The project as it stood at that read or write, so an external change
+    /// can tell whether it would land on unsaved edits. `None` when unknown
+    /// (a recovered autosave), which counts as unsaved.
+    disk_project: Option<MProject>,
+    /// When the live link last looked at the file.
+    disk_poll_at: Instant,
     /// Exports in progress and finished. See [`crate::renderqueue`].
     pub(crate) queue: crate::renderqueue::RenderQueue,
     /// Playback time, from the audio device when there is one. See
@@ -1263,6 +1272,9 @@ impl App {
             project_path: None,
             autosaved: String::new(),
             autosave_at: Instant::now(),
+            disk: Default::default(),
+            disk_project: None,
+            disk_poll_at: Instant::now(),
             queue: crate::renderqueue::RenderQueue::default(),
             clock: crate::clock::MasterClock::new(),
             audio_out: None,
@@ -1917,6 +1929,21 @@ impl ApplicationHandler for App {
 
         self.state = RenderState::Active { surface, window };
         self.open_floats(event_loop);
+    }
+
+    /// The live link's heartbeat: an idle editor sleeps (`ControlFlow::Wait`),
+    /// so with a file open it wakes every 250ms to look at it.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.project_path.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if self.poll_disk() {
+            if let RenderState::Active { window, .. } = &self.state {
+                window.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + std::time::Duration::from_millis(250)));
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -3480,11 +3507,24 @@ impl App {
                     .collect(),
                 preview: self.preview.as_ref().map(Preview::spec).or_else(|| self.pending_preview.clone()),
             },
+            rev: crate::livelink::rev_of(&self.disk.text) + 1,
         };
         serde_json::to_string_pretty(&project)
     }
 
     fn write_project(&mut self, path: std::path::PathBuf) {
+        // Saving over the open file after an agent wrote to it would silently
+        // throw its edit away. Another path is a new file: nothing to clobber
+        // unless it already exists, which the save dialog asked about.
+        if self.project_path.as_deref() == Some(path.as_path())
+            && self.disk.conflict(&path)
+            && !ask_yes_no(
+                "File changed on disk",
+                "The project was changed on disk since you opened it. Overwrite that change?",
+            )
+        {
+            return;
+        }
         match self.save_json() {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, &json) {
@@ -3497,12 +3537,57 @@ impl App {
                     // Only on success: a failed save leaves the project where
                     // it was, and a Draft must not aim at a file that isn't
                     // there.
+                    self.disk = crate::livelink::Disk::synced(&path, json.clone());
+                    self.disk_project = Some(self.project.clone());
                     self.project_path = Some(path);
                     self.autosaved = json;
                 }
             }
             Err(e) => eprintln!("serialize failed: {e}"),
         }
+    }
+
+    /// Take an agent's write to the open file, as one undo step. Throttled to
+    /// 250ms; returns whether the document changed, so the caller redraws.
+    ///
+    /// Unsaved edits in the editor make it ask: taken, they stay one Undo
+    /// away; declined, the next save asks before overwriting the file.
+    pub(crate) fn poll_disk(&mut self) -> bool {
+        if self.disk_poll_at.elapsed() < std::time::Duration::from_millis(250) {
+            return false;
+        }
+        self.disk_poll_at = Instant::now();
+        let Some(path) = self.project_path.clone() else { return false };
+        let Some(text) = self.disk.poll(&path) else { return false };
+        let incoming = match crate::livelink::parse(&text) {
+            Ok(p) => p,
+            // Half-written, or wrong: keep the editor's document. The write
+            // that finishes or fixes it is polled again.
+            Err(e) => {
+                eprintln!("ignoring external edit to {}: {e}", path.display());
+                return false;
+            }
+        };
+        if self.disk_project.as_ref() != Some(&self.project)
+            && !ask_yes_no(
+                "File changed on disk",
+                "The project was changed on disk, and you have unsaved edits. Load the change? Your edits stay in Undo.",
+            )
+        {
+            return false;
+        }
+        let changed = crate::livelink::take(&mut self.history, &mut self.project, incoming);
+        self.disk.text = text;
+        self.disk_project = Some(self.project.clone());
+        if changed {
+            self.after_history_jump();
+            // Asset ids may now name other files, and sounds other samples.
+            self.footage.clear();
+            self.reload_sounds();
+            self.doc_rev = self.doc_rev.wrapping_add(1);
+        }
+        self.autosaved = self.save_json().unwrap_or_default();
+        changed
     }
 
     /// Write the project to its sidecar if it changed since anything last hit
@@ -3615,6 +3700,8 @@ impl App {
         // footage that no longer exists. Keeping them would draw the previous
         // project's pixels under this one's layers.
         self.footage.clear();
+        self.disk = Default::default();
+        self.disk_project = None;
         self.project_path = path;
         // A render in flight belongs to the project that started it, and that
         // project is gone. The job holds its own snapshot so finishing would
@@ -3675,9 +3762,14 @@ impl App {
                 return false;
             }
         };
-        if !self.open_text(&text, Some(path)) {
+        if !self.open_text(&text, Some(path.clone())) {
             return false;
         }
+        // The live link's baseline is the file, not the sidecar: recovered work
+        // is unsaved, so an external change on top of it asks first.
+        let file_text = if recover { std::fs::read_to_string(&path).unwrap_or_default() } else { text.clone() };
+        self.disk_project = if recover { None } else { Some(self.project.clone()) };
+        self.disk = crate::livelink::Disk::synced(&path, file_text);
         // Recovered changes stay unsaved (and their sidecar stays) until a save.
         self.autosaved = if recover { text } else { self.save_json().unwrap_or_default() };
         true
@@ -3685,26 +3777,8 @@ impl App {
 
     /// Replace the project and layout with a `.pbc` file's text.
     fn open_text(&mut self, text: &str, path: Option<std::path::PathBuf>) -> bool {
-        // Three formats, newest first: a project, a pre-comps wrapper holding a
-        // single document, and a bare document from before the wrapper existed.
-        // Each older one loads as a one-comp project, so nothing is stranded.
-        let (project, layout) = match serde_json::from_str::<SaveFile>(text) {
-            Ok(f) => {
-                let layout = Some(f.layout);
-                match (f.project, f.document) {
-                    (Some(p), _) => (p, layout),
-                    (None, Some(d)) => (MProject::single(d), layout),
-                    // A `SaveFile` with neither is not one of our files: it
-                    // parsed only because every field defaults.
-                    (None, None) => match serde_json::from_str::<Document>(text) {
-                        Ok(d) => (MProject::single(d), None),
-                        Err(e) => {
-                            eprintln!("parse failed: {e}");
-                            return false;
-                        }
-                    },
-                }
-            }
+        let (project, layout) = match parse_save(text) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("parse failed: {e}");
                 return false;
@@ -5576,6 +5650,15 @@ pub(crate) fn is_newer(side: &std::path::Path, file: &std::path::Path) -> bool {
     }
 }
 
+fn ask_yes_no(title: &str, msg: &str) -> bool {
+    rfd::MessageDialog::new()
+        .set_title(title)
+        .set_description(msg)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
+}
+
 fn ask_recover(msg: &str) -> bool {
     rfd::MessageDialog::new()
         .set_title("Recover autosave")
@@ -5583,6 +5666,24 @@ fn ask_recover(msg: &str) -> bool {
         .set_buttons(rfd::MessageButtons::YesNo)
         .show()
         == rfd::MessageDialogResult::Yes
+}
+
+/// A `.pbc` file's text as a project and, when it carries one, a layout.
+///
+/// Three formats, newest first: a project, a pre-comps wrapper holding a single
+/// document, and a bare document from before the wrapper existed. Each older one
+/// loads as a one-comp project, so nothing is stranded. Not migrated: callers
+/// do that (invariant 8), via `replace_project` or the live link.
+pub(crate) fn parse_save(text: &str) -> Result<(MProject, Option<LayoutState>), String> {
+    let f = serde_json::from_str::<SaveFile>(text).map_err(|e| e.to_string())?;
+    let layout = Some(f.layout);
+    Ok(match (f.project, f.document) {
+        (Some(p), _) => (p, layout),
+        (None, Some(d)) => (MProject::single(d), layout),
+        // A `SaveFile` with neither is not one of our files: it parsed only
+        // because every field defaults.
+        (None, None) => (MProject::single(serde_json::from_str::<Document>(text).map_err(|e| e.to_string())?), None),
+    })
 }
 
 /// The app icon (assets/brand), decoded for the title bar and taskbar. macOS

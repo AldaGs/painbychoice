@@ -448,6 +448,11 @@ pub(crate) struct SaveFile {
     pub(crate) document: Option<Document>,
     #[serde(default)]
     pub(crate) layout: LayoutState,
+    /// How many times this file has been saved. Every writer — the editor or an
+    /// agent — writes the `rev` it read plus one (ADR 0024). Informational for
+    /// the editor, which detects a foreign write by content, not by number.
+    #[serde(default)]
+    pub(crate) rev: u64,
 }
 
 /// The persisted UI layout: the active arrangement and any user-made presets.

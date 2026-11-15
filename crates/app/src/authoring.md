@@ -98,3 +98,10 @@ Example: `{ "matchName": "ADBE Gaussian Blur 2", "props": { "ADBE Gaussian Blur 
 Every report has `ok`, `errors[]` and `warnings[]` (each `{path, message}`), plus
 `dropped` (features the importer couldn't carry) and `notes` (things the renderer
 couldn't draw, e.g. footage).
+
+## Editing a `.pbc` the editor has open
+The editor watches its file and takes your write as one undo step (ADR 0024).
+- Read the file, change it, write `rev` as the value you read plus one.
+- Re-read just before writing; if `rev` moved, re-derive your change from the new file.
+- A new layer needs an `id` unused in its comp (largest id + 1). A duplicate is refused.
+- An invalid or half-written file is ignored until the next write; the editor keeps its document.

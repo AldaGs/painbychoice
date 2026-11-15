@@ -554,6 +554,7 @@ fn project_round_trips_document_and_layout() {
     let project = SaveFile {
         project: Some(MProject::single(demo_document())),
         document: None,
+        rev: 0,
         layout: LayoutState {
             dock: Some(dock.clone()),
             windows: vec![],
@@ -640,6 +641,7 @@ fn a_multi_comp_project_round_trips_through_save_and_load() {
     let file = SaveFile {
         project: Some(project.clone()),
         document: None,
+        rev: 0,
         layout: LayoutState { dock: Some(Dock::default_layout()), user_presets: vec![], windows: vec![], preview: None },
     };
     let json = serde_json::to_string(&file).unwrap();
@@ -6317,4 +6319,86 @@ fn camera_point_of_interest_is_a_keyable_row() {
     assert!(crate::app::move_keys_in(&mut n, &[(PropKind::CameraTarget, vec![1])], 6, 100));
     camera_write_back(&mut cam, n);
     assert_eq!(cam.point_of_interest.as_ref().unwrap().key_frames(), vec![0, 30]);
+}
+
+/// Phase 1's acceptance test: an agent edits the open project's file while the
+/// editor has it open, and nothing is lost — not the agent's change, not the
+/// editor's, and the editor never writes over the agent without noticing.
+#[test]
+fn an_agent_edit_while_the_editor_is_open_loses_nothing() {
+    use crate::history::History;
+    use crate::livelink::{self, Disk};
+    let dir = std::env::temp_dir().join(format!("pbc-livelink-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shot.pbc");
+    let save = |p: &MProject, rev: u64| {
+        serde_json::to_string_pretty(&SaveFile { project: Some(p.clone()), document: None, layout: Default::default(), rev })
+            .unwrap()
+    };
+    let rename = |p: &mut MProject, name: &str| {
+        let root = p.root;
+        p.comp_mut(root).unwrap().root.children[0].name = name.into();
+    };
+    let first = |p: &MProject| p.root_comp().root.children[0].name.clone();
+
+    // The editor opens a saved project, then edits it without saving.
+    let saved = MProject::single(demo_document());
+    let text = save(&saved, 1);
+    std::fs::write(&path, &text).unwrap();
+    let mut disk = Disk::synced(&path, text);
+    let mut history = History::default();
+    let mut project = saved.clone();
+    let mut gui = project.clone();
+    rename(&mut gui, "gui");
+    history.record(std::mem::replace(&mut project, gui), "Rename layer", false);
+    assert!(disk.poll(&path).is_none(), "no foreign write yet");
+    assert!(!disk.conflict(&path), "saving now overwrites nothing");
+
+    // An agent reads the file, edits it, bumps the rev and writes it back.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let mut agent = livelink::parse(&on_disk).unwrap();
+    rename(&mut agent, "agent");
+    std::fs::write(&path, save(&agent, livelink::rev_of(&on_disk) + 1)).unwrap();
+
+    // The editor's save would now clobber it, so it must see the conflict…
+    assert!(disk.conflict(&path));
+    // …and the poll picks the write up, once.
+    let text = disk.poll(&path).expect("the agent's write is seen");
+    assert!(disk.poll(&path).is_none(), "seen once, not every poll");
+    assert_eq!(livelink::rev_of(&text), 2);
+
+    // Taken as one undo step: the agent's change is in, the editor's is one
+    // Undo away, and the saved original one more.
+    assert!(livelink::take(&mut history, &mut project, livelink::parse(&text).unwrap()));
+    assert_eq!(first(&project), "agent");
+    history.undo(&mut project).unwrap();
+    assert_eq!(first(&project), "gui");
+    history.undo(&mut project).unwrap();
+    assert_eq!(first(&project), first(&saved));
+    history.redo(&mut project).unwrap();
+    history.redo(&mut project).unwrap();
+    assert_eq!(first(&project), "agent");
+
+    // A half-written file is refused, keeping the editor's document; the write
+    // that finishes it is seen.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, &text[..text.len() / 2]).unwrap();
+    let half = disk.poll(&path).expect("a change");
+    assert!(livelink::parse(&half).is_err());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, &text).unwrap();
+    disk.text = half; // the editor never took the half file
+    assert!(disk.poll(&path).is_some());
+
+    // Two layers sharing an id would alias: refused.
+    let mut bad = agent.clone();
+    let root = bad.root;
+    let dup = bad.comp(root).unwrap().root.children[0].clone();
+    bad.comp_mut(root).unwrap().root.children.push(dup);
+    assert!(livelink::parse(&save(&bad, 3)).is_err());
+
+    // Taking a write identical to the open document is no step at all.
+    assert!(!livelink::take(&mut history, &mut project, agent));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

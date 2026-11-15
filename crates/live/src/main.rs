@@ -55,6 +55,7 @@ mod gizmo;
 mod history;
 mod icon;
 mod layers;
+mod livelink;
 mod motionpath;
 mod nodegraph;
 mod offscreen;
