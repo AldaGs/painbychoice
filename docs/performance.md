@@ -181,6 +181,31 @@ What it does not say: this is a headless loop with no egui and no swapchain
 present, on one machine, with synthetic 8-bit footage and no sound. See
 [`phase-0-playback-spike.md`](phase-0-playback-spike.md).
 
+## Rendering footage (`motion render`)
+
+Measured 2026-11-16 on the CI container (4 cores), release build, sidecar
+ffmpeg, H.264 draft. Two 1920x1080 5 Mbps H.264 clips (2 s GOP), both on
+screen, fit into a 1080x1920 comp at 24fps with a text layer, 240 frames.
+Reproduce with [`bench/footage-render.sh`](bench/footage-render.sh).
+
+| | 1 thread | 4 threads |
+| --- | --- | --- |
+| Before: one ffmpeg per frame per clip | 2.0 fps | 4.8 fps |
+| After: one open stream per clip | **15.3 fps** | **32.4 fps** |
+| Solids in place of the clips (no decode) | — | 84.6 fps |
+
+The footage was ~95% of the render before: `Footage::frame` started an ffmpeg
+for every frame of every clip, and each one seeked to the keyframe before its
+target and decoded forward. It now keeps one stream per clip and walks it
+forward, caching the frames it steps over for the threads just behind
+(`render/src/footage.rs`). Output is bit-identical (framemd5 of all four
+renders), and `footage::tests` pins the streamed frames to the per-frame decode.
+
+What is left of the gap to the solids row is the decode itself (software, and
+one clip decodes on one thread at a time) plus RGBA crossing the pipe. The
+editor's export (`pbc render`) already read footage through open streams and
+did not have this problem.
+
 ## The structural advantages, and the one structural cost
 
 Worth knowing which of these is real before optimising anything.
