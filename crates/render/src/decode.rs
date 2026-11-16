@@ -549,7 +549,7 @@ impl Decoder for FfmpegDecoder {
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=width,height,r_frame_rate,nb_frames,duration",
+                "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
                 "-of",
                 "default=noprint_wrappers=1",
             ])
@@ -706,6 +706,7 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
     let mut width = None;
     let mut height = None;
     let mut fps = None;
+    let mut avg_fps = None;
     let mut nb_frames = None;
     let mut duration = None;
     for line in text.lines() {
@@ -716,15 +717,12 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
             "height" => height = v.parse::<f64>().ok(),
             // Reported as a rational ("30000/1001"), because that is what
             // broadcast rates actually are.
-            "r_frame_rate" => {
-                fps = match v.split_once('/') {
-                    Some((n, d)) => match (n.parse::<f64>(), d.parse::<f64>()) {
-                        (Ok(n), Ok(d)) if d != 0.0 => Some(n / d),
-                        _ => None,
-                    },
-                    None => v.parse().ok(),
-                }
-            }
+            "r_frame_rate" => fps = rational(v),
+            // `r_frame_rate` is ffprobe's guess at the timebase, not the rate:
+            // plenty of 24fps phone and screen-recorder files report 60 there,
+            // which played them 2.5x fast and cut their length. The average —
+            // frames over duration — is the real one; "0/0" when unknown.
+            "avg_frame_rate" => avg_fps = rational(v),
             "nb_frames" => nb_frames = v.parse::<i64>().ok(),
             "duration" => duration = v.parse::<f64>().ok(),
             _ => {}
@@ -733,7 +731,7 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
     let (Some(width), Some(height)) = (width, height) else {
         return Err(DecodeError::Malformed("ffprobe reported no video stream".into()));
     };
-    let fps = fps.filter(|f| *f > 0.0).unwrap_or(25.0);
+    let fps = avg_fps.filter(|f| *f > 0.0).or(fps.filter(|f| *f > 0.0)).unwrap_or(25.0);
     // `nb_frames` is exact but frequently absent (it isn't in the container for
     // most streaming formats), so fall back to duration × rate. Both can be
     // wrong for a variable-rate file; a length that is slightly off is much
@@ -747,9 +745,33 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
     Ok(AssetMeta::visual(AssetKind::Video, width, height, frames, fps))
 }
 
+/// A frame rate as ffprobe prints it: a rational ("30000/1001") or a plain number.
+fn rational(v: &str) -> Option<f64> {
+    match v.split_once('/') {
+        Some((n, d)) => match (n.parse::<f64>(), d.parse::<f64>()) {
+            (Ok(n), Ok(d)) if d != 0.0 => Some(n / d),
+            _ => None,
+        },
+        None => v.parse().ok(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 24fps footage whose timebase makes ffprobe guess 60 must still import
+    /// at 24, or it plays fast and its duration shrinks.
+    #[test]
+    fn the_average_rate_wins_over_the_timebase_guess() {
+        let m = parse_probe(
+            "width=1920\nheight=1080\nr_frame_rate=60/1\navg_frame_rate=24/1\nnb_frames=240\n",
+        )
+        .unwrap();
+        assert_eq!(m.fps, 24.0);
+        let m = parse_probe("width=8\nheight=8\nr_frame_rate=25/1\navg_frame_rate=0/0\n").unwrap();
+        assert_eq!(m.fps, 25.0, "an unknown average falls back to r_frame_rate");
+    }
 
     /// Broadcast rates are rationals: 29.97 is 30000/1001, and rounding it to
     /// 30 would drift a frame every thirty-three seconds.
