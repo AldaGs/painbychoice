@@ -113,6 +113,10 @@ pub struct LibavStream {
     tick: f64,
     /// pts of source frame 0.
     start: i64,
+    /// How far the index's timestamps (decode order) run ahead of display
+    /// time, in pts ticks: the reorder delay B-frames add. Measured off the
+    /// first entry, which is the first keyframe, shown at `start`.
+    index_lead: i64,
     fps: f64,
     next: i64,
     /// Frames before this are decoded and thrown away: a seek lands on the
@@ -175,6 +179,7 @@ impl LibavStream {
             stream,
             tick,
             start,
+            index_lead: 0,
             fps: if fps > 0.0 { fps } else { 25.0 },
             next: 0,
             skip_until: 0,
@@ -186,6 +191,7 @@ impl LibavStream {
             scaler: None,
             path: path.to_path_buf(),
         };
+        s.index_lead = s.index_entry(0).map_or(0, |first| (s.start - first).max(0));
         if from > 0 {
             s.seek(from)?;
         }
@@ -223,6 +229,65 @@ impl LibavStream {
         self.keyframe_owed = true;
         self.next = frame;
         Ok(())
+    }
+
+    /// Move forward so the next frame returned is `frame`, **without seeking**:
+    /// the frames in between are decoded and dropped, never returned, and the
+    /// ones nothing refers to are not decoded at all (the same B-frame skip a
+    /// seek uses). No-op unless `frame` is ahead of [`Self::next_index`].
+    ///
+    /// The forward half of a scrub. Handing the in-between frames back, which
+    /// is what walking with [`Self::next_frame`] did, put them on screen one
+    /// after another: a jump a little way ahead *played* the footage in
+    /// between instead of going to the frame.
+    pub fn skip_to(&mut self, frame: i64) {
+        if frame <= self.next_index() {
+            return;
+        }
+        self.skip_until = frame;
+        self.skip_pts = self.start + ((frame as f64 - 0.5) / self.fps / self.tick) as i64;
+        // Not a seek: there is no keyframe to offer.
+        self.keyframe_owed = false;
+    }
+
+    /// The keyframe at or before `frame`, from the container's index, or
+    /// `None` when the container has none (raw streams, some live captures).
+    ///
+    /// What decides between [`Self::skip_to`] and [`Self::seek`]: a seek to
+    /// `frame` lands on this keyframe and decodes forward from it, so when it
+    /// is at or before where the stream already is, seeking only re-decodes
+    /// frames already passed and skipping forward is never slower.
+    ///
+    /// MP4 indexes by decode time, which with B-frames runs a frame or two
+    /// ahead of display time; `index_lead` takes that out. Variable reorder
+    /// can still leave it a frame early, which errs towards skipping where a
+    /// seek would have been a frame cheaper.
+    pub fn keyframe_at_or_before(&self, frame: i64) -> Option<i64> {
+        // Half a frame late, so rounding can't put `frame`'s own timestamp
+        // after the point asked about. Asked and answered in index time.
+        let ts = self.start + ((frame.max(0) as f64 + 0.5) / self.fps / self.tick) as i64 - self.index_lead;
+        // SAFETY: `stream` indexes this input's own stream array, which lives
+        // as long as `input`.
+        let i = unsafe {
+            let st = *(*self.input.as_ptr()).streams.add(self.stream);
+            ffi::av_index_search_timestamp(st, ts, ffi::AVSEEK_FLAG_BACKWARD as i32)
+        };
+        let at = self.index_entry(i)? + self.index_lead;
+        Some((((at - self.start) as f64) * self.tick * self.fps).round() as i64)
+    }
+
+    /// Timestamp of entry `i` of the stream's index, in pts ticks.
+    fn index_entry(&self, i: i32) -> Option<i64> {
+        if i < 0 {
+            return None;
+        }
+        // SAFETY: as above; the entry is read straight away, before anything
+        // can add to the index and move it.
+        unsafe {
+            let st = *(*self.input.as_ptr()).streams.add(self.stream);
+            let e = ffi::avformat_index_get_entry(st, i);
+            (!e.is_null()).then(|| (*e).timestamp)
+        }
     }
 
     /// Decode the next frame, or `None` at the end of the footage.
@@ -482,6 +547,47 @@ mod tests {
         // GOP is 45, so the keyframe before 70 is 45.
         let seen: Vec<i64> = (0..3).map(|_| stream.next_frame().unwrap().unwrap().0).collect();
         assert_eq!(seen, vec![45, 70, 71]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Skipping forward returns the frame asked for and nothing before it, and
+    /// it is the same picture a seek to that frame gives.
+    #[test]
+    fn skipping_forward_returns_only_the_frame_asked_for() {
+        let Some(path) = fixture("pbc_libav_skip.mp4", &[]) else { return };
+        let sidecar = FfmpegDecoder::new();
+        let meta = sidecar.open(&path).expect("probe the fixture");
+        let mut stream = LibavStream::open(&path, 10, meta.fps, false).unwrap();
+        stream.keyframe_first = true;
+        assert_eq!(stream.next_frame().unwrap().unwrap().0, 0, "the seek's keyframe");
+        assert_eq!(stream.next_frame().unwrap().unwrap().0, 10);
+        // Inside the GOP, then across into the next one.
+        for want in [30i64, 62] {
+            stream.skip_to(want);
+            assert_eq!(stream.next_index(), want);
+            let (index, frame) = stream.next_frame().unwrap().unwrap();
+            assert_eq!(index, want, "skipping hands back no frame before the target");
+            let diff = mean_abs_diff(&frame.to_rgba(), &sidecar.frame(&path, want, &meta).unwrap().rgba);
+            assert!(diff < 2.5, "frame {want} differs from the sidecar's by {diff:.2}");
+        }
+        // Backwards is not a skip.
+        stream.skip_to(5);
+        assert_eq!(stream.next_frame().unwrap().unwrap().0, 63);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The index names the GOP boundaries (45 frames here), with the B-frame
+    /// reorder delay in its decode-order timestamps taken out — without that,
+    /// the keyframe at 45 reads as 43 and "the keyframe before 44" is wrong.
+    #[test]
+    fn the_index_knows_where_the_keyframes_are() {
+        let Some(path) = fixture("pbc_libav_index.mp4", &[]) else { return };
+        let stream = LibavStream::open(&path, 0, 30.0, false).unwrap();
+        let near = |got: Option<i64>, kf: i64| got.is_some_and(|g| (kf - 1..=kf).contains(&g));
+        assert!(near(stream.keyframe_at_or_before(0), 0), "{:?}", stream.keyframe_at_or_before(0));
+        assert!(near(stream.keyframe_at_or_before(44), 0), "{:?}", stream.keyframe_at_or_before(44));
+        assert!(near(stream.keyframe_at_or_before(70), 45), "{:?}", stream.keyframe_at_or_before(70));
+        assert!(near(stream.keyframe_at_or_before(89), 45), "{:?}", stream.keyframe_at_or_before(89));
         let _ = std::fs::remove_file(&path);
     }
 

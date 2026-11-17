@@ -177,6 +177,28 @@ What this says:
   exact one, with four streams) and little during playback, where software
   also keeps up on this CPU.
 
+### Scrubbing, 2026-11-17
+
+The bench gained step scrubs (fifteen jumps of +40 and of -36 frames, a pause
+between, like pressing a key) and a count of **stand-ins**: frames put on screen
+that were not the one the playhead was on. Two 1920x1080 5 Mbps H.264 clips
+(2s GOP), measured on the CI container (4 cores, software decode, lavapipe as
+the GPU, so a redraw takes ~55ms and every time below is rounded up to them):
+
+| | Step +40, exact | Stand-ins | Step -36, exact | Stand-ins |
+| --- | --- | --- | --- | --- |
+| Before | 286 ms | 46 | 270 ms | 42 |
+| After | **196 ms** | **4** | **223 ms** | 26 |
+
+Before, a jump just past the run-ahead walked the stream and every frame on the
+way went on screen, and a keyframe left over from an earlier seek could come
+back. On a real GPU, redrawing every few ms, the walk reads as the footage
+playing. Now a forward jump inside the GOP skips without publishing anything
+(which is also why it is faster: no seek back to the keyframe), and a seek's
+keyframe stands in only after 150ms. The stand-ins left are those slow seeks:
+this CPU decodes a GOP of two streams in ~200ms. A hardware decoder on 1080p,
+or a proxy, should finish inside 150ms and show none.
+
 What it does not say: this is a headless loop with no egui and no swapchain
 present, on one machine, with synthetic 8-bit footage and no sound. See
 [`phase-0-playback-spike.md`](phase-0-playback-spike.md).

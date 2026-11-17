@@ -64,9 +64,19 @@ it runs on.
   `docs/performance.md`) and it is not zero-copy; sharing the decoder's texture
   with wgpu is the upgrade if 8K or many more streams ever matter.
 - **Exact-frame scrubbing is bounded by GOP length**, not by this design: the
-  frames between the keyframe and the target have to be decoded. The preview
-  shows the seek's keyframe first, then the exact frame. All-intra proxies are
-  what make scrubbing instant, and they were already on the roadmap.
+  frames between the keyframe and the target have to be decoded. All-intra
+  proxies are what make scrubbing instant, and they were already on the roadmap.
+- **A scrub goes to the frame; it never plays the way there** (amended
+  2026-11-17). The preview used to show the seek's keyframe first, always, and a
+  short jump ahead walked the stream handing every frame in between to the
+  screen, so stepping a little way forward *played* the footage. Now a jump
+  forward skips (`LibavStream::skip_to`) whenever the container's index puts the
+  target's keyframe no further on than the decoder already is (the same work as
+  a seek, minus the frames already behind it), and nothing in between is
+  published. The last picture holds until the exact frame arrives; the keyframe
+  stands in only once a seek has taken 150ms, and any stand-in must be nearer
+  the playhead than what is already up. Pinned by
+  `video::tests::a_jump_forward_publishes_no_frame_in_between`.
 - **Variable frame rate is approximated** on a constant grid at the probed rate,
   the same as the sidecar. A gap holds the previous frame.
 - **One wgpu device.** A second window on a different adapter would not see the
