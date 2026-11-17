@@ -10,6 +10,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::yuv::{Matrix, Transfer, YuvFrame};
+
 use motion_core::asset::{
     AssetKind, AssetMeta, DecodeError, Decoder, DecoderRegistry, Frame, FrameStream,
 };
@@ -491,6 +493,60 @@ impl Decoder for HeicDecoder {
 pub struct FfmpegDecoder {
     ffmpeg: String,
     ffprobe: String,
+    /// Which files are HDR, probed once per file on first decode. Not part
+    /// of the document: projects imported before HDR support get it too.
+    hdr: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<Hdr>>>,
+}
+
+/// How an HDR file's pixels are encoded. SDR files have none and decode
+/// straight to RGBA as they always have.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hdr {
+    matrix: Matrix,
+    transfer: Transfer,
+    full_range: bool,
+}
+
+impl Hdr {
+    /// From ffprobe's `color_transfer`, `color_space`, `color_range` lines.
+    fn parse(text: &str) -> Option<Hdr> {
+        let mut hdr = Hdr { matrix: Matrix::Bt2020, transfer: Transfer::Sdr, full_range: false };
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match (k.trim(), v.trim()) {
+                ("color_transfer", "arib-std-b67") => hdr.transfer = Transfer::Hlg,
+                ("color_transfer", "smpte2084") => hdr.transfer = Transfer::Pq,
+                ("color_space", "bt709") => hdr.matrix = Matrix::Bt709,
+                ("color_space", s) if !s.starts_with("bt2020") && s != "unknown" => hdr.matrix = Matrix::Bt601,
+                ("color_range", "pc") => hdr.full_range = true,
+                _ => {}
+            }
+        }
+        (hdr.transfer != Transfer::Sdr).then_some(hdr)
+    }
+
+    /// What ffmpeg is asked for: NV12 for HDR, which [`YuvFrame::to_rgba`]
+    /// tone maps exactly as the preview's shader does.
+    fn pix_fmt(hdr: Option<Hdr>) -> &'static str {
+        if hdr.is_some() { "nv12" } else { "rgba" }
+    }
+
+    fn frame_bytes(hdr: Option<Hdr>, w: u32, h: u32) -> usize {
+        let (w, h) = (w as usize, h as usize);
+        if hdr.is_some() { w * h + w.div_ceil(2) * h.div_ceil(2) * 2 } else { w * h * 4 }
+    }
+
+    /// One frame of ffmpeg output as RGBA.
+    fn frame(hdr: Option<Hdr>, w: u32, h: u32, mut buf: Vec<u8>) -> Result<Frame, DecodeError> {
+        let Some(hdr) = hdr else { return Frame::new(w, h, buf) };
+        let split = (w * h) as usize;
+        if buf.len() < split {
+            return Err(DecodeError::Malformed(format!("short NV12 frame: {} bytes", buf.len())));
+        }
+        let uv = buf.split_off(split);
+        let yuv = YuvFrame { width: w, height: h, y: buf, uv, matrix: hdr.matrix, full_range: hdr.full_range, transfer: hdr.transfer };
+        Frame::new(w, h, yuv.to_rgba())
+    }
 }
 
 // Containers, not codecs: probing is by extension and the codec inside is
@@ -510,7 +566,23 @@ impl Default for FfmpegDecoder {
 
 impl FfmpegDecoder {
     pub fn new() -> Self {
-        Self { ffmpeg: ffmpeg_bin(), ffprobe: ffprobe_bin() }
+        Self { ffmpeg: ffmpeg_bin(), ffprobe: ffprobe_bin(), hdr: Default::default() }
+    }
+
+    /// Whether `path` is HDR, and how; asked of ffprobe once per file.
+    fn hdr(&self, path: &Path) -> Option<Hdr> {
+        if let Some(h) = self.hdr.lock().unwrap().get(path) {
+            return *h;
+        }
+        let h = Command::new(&self.ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=color_transfer,color_space,color_range", "-of", "default=noprint_wrappers=1"])
+            .arg(path)
+            .output()
+            .ok()
+            .and_then(|o| Hdr::parse(&String::from_utf8_lossy(&o.stdout)));
+        self.hdr.lock().unwrap().insert(path.to_path_buf(), h);
+        h
     }
 
     /// Whether the tools are actually callable. Used by the UI to explain a
@@ -574,11 +646,12 @@ impl Decoder for FfmpegDecoder {
         meta: &AssetMeta,
     ) -> Result<Frame, DecodeError> {
         let (w, h) = (meta.width as u32, meta.height as u32);
+        let hdr = self.hdr(path);
         let out = Command::new(&self.ffmpeg)
             .args(["-v", "error", "-ss", &format!("{:.6}", seek_seconds(source_frame, meta))])
             .arg("-i")
             .arg(path)
-            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", Hdr::pix_fmt(hdr), "-"])
             .output()
             .map_err(|_| self.missing_tool(&self.ffmpeg))?;
         if !out.status.success() {
@@ -598,10 +671,11 @@ impl Decoder for FfmpegDecoder {
                 path.display()
             )));
         }
-        Frame::new(w, h, out.stdout)
+        Hdr::frame(hdr, w, h, out.stdout)
     }
 
     fn stream(&self, path: &Path, from: i64, meta: &AssetMeta) -> Option<Box<dyn FrameStream>> {
+        let hdr = self.hdr(path);
         // One process, left running, with frames read off its stdout as they
         // come. Everything expensive about the sidecar — process creation,
         // container parsing, decoder setup — is paid once here instead of once
@@ -610,7 +684,7 @@ impl Decoder for FfmpegDecoder {
             .args(["-v", "error", "-ss", &format!("{:.6}", seek_seconds(from, meta))])
             .arg("-i")
             .arg(path)
-            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .args(["-f", "rawvideo", "-pix_fmt", Hdr::pix_fmt(hdr), "-"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
@@ -624,6 +698,7 @@ impl Decoder for FfmpegDecoder {
             height: meta.height as u32,
             next: from,
             last: meta.frames - 1,
+            hdr,
         }))
     }
 }
@@ -657,6 +732,7 @@ struct FfmpegStream {
     /// Last valid source frame. The probed frame count can overstate a
     /// variable-rate file, so the stream can also just end; both are handled.
     last: i64,
+    hdr: Option<Hdr>,
 }
 
 impl FrameStream for FfmpegStream {
@@ -665,14 +741,14 @@ impl FrameStream for FfmpegStream {
         if self.next > self.last {
             return Ok(None);
         }
-        let mut buf = vec![0u8; self.width as usize * self.height as usize * 4];
+        let mut buf = vec![0u8; Hdr::frame_bytes(self.hdr, self.width, self.height)];
         // `read_exact` rather than `read`: a pipe hands over whatever happens to
         // be buffered, so a single read routinely returns a partial frame.
         // Treating that as a whole one would tear the picture.
         match self.stdout.read_exact(&mut buf) {
             Ok(()) => {
                 self.next += 1;
-                Frame::new(self.width, self.height, buf).map(Some)
+                Hdr::frame(self.hdr, self.width, self.height, buf).map(Some)
             }
             // A clean EOF is the end of the footage, not a failure.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
@@ -732,10 +808,8 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
             // `TAG:rotate`. ffmpeg turns the frames upright when decoding, so
             // the asset has to be the upright size or every frame is read
             // at the wrong stride.
-            "rotation" | "TAG:rotate" => {
-                if v.parse::<f64>().is_ok_and(|r| (r.round() as i64).rem_euclid(180) == 90) {
-                    sideways = true;
-                }
+            "rotation" | "TAG:rotate" if v.parse::<f64>().is_ok_and(|r| (r.round() as i64).rem_euclid(180) == 90) => {
+                sideways = true;
             }
             _ => {}
         }
@@ -784,6 +858,25 @@ mod tests {
         assert_eq!(m.fps, 24.0);
         let m = parse_probe("width=8\nheight=8\nr_frame_rate=25/1\navg_frame_rate=0/0\n").unwrap();
         assert_eq!(m.fps, 25.0, "an unknown average falls back to r_frame_rate");
+    }
+
+    /// Only HLG and PQ take the HDR path; everything else, tagged or not,
+    /// keeps decoding straight to RGBA.
+    #[test]
+    fn only_hdr_transfers_are_hdr() {
+        let iphone = Hdr::parse("color_range=tv
+color_space=bt2020nc
+color_transfer=arib-std-b67
+");
+        assert_eq!(iphone, Some(Hdr { matrix: Matrix::Bt2020, transfer: Transfer::Hlg, full_range: false }));
+        assert_eq!(Hdr::parse("color_space=bt2020nc
+color_transfer=smpte2084
+").map(|h| h.transfer), Some(Transfer::Pq));
+        assert_eq!(Hdr::parse("color_range=tv
+color_space=bt709
+color_transfer=bt709
+"), None);
+        assert_eq!(Hdr::parse(""), None);
     }
 
     /// Portrait phone footage is stored sideways with a rotation; ffmpeg
@@ -969,5 +1062,31 @@ mod ai_smoke {
         let opaque = f.rgba.chunks(4).filter(|p| p[3] > 0).count();
         println!("layer {}x{} opaque {} in {:?}", f.width, f.height, opaque, t.elapsed());
         image::save_buffer(std::env::var("PBC_OUT").unwrap(), &f.rgba, f.width, f.height, image::ColorType::Rgba8).unwrap();
+    }
+}
+#[cfg(test)]
+mod hdr_smoke {
+    /// `PBC_VIDEO=<clip> PBC_OUT=<png> cargo test -p motion-render hdr_smoke -- --ignored`:
+    /// one frame of a real clip as the export decodes it.
+    #[test]
+    #[ignore]
+    fn decodes_a_real_frame() {
+        use motion_core::asset::Decoder;
+        let path = std::path::PathBuf::from(std::env::var("PBC_VIDEO").unwrap());
+        let d = super::FfmpegDecoder::new();
+        let meta = d.open(&path).unwrap();
+        println!("{}x{} hdr {:?}", meta.width, meta.height, d.hdr(&path));
+        let n = std::env::var("PBC_FRAME").map_or(240, |v| v.parse().unwrap());
+        let t = std::time::Instant::now();
+        let f = d.frame(&path, n, &meta).unwrap();
+        println!("frame {n} in {:?}", t.elapsed());
+        image::save_buffer(std::env::var("PBC_OUT").unwrap(), &f.rgba, f.width, f.height, image::ColorType::Rgba8).unwrap();
+        // Export throughput: the streaming path, 48 frames.
+        let mut st = d.stream(&path, n, &meta).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..48 {
+            st.next_frame().unwrap().unwrap();
+        }
+        println!("streamed 48 frames at {:.1} fps", 48.0 / t.elapsed().as_secs_f64());
     }
 }

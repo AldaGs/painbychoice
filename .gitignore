@@ -12,3 +12,6 @@ frames/
 *.avi
 *.m4v
 *.mxf
+
+# Machine-local build paths (FFMPEG_DIR, LIBCLANG_PATH).
+.cargo/config.toml

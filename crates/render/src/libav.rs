@@ -19,86 +19,7 @@ use ff::format::Pixel;
 use ff::util::color;
 use motion_core::asset::DecodeError;
 
-/// Which YCbCr→RGB matrix a frame was encoded with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Matrix {
-    Bt601,
-    Bt709,
-}
-
-/// One decoded frame as 8-bit NV12: a full-resolution luma plane and one
-/// half-resolution plane of interleaved Cb,Cr. Rows are tightly packed (no
-/// stride padding), so a plane uploads to a texture as-is.
-#[derive(Clone, Debug)]
-pub struct YuvFrame {
-    pub width: u32,
-    pub height: u32,
-    /// `width * height` bytes.
-    pub y: Vec<u8>,
-    /// `chroma_width() * chroma_height() * 2` bytes.
-    pub uv: Vec<u8>,
-    pub matrix: Matrix,
-    /// Full ("JPEG") range rather than the usual 16–235 video range.
-    pub full_range: bool,
-}
-
-impl YuvFrame {
-    pub fn chroma_width(&self) -> u32 {
-        self.width.div_ceil(2)
-    }
-    pub fn chroma_height(&self) -> u32 {
-        self.height.div_ceil(2)
-    }
-    pub fn bytes(&self) -> usize {
-        self.y.len() + self.uv.len()
-    }
-
-    /// The offsets and 3x3 matrix that take `(y, cb, cr)` in 0..1 to RGB:
-    /// `rgb = m * (yuv - offset)`. Shared by the CPU reference below and the
-    /// preview's shader, so the two cannot drift.
-    pub fn coefficients(&self) -> ([f32; 3], [[f32; 3]; 3]) {
-        let (kr, kb) = match self.matrix {
-            Matrix::Bt601 => (0.299f32, 0.114f32),
-            Matrix::Bt709 => (0.2126, 0.0722),
-        };
-        let kg = 1.0 - kr - kb;
-        let (y_off, y_scale, c_scale) = if self.full_range {
-            (0.0, 1.0, 1.0)
-        } else {
-            (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0)
-        };
-        let rv = 2.0 * (1.0 - kr) * c_scale;
-        let bu = 2.0 * (1.0 - kb) * c_scale;
-        let gu = -2.0 * (1.0 - kb) * kb / kg * c_scale;
-        let gv = -2.0 * (1.0 - kr) * kr / kg * c_scale;
-        // Rows are R, G, B; columns are Y, Cb, Cr.
-        ([y_off, 0.5, 0.5], [[y_scale, 0.0, rv], [y_scale, gu, gv], [y_scale, bu, 0.0]])
-    }
-
-    /// CPU conversion to straight RGBA. The reference the shader is tested
-    /// against, and what the parity test compares with the sidecar — never
-    /// called in the preview path.
-    pub fn to_rgba(&self) -> Vec<u8> {
-        let (off, m) = self.coefficients();
-        let (w, h, cw) = (self.width as usize, self.height as usize, self.chroma_width() as usize);
-        let mut out = vec![255u8; w * h * 4];
-        for row in 0..h {
-            for col in 0..w {
-                let c = ((row / 2) * cw + col / 2) * 2;
-                let yuv = [
-                    self.y[row * w + col] as f32 / 255.0 - off[0],
-                    self.uv[c] as f32 / 255.0 - off[1],
-                    self.uv[c + 1] as f32 / 255.0 - off[2],
-                ];
-                let px = &mut out[(row * w + col) * 4..][..3];
-                for (ch, r) in px.iter_mut().zip(m) {
-                    *ch = ((r[0] * yuv[0] + r[1] * yuv[1] + r[2] * yuv[2]) * 255.0).round().clamp(0.0, 255.0) as u8;
-                }
-            }
-        }
-        out
-    }
-}
+pub use crate::yuv::{Matrix, Transfer, YuvFrame};
 
 fn err(path: &Path, what: impl std::fmt::Display) -> DecodeError {
     DecodeError::Malformed(format!("{}: {what}", path.display()))
@@ -425,18 +346,58 @@ impl LibavStream {
             // therefore what the sidecar and every export already draw. Preview
             // must equal export before it equals convention.
             matrix: match frame.color_space() {
-                color::Space::BT709 | color::Space::BT2020NCL | color::Space::BT2020CL => Matrix::Bt709,
+                color::Space::BT709 => Matrix::Bt709,
+                color::Space::BT2020NCL | color::Space::BT2020CL => Matrix::Bt2020,
                 _ => Matrix::Bt601,
             },
             full_range: frame.color_range() == color::Range::JPEG || fmt == Pixel::YUVJ420P,
+            transfer: match frame.color_transfer_characteristic() {
+                color::TransferCharacteristic::ARIB_STD_B67 => Transfer::Hlg,
+                color::TransferCharacteristic::SMPTE2084 => Transfer::Pq,
+                _ => Transfer::Sdr,
+            },
         };
+
+        // 10-bit 4:2:0 (phone HDR, and what a hardware decoder hands back for
+        // it as P010): keep the top 8 bits of each sample. A shift per sample
+        // where swscale cost a 4K frame's worth of filtering.
+        // ponytail: 8 bits of an HDR signal can band in smooth skies; a P010
+        // texture (R16Unorm planes) is the upgrade.
+        let shift = match fmt {
+            Pixel::YUV420P10LE => Some(2),
+            Pixel::P010LE => Some(8),
+            _ => None,
+        };
+        if let Some(shift) = shift {
+            let top = |row: &[u8], n: usize, out: &mut Vec<u8>| {
+                out.extend(row[..n * 2].chunks_exact(2).map(|p| ((u16::from_le_bytes([p[0], p[1]]) as u32 + (1 << shift >> 1)) >> shift).min(255) as u8));
+            };
+            let (wu, hu) = (w as usize, h as usize);
+            for row in frame.data(0).chunks(frame.stride(0)).take(hu) {
+                top(row, wu, &mut out.y);
+            }
+            if fmt == Pixel::P010LE {
+                for row in frame.data(1).chunks(frame.stride(1)).take(ch) {
+                    top(row, cw * 2, &mut out.uv);
+                }
+            } else {
+                let (mut u, mut v) = (Vec::with_capacity(cw), Vec::with_capacity(cw));
+                for (ur, vr) in frame.data(1).chunks(frame.stride(1)).zip(frame.data(2).chunks(frame.stride(2))).take(ch) {
+                    u.clear();
+                    v.clear();
+                    top(ur, cw, &mut u);
+                    top(vr, cw, &mut v);
+                    out.uv.extend(u.iter().zip(&v).flat_map(|(a, b)| [*a, *b]));
+                }
+            }
+            return Ok(self.turn(out));
+        }
 
         let mut converted = ff::frame::Video::empty();
         let frame = match fmt {
             Pixel::NV12 | Pixel::YUV420P | Pixel::YUVJ420P => frame,
-            // ponytail: anything else (10-bit, 4:2:2, 4:4:4) goes through
-            // swscale down to 8-bit NV12 on this thread. Correct but slow and
-            // lossy; a P010 upload path is the upgrade when HDR footage matters.
+            // ponytail: anything else (4:2:2, 4:4:4, 12-bit) goes through
+            // swscale down to 8-bit NV12 on this thread. Correct but slow.
             _ => {
                 let scaler = match &mut self.scaler {
                     Some(s) => s,
@@ -469,14 +430,21 @@ impl LibavStream {
                 }
             }
         }
+        Ok(self.turn(out))
+    }
+
+    /// `frame` turned upright by the stream's display rotation.
+    fn turn(&self, mut out: YuvFrame) -> YuvFrame {
         if self.turns != 0 {
+            let (w, h) = (out.width as usize, out.height as usize);
+            let (cw, ch) = (out.chroma_width() as usize, out.chroma_height() as usize);
             out.y = rotate_plane(&out.y, w, h, 1, self.turns);
             out.uv = rotate_plane(&out.uv, cw, ch, 2, self.turns);
             if self.turns % 2 == 1 {
                 (out.width, out.height) = (out.height, out.width);
             }
         }
-        Ok(out)
+        out
     }
 }
 
@@ -589,6 +557,16 @@ mod tests {
             &["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"],
             false,
         );
+    }
+
+    /// HLG phone footage: tone mapped the same way by both paths. 8-bit
+    /// takes the NV12 route, 10-bit the shift that replaced swscale.
+    #[test]
+    fn hlg_footage_matches_the_sidecar() {
+        let hlg = ["-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "arib-std-b67"];
+        libav_matches_the_sidecar("pbc_libav_parity_hlg.mp4", &hlg, false);
+        let ten: Vec<&str> = hlg.iter().copied().chain(["-pix_fmt", "yuv420p10le"]).collect();
+        libav_matches_the_sidecar("pbc_libav_parity_hlg10.mp4", &ten, false);
     }
 
     /// The hardware decoder, where there is one, is the same decoder as far as

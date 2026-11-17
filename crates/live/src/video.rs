@@ -456,9 +456,46 @@ struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     return o;
 }
 
+// `motion_render::yuv::hdr_to_sdr`, line for line; `off.w` is the transfer
+// (0 SDR, 1 HLG, 2 PQ). The test below holds the two together.
+fn hdr_to_sdr(rgb: vec3<f32>, transfer: f32) -> vec3<f32> {
+    var nits: vec3<f32>;
+    if (transfer < 0.5) {
+        return rgb;
+    } else if (transfer < 1.5) {
+        let a = 0.17883277; let b = 0.28466892; let c = 0.5599107;
+        let v = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+        let e = select((exp((v - c) / a) + b) / 12.0, v * v / 3.0, v <= vec3<f32>(0.5));
+        let ys = dot(vec3<f32>(0.2627, 0.6780, 0.0593), e);
+        nits = e * (1000.0 * pow(max(ys, 1e-6), 0.2));
+    } else {
+        let p = pow(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 78.84375));
+        nits = 10000.0 * pow(max(p - 0.8359375, vec3<f32>(0.0)) / (18.851563 - 18.6875 * p), vec3<f32>(1.0 / 0.15930176));
+    }
+    let x = nits / 406.0;
+    let lin = max(vec3<f32>(
+        dot(vec3<f32>(1.6605, -0.5876, -0.0728), x),
+        dot(vec3<f32>(-0.1246, 1.1329, -0.0083), x),
+        dot(vec3<f32>(-0.0182, -0.1006, 1.1187), x),
+    ), vec3<f32>(0.0));
+    let peak = max(lin.r, max(lin.g, lin.b));
+    let k = 0.8;
+    let top = (1000.0 / 406.0 - k) / (1.0 - k);
+    var scale = 1.0;
+    if (peak > k) {
+        let t = (peak - k) / (1.0 - k);
+        scale = (k + (1.0 - k) * min(t * (1.0 + t / (top * top)) / (1.0 + t), 1.0)) / peak;
+    }
+    let s = lin * scale;
+    let grey = dot(vec3<f32>(0.2126, 0.7152, 0.0722), s);
+    let desat = 0.5 * clamp((peak - k) / (1.0 - k), 0.0, 1.0);
+    return pow(min(mix(s, vec3<f32>(grey), desat), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.4));
+}
+
 @fragment fn fs(v: V) -> @location(0) vec4<f32> {
     let yuv = vec3<f32>(textureSample(y_tex, samp, v.uv).r, textureSample(uv_tex, samp, v.uv).rg) - u.off.xyz;
-    return vec4<f32>(dot(u.r.xyz, yuv), dot(u.g.xyz, yuv), dot(u.b.xyz, yuv), 1.0);
+    let rgb = vec3<f32>(dot(u.r.xyz, yuv), dot(u.g.xyz, yuv), dot(u.b.xyz, yuv));
+    return vec4<f32>(hdr_to_sdr(rgb, u.off.w), 1.0);
 }
 "#;
 
@@ -563,7 +600,7 @@ impl Gpu {
         write(&tex.uv, &frame.uv, frame.chroma_width(), frame.chroma_height(), 2);
 
         let (off, m) = frame.coefficients();
-        let rows = [[off[0], off[1], off[2], 0.0], [m[0][0], m[0][1], m[0][2], 0.0], [m[1][0], m[1][1], m[1][2], 0.0], [m[2][0], m[2][1], m[2][2], 0.0]];
+        let rows = [[off[0], off[1], off[2], frame.transfer.code()], [m[0][0], m[0][1], m[0][2], 0.0], [m[1][0], m[1][1], m[1][2], 0.0], [m[2][0], m[2][1], m[2][2], 0.0]];
         let bytes: Vec<u8> = rows.iter().flatten().flat_map(|f| f.to_ne_bytes()).collect();
         queue.write_buffer(&tex.uniforms, 0, &bytes);
 
@@ -594,7 +631,7 @@ impl Gpu {
 mod tests {
     use super::*;
     use crate::offscreen::Headless;
-    use motion_render::libav::Matrix;
+    use motion_render::libav::{Matrix, Transfer};
 
     /// **The shader is the CPU reference.** The same planes through
     /// `YuvFrame::to_rgba` and through the GPU pass give the same picture, so
@@ -606,16 +643,31 @@ mod tests {
             return;
         };
         let (w, h) = (64u32, 36u32);
-        for (matrix, full_range) in [(Matrix::Bt601, false), (Matrix::Bt709, false), (Matrix::Bt709, true)] {
-            // Smooth ramps: chroma is interpolated on the GPU and replicated on
-            // the CPU, and a ramp keeps that difference under a level.
+        let cases = [
+            (Matrix::Bt601, false, Transfer::Sdr),
+            (Matrix::Bt709, false, Transfer::Sdr),
+            (Matrix::Bt709, true, Transfer::Sdr),
+            (Matrix::Bt2020, false, Transfer::Hlg),
+            (Matrix::Bt2020, false, Transfer::Pq),
+        ];
+        // Smooth chroma ramps: chroma is interpolated on the GPU and replicated
+        // on the CPU, and a ramp keeps that difference under a level — or a
+        // little over where an HDR curve steepens it. Flat chroma has nothing
+        // to interpolate, so there the maths alone is compared, tightly.
+        let ramp: Vec<u8> = (0..(w / 2) * (h / 2)).flat_map(|i| [(64 + (i % (w / 2)) * 4) as u8, (64 + (i / (w / 2)) * 7) as u8]).collect();
+        let flat: Vec<u8> = [148u8, 108].repeat(((w / 2) * (h / 2)) as usize);
+        for ((matrix, full_range, transfer), (uv, budget)) in cases.into_iter().flat_map(|c| {
+            let ramp_budget = if c.2 == Transfer::Sdr { 1.5 } else { 2.5 };
+            [(c, (ramp.clone(), ramp_budget)), (c, (flat.clone(), 0.75))]
+        }) {
             let frame = YuvFrame {
                 width: w,
                 height: h,
                 y: (0..w * h).map(|i| (16 + (i % w) * 219 / w) as u8).collect(),
-                uv: (0..(w / 2) * (h / 2)).flat_map(|i| [(64 + (i % (w / 2)) * 4) as u8, (64 + (i / (w / 2)) * 7) as u8]).collect(),
+                uv,
                 matrix,
                 full_range,
+                transfer,
             };
             let pass = Gpu::new(&gpu.device);
             let (tex, rgba) = pass.clip_textures(&gpu.device, w, h);
@@ -623,7 +675,7 @@ mod tests {
             let got = crate::scene::read_texture_rgba(&gpu.device, &gpu.queue, &rgba, w, h).expect("readback");
             let want = frame.to_rgba();
             let diff = got.iter().zip(&want).map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>() / want.len() as f64;
-            assert!(diff < 1.5, "{matrix:?} full={full_range}: shader differs from the CPU reference by {diff:.2}");
+            assert!(diff < budget, "{matrix:?} {transfer:?} full={full_range} budget {budget}: shader differs from the CPU reference by {diff:.2}");
             // Orientation: the top-left pixel is the top-left pixel.
             let d0 = (got[0] as i32 - want[0] as i32).abs();
             assert!(d0 <= 3, "top-left pixel is off by {d0}: flipped?");
