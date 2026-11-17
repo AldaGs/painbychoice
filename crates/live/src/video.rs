@@ -38,17 +38,38 @@ const MAX_AHEAD: i64 = 24;
 /// was about to show and a one-frame step back is free.
 const KEEP_BEHIND: i64 = 2;
 /// How far ahead of the decoder a wanted frame may be before a seek beats
-/// decoding forward to it.
+/// decoding forward to it — for footage whose container has no index. With an
+/// index the keyframes decide (see `decode_loop`).
 const WALK: i64 = 12;
+/// How long a seek may take before its keyframe is put up as a stand-in.
+///
+/// The keyframe can be a whole GOP (seconds) before the frame asked for. When
+/// the exact frame follows within a few frames' time — a hardware decoder on
+/// 1080p, any all-intra proxy — flashing it first only shows footage nobody
+/// asked to see, so the screen holds the last picture and goes straight to the
+/// exact frame. Past this, something near the target beats a frozen picture.
+const KEYFRAME_AFTER: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// A picture for a position whose exact frame isn't decoded yet.
+struct Approx {
+    index: i64,
+    frame: Arc<YuvFrame>,
+    /// The frame this was decoded on the way to.
+    for_want: i64,
+    /// For the keyframe a seek landed on: when the seek began. It is shown
+    /// only once [`KEYFRAME_AFTER`] has passed. `None` for an exact frame the
+    /// playhead moved past while it decoded, which is shown straight away: it
+    /// is where the playhead just was, not footage it skipped over.
+    seeked: Option<Instant>,
+}
 
 /// What the decode thread and the UI share.
 struct Queue {
     frames: BTreeMap<i64, Arc<YuvFrame>>,
     /// The frame the UI is drawing. The thread fills `want..=want + ahead`.
     want: i64,
-    /// The keyframe the last seek landed on, and the frame that seek was for.
-    /// Shown while the exact frame is still a GOP's decoding away.
-    approx: Option<(i64, Arc<YuvFrame>, i64)>,
+    /// Something to show while the exact frame is still a GOP's decoding away.
+    approx: Option<Approx>,
     /// First frame past the end of the file, once the decoder has found it.
     end: Option<i64>,
     /// The file would not open or decode. The clip falls back to the sidecar.
@@ -95,8 +116,24 @@ fn decode_loop(shared: Arc<Shared>, path: PathBuf, fps: f64, frame_bytes: usize,
                 Err(e) => return fail(e.to_string()),
             },
         };
+        // Forward or seek. A seek lands on the keyframe at or before `need` and
+        // decodes forward from there, so when that keyframe is no further on
+        // than the stream already is, skipping forward does the same work
+        // minus the frames already behind us. Either way nothing between here
+        // and `need` is handed back: walking with `next_frame` used to, and
+        // every one of those frames went on screen in turn, so a jump a little
+        // way ahead played the footage in between.
         let at = s.next_index();
-        if need < at || need - at > WALK {
+        let forward = need >= at
+            && match s.keyframe_at_or_before(need) {
+                Some(kf) => kf <= at,
+                None => need - at <= WALK,
+            };
+        let mut seeked = None;
+        if forward {
+            s.skip_to(need);
+        } else {
+            seeked = Some(Instant::now());
             if let Err(e) = s.seek(need) {
                 return fail(e.to_string());
             }
@@ -107,9 +144,16 @@ fn decode_loop(shared: Arc<Shared>, path: PathBuf, fps: f64, frame_bytes: usize,
                 let mut q = shared.q.lock().unwrap();
                 q.hardware = s.is_hardware();
                 if index < need {
-                    // The keyframe on the way to `need`: something to look at.
-                    q.approx = Some((index, frame, need));
+                    // The keyframe on the way to `need`: something to look at,
+                    // if the exact frame turns out to be slow.
+                    q.approx = Some(Approx { index, frame, for_want: need, seeked: seeked.or(Some(Instant::now())) });
                     continue;
+                }
+                if index < q.want - KEEP_BEHIND {
+                    // The playhead moved on while this decoded (a fast drag).
+                    // Too far behind for the cache, but it is the latest real
+                    // position, which beats a keyframe or a frozen picture.
+                    q.approx = Some(Approx { index, frame: frame.clone(), for_want: need, seeked: None });
                 }
                 // ponytail: a gap in the timestamps (variable frame rate) is
                 // filled by holding this frame over it, or `need` would stay
@@ -176,6 +220,9 @@ pub(crate) struct Stats {
     pub(crate) dropped: u64,
     /// The slowest request-to-screen time, in milliseconds.
     pub(crate) worst_ms: f64,
+    /// Frames put on screen that were not the frame the playhead was on: the
+    /// stand-ins shown while the exact frame decodes.
+    pub(crate) standins: u64,
 }
 
 pub(crate) enum Lookup<'a> {
@@ -300,7 +347,18 @@ impl VideoPlayback {
                     .next_back()
                     .or_else(|| q.frames.range(clip.want..=clip.want + MAX_AHEAD).next())
                     .map(|(i, f)| (*i, f.clone(), true))
-                    .or_else(|| q.approx.as_ref().map(|(i, f, for_want)| (*i, f.clone(), *for_want == clip.want)));
+                    .or_else(|| {
+                        // A stand-in has to earn its place: nearer the playhead
+                        // than the picture already up. Otherwise it is left
+                        // over from an earlier position — the keyframe of some
+                        // seek long ago — and putting it up shows footage from
+                        // nowhere near where the playhead is.
+                        let nearer = |a: &Approx| clip.shown.is_none_or(|s| (a.index - clip.want).abs() < (s - clip.want).abs());
+                        q.approx
+                            .as_ref()
+                            .filter(|a| nearer(a) && a.seeked.is_none_or(|t| t.elapsed() >= KEYFRAME_AFTER))
+                            .map(|a| (a.index, a.frame.clone(), a.for_want == clip.want))
+                    });
                 (pick, q.error.is_some() || q.end.is_some_and(|e| clip.want >= e))
             };
             if let Some((index, frame, fresh)) = pick {
@@ -325,6 +383,9 @@ impl VideoPlayback {
                         gpu.convert(device, queue, tex, &frame);
                         renderer.mark_override_image_dirty(&clip.handle);
                         clip.shown = Some(index);
+                        if index != clip.want {
+                            self.stats.standins += 1;
+                        }
                     }
                 }
                 if index == clip.want && !clip.hit {
@@ -570,6 +631,76 @@ mod tests {
         let _ = &mut gpu.renderer;
     }
 
+    /// **A jump forward goes to the frame; it does not play the way there.**
+    /// Drives the decode thread directly (no GPU) and records every frame it
+    /// publishes, cached or as a stand-in. A short jump past the run-ahead used
+    /// to walk the stream with every frame in between handed out as the
+    /// stand-in, and the preview drew each of them: scrubbing played footage.
+    #[test]
+    fn a_jump_forward_publishes_no_frame_in_between() {
+        let path = std::env::temp_dir().join(format!("pbc_video_jump_{}.mp4", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=3"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "45", "-bf", "2"])
+            .arg(&path)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("skipping: ffmpeg (with libx264) couldn't generate a fixture");
+            return;
+        }
+        let shared = Arc::new(Shared {
+            q: Mutex::new(Queue { frames: BTreeMap::new(), want: 0, approx: None, end: None, error: None, hardware: false, stop: false }),
+            wake: Condvar::new(),
+        });
+        let thread = {
+            let (s, p) = (shared.clone(), path.clone());
+            std::thread::spawn(move || decode_loop(s, p, 30.0, 320 * 180 * 3 / 2, false))
+        };
+        // Everything the thread has made visible, polled until `until` holds.
+        let watch = |until: &dyn Fn(&Queue) -> bool| {
+            let mut seen = std::collections::BTreeSet::new();
+            let t = Instant::now();
+            loop {
+                {
+                    let q = shared.q.lock().unwrap();
+                    seen.extend(q.frames.keys().copied());
+                    seen.extend(q.approx.as_ref().map(|a| a.index));
+                    assert!(q.error.is_none(), "{:?}", q.error);
+                    if until(&q) {
+                        return seen;
+                    }
+                }
+                assert!(t.elapsed() < std::time::Duration::from_secs(10), "the decoder never got there");
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        };
+        let jump = |to: i64| {
+            shared.q.lock().unwrap().want = to;
+            shared.wake.notify_all();
+        };
+
+        // Settle at 0 with the run-ahead full (24 frames, then the decoder sleeps).
+        watch(&|q| q.frames.contains_key(&MAX_AHEAD));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // A short way past the run-ahead, inside the GOP: within the old walk.
+        jump(35);
+        let seen = watch(&|q| q.frames.contains_key(&35));
+        let between: Vec<_> = seen.range(MAX_AHEAD + 1..35).collect();
+        assert!(between.is_empty(), "frames between the old run-ahead and the target were published: {between:?}");
+
+        // Across a GOP: seeks, and the only stand-in is the keyframe, held
+        // back until the seek has been slow.
+        jump(80);
+        let seen = watch(&|q| q.frames.contains_key(&80));
+        let between: Vec<_> = seen.range(35 + MAX_AHEAD + 1..80).filter(|f| **f != 45).collect();
+        assert!(between.is_empty(), "only the keyframe may stand in: {between:?}");
+
+        shared.q.lock().unwrap().stop = true;
+        shared.wake.notify_all();
+        thread.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// **The Phase 0 gate, as a measurement** — not an assertion, because the
     /// answer belongs to a machine and goes in `docs/performance.md`.
     ///
@@ -703,6 +834,25 @@ mod tests {
         firsts.sort_by(f64::total_cmp);
         jumps.sort_by(f64::total_cmp);
 
+        // Step scrubs: a jump of 36-40 frames at a time with a pause between,
+        // like pressing a key or clicking a little way along the ruler. Past
+        // the run-ahead, inside or across a GOP. Counts the frames put on
+        // screen that were not the one asked for.
+        let mut steps = |from: i64, by: i64| {
+            settle(&mut cache, &mut gpu, from);
+            std::thread::sleep(Duration::from_millis(300));
+            cache.video.stats = Default::default();
+            let mut exact = Vec::new();
+            for k in 1..=15 {
+                exact.push(settle(&mut cache, &mut gpu, from + by * k).1);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            exact.sort_by(f64::total_cmp);
+            (exact[7], exact[14], cache.video.stats.standins)
+        };
+        let fwd = steps(0, 40);
+        let back = steps(560, -36);
+
         println!("clips: {names}  ({hw}/{open} on the hardware decoder)");
         println!("cold start to first frame of all clips: {cold:.0} ms");
         println!(
@@ -715,5 +865,8 @@ mod tests {
         println!("redraw: {} redraws, median {:.1} ms, p99 {:.1} ms, max {:.1} ms", times.len(), pct(0.5), pct(0.99), pct(1.0));
         println!("scrub (all clips showing a frame): median {:.0} ms, p90 {:.0} ms, max {:.0} ms", firsts[10], firsts[18], firsts[19]);
         println!("scrub (all clips exact): median {:.0} ms, p90 {:.0} ms, max {:.0} ms", jumps[10], jumps[18], jumps[19]);
+        for (name, (median, max, standins)) in [("forward 40", fwd), ("back 36", back)] {
+            println!("step {name} x15 (all clips exact): median {median:.0} ms, max {max:.0} ms, {standins} stand-in frames shown");
+        }
     }
 }
