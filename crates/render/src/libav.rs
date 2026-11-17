@@ -133,7 +133,55 @@ pub struct LibavStream {
     eof_sent: bool,
     hardware: bool,
     scaler: Option<ff::software::scaling::Context>,
+    /// Clockwise quarter turns that make the picture upright (phone footage
+    /// stored sideways). The sidecar's ffmpeg applies the same turn itself.
+    turns: u8,
     path: std::path::PathBuf,
+}
+
+/// Clockwise quarter turns (0..4) the stream's display matrix asks for.
+fn display_turns(st: &ff::format::stream::Stream) -> u8 {
+    unsafe {
+        let par = (*st.as_ptr()).codecpar;
+        let sd = ffi::av_packet_side_data_get(
+            (*par).coded_side_data,
+            (*par).nb_coded_side_data,
+            ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+        );
+        if sd.is_null() || (*sd).size < 36 {
+            return 0;
+        }
+        // Counter-clockwise degrees, so `-90` means turn clockwise once —
+        // the same reading as ffmpeg's own autorotate.
+        let ccw = ffi::av_display_rotation_get((*sd).data as *const i32);
+        if !ccw.is_finite() {
+            return 0;
+        }
+        ((-ccw / 90.0).round() as i64).rem_euclid(4) as u8
+    }
+}
+
+/// `plane` (`w`×`h` pixels of `px` bytes) turned clockwise `turns` times.
+// ponytail: a CPU transpose, a few ms per 4K frame; rotating in the YUV shader
+// is the upgrade if portrait footage has to keep up with several clips.
+fn rotate_plane(plane: &[u8], w: usize, h: usize, px: usize, turns: u8) -> Vec<u8> {
+    if turns == 0 {
+        return plane.to_vec();
+    }
+    let mut out = vec![0u8; plane.len()];
+    let ow = if turns == 2 { w } else { h };
+    for y in 0..h {
+        for x in 0..w {
+            let (ox, oy) = match turns {
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let (s, d) = ((y * w + x) * px, (oy * ow + ox) * px);
+            out[d..d + px].copy_from_slice(&plane[s..s + px]);
+        }
+    }
+    out
 }
 
 // The contexts hold raw pointers, but nothing here is shared: a stream is owned
@@ -163,6 +211,7 @@ impl LibavStream {
         let tb = st.time_base();
         let tick = tb.numerator() as f64 / tb.denominator().max(1) as f64;
         let start = if st.start_time() == ffi::AV_NOPTS_VALUE { 0 } else { st.start_time() };
+        let turns = display_turns(&st);
 
         let mut ctx = ff::codec::context::Context::from_parameters(st.parameters()).map_err(|e| err(path, e))?;
         let hardware = hardware && attach_hw_device(&mut ctx);
@@ -189,6 +238,7 @@ impl LibavStream {
             eof_sent: false,
             hardware,
             scaler: None,
+            turns,
             path: path.to_path_buf(),
         };
         s.index_lead = s.index_entry(0).map_or(0, |first| (s.start - first).max(0));
@@ -419,6 +469,13 @@ impl LibavStream {
                 }
             }
         }
+        if self.turns != 0 {
+            out.y = rotate_plane(&out.y, w, h, 1, self.turns);
+            out.uv = rotate_plane(&out.uv, cw, ch, 2, self.turns);
+            if self.turns % 2 == 1 {
+                (out.width, out.height) = (out.height, out.width);
+            }
+        }
         Ok(out)
     }
 }
@@ -485,6 +542,11 @@ mod tests {
     /// off-by-one in the pts→index mapping would look like.
     fn libav_matches_the_sidecar(name: &str, extra: &[&str], hardware: bool) {
         let Some(path) = fixture(name, extra) else { return };
+        parity(&path, hardware);
+    }
+
+    fn parity(path: &std::path::Path, hardware: bool) {
+        let path = path.to_path_buf();
         let sidecar = FfmpegDecoder::new();
         let meta = sidecar.open(&path).expect("probe the fixture");
 
@@ -534,6 +596,30 @@ mod tests {
     #[test]
     fn hardware_decode_matches_the_sidecar() {
         libav_matches_the_sidecar("pbc_libav_parity_hw.mp4", &[], true);
+    }
+
+    /// Portrait phone footage: stored sideways with a display rotation. Both
+    /// paths show it upright, at the size the import reports.
+    #[test]
+    fn rotated_footage_matches_the_sidecar() {
+        let Some(flat) = fixture("pbc_libav_flat.mp4", &[]) else { return };
+        let path = std::env::temp_dir().join("pbc_libav_rotated.mp4");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-display_rotation", "-90", "-i"])
+            .arg(&flat)
+            .args(["-c", "copy"])
+            .arg(&path)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("skipping: this ffmpeg can't tag a display rotation");
+            return;
+        }
+        let meta = FfmpegDecoder::new().open(&path).unwrap();
+        assert_eq!((meta.width, meta.height), (180.0, 320.0), "imported upright");
+        let (_, f) = LibavStream::open(&path, 0, meta.fps, false).unwrap().next_frame().unwrap().unwrap();
+        assert_eq!((f.width, f.height), (180, 320));
+        parity(&path, false);
+        let _ = std::fs::remove_file(&flat);
     }
 
     /// The keyframe a seek lands on is offered once, early, and does not

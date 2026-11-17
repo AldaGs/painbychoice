@@ -549,7 +549,8 @@ impl Decoder for FfmpegDecoder {
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+                "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration\
+                 :stream_side_data=rotation:stream_tags=rotate",
                 "-of",
                 "default=noprint_wrappers=1",
             ])
@@ -709,6 +710,7 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
     let mut avg_fps = None;
     let mut nb_frames = None;
     let mut duration = None;
+    let mut sideways = false;
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         let v = v.trim();
@@ -725,12 +727,23 @@ fn parse_probe(text: &str) -> Result<AssetMeta, DecodeError> {
             "avg_frame_rate" => avg_fps = rational(v),
             "nb_frames" => nb_frames = v.parse::<i64>().ok(),
             "duration" => duration = v.parse::<f64>().ok(),
+            // A phone shooting portrait stores the picture sideways plus a
+            // display rotation: `rotation` in the side data, or the older
+            // `TAG:rotate`. ffmpeg turns the frames upright when decoding, so
+            // the asset has to be the upright size or every frame is read
+            // at the wrong stride.
+            "rotation" | "TAG:rotate" => {
+                if v.parse::<f64>().is_ok_and(|r| (r.round() as i64).rem_euclid(180) == 90) {
+                    sideways = true;
+                }
+            }
             _ => {}
         }
     }
     let (Some(width), Some(height)) = (width, height) else {
         return Err(DecodeError::Malformed("ffprobe reported no video stream".into()));
     };
+    let (width, height) = if sideways { (height, width) } else { (width, height) };
     let fps = avg_fps.filter(|f| *f > 0.0).or(fps.filter(|f| *f > 0.0)).unwrap_or(25.0);
     // `nb_frames` is exact but frequently absent (it isn't in the container for
     // most streaming formats), so fall back to duration × rate. Both can be
@@ -771,6 +784,18 @@ mod tests {
         assert_eq!(m.fps, 24.0);
         let m = parse_probe("width=8\nheight=8\nr_frame_rate=25/1\navg_frame_rate=0/0\n").unwrap();
         assert_eq!(m.fps, 25.0, "an unknown average falls back to r_frame_rate");
+    }
+
+    /// Portrait phone footage is stored sideways with a rotation; ffmpeg
+    /// decodes it upright, so the asset is the upright size.
+    #[test]
+    fn a_quarter_turned_clip_imports_upright() {
+        let m = parse_probe("width=3840\nheight=2160\nr_frame_rate=24/1\nrotation=-90\n").unwrap();
+        assert_eq!((m.width, m.height), (2160.0, 3840.0));
+        let m = parse_probe("width=3840\nheight=2160\nr_frame_rate=24/1\nTAG:rotate=270\n").unwrap();
+        assert_eq!((m.width, m.height), (2160.0, 3840.0));
+        let m = parse_probe("width=3840\nheight=2160\nr_frame_rate=24/1\nrotation=180\n").unwrap();
+        assert_eq!((m.width, m.height), (3840.0, 2160.0), "upside down keeps its size");
     }
 
     /// Broadcast rates are rationals: 29.97 is 30000/1001, and rounding it to
