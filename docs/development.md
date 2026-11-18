@@ -36,6 +36,16 @@ with whatever `ffmpeg` comes first, and an LGPL build has no `libx264`. They say
 `PBC_HWDEC=0` forces software decode; `PBC_VIDEO_STATS=1` prints drop counts
 while playing.
 
+To run the release exe outside that shell, copy the DLLs next to it once:
+
+```bash
+cargo build --release -p motion-live --features libav
+cp "$FFMPEG_DIR"/bin/*.dll target/release/
+```
+
+Cargo leaves them there across rebuilds; recopy after `cargo clean` or an SDK
+change.
+
 Before pushing: `cargo test --workspace` and `cargo clippy --workspace
 --all-targets`. The test suite is fast (well under a second) — there is no
 excuse for not running it.
