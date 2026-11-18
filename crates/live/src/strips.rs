@@ -155,7 +155,7 @@ fn clip_bar(
     track: egui::Rect,
     resp: &egui::Response,
     row: &StripRow,
-    selected: Option<NodeId>,
+    selected: &[NodeId],
     axis: &Axis,
     tb: motion_core::Timebase,
     frame: f64,
@@ -165,9 +165,10 @@ fn clip_bar(
     tool: EditTool,
     clips: &[Clip],
     snap: &Magnet,
+    group: &[(NodeId, LayerTiming)],
     out: &mut DopeEdits,
 ) -> bool {
-    let is_sel = selected == Some(row.id);
+    let is_sel = selected.contains(&row.id);
     let accent = egui::Color32::from_rgb(255, 216, 51);
     let mut drag = false;
     let dragging = &mut drag;
@@ -177,17 +178,7 @@ fn clip_bar(
     // band rather than nothing: "alive the whole time" is a real state
     // and should look like one, not like a missing layer.
     let timing = row.timing;
-    let (x0, x1) = match timing {
-        Some(t) => (
-            axis.frame_to_x(t.in_ as f64),
-            axis.frame_to_x(t.out as f64),
-        ),
-        None => (track.left(), track.right()),
-    };
-    let bar = egui::Rect::from_min_max(
-        egui::pos2(x0.max(track.left()), track.top() + 3.0),
-        egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
-    );
+    let bar = bar_rect(track, timing, axis);
     if bar.width() > 0.0 {
         // Tinted with the layer type's accent: faint when it has no
         // range, stronger when it does, strongest when selected.
@@ -273,8 +264,8 @@ fn clip_bar(
             if let Some(p) = resp.interact_pointer_pos() {
                 out.clip_op = Some(Op::Razor(row.id, at(p.x)));
             }
-        } else if !is_sel {
-            out.select_layer = Some(row.id);
+        } else {
+            out.pick_layers = Some((vec![row.id], PickMode::click(crate::layers::click_mods(ui))));
         }
     }
     if row.depth == 0 {
@@ -287,7 +278,7 @@ fn clip_bar(
                 out.clip_op = Some(Op::RippleDelete(row.id));
                 ui.close();
             }
-            if let Some(sel) = selected.filter(|s| *s != row.id) {
+            if let Some(sel) = selected.first().copied().filter(|s| *s != row.id) {
                 if ui
                     .button("Sync-lock with selected")
                     .on_hover_text("Edit tools move, trim and cut them together")
@@ -326,6 +317,14 @@ fn clip_bar(
         // which point the pointer has already left the handle it
         // grabbed — which would read every trim as a slide.
         if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+            // Off the bar, on empty track: a marquee, not a slide.
+            if p.x < bar.left() || p.x > bar.right() {
+                ui.ctx().data_mut(|d| {
+                    d.remove::<(ClipGrab, i64, LayerTiming)>(drag_id);
+                    d.insert_temp(marquee_id(), Some(p));
+                });
+                return false;
+            }
             let alt = ui.input(|i| i.modifiers.alt);
             let grab = clip_grab_at(p.x, bar.left(), bar.right(), HANDLE_W, alt);
             let anchor = axis.x_to_frame(p.x);
@@ -333,6 +332,9 @@ fn clip_bar(
                 d.insert_temp(drag_id, (grab, anchor, timing));
                 // Ripple and roll act on the row as it stood at the press.
                 d.insert_temp(drag_id.with("clips"), clips.to_vec());
+                // The other selected bars, as they stood at the press.
+                let rides = is_sel && group.len() > 1;
+                d.insert_temp(drag_id.with("group"), if rides { group.to_vec() } else { Vec::new() });
             });
         }
     }
@@ -380,7 +382,17 @@ fn clip_bar(
                     (next != timing).then(|| Patch::from([(row.id, next)]))
                 }
             };
+            // A selected bar takes the rest of the selection along: every one
+            // gets the same trim, slide or slip, from where it stood at the press.
+            let group: Vec<(NodeId, LayerTiming)> = ui.ctx().data(|m| m.get_temp(drag_id.with("group"))).unwrap_or_default();
+            let patch = match patch {
+                Some(_) if !group.is_empty() && !matches!(tool, EditTool::Ripple | EditTool::Roll) => {
+                    Some(group.iter().map(|(id, t)| (*id, drag_clip(*t, grab, d))).collect::<Patch>())
+                }
+                p => p,
+            };
             match patch {
+                Some(p) if !group.is_empty() => out.clip_op = Some(Op::Patch(p)),
                 // A nested layer has no row and no sync group: a plain edit.
                 Some(p) if row.depth > 0 => out.set_layer_timing = p.get(&row.id).map(|t| (row.id, Some(*t))),
                 Some(p) if !p.is_empty() => out.clip_op = Some(Op::Patch(p)),
@@ -748,6 +760,40 @@ fn cache_bar(
     }
 }
 
+/// Where a row's bar sits on its track: its time range, or the whole track
+/// for a layer with none.
+fn bar_rect(track: egui::Rect, timing: Option<LayerTiming>, axis: &Axis) -> egui::Rect {
+    let (x0, x1) = match timing {
+        Some(t) => (axis.frame_to_x(t.in_ as f64), axis.frame_to_x(t.out as f64)),
+        None => (track.left(), track.right()),
+    };
+    egui::Rect::from_min_max(
+        egui::pos2(x0.max(track.left()), track.top() + 3.0),
+        egui::pos2(x1.min(track.right()), track.bottom() - 3.0),
+    )
+}
+
+/// The marquee's press point, set by a drag that starts on empty track.
+fn marquee_id() -> egui::Id {
+    egui::Id::new("strip_marquee")
+}
+
+/// The strips marquee: draws the band while held and, on release, picks every
+/// layer whose bar it touches. Returns whether it is live.
+fn sweep_bars(ui: &egui::Ui, bars: &[(NodeId, egui::Rect)], out: &mut DopeEdits) -> bool {
+    let anchor: Option<egui::Pos2> = ui.data(|d| d.get_temp(marquee_id())).flatten();
+    let (Some(a), Some(b)) = (anchor, ui.input(|i| i.pointer.latest_pos())) else { return false };
+    let r = egui::Rect::from_two_pos(a, b);
+    if ui.input(|i| i.pointer.primary_down()) {
+        crate::layers::paint_marquee(&ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, marquee_id())), r);
+        return true;
+    }
+    let hits = bars.iter().filter(|(_, bar)| bar.intersects(r)).map(|(id, _)| *id).collect();
+    out.pick_layers = Some((hits, PickMode::sweep(crate::layers::click_mods(ui))));
+    ui.data_mut(|d| d.insert_temp::<Option<egui::Pos2>>(marquee_id(), None));
+    false
+}
+
 /// The layer-strips view.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn strips_ui(
@@ -757,7 +803,7 @@ pub(crate) fn strips_ui(
     last_frame: i64,
     tb: motion_core::Timebase,
     view: TimelineView,
-    selected: Option<NodeId>,
+    selected: &[NodeId],
     work_area: Option<WorkArea>,
     label_w: f32,
     peaks: &std::collections::HashMap<
@@ -822,6 +868,9 @@ pub(crate) fn strips_ui(
         Magnet { on: magnet, targets }
     };
 
+    // The selected layers that have a range: what a drag on one of them moves.
+    let group: Vec<(NodeId, LayerTiming)> =
+        rows.iter().filter(|r| selected.contains(&r.id)).filter_map(|r| r.timing.map(|t| (r.id, t))).collect();
     let playhead_col = egui::Color32::from_rgb(240, 90, 90);
     let mut dragging = false;
     let columns_top = ui.cursor().top();
@@ -879,10 +928,10 @@ pub(crate) fn strips_ui(
                             ui.interact(bar, ui.id().with(("strip_packed", c.id)), egui::Sense::click_and_drag());
                         dragging |= clip_bar(
                             ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips,
-                            &snap, out,
+                            &snap, &group, out,
                         );
                         let name = egui::Rect::from_min_max(bar.min + egui::vec2(4.0, 0.0), bar.max);
-                        label_text(ui, name, &row.name, selected != Some(row.id));
+                        label_text(ui, name, &row.name, !selected.contains(&row.id));
                     }
                     playhead(ui, track, &axis, frame, playhead_col);
                 });
@@ -893,8 +942,9 @@ pub(crate) fn strips_ui(
         // Rows opened by hand, by id. View state for the session, not saved.
         let open_id = egui::Id::new("strip_open");
         let mut open: std::collections::HashSet<NodeId> = ui.data(|d| d.get_temp(open_id)).unwrap_or_default();
-        for row in visible_rows(rows, &open, selected) {
-            let is_sel = selected == Some(row.id);
+        let mut bars = Vec::new();
+        for row in visible_rows(rows, &open, selected.first().copied()) {
+            let is_sel = selected.contains(&row.id);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 let cell = label_cell(ui, label_w, ROW_H);
@@ -921,7 +971,7 @@ pub(crate) fn strips_ui(
                     );
                 }
                 if name_resp.clicked() {
-                    out.select_layer = Some(row.id);
+                    out.pick_layers = Some((vec![row.id], PickMode::click(crate::layers::click_mods(ui))));
                 }
                 // The fold arrow for a row with layers inside, then the type
                 // glyph in its accent, then the name beside it.
@@ -983,13 +1033,16 @@ pub(crate) fn strips_ui(
                     egui::Sense::click_and_drag(),
                 );
                 ui.painter_at(track).rect_filled(track, 3.0, egui::Color32::from_gray(32));
+                bars.push((row.id, bar_rect(track, row.timing, &axis)));
                 dragging |= clip_bar(
-                    ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips, &snap, out,
+                    ui, track, &resp, row, selected, &axis, tb, frame, last_frame, peaks, cached, tool, &clips, &snap, &group,
+                    out,
                 );
                 playhead(ui, track, &axis, frame, playhead_col);
             });
         }
         ui.data_mut(|d| d.insert_temp(open_id, open));
+        dragging |= sweep_bars(ui, &bars, out);
     });
 
     // --- Column splitter, spanning the ruler and every row: the columns are

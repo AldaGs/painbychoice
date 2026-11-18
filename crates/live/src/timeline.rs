@@ -283,8 +283,8 @@ pub(crate) struct DopeEdits {
     /// The curve editor's property column was clicked: the new set of plotted
     /// properties (empty = all of them).
     pub(crate) set_shown_props: Option<PropSelection>,
-    /// A layer strip was clicked: select that layer.
-    pub(crate) select_layer: Option<NodeId>,
+    /// A layer strip was clicked or swept: select those layers.
+    pub(crate) pick_layers: Option<crate::layers::LayerPick>,
     /// A named layer's time range was edited or cleared. Distinct from
     /// `set_timing`, which always means *the selected layer* — the strips view
     /// edits any row, selected or not.

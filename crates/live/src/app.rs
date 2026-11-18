@@ -78,6 +78,13 @@ pub(crate) struct App {
     pub(crate) cursor: (f64, f64),
     pub(crate) pending_pick: Option<(f64, f64)>,
     pub(crate) selected: Option<NodeId>,
+    /// The whole layer selection, primary first — see [`App::selection`]. Only
+    /// trusted while its head is still `selected`, so every place that just
+    /// assigns `selected` drops the rest of the set without knowing about it.
+    pub(crate) multi: Vec<NodeId>,
+    /// Where a canvas press landed on empty space, physical pixels: a drag
+    /// from here is a marquee. Cleared on release.
+    pub(crate) canvas_marquee: Option<(f64, f64)>,
     /// The last frame's evaluation warnings (node id + message), kept so the
     /// comp bar can show them and stderr only prints when the set changes.
     pub(crate) warnings: Vec<(u64, String)>,
@@ -1143,6 +1150,21 @@ pub(crate) fn fresh_id(comp: &Comp) -> u64 {
 ///
 /// Returns whether anything was removed. A free fn, like [`split_shape`], so
 /// it's testable without a window.
+/// Whether any layer under `n` instances comp `id`.
+fn uses_comp(n: &MNode, id: CompId) -> bool {
+    n.precomp == Some(id) || n.children.iter().any(|c| uses_comp(c, id))
+}
+
+/// The channels a gizmo drag moves, resolved at `frame`: position, the
+/// three rotations (z, x, y), and scale.
+fn xf_at(node: &MNode, frame: i64) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let mut ctx = EvalCtx::at(frame as f64);
+    let tr = &node.transform;
+    let (p, s) = (tr.position.resolve(&mut ctx), tr.scale.resolve(&mut ctx));
+    let r = [tr.rotation.resolve(&mut ctx), tr.rotation_x.resolve(&mut ctx), tr.rotation_y.resolve(&mut ctx)];
+    ([p.x, p.y, p.z], r, [s.x, s.y, s.z])
+}
+
 pub(crate) fn delete_layer(project: &mut MProject, comp: CompId, id: NodeId) -> bool {
     project.delete_layer(comp, id).is_some()
 }
@@ -1202,6 +1224,8 @@ impl App {
             cursor: (0.0, 0.0),
             pending_pick: None,
             selected: None,
+            multi: Vec::new(),
+            canvas_marquee: None,
             selected_keys: KeySelection::new(),
             key_clipboard: None,
             view,
@@ -2040,6 +2064,7 @@ impl ApplicationHandler for App {
                 // Defer the hit-test to render(), where the evaluated scene and
                 // fit transform for this exact frame are in hand.
                 self.pending_pick = Some(self.cursor);
+                self.canvas_marquee = Some(self.cursor);
                 window.request_redraw();
             }
 
@@ -2786,6 +2811,111 @@ impl App {
             MColor::rgb(0.70, 0.45, 0.90),
         ];
         (id, at_center, palette[(id as usize) % palette.len()])
+    }
+
+    /// Give every other selected layer the change the primary just took from
+    /// `before`: moved and turned by the same amounts, scaled by the same
+    /// factor. A layer inside another selected one already rides along.
+    // ponytail: deltas are in each layer's own parent space, so layers under
+    // differently-transformed parents move by the same numbers, not the same
+    // on-screen distance. Convert through world space if that bites.
+    fn follow_primary(&mut self, frame: i64, before: ([f64; 3], [f64; 3], [f64; 3])) -> bool {
+        let sel = self.selection();
+        let Some((&primary, others)) = sel.split_first() else { return false };
+        let root = &self.doc().root;
+        let Some(after) = root.find(primary).map(|n| xf_at(n, frame)) else { return false };
+        if after == before {
+            return false;
+        }
+        let others: Vec<NodeId> = others
+            .iter()
+            .copied()
+            .filter(|id| *id != CAMERA_ID && !is_locked(root, *id))
+            .filter(|id| !sel.iter().any(|a| a != id && root.find(*a).is_some_and(|n| n.find(*id).is_some())))
+            .collect();
+        let ratio = |a: f64, b: f64| if b.abs() > 1e-9 { a / b } else { 1.0 };
+        let mut ctx = EvalCtx::at(frame as f64);
+        let root = &mut self.project.comp_mut(self.current).unwrap().root;
+        let mut changed = false;
+        for id in others {
+            let Some(node) = root.find_mut(id) else { continue };
+            let tr = &mut node.transform;
+            if after.0 != before.0 {
+                let c = tr.position.resolve(&mut ctx);
+                let v = motion_core::Vec3::new(
+                    c.x + after.0[0] - before.0[0],
+                    c.y + after.0[1] - before.0[1],
+                    c.z + after.0[2] - before.0[2],
+                );
+                tr.position.set_at(frame, v);
+            }
+            for (i, ch) in [&mut tr.rotation, &mut tr.rotation_x, &mut tr.rotation_y].into_iter().enumerate() {
+                if after.1[i] != before.1[i] {
+                    let c = ch.resolve(&mut ctx);
+                    ch.set_at(frame, c + after.1[i] - before.1[i]);
+                }
+            }
+            if after.2 != before.2 {
+                let c = tr.scale.resolve(&mut ctx);
+                let v = motion_core::Vec3::new(
+                    c.x * ratio(after.2[0], before.2[0]),
+                    c.y * ratio(after.2[1], before.2[1]),
+                    c.z * ratio(after.2[2], before.2[2]),
+                );
+                tr.scale.set_at(frame, v);
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Take files and comps out of the project. Layers using a file are left
+    /// to show it missing (see `Project::remove_asset`). A comp goes only if
+    /// nothing instances it and it isn't the root or the open one — a dangling
+    /// precomp would quietly adopt whatever comp next takes its id.
+    fn remove_assets(&mut self, items: &[AssetDrag]) -> bool {
+        let mut kept = 0;
+        let mut changed = false;
+        for item in items {
+            match *item {
+                AssetDrag::File(id) => changed |= self.project.remove_asset(id).is_some(),
+                AssetDrag::Comp(id) => {
+                    let used = self.project.comps.values().any(|c| uses_comp(&c.root, id));
+                    if id == self.project.root || id == self.current || used {
+                        kept += 1;
+                        continue;
+                    }
+                    changed |= self.project.comps.remove(&id).is_some();
+                }
+            }
+            self.project.file_into(*item, None);
+        }
+        if kept > 0 {
+            self.ng_status = Some(format!("Kept {kept} composition(s): the root, the open one, or one used as a layer."));
+        }
+        changed
+    }
+
+    /// Every selected layer, the primary (`selected`) first.
+    pub(crate) fn selection(&self) -> Vec<NodeId> {
+        match self.selected {
+            Some(p) if self.multi.first() == Some(&p) => self.multi.clone(),
+            Some(p) => vec![p],
+            None => Vec::new(),
+        }
+    }
+
+    /// Fold a click or marquee into the layer selection.
+    pub(crate) fn pick_layers(&mut self, ids: &[NodeId], mode: PickMode) {
+        let next = combine(&self.selection(), ids, mode);
+        let primary = next.first().copied();
+        if primary != self.selected {
+            self.selected = primary;
+            self.selected_keys.clear();
+            // The curve filter names the old node's properties.
+            self.shown_props.clear();
+        }
+        self.multi = next;
     }
 
     /// Parent `node` under `parent` (or the root), then select it.
@@ -4113,13 +4243,14 @@ impl App {
         if let Some(px) = self.pending_pick.take() {
             let root = &self.doc().root;
             let picked = pick(&scene, fit, px, |id| is_locked(root, id));
-            if picked != self.selected {
-                self.selected = picked;
-                self.selected_keys.clear();
-                // The filter names properties of the node that was open; the
-                // new one may not even have them, which would plot nothing and
-                // look broken. Back to showing all of the new node's curves.
-                self.shown_props.clear();
+            let mode = PickMode::click(self.egui_ctx.input(|i| i.modifiers));
+            // A press on a layer is a pick; only one on empty space can grow
+            // into a marquee. A modifier click on empty space keeps the set.
+            if picked.is_some() {
+                self.canvas_marquee = None;
+            }
+            if picked.is_some() || mode == PickMode::Replace {
+                self.pick_layers(&picked.into_iter().collect::<Vec<_>>(), mode);
             }
         }
 
@@ -4267,7 +4398,27 @@ impl App {
         // One box per drawable item in the selection's subtree — a group shows
         // its pieces, not just its extent. Comp space, projected at paint time
         // like the motion path.
-        let sel_boxes = sel_node.map(|n| selection_boxes(&scene, n)).unwrap_or_default();
+        let sel_boxes: Vec<kurbo::Rect> = self
+            .selection()
+            .iter()
+            .filter_map(|id| self.doc().root.find(*id))
+            .flat_map(|n| selection_boxes(&scene, n))
+            .collect();
+        // What a canvas marquee can catch: every unlocked item's box, comp space.
+        let sweepable: Vec<(NodeId, kurbo::Rect)> = if self.canvas_marquee.is_some() {
+            let root = &self.doc().root;
+            scene
+                .items
+                .iter()
+                .filter(|i| !is_locked(root, i.source))
+                .map(|i| (i.source, (i.transform * i.path.clone()).bounding_box()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let marquee_at = self.canvas_marquee;
+        let mut canvas_sweep: Option<LayerPick> = None;
+        let mut marquee_done = false;
         // Snap candidates: the dragged layer's own extent, and every *other*
         // node's. Both come straight from `Scene::places`, so they agree with
         // what the walk actually did rather than being re-derived here.
@@ -4398,7 +4549,7 @@ impl App {
         let mut dope = DopeEdits::default();
         let mut tree_edits = TreeEdits::default();
         let mut selected_keys = std::mem::take(&mut self.selected_keys);
-        let selected_node = self.selected;
+        let selection = self.selection();
         let mut ease_out: Option<((f32, f32), (f32, f32))> = None;
         // The project's saved timing curves, shown beside the built-ins, plus
         // the panel's reported intent to add or drop one.
@@ -4576,7 +4727,7 @@ impl App {
                         undo_label,
                         redo_label,
                     ),
-                    Editor::Layers => tree_ui(ui, &tree, selected_node, &mut tree_edits),
+                    Editor::Layers => tree_ui(ui, &tree, &selection, &mut tree_edits),
                     Editor::Assets => assets_ui(ui, &self.project, current_comp, (self.proxies.on, self.proxies.pending(), self.proxies.status.as_deref()), &mut tree_edits),
                     Editor::Subtitles => crate::subtitles::subs_ui(ui, &subs_view, &mut subs_state, &mut subs_edits),
                     Editor::Mixer => crate::mixer::mixer_ui(ui, &self.project.buses, &self.project.outputs, frame, &meters, &mut mixer_edit),
@@ -4611,7 +4762,7 @@ impl App {
                             last_frame,
                             timebase,
                             view,
-                            selected_node,
+                            &selection,
                             work_area,
                             dope_label_w,
                             &peaks,
@@ -4740,6 +4891,31 @@ impl App {
                             for b in &sel_boxes {
                                 draw_bounds(&painter, *b, fit, ppp);
                             }
+                            // The marquee: a drag that began on empty canvas.
+                            // Picks on release, so the gizmo isn't redrawn
+                            // under the band on every frame of the drag.
+                            if let Some(a) = marquee_at {
+                                let a = egui::pos2((a.0 / ppp) as f32, (a.1 / ppp) as f32);
+                                let (down, now, mods) =
+                                    ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos(), i.modifiers));
+                                let band = now.map(|b| egui::Rect::from_two_pos(a, b)).filter(|r| r.width().max(r.height()) > 3.0);
+                                match (band, down) {
+                                    (Some(r), true) => crate::layers::paint_marquee(&painter, r),
+                                    (Some(r), false) => {
+                                        let to_comp = |p: egui::Pos2| fit.inverse() * Point::new(p.x as f64 * ppp, p.y as f64 * ppp);
+                                        let hit = kurbo::Rect::from_points(to_comp(r.min), to_comp(r.max));
+                                        let mut ids: Vec<NodeId> = Vec::new();
+                                        for (id, b) in &sweepable {
+                                            if b.overlaps(hit) && !ids.contains(id) {
+                                                ids.push(*id);
+                                            }
+                                        }
+                                        canvas_sweep = Some((ids, PickMode::sweep(mods)));
+                                    }
+                                    (None, _) => {}
+                                }
+                                marquee_done = !down;
+                            }
                         }
                         // Path next, gizmo last: the gizmo is what you grab, so
                         // it must never be obscured by the trajectory.
@@ -4819,7 +4995,8 @@ impl App {
         let del_key = self.tool.pen_mode().is_none()
             && self.shortcut(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
         let delete_keys = del_key && !selected_keys.is_empty();
-        if del_key && !delete_keys {
+        // Delete over the Assets panel removes assets, not layers.
+        if del_key && !delete_keys && tree_edits.remove_assets.is_empty() {
             let root = &self.doc().root;
             tree_edits.delete = tree_edits
                 .delete
@@ -5063,12 +5240,12 @@ impl App {
             self.ungroup_selected(id);
         }
 
-        // Layers panel: selection + reorder.
-        if let Some(id) = tree_edits.select {
-            if Some(id) != self.selected {
-                self.selected = Some(id);
-                self.selected_keys.clear();
-            }
+        // Layer picks: the Layers panel, the strips, and the canvas marquee.
+        if marquee_done {
+            self.canvas_marquee = None;
+        }
+        for (ids, mode) in [tree_edits.pick.take(), dope.pick_layers.take(), canvas_sweep].into_iter().flatten() {
+            self.pick_layers(&ids, mode);
         }
 
         // Edit tools (razor, ripple, roll, sync-lock) on top-level layers.
@@ -5088,13 +5265,6 @@ impl App {
             if let Some(node) = self.doc_mut().root.find_mut(id) {
                 node.timing = timing;
                 window.request_redraw();
-            }
-        }
-        if let Some(id) = dope.select_layer {
-            if self.selected != Some(id) {
-                self.selected = Some(id);
-                self.selected_keys.clear();
-                self.shown_props.clear();
             }
         }
 
@@ -5208,7 +5378,13 @@ impl App {
         // level that only reaches the picture would be a fader that moves and
         // changes nothing you can hear.
         let touched_audio = edits.touches_audio();
+        // A gizmo drag with several layers selected moves them all: whatever
+        // it did to the primary this frame, the others get the same change.
+        let gizmo_before = self.gizmo_drag.as_ref().and(self.selected).and_then(|id| self.doc().root.find(id)).map(|n| xf_at(n, frame));
         let mut dirty = self.apply_edits(frame, &edits);
+        if let Some(before) = gizmo_before {
+            dirty |= self.follow_primary(frame, before);
+        }
         if delete_keys {
             dirty |= self.delete_selected_keys();
         }
@@ -5434,8 +5610,15 @@ impl App {
             dirty |= self.add_node(kind);
         }
         if let Some(id) = tree_edits.delete {
-            delete_layer(&mut self.project, self.current, id);
-            if self.selected == Some(id) {
+            // Deleting a selected layer deletes the whole selection.
+            let sel = self.selection();
+            let ids = if sel.contains(&id) { sel } else { vec![id] };
+            let root = &self.doc().root;
+            let ids: Vec<NodeId> = ids.into_iter().filter(|i| *i != root.id && !is_locked(root, *i)).collect();
+            for i in &ids {
+                delete_layer(&mut self.project, self.current, *i);
+            }
+            if self.selected.is_some_and(|s| ids.contains(&s)) {
                 self.selected = None;
                 self.selected_keys.clear();
             }
@@ -5483,8 +5666,25 @@ impl App {
             crate::assets::apply_folder_edit(&mut self.project, edit);
             dirty = true;
         }
-        if let Some(item) = tree_edits.place.take() {
-            dirty |= self.place_asset(item);
+        if !tree_edits.place.is_empty() {
+            // Every item lands under the same parent, not inside the one
+            // placed before it, and the new layers end up selected together.
+            let parent = self.selected;
+            let mut placed = Vec::new();
+            for item in std::mem::take(&mut tree_edits.place) {
+                self.selected = parent;
+                if self.place_asset(item) {
+                    dirty = true;
+                    placed.extend(self.selected);
+                }
+            }
+            self.selected = parent;
+            if !placed.is_empty() {
+                self.pick_layers(&placed, PickMode::Replace);
+            }
+        }
+        if !tree_edits.remove_assets.is_empty() {
+            dirty |= self.remove_assets(&std::mem::take(&mut tree_edits.remove_assets));
         }
         if tree_edits.import || comp.file == Some(FileCmd::Import) || shortcut == Some(FileCmd::Import) {
             dirty |= self.import_files(true);

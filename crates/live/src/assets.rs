@@ -9,6 +9,22 @@ use motion_core::{Asset, AssetKind};
 /// between folders when dropped in this panel.
 pub(crate) type AssetDrag = motion_core::ProjectItem;
 
+/// The panel's selected rows, kept in egui memory: view state, not document.
+fn sel_id() -> egui::Id {
+    egui::Id::new("asset_sel")
+}
+
+fn selection(ctx: &egui::Context) -> Vec<AssetDrag> {
+    ctx.data(|d| d.get_temp(sel_id())).unwrap_or_default()
+}
+
+/// `item` and, when it is selected, everything else that is: what a drag,
+/// a double-click or a menu acts on.
+pub(crate) fn with_selection(ctx: &egui::Context, item: AssetDrag) -> Vec<AssetDrag> {
+    let sel = selection(ctx);
+    if sel.contains(&item) { sel } else { vec![item] }
+}
+
 /// A change to the panel's folders.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FolderEdit {
@@ -122,16 +138,18 @@ fn kind_icon(ui: &mut egui::Ui, kind: AssetKind) {
     }
 }
 
-/// One draggable row: icon, name, info line.
-/// Returns whether the row was double-clicked.
-fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), name: &str, info: impl FnOnce(&mut egui::Ui), hover: String) -> bool {
+/// One draggable row: icon, name, info line. Handles its own selection
+/// clicks and context menu; returns whether it was double-clicked.
+fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), name: &str, info: impl FnOnce(&mut egui::Ui), hover: String, out: &mut TreeEdits) -> bool {
     let id = egui::Id::new(("asset_row", payload));
+    let sel = selection(ui.ctx());
+    let selected = sel.contains(&payload);
     let n = ui.data(|d| d.get_temp::<usize>(egui::Id::new("asset_zebra"))).unwrap_or(0);
     ui.data_mut(|d| d.insert_temp(egui::Id::new("asset_zebra"), n + 1));
     let resp = ui.dnd_drag_source(id, payload, |ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
         let hovered = ui.rect_contains_pointer(rect);
-        ui.painter().rect_filled(rect, 0.0, crate::layers::row_fill(ui, n, false, hovered));
+        ui.painter().rect_filled(rect, 0.0, crate::layers::row_fill(ui, n, selected, hovered));
         let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(4.0, 0.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         row.style_mut().interaction.selectable_labels = false;
         icon(&mut row);
@@ -140,9 +158,34 @@ fn row(ui: &mut egui::Ui, payload: AssetDrag, icon: impl FnOnce(&mut egui::Ui), 
     })
     .response
     .on_hover_text(hover);
-    // The drag source senses drags only, so the double-click is read off the
-    // pointer rather than the response.
-    resp.hovered() && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+    ui.data_mut(|d| d.get_temp_mut_or_default::<Vec<(AssetDrag, egui::Rect)>>(egui::Id::new("asset_rects")).push((payload, resp.rect)));
+    // The drag source senses drags only, so clicks go to a click sensor laid
+    // over it: a press that moves becomes the drag, one that doesn't a click.
+    let menu = ui.interact(resp.rect, id.with("menu"), egui::Sense::click());
+    if menu.clicked() {
+        let next = crate::layers::combine(&sel, &[payload], PickMode::click(crate::layers::click_mods(ui)));
+        ui.data_mut(|d| d.insert_temp(sel_id(), next));
+    }
+    // A right-click on an unselected row selects it, so the menu's "these"
+    // is what is highlighted.
+    if menu.secondary_clicked() && !selected {
+        ui.data_mut(|d| d.insert_temp(sel_id(), vec![payload]));
+    }
+    let dbl = menu.double_clicked();
+    menu.context_menu(|ui| {
+        let these = with_selection(ui.ctx(), payload);
+        let n = these.len();
+        let label = |s: &str| if n > 1 { format!("{s} ({n})") } else { s.to_string() };
+        if ui.button(label("Add to composition")).clicked() {
+            out.place = these.clone();
+            ui.close();
+        }
+        if ui.button(label("Remove from project")).on_hover_text("Layers using a file keep their place and show it missing").clicked() {
+            out.remove_assets = these;
+            ui.close();
+        }
+    });
+    dbl
 }
 
 /// `proxy`: whether the preview reads proxies, how many are being made, and
@@ -152,9 +195,24 @@ pub(crate) fn assets_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, 
     // goes back to the top level. Folder headers claim theirs first.
     let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
         ui.set_min_width(ui.available_width());
+        ui.data_mut(|d| d.insert_temp(egui::Id::new("asset_rects"), Vec::<(AssetDrag, egui::Rect)>::new()));
         panel_ui(ui, project, current, proxy, out);
-        ui.allocate_space(egui::vec2(ui.available_width(), ui.available_height().max(40.0)));
+        // The empty space under the rows: a click clears the selection, a
+        // drag sweeps a marquee over the rows.
+        let size = egui::vec2(ui.available_width(), ui.available_height().max(40.0));
+        let (_, empty) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        let rects: Vec<(AssetDrag, egui::Rect)> = ui.data(|d| d.get_temp(egui::Id::new("asset_rects"))).unwrap_or_default();
+        if let Some((hits, mode)) = crate::layers::sweep_rows(ui, &empty, &rects, egui::Id::new("asset_marquee")) {
+            let next = crate::layers::combine(&selection(ui.ctx()), &hits, mode);
+            ui.data_mut(|d| d.insert_temp(sel_id(), next));
+        }
     });
+    // Delete with the pointer over the panel removes the selection from the
+    // project (the app then skips deleting layers).
+    let over = ui.rect_contains_pointer(ui.max_rect());
+    if over && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+        out.remove_assets = selection(ui.ctx());
+    }
     if let Some(item) = dropped {
         if project.folders.iter().any(|f| f.items.contains(&item)) {
             out.folder = Some(FolderEdit::File(*item, None));
@@ -192,7 +250,7 @@ fn panel_ui(ui: &mut egui::Ui, project: &MProject, current: CompId, proxy: (bool
     let search_id = egui::Id::new("asset_search");
     let mut search: String = ui.data(|d| d.get_temp(search_id)).unwrap_or_default();
     ui.add(egui::TextEdit::singleline(&mut search).hint_text("🔍 Search").desired_width(f32::INFINITY))
-        .on_hover_text("Drag onto Layers to add, onto a folder to file · double-click a comp to open it");
+        .on_hover_text("Drag onto Layers to add, onto a folder to file · double-click a file to add it, a comp to open it · Delete removes the selection from the project");
     ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
     ui.data_mut(|d| d.insert_temp(egui::Id::new("asset_zebra"), 0usize));
     let needle = search.trim().to_lowercase();
@@ -328,6 +386,7 @@ fn item_row(ui: &mut egui::Ui, project: &MProject, current: CompId, item: AssetD
                     ui.weak(comp_info(c));
                 },
                 if open { "The open composition".into() } else { "Composition".into() },
+                out,
             );
             if dbl && !open {
                 out.open_comp = Some(id);
@@ -335,7 +394,7 @@ fn item_row(ui: &mut egui::Ui, project: &MProject, current: CompId, item: AssetD
         }
         AssetDrag::File(id) => {
             let Some(a) = project.assets.get(&id) else { return };
-            let _ = row(
+            let dbl = row(
                 ui,
                 item,
                 |ui| kind_icon(ui, a.kind),
@@ -353,7 +412,13 @@ fn item_row(ui: &mut egui::Ui, project: &MProject, current: CompId, item: AssetD
                     }
                 },
                 a.path.display().to_string(),
+                out,
             );
+            // Double-click a file: into the open comp, with the rest of the
+            // selection.
+            if dbl {
+                out.place = with_selection(ui.ctx(), item);
+            }
         }
     }
 }

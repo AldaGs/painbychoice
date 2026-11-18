@@ -6451,3 +6451,16 @@ fn an_export_never_waits_on_a_frame_nobody_asked_for() {
     }
     assert!(started.elapsed().as_secs() < 20, "no deadline was waited out ({:?})", started.elapsed());
 }
+
+/// How a click or a marquee folds into the layer selection, primary first: a
+/// toggled-in layer leads (it was just clicked), a sweep keeps the old lead.
+#[test]
+fn layer_picks_combine_with_the_selection() {
+    use crate::layers::{combine, PickMode};
+    let (a, b, c) = (NodeId(1), NodeId(2), NodeId(3));
+    assert_eq!(combine(&[a, b], &[c], PickMode::Replace), [c]);
+    assert_eq!(combine(&[a, b], &[], PickMode::Replace), []);
+    assert_eq!(combine(&[a, b], &[b, c], PickMode::Add), [a, b, c]);
+    assert_eq!(combine(&[a, b], &[c], PickMode::Toggle), [c, a, b]);
+    assert_eq!(combine(&[a, b], &[a], PickMode::Toggle), [b]);
+}

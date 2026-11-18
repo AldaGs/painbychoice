@@ -34,6 +34,15 @@ pub(crate) fn run(project: &mut crate::MProject, comp: crate::CompId, op: Op, ne
         Op::Patch(p) => {
             let p = with_sync(root, frames, p);
             apply(root, &p);
+            // `apply` reaches only top-level layers; a group drag in the
+            // strips can carry nested ones too.
+            for (id, t) in &p {
+                if root.children.iter().all(|n| n.id != *id) {
+                    if let Some(n) = root.find_mut(*id) {
+                        n.timing = Some(*t);
+                    }
+                }
+            }
             !p.is_empty()
         }
         Op::Razor(id, f) => {
@@ -113,6 +122,18 @@ mod tests {
         assert!(r.children[0].sync.is_some() && r.children[0].sync == r.children[1].sync);
         assert!(run(&mut project, id, Op::Unsync(NodeId(4)), &mut next));
         assert!(!run(&mut project, id, Op::Unsync(NodeId(4)), &mut next));
+    }
+
+    /// A group drag in the strips patches nested layers as well as top-level ones.
+    #[test]
+    fn a_patch_reaches_nested_layers() {
+        let mut project = crate::MProject::single(crate::Comp::new(100.0, 100.0, comp()));
+        let id = project.root;
+        let p = Patch::from([(NodeId(2), lt(5, 10)), (NodeId(4), lt(5, 10))]);
+        assert!(run(&mut project, id, Op::Patch(p), &mut 20));
+        let root = &project.comps[&id].root;
+        assert_eq!(root.find(NodeId(2)).unwrap().timing, Some(lt(5, 10)));
+        assert_eq!(root.find(NodeId(4)).unwrap().timing, Some(lt(5, 10)));
     }
 
 }

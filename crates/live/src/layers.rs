@@ -213,10 +213,84 @@ pub(crate) enum NewShape {
     Vector,
 }
 
+/// How a click or a marquee combines with the layer selection already there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PickMode {
+    /// These layers become the whole selection.
+    Replace,
+    /// Each one flips in or out — ctrl/shift-click.
+    Toggle,
+    /// These join the selection — ctrl/shift-marquee.
+    Add,
+}
+
+impl PickMode {
+    /// A click: ctrl or shift toggles the one layer in or out.
+    pub(crate) fn click(m: egui::Modifiers) -> Self {
+        if m.command || m.shift { PickMode::Toggle } else { PickMode::Replace }
+    }
+
+    /// A marquee: ctrl or shift adds what it covers to what is selected.
+    pub(crate) fn sweep(m: egui::Modifiers) -> Self {
+        if m.command || m.shift { PickMode::Add } else { PickMode::Replace }
+    }
+}
+
+/// The modifiers held when the pointer button last changed this frame, else
+/// the live ones. A quick shift-click can press and lift shift inside one
+/// frame, and `i.modifiers` is only the state at the frame's end.
+pub(crate) fn click_mods(ui: &egui::Ui) -> egui::Modifiers {
+    ui.input(|i| {
+        i.events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                egui::Event::PointerButton { modifiers, .. } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or(i.modifiers)
+    })
+}
+
+/// Layers to select and how — what every panel's click or marquee reports.
+pub(crate) type LayerPick = (Vec<NodeId>, PickMode);
+
+/// The selection after `ids` is picked into `sel` with `mode`. The first entry
+/// is the primary layer, the one the Properties panel and gizmo edit: a toggled-in
+/// layer becomes it (you just clicked it), a marquee keeps the one there was.
+pub(crate) fn combine<T: Copy + PartialEq>(sel: &[T], ids: &[T], mode: PickMode) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let push = |out: &mut Vec<T>, id: T| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    match mode {
+        PickMode::Replace => ids.iter().for_each(|id| push(&mut out, *id)),
+        PickMode::Add => sel.iter().chain(ids).for_each(|id| push(&mut out, *id)),
+        PickMode::Toggle => {
+            ids.iter().filter(|id| !sel.contains(id)).for_each(|id| push(&mut out, *id));
+            sel.iter().filter(|id| !ids.contains(id)).for_each(|id| push(&mut out, *id));
+        }
+    }
+    out
+}
+
+/// The rubber band every layer marquee draws, the node graph's colours.
+pub(crate) fn paint_marquee(painter: &egui::Painter, r: egui::Rect) {
+    painter.rect(
+        r,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(90, 140, 220, 40),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(130, 175, 240)),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// What the layers panel reports: selection, reorder, add, and/or delete.
 #[derive(Default)]
 pub(crate) struct TreeEdits {
-    pub(crate) select: Option<NodeId>,
+    pub(crate) pick: Option<LayerPick>,
     /// Preview from proxies, or from the originals.
     pub(crate) proxies: Option<bool>,
     /// Move this layer's own shape into a child layer, so it can be stacked
@@ -237,7 +311,9 @@ pub(crate) struct TreeEdits {
     pub(crate) import_to_library: bool,
     /// Add this library item to the open comp — an Assets-panel drop or
     /// double-click.
-    pub(crate) place: Option<AssetDrag>,
+    pub(crate) place: Vec<AssetDrag>,
+    /// Take these files and comps out of the project.
+    pub(crate) remove_assets: Vec<AssetDrag>,
     /// An Assets-panel folder change.
     pub(crate) folder: Option<crate::assets::FolderEdit>,
     pub(crate) delete: Option<NodeId>,
@@ -281,23 +357,63 @@ pub(crate) fn add_menu(ui: &mut egui::Ui, out: &mut crate::dock::CompEdits) {
 
 /// Left layers panel: the scene graph as a clickable, indented list. Clicking a
 /// row selects that node; the ▲/▼ buttons restack it among its siblings.
-pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+pub(crate) fn tree_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: &[NodeId], out: &mut TreeEdits) {
     // The whole panel is a drop target for Assets-panel rows.
     let (_, dropped) = ui.dnd_drop_zone::<AssetDrag, _>(egui::Frame::NONE, |ui| {
         ui.set_min_width(ui.available_width());
-        panel_ui(ui, rows, selected, out);
-        // Fill the rest of the panel, so a drop anywhere lands.
-        ui.allocate_space(egui::vec2(ui.available_width(), ui.available_height().max(40.0)));
+        let row_rects = panel_ui(ui, rows, selected, out);
+        // Fill the rest of the panel, so a drop anywhere lands. A row drag
+        // reorders, so the empty space under the rows is where a marquee
+        // starts; a plain click there drops the selection.
+        let size = egui::vec2(ui.available_width(), ui.available_height().max(40.0));
+        let (_, empty) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        if let Some(p) = sweep_rows(ui, &empty, &row_rects, egui::Id::new("layer_marquee")) {
+            out.pick = Some(p);
+        }
     });
     if let Some(item) = dropped {
-        out.place = Some(*item);
+        // A dragged asset brings the rest of the Assets selection with it.
+        out.place = crate::assets::with_selection(ui.ctx(), *item);
     }
 }
 
-fn panel_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+/// The marquee over a panel's rows: the drag on `empty` sweeps vertically, and
+/// every row its band touches is picked on release. A plain click on `empty`
+/// picks nothing, which clears the selection.
+pub(crate) fn sweep_rows<T: Copy>(
+    ui: &egui::Ui,
+    empty: &egui::Response,
+    rows: &[(T, egui::Rect)],
+    id: egui::Id,
+) -> Option<(Vec<T>, PickMode)> {
+    let mods = click_mods(ui);
+    let mut out = None;
+    if empty.clicked() && PickMode::click(mods) == PickMode::Replace {
+        out = Some((Vec::new(), PickMode::Replace));
+    }
+    let mut anchor: Option<egui::Pos2> = ui.data(|d| d.get_temp(id)).flatten();
+    if empty.drag_started_by(egui::PointerButton::Primary) {
+        anchor = ui.input(|i| i.pointer.press_origin());
+    }
+    let band = anchor.zip(ui.input(|i| i.pointer.latest_pos())).map(|(a, b)| egui::Rect::from_two_pos(a, b));
+    if let Some(r) = band.filter(|_| empty.dragged()) {
+        paint_marquee(&ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, id)), r);
+    }
+    if empty.drag_stopped() {
+        if let Some(r) = band {
+            let hits = rows.iter().filter(|(_, rr)| rr.y_range().intersects(r.y_range())).map(|(id, _)| *id).collect();
+            out = Some((hits, PickMode::sweep(mods)));
+        }
+        anchor = None;
+    }
+    ui.data_mut(|d| d.insert_temp(id, anchor));
+    out
+}
+
+fn panel_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: &[NodeId], out: &mut TreeEdits) -> Vec<(NodeId, egui::Rect)> {
     ui.add_space(8.0);
     ui.heading("Layers");
-    rows_ui(ui, rows, selected, out);
+    rows_ui(ui, rows, selected, out)
 }
 
 /// The rows left showing once folded layers hide everything inside them.
@@ -385,7 +501,8 @@ fn switch(ui: &mut egui::Ui, eye: bool, on: bool, tip: &str) -> bool {
     resp.on_hover_text(tip).clicked()
 }
 
-fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &mut TreeEdits) {
+fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: &[NodeId], out: &mut TreeEdits) -> Vec<(NodeId, egui::Rect)> {
+    let mut rects = Vec::new();
     // The row whose name is being edited, kept in egui memory across frames.
     let rename_id = egui::Id::new("layer_rename");
     let mut renaming: Option<(NodeId, String)> = ui.data(|d| d.get_temp(rename_id));
@@ -401,13 +518,14 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
         // put a drag sensor over the label that ate double- and right-clicks.)
         let id = egui::Id::new(("layer_row", row.id));
         let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::click_and_drag());
+        rects.push((row.id, rect));
         let lifted = row.depth > 0 && r.dragged();
         if lifted {
             egui::DragAndDrop::set_payload(ui.ctx(), LayerDrag(row.id));
         }
         // A lifted row paints on a top layer that follows the pointer.
         let layer = if lifted { egui::LayerId::new(egui::Order::Tooltip, id) } else { ui.layer_id() };
-        let fill = row_fill(ui, n, selected == Some(row.id), lifted || ui.rect_contains_pointer(rect));
+        let fill = row_fill(ui, n, selected.contains(&row.id), lifted || ui.rect_contains_pointer(rect));
         let mut row_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
@@ -485,7 +603,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
             }
         }
         if r.clicked() {
-            out.select = Some(row.id);
+            out.pick = Some((vec![row.id], PickMode::click(click_mods(ui))));
         }
         if r.double_clicked() && row.depth > 0 {
             renaming = Some((row.id, row.name.clone()));
@@ -517,6 +635,7 @@ fn rows_ui(ui: &mut egui::Ui, rows: &[TreeRow], selected: Option<NodeId>, out: &
         }
         None => d.remove::<(NodeId, String)>(rename_id),
     });
+    rects
 }
 
 /// The row's right-click menu: the structural commands that need words.
