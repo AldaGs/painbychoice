@@ -43,7 +43,7 @@ pub use asset::{
 };
 pub use composite::{BlendMode, ComposeMode, Mask, MatteMode};
 pub use effect::{Effect, EffectKind, EffectParamSpec, ParamUi, EffectType, ResolvedEffect};
-pub use eval::{evaluate, evaluate_comp, evaluate_comp_orbited, evaluate_comp_sample, evaluate_project, LayerGroup, MaskPath, RenderItem, Scene};
+pub use eval::{evaluate, evaluate_comp, evaluate_comp_orbited, evaluate_comp_sample, evaluate_project, LayerGroup, MaskPath, RenderItem, ResolvedGradient, Scene};
 pub use expr::{
     eval_script, eval_script_ctx, BinOp, EvalCtx, Expr, ExprKind, ExprValue, FromExpr, Generator,
     Axis, MathOp, UnOp,
@@ -53,7 +53,7 @@ pub use path::{Anchor, PathPart, PathSample, VectorPath};
 pub use pathfinder::{combine as combine_paths, BoolOp};
 pub use node::{
     AssetFolder, Comp, CompId, Document, ProjectItem, Grid, Guide, GuideAxis, Guides, Node, NodeId, Onion, Project,
-    LineCap, LineJoin, MotionBlur, RenderPreset, Shape, Stroke, StrokeStyle, Transform, ViewAids,
+    Gradient, GradientKind, GradientStop, LineCap, LineJoin, MotionBlur, RenderPreset, Shape, Stroke, StrokeStyle, Transform, ViewAids,
 };
 pub use graph::{
     Binding, ConnectError, Edge, Endpoint, GraphCtx, GraphError, GraphNode, GraphNodeId, NodeGraph,

@@ -36,6 +36,43 @@ pub struct RenderItem {
     pub image: Option<ImagePaint>,
     /// Effective opacity after multiplying down the ancestor chain.
     pub opacity: f64,
+    /// Paints `path` instead of `fill` when set. Its points are in the same
+    /// space as `path` (so `transform` carries them too).
+    pub gradient: Option<ResolvedGradient>,
+}
+
+/// A [`crate::node::Gradient`] at one time: plain points and colours.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedGradient {
+    pub kind: crate::node::GradientKind,
+    pub start: kurbo::Point,
+    pub end: kurbo::Point,
+    /// (offset 0–1, colour), in order.
+    pub stops: Vec<(f64, Color)>,
+}
+
+impl ResolvedGradient {
+    /// The same ramp with its points moved by `a` (for items drawn in another space).
+    pub fn mapped(mut self, a: Affine) -> Self {
+        self.start = a * self.start;
+        self.end = a * self.end;
+        self
+    }
+}
+
+/// A node's gradient at the current time, or `None` without one (or with no
+/// stops). Non-finite numbers resolve to 0, never NaN (invariant 7).
+fn resolve_gradient(node: &Node, ctx: &mut EvalCtx) -> Option<ResolvedGradient> {
+    let g = node.gradient.as_ref()?;
+    if g.stops.is_empty() {
+        return None;
+    }
+    let fin = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let point = |v: kurbo::Vec2| kurbo::Point::new(fin(v.x), fin(v.y));
+    let start = point(g.start.resolve(ctx));
+    let end = point(g.end.resolve(ctx));
+    let stops = g.stops.iter().map(|s| (fin(s.offset).clamp(0.0, 1.0), s.color.resolve(ctx))).collect();
+    Some(ResolvedGradient { kind: g.kind, start, end, stops })
 }
 
 /// The evaluated frame: a flat draw list plus any warnings gathered while
@@ -508,6 +545,7 @@ fn walk(
         let merged = compound_geometry(node, ctx, op);
         if !merged.is_empty() {
             let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
+            let gradient = resolve_gradient(node, ctx);
             let stroke = node
                 .stroke
                 .as_ref()
@@ -523,6 +561,7 @@ fn walk(
                 stroke_style,
                 image: None,
                 opacity,
+                gradient,
             });
         }
         scene.places[place_at].1.bounds = bounds;
@@ -554,6 +593,7 @@ fn walk(
         let path = trimmed(node, shape.to_path(ctx), ctx);
         let image = shape.image_paint(ctx);
         let fill = node.fill.as_ref().map(|f| f.resolve(ctx));
+        let gradient = resolve_gradient(node, ctx);
         let stroke = node
             .stroke
             .as_ref()
@@ -593,6 +633,9 @@ fn walk(
                         stroke_style,
                         image,
                         opacity,
+                        // The path is in comp space now; the ramp follows the
+                        // flat reading (exact for an untipped layer).
+                        gradient: gradient.clone().map(|g| g.mapped(flat)),
                     });
                 }
                 None if animated => {
@@ -638,6 +681,8 @@ fn walk(
                             stroke_style,
                             image: None,
                             opacity: opacity * t.alpha,
+                            // ponytail: animated per-glyph text draws its solid fill; a ramp across moving glyphs needs each piece's inverse transform.
+                            gradient: None,
                         });
                     }
                 }
@@ -654,6 +699,7 @@ fn walk(
                         stroke_style,
                         image,
                         opacity,
+                        gradient,
                     });
                 }
             }

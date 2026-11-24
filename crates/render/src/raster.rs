@@ -281,7 +281,15 @@ fn draw_item(
     let Some(path) = to_sk_path(&item.path, item.transform, scale) else { return };
     let alpha = item.opacity.clamp(0.0, 1.0);
 
-    if let Some(fill) = item.fill {
+    if let Some(g) = &item.gradient {
+        // The ramp is in the item's own space: carry it with the same matrix as the path.
+        let [a, b, c, d, e, f] = (Affine::scale(scale) * item.transform).as_coeffs();
+        let xf = Transform::from_row(a as f32, b as f32, c as f32, d as f32, e as f32, f as f32);
+        if let Some(shader) = gradient_shader(g, alpha, xf) {
+            let paint = Paint { anti_alias: true, shader, ..Default::default() };
+            target.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+    } else if let Some(fill) = item.fill {
         let mut paint = Paint { anti_alias: true, ..Default::default() };
         paint.set_color(sk_color(with_alpha(fill, alpha)));
         target.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
@@ -354,6 +362,31 @@ fn to_sk_path(path: &BezPath, transform: Affine, scale: f64) -> Option<tiny_skia
         }
     }
     b.finish()
+}
+
+/// A tiny-skia shader for a resolved gradient, faded by `alpha`. A single stop
+/// (or two coincident points) paints that flat colour.
+fn gradient_shader(g: &motion_core::ResolvedGradient, alpha: f64, xf: Transform) -> Option<tiny_skia::Shader<'static>> {
+    let stops: Vec<tiny_skia::GradientStop> = g
+        .stops
+        .iter()
+        .map(|&(o, c)| tiny_skia::GradientStop::new(o as f32, sk_color(with_alpha(c, alpha))))
+        .collect();
+    if stops.len() == 1 {
+        return Some(tiny_skia::Shader::SolidColor(sk_color(with_alpha(g.stops[0].1, alpha))));
+    }
+    let (p0, p1) = (
+        tiny_skia::Point::from_xy(g.start.x as f32, g.start.y as f32),
+        tiny_skia::Point::from_xy(g.end.x as f32, g.end.y as f32),
+    );
+    let pad = tiny_skia::SpreadMode::Pad;
+    match g.kind {
+        motion_core::GradientKind::Linear => tiny_skia::LinearGradient::new(p0, p1, stops, pad, xf),
+        motion_core::GradientKind::Radial => {
+            let r = (g.end - g.start).hypot() as f32;
+            tiny_skia::RadialGradient::new(p0, p0, r, stops, pad, xf)
+        }
+    }
 }
 
 fn with_alpha(mut c: Color, mul: f64) -> Color {
@@ -441,6 +474,35 @@ mod tests {
         let (buf, report) =
             rasterize(&scene, comp.width as u32, comp.height as u32, BLACK, scale).unwrap();
         (buf, report, w)
+    }
+
+    /// A linear gradient ramps across the shape in the layer's own space and
+    /// replaces the solid fill; a radial one is brightest at its centre.
+    #[test]
+    fn a_gradient_paints_instead_of_the_fill() {
+        use motion_core::{Gradient, GradientKind, GradientStop};
+        let ramp = |kind, from: f64| {
+            let mut n = square_at(1, 40.0, Color::rgb(0.0, 1.0, 0.0), 20.0);
+            n.gradient = Some(Gradient {
+                kind,
+                start: Value::constant(kurbo::Vec2::new(from, 0.0)),
+                end: Value::constant(kurbo::Vec2::new(20.0, 0.0)),
+                stops: vec![
+                    GradientStop { offset: 0.0, color: Value::constant(Color::rgb(1.0, 0.0, 0.0)) },
+                    GradientStop { offset: 1.0, color: Value::constant(Color::rgb(0.0, 0.0, 1.0)) },
+                ],
+            });
+            let (buf, _, w) = render(&Comp::new(40.0, 40.0, Node::group(0, "root").with_child(n)), 1.0);
+            (px(&buf, w, 1, 20), px(&buf, w, 20, 20), px(&buf, w, 38, 20))
+        };
+        let (left, _, right) = ramp(GradientKind::Linear, -20.0);
+        assert!(left[0] > 230 && left[2] < 25, "red at the start: {left:?}");
+        assert!(right[2] > 230 && right[0] < 25, "blue at the end: {right:?}");
+        assert_eq!(left[1], 0, "the solid green fill is not drawn");
+        // Centre (0, 0), radius 20.
+        let (_, centre, edge) = ramp(GradientKind::Radial, 0.0);
+        assert!(centre[0] > 230, "radial: start colour at the centre: {centre:?}");
+        assert!(edge[2] > 200, "radial: end colour at the radius: {edge:?}");
     }
 
     /// A stroke's cap reaches the pixels: a round cap paints past the end of

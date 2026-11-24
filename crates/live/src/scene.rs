@@ -715,7 +715,9 @@ fn draw_range(
                 Some(paint) => draw_footage(vs, item, xf, paint, footage, assets),
                 None => false,
             };
-            if let Some(fill) = item.fill {
+            if let (Some(g), false) = (&item.gradient, drew_footage) {
+                vs.fill(Fill::NonZero, xf, &to_peniko_gradient(g, item.opacity, &open), None, &item.path);
+            } else if let Some(fill) = item.fill {
                 if !drew_footage {
                     let c = with_effects(fill, &open);
                     vs.fill(Fill::NonZero, xf, to_peniko(c, item.opacity), None, &item.path);
@@ -759,6 +761,19 @@ fn draw_range(
 pub(crate) fn needs_readback(scene: &MScene, g: &LayerGroup) -> bool {
     motion_render::fx::needs_readback(&g.effects)
         || (!g.effects.is_empty() && scene.items[g.start..g.end].iter().any(|it| it.image.is_some()))
+}
+
+/// A vello brush for a resolved gradient; colour effects apply to every stop.
+/// The points are in the item's own space, which `vs.fill`'s transform carries.
+fn to_peniko_gradient(g: &motion_core::ResolvedGradient, opacity: f64, open: &[&LayerGroup]) -> vello::peniko::Gradient {
+    use vello::peniko::Gradient;
+    let p = |q: kurbo::Point| (q.x, q.y);
+    let base = match g.kind {
+        motion_core::GradientKind::Linear => Gradient::new_linear(p(g.start), p(g.end)),
+        motion_core::GradientKind::Radial => Gradient::new_radial(p(g.start), (g.end - g.start).hypot() as f32),
+    };
+    let stops: Vec<(f32, Color)> = g.stops.iter().map(|&(o, c)| (o as f32, to_peniko(with_effects(c, open), opacity))).collect();
+    base.with_stops(stops.as_slice())
 }
 
 fn with_effects(color: MColor, open: &[&LayerGroup]) -> MColor {

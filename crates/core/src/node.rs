@@ -1083,6 +1083,36 @@ pub struct Stroke {
     pub style: StrokeStyle,
 }
 
+/// A colour ramp that paints a layer's shape **in place of** its solid
+/// [`Node::fill`]. The fill stays as the flat fallback: anything that doesn't
+/// draw gradients (onion skins, a colour swatch, an older reader) still shows a
+/// sensible colour.
+///
+/// Points live in the layer's own space, where shapes are centred on the
+/// origin, so the ramp moves, turns and scales with the layer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Gradient {
+    pub kind: GradientKind,
+    /// Linear: where offset 0 sits. Radial: the centre.
+    pub start: Value<Vec2>,
+    /// Linear: where offset 1 sits. Radial: a point on the offset-1 circle.
+    pub end: Value<Vec2>,
+    /// Offsets 0–1, in order. No stops draws the plain fill.
+    pub stops: Vec<GradientStop>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GradientKind {
+    Linear,
+    Radial,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GradientStop {
+    pub offset: f64,
+    pub color: Value<Color>,
+}
+
 /// End caps and corner joins. Not animatable: they are switches, like AE's.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StrokeStyle {
@@ -1306,6 +1336,10 @@ pub struct Node {
     pub shape: Option<Shape>,
     pub fill: Option<Value<Color>>,
     pub stroke: Option<Stroke>,
+    /// Paints the shape instead of `fill` when set (see [`Gradient`]).
+    /// `#[serde(default)]` so every older `.pbc` loads with none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient: Option<Gradient>,
     /// User-exposed controls, in display order. `#[serde(default)]` so a `.pbc`
     /// written before parameters existed still loads.
     #[serde(default)]
@@ -1487,6 +1521,7 @@ impl Node {
             shape: None,
             fill: None,
             stroke: None,
+            gradient: None,
             params: Vec::new(),
             timing: None,
             precomp: None,
@@ -1519,6 +1554,7 @@ impl Node {
             shape: Some(shape),
             fill: None,
             stroke: None,
+            gradient: None,
             params: Vec::new(),
             timing: None,
             precomp: None,
@@ -2922,6 +2958,24 @@ mod tests {
     /// Render presets travel with the project, which is the entire reason they
     /// are project data: two people opening one `.pbc` must render the same
     /// file. A round-trip is therefore the property under test.
+    #[test]
+    fn gradients_round_trip_and_older_files_load_without_one() {
+        let old = r#"{"id":1,"name":"a","transform":{"anchor":{"Const":{"x":0,"y":0,"z":0}},"position":{"Const":{"x":0,"y":0,"z":0}},"rotation":{"Const":0},"scale":{"Const":{"x":1,"y":1,"z":1}},"opacity":{"Const":1}},"shape":null,"fill":null,"stroke":null,"children":[]}"#;
+        let n: Node = serde_json::from_str(old).unwrap();
+        assert!(n.gradient.is_none());
+        assert!(!serde_json::to_string(&n).unwrap().contains("gradient"), "absent stays absent");
+
+        let mut g = n.clone();
+        g.gradient = Some(Gradient {
+            kind: GradientKind::Radial,
+            start: Value::constant(Vec2::new(0.0, 0.0)),
+            end: Value::constant(Vec2::new(10.0, 0.0)),
+            stops: vec![GradientStop { offset: 0.0, color: Value::constant(Color::rgb(1.0, 0.0, 0.0)) }],
+        });
+        let back: Node = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back, g);
+    }
+
     #[test]
     fn render_presets_round_trip_with_the_project() {
         let mut project = Project::single(Comp::new(64.0, 64.0, Node::group(0, "root")));

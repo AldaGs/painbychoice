@@ -49,6 +49,11 @@ produce a finished video.
   imported `Path` no size. **All of them are animatable**, on equal footing:
   every one gets a stopwatch, a dopesheet row, and the full selection /
   retime / copy-paste / easing treatment.
+- **Gradient fill** — a layer's optional `gradient` (linear or radial, two
+  points in the layer's own space, colour stops) paints its shape in place of
+  the solid fill, in the preview and in export. The solid fill stays as the
+  fallback colour. Written by Nook's `.pbc` export; not editable in the
+  properties panel yet.
 - **Effects** — a per-layer stack of pixel operations, in the properties panel
   beside blend and matte (a non-empty stack isolates the layer, exactly as a
   blend mode does). **Gaussian blur, brightness/contrast, hue/saturation, tint,
