@@ -552,6 +552,7 @@ fn walk(
                 .map(|s| (s.color.resolve(ctx), s.width.resolve(ctx)));
             let stroke_style = node.stroke.as_ref().map(|s| s.style).unwrap_or_default();
             bounds = Some((flat * merged.clone()).bounding_box());
+            let first = scene.items.len();
             scene.items.push(RenderItem {
                 source: node.id,
                 transform: flat,
@@ -563,6 +564,7 @@ fn walk(
                 opacity,
                 gradient,
             });
+            align_strokes(&mut scene.items, first);
         }
         scene.places[place_at].1.bounds = bounds;
         ctx.exit_node(prev_node);
@@ -619,6 +621,7 @@ fn walk(
             // What can't be cut (footage, per-glyph text's fallback) is placed
             // by its origin; once that is behind the camera it has no place.
             let placeable = warp.is_none() || view.is_none_or(|v| v.origin_in_front(xf));
+            let first = scene.items.len();
             match warped {
                 // Wholly behind the near plane.
                 Some(None) => {}
@@ -703,6 +706,7 @@ fn walk(
                     });
                 }
             }
+            align_strokes(&mut scene.items, first);
         }
     }
 
@@ -893,6 +897,39 @@ fn walk(
     ctx.timing = prev_timing;
     (ctx.comp_frame, ctx.shifted) = (prev_comp_frame, prev_shifted);
     bounds
+}
+
+/// Turn each inside/outside stroke among `items[first..]` into its own filled
+/// item right after its owner: the outline stroked twice as wide, then cut to
+/// the shape (inside) or cut out of it (outside). Centred strokes are left for
+/// the renderers, so they never see an alignment.
+fn align_strokes(items: &mut Vec<RenderItem>, first: usize) {
+    use crate::node::StrokeAlign;
+    use crate::pathfinder::{combine, BoolOp};
+    let mut i = first;
+    while i < items.len() {
+        let item = &mut items[i];
+        let (align, Some((color, width))) = (item.stroke_style.align, item.stroke) else {
+            i += 1;
+            continue;
+        };
+        if align == StrokeAlign::Center || item.image.is_some() {
+            i += 1;
+            continue;
+        }
+        item.stroke = None;
+        let mut style = item.stroke_style;
+        style.align = StrokeAlign::Center;
+        let ring = kurbo::stroke(item.path.iter(), &style.kurbo(width * 2.0), &kurbo::StrokeOpts::default(), 0.1);
+        let op = if align == StrokeAlign::Inside { BoolOp::Intersect } else { BoolOp::Subtract };
+        let path = match align {
+            StrokeAlign::Inside => combine(&[item.path.clone(), ring], op),
+            _ => combine(&[ring, item.path.clone()], op),
+        };
+        let piece = RenderItem { path, fill: Some(color), stroke: None, image: None, gradient: None, ..item.clone() };
+        items.insert(i + 1, piece);
+        i += 2;
+    }
 }
 
 /// The combined contour of a compound group's direct shape children, in the
@@ -1854,6 +1891,29 @@ mod tests {
 
         let scene = evaluate(&doc, 0.0);
         assert!((scene.items[0].opacity - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn inside_and_outside_strokes_become_clipped_fills() {
+        use crate::node::{Stroke, StrokeAlign, StrokeStyle};
+        use kurbo::Shape as _;
+        let ring = |align| {
+            let mut n = Node::shape(1, "r", Shape::Rect { size: Value::constant(Vec2::new(100.0, 100.0)), radius: Value::constant(0.0) })
+                .with_fill(Color::rgb(1.0, 0.0, 0.0));
+            n.stroke = Some(Stroke { color: Value::constant(Color::rgb(0.0, 0.0, 1.0)), width: Value::constant(10.0), style: StrokeStyle { align, ..Default::default() } });
+            let scene = evaluate(&Document::new(200.0, 200.0, Node::group(0, "root").with_child(n)), 0.0);
+            assert_eq!(scene.items.len(), 2, "fill, then the stroke as a fill");
+            assert!(scene.items[0].stroke.is_none() && scene.items[1].stroke.is_none());
+            scene.items[1].path.clone()
+        };
+        let inside = ring(StrokeAlign::Inside);
+        assert_ne!(inside.winding((45.0, 0.0).into()), 0, "inside band");
+        assert_eq!(inside.winding((52.0, 0.0).into()), 0, "nothing outside");
+        assert_eq!(inside.winding((0.0, 0.0).into()), 0, "centre open");
+        let outside = ring(StrokeAlign::Outside);
+        assert_ne!(outside.winding((55.0, 0.0).into()), 0, "outside band");
+        assert_eq!(outside.winding((48.0, 0.0).into()), 0, "nothing inside");
+        assert_eq!(outside.winding((62.0, 0.0).into()), 0, "only 10 wide");
     }
 
     #[test]

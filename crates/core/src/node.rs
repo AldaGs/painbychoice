@@ -1123,11 +1123,30 @@ pub struct StrokeStyle {
     /// Dash and gap lengths; `None` is a solid line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dash: Option<[f64; 2]>,
+    /// Which side of the outline the stroke's width sits on.
+    #[serde(default, skip_serializing_if = "StrokeAlign::is_center")]
+    pub align: StrokeAlign,
+}
+
+/// Where a stroke sits on its outline: centred on it, or all inside or all
+/// outside the shape (the stroke is drawn twice as wide and clipped).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StrokeAlign {
+    #[default]
+    Center,
+    Inside,
+    Outside,
+}
+
+impl StrokeAlign {
+    fn is_center(&self) -> bool {
+        *self == Self::Center
+    }
 }
 
 impl Default for StrokeStyle {
     fn default() -> Self {
-        Self { cap: LineCap::Butt, join: LineJoin::Miter, miter_limit: 4.0, dash: None }
+        Self { cap: LineCap::Butt, join: LineJoin::Miter, miter_limit: 4.0, dash: None, align: StrokeAlign::Center }
     }
 }
 

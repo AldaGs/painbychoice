@@ -1428,6 +1428,7 @@ fn stroke_style(props: &[J]) -> StrokeStyle {
             _ => LineJoin::Miter,
         },
         miter_limit: prop(props, "ADBE Vector Stroke Miter Limit").and_then(|p| nums(&p["value"]).first().copied()).unwrap_or(4.0),
+        align: Default::default(),
         // ponytail: the first dash/gap pair, static; AE allows three, animated.
         dash: prop(props, "ADBE Vector Stroke Dashes").and_then(|d| {
             let d = d["properties"].as_array()?;
