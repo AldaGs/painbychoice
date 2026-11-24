@@ -90,7 +90,33 @@ pub fn combine(paths: &[BezPath], op: BoolOp) -> BezPath {
             BoolOp::Merge => unreachable!("handled above"),
         };
     }
-    from_flo(&acc)
+    even_odd_as_nonzero(&from_flo(&acc))
+}
+
+/// Re-wind `path`'s contours so a non-zero fill draws what an even-odd fill
+/// would: a contour nested inside an odd number of others winds the other way
+/// (a hole). Renderers fill non-zero, and the boolean solver doesn't promise
+/// its output's directions, so a hole fully inside a shape drew filled.
+pub fn even_odd_as_nonzero(path: &BezPath) -> BezPath {
+    use kurbo::{ParamCurve, Shape};
+    let mut contours: Vec<BezPath> = Vec::new();
+    for el in path.elements() {
+        if matches!(el, PathEl::MoveTo(_)) || contours.is_empty() {
+            contours.push(BezPath::new());
+        }
+        contours.last_mut().unwrap().push(*el);
+    }
+    let probe = |c: &BezPath| c.segments().next().map(|s| s.eval(0.5));
+    let mut out = BezPath::new();
+    for (i, c) in contours.iter().enumerate() {
+        let depth = probe(c).map_or(0, |p| {
+            contours.iter().enumerate().filter(|(j, o)| *j != i && o.winding(p) != 0).count()
+        });
+        let want_positive = depth % 2 == 0;
+        let flip = (c.area() > 0.0) != want_positive;
+        out.extend(if flip { c.reverse_subpaths() } else { c.clone() });
+    }
+    out
 }
 
 /// A kurbo path's subpaths as flo_curves paths. Each `MoveTo` starts a contour;
@@ -223,6 +249,19 @@ mod tests {
         // Two separate move_tos = two contours survived.
         let moves = u.elements().iter().filter(|e| matches!(e, PathEl::MoveTo(_))).count();
         assert_eq!(moves, 2);
+    }
+
+    #[test]
+    fn square_minus_centred_circle_leaves_the_centre_empty() {
+        use kurbo::Circle;
+        let a = rect(0.0, 0.0, 100.0, 100.0);
+        let b = Circle::new((50.0, 50.0), 20.0).to_path(0.1);
+        for op in [BoolOp::Subtract, BoolOp::Exclude] {
+            let s = combine(&[a.clone(), b.clone()], op);
+            // Non-zero winding is what the renderers fill with.
+            assert_eq!(s.winding((50.0, 50.0).into()), 0, "{op:?} centre filled");
+            assert_ne!(s.winding((10.0, 10.0).into()), 0, "{op:?} ring empty");
+        }
     }
 
     #[test]
