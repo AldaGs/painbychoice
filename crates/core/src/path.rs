@@ -160,18 +160,27 @@ pub struct PathSample {
 pub struct VectorPath {
     pub anchors: Vec<Anchor>,
     pub closed: bool,
+    /// More contours drawn as part of this one shape: holes and separate
+    /// pieces. Each is a whole path of its own (its own `contours` and
+    /// `even_odd` are ignored). The pen edits only the first contour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contours: Vec<VectorPath>,
+    /// Fill the contours even-odd (overlaps alternate filled/empty) instead
+    /// of non-zero (overlaps winding the same way stay filled).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub even_odd: bool,
 }
 
 impl VectorPath {
     /// An empty path — what the "add vector layer" button seeds before the pen
     /// tool places a first anchor.
     pub fn empty() -> Self {
-        Self { anchors: Vec::new(), closed: false }
+        Self { anchors: Vec::new(), closed: false, ..Default::default() }
     }
 
     /// A polyline through `points`, corners only (zero tangents).
     pub fn polyline(points: impl IntoIterator<Item = Vec2>, closed: bool) -> Self {
-        Self { anchors: points.into_iter().map(Anchor::corner).collect(), closed }
+        Self { anchors: points.into_iter().map(Anchor::corner).collect(), closed, ..Default::default() }
     }
 
     /// Borrow one anchor's control-point value, if the index is in range. The
@@ -207,6 +216,22 @@ impl VectorPath {
     /// zero tangent on both ends degrades to a straight line, so a corner
     /// polyline and a smooth curve are the same code path.
     pub fn to_bez(&self, ctx: &mut EvalCtx) -> BezPath {
+        if self.contours.is_empty() {
+            return self.contour_to_bez(ctx);
+        }
+        let all: Vec<BezPath> = std::iter::once(self.contour_to_bez(ctx))
+            .chain(self.contours.iter().map(|c| c.contour_to_bez(ctx)))
+            .collect();
+        if self.even_odd {
+            // Folding contours by symmetric difference *is* the even-odd
+            // fill, and its result fills right under the renderers' non-zero.
+            crate::pathfinder::combine(&all, crate::pathfinder::BoolOp::Exclude)
+        } else {
+            all.into_iter().flatten().collect()
+        }
+    }
+
+    fn contour_to_bez(&self, ctx: &mut EvalCtx) -> BezPath {
         let mut path = BezPath::new();
         if self.anchors.is_empty() {
             return path;
@@ -292,10 +317,13 @@ impl VectorPath {
                 }
             }
         }
-        Self { anchors, closed }
+        Self { anchors, closed, ..Default::default() }
     }
 
     pub(crate) fn migrate_frames(&mut self, fps: f64) {
+        for c in &mut self.contours {
+            c.migrate_frames(fps);
+        }
         for a in &mut self.anchors {
             for v in a.parts_mut() {
                 v.migrate_frames(fps);
@@ -304,6 +332,9 @@ impl VectorPath {
     }
 
     pub(crate) fn retime(&mut self, ratio: f64) {
+        for c in &mut self.contours {
+            c.retime(ratio);
+        }
         for a in &mut self.anchors {
             for v in a.parts_mut() {
                 v.retime(ratio);
@@ -425,6 +456,24 @@ mod tests {
             curved.to_bez(&mut ctx()).bounding_box().height()
                 > straight.to_bez(&mut ctx()).bounding_box().height()
         );
+    }
+
+    #[test]
+    fn extra_contours_fill_by_the_paths_rule() {
+        use kurbo::Shape as _;
+        let sq = |h: f64| VectorPath::polyline([Vec2::new(-h, -h), Vec2::new(h, -h), Vec2::new(h, h), Vec2::new(-h, h)], true);
+        // Both squares wind the same way: non-zero keeps the inner one filled,
+        // even-odd makes it a hole.
+        let mut p = VectorPath { contours: vec![sq(20.0)], ..sq(50.0) };
+        let mut ctx = EvalCtx::at(0.0);
+        assert_ne!(p.to_bez(&mut ctx).winding((0.0, 0.0).into()), 0);
+        p.even_odd = true;
+        let b = p.to_bez(&mut ctx);
+        assert_eq!(b.winding((0.0, 0.0).into()), 0, "hole");
+        assert_ne!(b.winding((35.0, 0.0).into()), 0, "ring");
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"contours\"") && json.contains("\"even_odd\":true"), "{json}");
+        assert!(!serde_json::to_string(&sq(1.0)).unwrap().contains("contours"), "omitted when unused");
     }
 
     #[test]

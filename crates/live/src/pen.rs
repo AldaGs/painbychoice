@@ -108,7 +108,9 @@ const CLOSE_R: f32 = GRAB_R * 2.0;
 /// auto-keys at `frame` and a static one stays constant.
 pub(crate) fn merge_path(existing: &mut VectorPath, new_path: &VectorPath, frame: i64) {
     if existing.anchors.len() != new_path.anchors.len() || existing.closed != new_path.closed {
-        *existing = new_path.clone();
+        // Only the first contour is pen-edited; the rest and the fill rule stay.
+        existing.anchors = new_path.anchors.clone();
+        existing.closed = new_path.closed;
         return;
     }
     for (i, a) in new_path.anchors.iter().enumerate() {
@@ -135,6 +137,7 @@ fn path_from(samples: &[PathSample], closed: bool) -> VectorPath {
             })
             .collect(),
         closed,
+        ..Default::default()
     }
 }
 

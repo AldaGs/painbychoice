@@ -1247,7 +1247,7 @@ impl Importer<'_> {
                 Anchor { point: channel(0), in_tan: channel(1), out_tan: channel(2) }
             })
             .collect();
-        VectorPath { anchors, closed }
+        VectorPath { anchors, closed, ..Default::default() }
     }
 
     fn scalar(&mut self, p: Option<&J>, k: f64, or: f64) -> Value<f64> {
