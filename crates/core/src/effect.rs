@@ -55,6 +55,9 @@ macro_rules! effect_fields {
             EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity, spread } => {
                 (Some(color), vec![offset_x, offset_y, radius, opacity, spread])
             }
+            EffectKind::InnerShadow { color, offset_x, offset_y, radius, opacity, spread } => {
+                (Some(color), vec![offset_x, offset_y, radius, opacity, spread])
+            }
             EffectKind::Glow { threshold, radius, intensity } => {
                 (None, vec![threshold, radius, intensity])
             }
@@ -194,6 +197,19 @@ pub enum EffectKind {
         opacity: Value<f64>,
         /// Pixels the alpha grows by before blurring (negative shrinks it).
         /// Absent in old projects = 0.
+        #[serde(default = "zero")]
+        spread: Value<f64>,
+    },
+    /// A blurred, offset copy of the layer's *missing* alpha, painted in
+    /// `color` inside the layer: the shadow an edge casts into a cut-out.
+    /// `spread` chokes it inwards. Offset is in composition pixels, like
+    /// [`EffectKind::DropShadow`]'s.
+    InnerShadow {
+        color: Value<Color>,
+        offset_x: Value<f64>,
+        offset_y: Value<f64>,
+        radius: Value<f64>,
+        opacity: Value<f64>,
         #[serde(default = "zero")]
         spread: Value<f64>,
     },
@@ -405,6 +421,14 @@ impl Effect {
                 opacity: Value::constant(0.5),
                 spread: zero(),
             },
+            EffectType::InnerShadow => EffectKind::InnerShadow {
+                color: Value::constant(Color::rgb(0.0, 0.0, 0.0)),
+                offset_x: Value::constant(4.0),
+                offset_y: Value::constant(4.0),
+                radius: Value::constant(6.0),
+                opacity: Value::constant(0.5),
+                spread: zero(),
+            },
             // Like the shadow, a glow is the thing it adds: seeded visible.
             EffectType::Glow => EffectKind::Glow {
                 threshold: Value::constant(0.6),
@@ -568,6 +592,7 @@ impl Effect {
             EffectKind::Tint { .. } => EffectType::Tint,
             EffectKind::Levels { .. } => EffectType::Levels,
             EffectKind::DropShadow { .. } => EffectType::DropShadow,
+            EffectKind::InnerShadow { .. } => EffectType::InnerShadow,
             EffectKind::Glow { .. } => EffectType::Glow,
             EffectKind::ColorBalance { .. } => EffectType::ColorBalance,
             EffectKind::ChromaKey { .. } => EffectType::ChromaKey,
@@ -653,6 +678,14 @@ impl Effect {
                     opacity: opacity.resolve(ctx).clamp(0.0, 1.0),
                 }
             }
+            EffectKind::InnerShadow { color, offset_x, offset_y, radius, opacity, spread } => ResolvedEffect::InnerShadow {
+                color: color.resolve(ctx),
+                offset_x: offset_x.resolve(ctx),
+                offset_y: offset_y.resolve(ctx),
+                radius: radius.resolve(ctx).max(0.0),
+                opacity: opacity.resolve(ctx).clamp(0.0, 1.0),
+                spread: spread.resolve(ctx),
+            },
             EffectKind::Glow { threshold, radius, intensity } => ResolvedEffect::Glow {
                 threshold: threshold.resolve(ctx).clamp(0.0, 1.0),
                 radius: radius.resolve(ctx).max(0.0),
@@ -921,6 +954,7 @@ pub enum EffectType {
     Tint,
     Levels,
     DropShadow,
+    InnerShadow,
     Glow,
     ColorBalance,
     ChromaKey,
@@ -958,13 +992,14 @@ pub enum EffectType {
 
 impl EffectType {
     /// Every kind, in menu order.
-    pub const ALL: [EffectType; 39] = [
+    pub const ALL: [EffectType; 40] = [
         EffectType::GaussianBlur,
         EffectType::BrightnessContrast,
         EffectType::HueSaturation,
         EffectType::Tint,
         EffectType::Levels,
         EffectType::DropShadow,
+        EffectType::InnerShadow,
         EffectType::Glow,
         EffectType::ColorBalance,
         EffectType::ChromaKey,
@@ -1014,7 +1049,7 @@ impl EffectType {
             | Curves | Exposure | BlackWhite | Vibrance | PhotoFilter | ChannelMixer
             | GammaPedestalGain | LeaveColor => "Color Correction",
             ChromaKey | ColorKey => "Keying",
-            DropShadow => "Perspective",
+            DropShadow | InnerShadow => "Perspective",
             Glow | Posterize | Threshold | ThresholdRgb | FindEdges | Emboss | ColorEmboss
             | Mosaic | Colorama => "Stylize",
             FractalNoise | Noise => "Noise & Grain",
@@ -1030,6 +1065,7 @@ impl EffectType {
             EffectType::Tint => "Tint",
             EffectType::Levels => "Levels",
             EffectType::DropShadow => "Drop Shadow",
+            EffectType::InnerShadow => "Inner Shadow",
             EffectType::Glow => "Glow",
             EffectType::ColorBalance => "Color Balance",
             EffectType::ChromaKey => "Chroma Key",
@@ -1076,6 +1112,7 @@ impl EffectType {
             EffectType::Tint => "fx.tint",
             EffectType::Levels => "fx.levels",
             EffectType::DropShadow => "fx.drop_shadow",
+            EffectType::InnerShadow => "fx.inner_shadow",
             EffectType::Glow => "fx.glow",
             EffectType::ColorBalance => "fx.color_balance",
             EffectType::ChromaKey => "fx.chroma_key",
@@ -1138,7 +1175,7 @@ impl EffectType {
                 p!("out_black", "Out Black", 0.01),
                 p!("out_white", "Out White", 0.01),
             ],
-            EffectType::DropShadow => &[
+            EffectType::DropShadow | EffectType::InnerShadow => &[
                 p!("offset_x", "Offset X", 0.5),
                 p!("offset_y", "Offset Y", 0.5),
                 p!("radius", "Softness", 0.5),
@@ -1310,6 +1347,7 @@ pub enum ResolvedEffect {
     Tint { color: Color, amount: f64 },
     Levels { in_black: f64, in_white: f64, gamma: f64, out_black: f64, out_white: f64 },
     DropShadow { color: Color, offset_x: f64, offset_y: f64, radius: f64, opacity: f64, spread: f64 },
+    InnerShadow { color: Color, offset_x: f64, offset_y: f64, radius: f64, opacity: f64, spread: f64 },
     Glow { threshold: f64, radius: f64, intensity: f64 },
     ColorBalance { red: f64, green: f64, blue: f64 },
     ChromaKey { color: Color, tolerance: f64, softness: f64 },

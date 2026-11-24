@@ -58,7 +58,7 @@ pub fn apply_color_effects(color: MColor, effects: &[ResolvedEffect]) -> MColor 
             }
             // A shadow is made of the layer's *alpha*, offset — there is no
             // such thing as one pixel's shadow. The readback path draws it.
-            ResolvedEffect::DropShadow { .. } => rgb,
+            ResolvedEffect::DropShadow { .. } | ResolvedEffect::InnerShadow { .. } => rgb,
             ResolvedEffect::ColorBalance { red, green, blue } => color_balance(rgb, red, green, blue),
             // A glow spreads to neighbours and a key writes alpha; neither is
             // one pixel's colour. Both are the readback path's.
@@ -104,6 +104,7 @@ pub fn needs_readback(effects: &[ResolvedEffect]) -> bool {
             e,
             ResolvedEffect::GaussianBlur { .. }
                 | ResolvedEffect::DropShadow { .. }
+                | ResolvedEffect::InnerShadow { .. }
                 | ResolvedEffect::Glow { .. }
                 | ResolvedEffect::ChromaKey { .. }
                 | ResolvedEffect::ColorKey { .. }
@@ -164,6 +165,9 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         }
         ResolvedEffect::DropShadow { color, offset_x, offset_y, radius, opacity, spread } => {
             drop_shadow(px, width, height, color, offset_x, offset_y, radius, opacity, spread)
+        }
+        ResolvedEffect::InnerShadow { color, offset_x, offset_y, radius, opacity, spread } => {
+            inner_shadow(px, width, height, color, offset_x, offset_y, radius, opacity, spread)
         }
         ResolvedEffect::Glow { threshold, radius, intensity } => {
             glow(px, width, height, threshold, radius, intensity)
@@ -689,6 +693,38 @@ fn drop_shadow(
             out[ch] = to_u8((s + d) / a);
         }
         out[3] = to_u8(a);
+    }
+}
+
+/// The layer's missing alpha, offset, choked by `spread` and blurred, laid
+/// over the layer's own pixels in `color`. Alpha is unchanged: the shadow
+/// lives only where the layer is. Off the buffer counts as empty, so an
+/// edge at the frame still casts.
+#[allow(clippy::too_many_arguments)]
+fn inner_shadow(px: &mut [u8], width: usize, height: usize, color: MColor, offset_x: f64, offset_y: f64, radius: f64, opacity: f64, spread: f64) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let (dx, dy) = (offset_x.round() as isize, offset_y.round() as isize);
+    let mut shadow = vec![0u8; px.len()];
+    for y in 0..height as isize {
+        for x in 0..width as isize {
+            let (sx, sy) = (x - dx, y - dy);
+            let inside = sx >= 0 && sy >= 0 && sx < width as isize && sy < height as isize;
+            let a = if inside { px[((sy as usize) * width + sx as usize) * 4 + 3] } else { 0 };
+            shadow[((y as usize) * width + x as usize) * 4 + 3] = 255 - a;
+        }
+    }
+    // Growing the hole is what chokes the shadow into the layer.
+    spread_alpha(&mut shadow, width, height, spread);
+    gaussian_blur(&mut shadow, width, height, radius);
+    let rgb = [color.r as f32, color.g as f32, color.b as f32];
+    let strength = opacity.clamp(0.0, 1.0) as f32;
+    for (out, sh) in px.chunks_exact_mut(4).zip(shadow.chunks_exact(4)) {
+        let k = sh[3] as f32 / 255.0 * strength;
+        for ch in 0..3 {
+            out[ch] = to_u8(out[ch] as f32 / 255.0 * (1.0 - k) + rgb[ch] * k);
+        }
     }
 }
 
@@ -1526,6 +1562,25 @@ mod tests {
         assert_eq!(grown[at(1, 5) + 3], 0, "3px out is not");
         let shrunk = shadow(-1.0);
         assert_eq!(shrunk[at(3, 5) + 3], 0, "shrunk shadow hides under the artwork");
+    }
+
+    /// An inner shadow darkens the layer's inside next to the edge it is cast
+    /// from, and leaves the alpha and the far side alone.
+    #[test]
+    fn an_inner_shadow_lands_inside_the_cast_edge() {
+        let (w, h) = (11usize, 11usize);
+        let at = |x: usize, y: usize| (y * w + x) * 4;
+        let mut px = vec![0u8; w * h * 4];
+        for y in 2..=8 {
+            for x in 2..=8 {
+                px[at(x, y)..at(x, y) + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        let fx = ResolvedEffect::InnerShadow { color: Color::rgb(0.0, 0.0, 0.0), offset_x: 2.0, offset_y: 0.0, spread: 0.0, radius: 0.0, opacity: 1.0 };
+        apply_stack(&mut px, w, h, &[fx]);
+        assert_eq!(&px[at(3, 5)..at(3, 5) + 4], &[0, 0, 0, 255], "shadowed by the left edge");
+        assert_eq!(&px[at(7, 5)..at(7, 5) + 4], &[255, 255, 255, 255], "right side untouched");
+        assert_eq!(px[at(0, 5) + 3], 0, "nothing outside the layer");
     }
 
     /// A transparent layer casts no shadow: the shadow is made of the layer's
