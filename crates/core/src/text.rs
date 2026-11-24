@@ -48,6 +48,44 @@ thread_local! {
     static FONT_CTX: RefCell<FontContext> = RefCell::new(FontContext::new());
     /// Layout scratch, likewise reused (it caches shaping work internally).
     static LAYOUT_CTX: RefCell<LayoutContext<()>> = RefCell::new(LayoutContext::new());
+    /// (family, italic) → the private family its variable face was registered
+    /// under, or `None` when it has no variable face to prefer. See
+    /// [`variable_alias`].
+    static VAR_ALIAS: RefCell<std::collections::HashMap<(String, bool), Option<String>>> = RefCell::default();
+}
+
+/// A private family holding only `family`'s variable face, when that face's
+/// `wght` axis covers `weight` and the family also has other faces.
+///
+/// fontique matches weight by each face's *nominal* weight (a variable font's
+/// default, often 100) and ignores axis ranges, so a family with a variable
+/// face plus one static Black (Adobe Fonts syncs those) drew every weight over
+/// 500 as the Black. Shaping against the alias leaves fontique one face, and
+/// its synthesis then sets `wght` to the requested weight.
+fn variable_alias(fcx: &mut FontContext, family: &str, weight: f32, italic: bool) -> Option<String> {
+    let key = (family.to_lowercase(), italic);
+    let alias = VAR_ALIAS.with(|c| {
+        c.borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                let fam = fcx.collection.family_by_name(family)?;
+                let fonts = fam.fonts();
+                if fonts.len() < 2 {
+                    return None; // nothing to mis-pick
+                }
+                let face = fonts.iter().find(|f| f.has_weight_axis() && (f.style() != FontStyle::Normal) == italic)?.clone();
+                let alias = format!("{family}\u{1}variable{}", if italic { "-italic" } else { "" });
+                let blob = face.load(None)?;
+                let over = parley::fontique::FontInfoOverride { family_name: Some(&alias), ..Default::default() };
+                fcx.collection.register_fonts(blob, Some(over));
+                Some(alias)
+            })
+            .clone()
+    })?;
+    // Only inside the axis' range; outside it the static cuts are the better pick.
+    let fam = fcx.collection.family_by_name(&alias)?;
+    let axis = fam.fonts().first()?.axes().iter().find(|a| a.tag.to_be_bytes() == *b"wght")?.clone();
+    (axis.min..=axis.max).contains(&weight).then_some(alias)
 }
 
 /// How lines sit relative to the text block's own box.
@@ -314,10 +352,12 @@ fn with_layout<R>(
             // scale 1.0: this is document space, not physical pixels — the
             // canvas transform handles device scaling later. No quantization for
             // the same reason (rounding here would fight the zoom).
+            let weight = style.weight.clamp(1.0, 1000.0) as f32;
+            let alias = variable_alias(&mut fcx, style.family.trim(), weight, style.italic);
             let mut builder = lcx.ranged_builder(&mut fcx, content, 1.0, false);
             builder.push_default(StyleProperty::FontSize(size as f32));
-            builder.push_default(StyleProperty::FontFamily(font_family(style.family)));
-            builder.push_default(StyleProperty::FontWeight(FontWeight::new(style.weight.clamp(1.0, 1000.0) as f32)));
+            builder.push_default(StyleProperty::FontFamily(font_family(alias.as_deref().unwrap_or(style.family))));
+            builder.push_default(StyleProperty::FontWeight(FontWeight::new(weight)));
             if style.italic {
                 builder.push_default(StyleProperty::FontStyle(FontStyle::Italic));
             }
@@ -447,6 +487,18 @@ mod tests {
         assert_eq!(at(300.0), regular, "300 falls back to Regular");
         let italic = text_to_path("Hamburg", &TextStyle { italic: true, ..TextStyle::family("Arial") }, 40.0, TextAlign::Left, None);
         assert_ne!(italic, regular, "italic picks a different face");
+    }
+
+    /// Only meaningful where Montserrat's variable font is installed beside
+    /// a static cut (the Nook report's machine); elsewhere it checks less.
+    #[test]
+    fn variable_font_weights_step_up_to_900() {
+        if !font_exists("Montserrat") {
+            return;
+        }
+        let w = |weight| text_bounds("Hamburg", &TextStyle { weight, ..TextStyle::family("Montserrat") }, 40.0, TextAlign::Left, None).unwrap().width();
+        let ws: Vec<f64> = [400.0, 600.0, 700.0, 800.0, 900.0].into_iter().map(w).collect();
+        assert!(ws.windows(2).all(|p| p[1] > p[0]), "each weight is wider: {ws:?}");
     }
 
     #[test]
