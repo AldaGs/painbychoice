@@ -894,6 +894,7 @@ impl Importer<'_> {
                     offset_y: Value::constant(-dist * dir.cos()),
                     radius: fk(self, 5, 0.5, 0.0),
                     opacity: fk(self, 2, 1.0 / 255.0, 127.5 / 255.0),
+                    spread: Value::constant(0.0),
                 }
             }
             _ => return None,

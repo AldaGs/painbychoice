@@ -162,8 +162,8 @@ fn apply_one(px: &mut [u8], width: usize, height: usize, effect: &ResolvedEffect
         ResolvedEffect::Levels { in_black, in_white, gamma, out_black, out_white } => {
             map_rgb(px, |c| levels(c, in_black, in_white, gamma, out_black, out_white))
         }
-        ResolvedEffect::DropShadow { color, offset_x, offset_y, radius, opacity } => {
-            drop_shadow(px, width, height, color, offset_x, offset_y, radius, opacity)
+        ResolvedEffect::DropShadow { color, offset_x, offset_y, radius, opacity, spread } => {
+            drop_shadow(px, width, height, color, offset_x, offset_y, radius, opacity, spread)
         }
         ResolvedEffect::Glow { threshold, radius, intensity } => {
             glow(px, width, height, threshold, radius, intensity)
@@ -597,6 +597,33 @@ fn levels(
     })
 }
 
+/// Grow (positive) or shrink (negative) the alpha channel by `spread` pixels:
+/// a max (or min) filter, run separably.
+// ponytail: square kernel, so corners of a spread shape go square before the
+// blur softens them; a round kernel (distance transform) if that shows.
+fn spread_alpha(px: &mut [u8], width: usize, height: usize, spread: f64) {
+    let r = spread.abs().round() as usize;
+    if r == 0 {
+        return;
+    }
+    let pick: fn(u8, u8) -> u8 = if spread > 0.0 { u8::max } else { u8::min };
+    let mut a: Vec<u8> = px.chunks_exact(4).map(|p| p[3]).collect();
+    let mut tmp = a.clone();
+    for (len, stride, lines, step) in [(width, 1, height, width), (height, width, width, 1)] {
+        for l in 0..lines {
+            let base = l * step;
+            for i in 0..len {
+                let (lo, hi) = (i.saturating_sub(r), (i + r).min(len - 1));
+                tmp[base + i * stride] = (lo..=hi).map(|k| a[base + k * stride]).reduce(pick).unwrap();
+            }
+        }
+        std::mem::swap(&mut a, &mut tmp);
+    }
+    for (p, v) in px.chunks_exact_mut(4).zip(a) {
+        p[3] = v;
+    }
+}
+
 /// Paint a blurred, offset copy of the image's own alpha underneath it.
 ///
 /// The shadow is built as a full RGBA image — the shadow colour everywhere,
@@ -618,6 +645,7 @@ fn drop_shadow(
     offset_y: f64,
     radius: f64,
     opacity: f64,
+    spread: f64,
 ) {
     if width == 0 || height == 0 {
         return;
@@ -642,6 +670,7 @@ fn drop_shadow(
             shadow[dst + 3] = px[src + 3];
         }
     }
+    spread_alpha(&mut shadow, width, height, spread);
     gaussian_blur(&mut shadow, width, height, radius);
 
     let strength = opacity.clamp(0.0, 1.0) as f32;
@@ -1459,6 +1488,7 @@ mod tests {
                 color: Color::rgb(0.0, 0.0, 0.0),
                 offset_x: 3.0,
                 offset_y: 3.0,
+                spread: 0.0,
                 // Hard-edged, so the assertions are about placement rather
                 // than about the blur kernel.
                 radius: 0.0,
@@ -1471,6 +1501,31 @@ mod tests {
         assert_eq!(&px[at(5, 5)..at(5, 5) + 3], &[0, 0, 0], "and is the shadow colour");
         assert_eq!(&px[at(2, 2)..at(2, 2) + 4], &[255, 255, 255, 255], "the artwork is untouched");
         assert_eq!(alpha(8, 8), 0, "and nothing lands where neither is");
+    }
+
+    /// Spread grows the shadow's alpha before the blur; negative shrinks it.
+    #[test]
+    fn drop_shadow_spread_grows_and_shrinks_the_shadow() {
+        let (w, h) = (11usize, 11usize);
+        let at = |x: usize, y: usize| (y * w + x) * 4;
+        let shadow = |spread: f64| {
+            // A 3x3 opaque square at (4..=6, 4..=6), shadow offset 0 so only
+            // the ring outside the artwork shows the shadow's reach.
+            let mut px = vec![0u8; w * h * 4];
+            for y in 4..=6 {
+                for x in 4..=6 {
+                    px[at(x, y)..at(x, y) + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+            let fx = ResolvedEffect::DropShadow { color: Color::rgb(0.0, 0.0, 0.0), offset_x: 0.0, offset_y: 0.0, spread, radius: 0.0, opacity: 1.0 };
+            apply_stack(&mut px, w, h, &[fx]);
+            px
+        };
+        let grown = shadow(2.0);
+        assert_eq!(grown[at(2, 5) + 3], 255, "2px out is shadow");
+        assert_eq!(grown[at(1, 5) + 3], 0, "3px out is not");
+        let shrunk = shadow(-1.0);
+        assert_eq!(shrunk[at(3, 5) + 3], 0, "shrunk shadow hides under the artwork");
     }
 
     /// A transparent layer casts no shadow: the shadow is made of the layer's
@@ -1487,6 +1542,7 @@ mod tests {
                 color: Color::rgb(0.0, 0.0, 0.0),
                 offset_x: 1.0,
                 offset_y: 1.0,
+                spread: 0.0,
                 radius: 2.0,
                 opacity: 1.0,
             }],
@@ -1511,6 +1567,7 @@ mod tests {
                     color: Color::rgb(0.0, 0.0, 0.0),
                     offset_x: 3.0,
                     offset_y: 3.0,
+                spread: 0.0,
                     radius: 0.0,
                     opacity,
                 }],

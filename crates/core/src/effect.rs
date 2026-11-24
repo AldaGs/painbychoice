@@ -52,8 +52,8 @@ macro_rules! effect_fields {
             EffectKind::Levels { in_black, in_white, gamma, out_black, out_white } => {
                 (None, vec![in_black, in_white, gamma, out_black, out_white])
             }
-            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity } => {
-                (Some(color), vec![offset_x, offset_y, radius, opacity])
+            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity, spread } => {
+                (Some(color), vec![offset_x, offset_y, radius, opacity, spread])
             }
             EffectKind::Glow { threshold, radius, intensity } => {
                 (None, vec![threshold, radius, intensity])
@@ -192,6 +192,10 @@ pub enum EffectKind {
         offset_y: Value<f64>,
         radius: Value<f64>,
         opacity: Value<f64>,
+        /// Pixels the alpha grows by before blurring (negative shrinks it).
+        /// Absent in old projects = 0.
+        #[serde(default = "zero")]
+        spread: Value<f64>,
     },
     /// The layer's bright parts, blurred and added back on top: everything
     /// above `threshold` (luma, `0..1`) bleeds out by `radius` pixels at
@@ -399,6 +403,7 @@ impl Effect {
                 offset_y: Value::constant(8.0),
                 radius: Value::constant(6.0),
                 opacity: Value::constant(0.5),
+                spread: zero(),
             },
             // Like the shadow, a glow is the thing it adds: seeded visible.
             EffectType::Glow => EffectKind::Glow {
@@ -638,8 +643,9 @@ impl Effect {
                     out_white: out_white.resolve(ctx),
                 }
             }
-            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity } => {
+            EffectKind::DropShadow { color, offset_x, offset_y, radius, opacity, spread } => {
                 ResolvedEffect::DropShadow {
+                    spread: spread.resolve(ctx),
                     color: color.resolve(ctx),
                     offset_x: offset_x.resolve(ctx),
                     offset_y: offset_y.resolve(ctx),
@@ -1137,6 +1143,7 @@ impl EffectType {
                 p!("offset_y", "Offset Y", 0.5),
                 p!("radius", "Softness", 0.5),
                 p!("opacity", "Opacity", 0.01),
+                p!("spread", "Spread", 0.5),
             ],
             EffectType::Glow => &[
                 p!("threshold", "Threshold", 0.01),
@@ -1302,7 +1309,7 @@ pub enum ResolvedEffect {
     HueSaturation { hue: f64, saturation: f64, lightness: f64 },
     Tint { color: Color, amount: f64 },
     Levels { in_black: f64, in_white: f64, gamma: f64, out_black: f64, out_white: f64 },
-    DropShadow { color: Color, offset_x: f64, offset_y: f64, radius: f64, opacity: f64 },
+    DropShadow { color: Color, offset_x: f64, offset_y: f64, radius: f64, opacity: f64, spread: f64 },
     Glow { threshold: f64, radius: f64, intensity: f64 },
     ColorBalance { red: f64, green: f64, blue: f64 },
     ChromaKey { color: Color, tolerance: f64, softness: f64 },
