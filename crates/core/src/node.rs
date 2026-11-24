@@ -1359,6 +1359,10 @@ pub struct Node {
     /// `#[serde(default)]` so every older `.pbc` loads with none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient: Option<Gradient>,
+    /// Paints the stroke instead of its colour when set, in the same space as
+    /// [`Node::gradient`]. The stroke's colour stays the flat fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_gradient: Option<Gradient>,
     /// User-exposed controls, in display order. `#[serde(default)]` so a `.pbc`
     /// written before parameters existed still loads.
     #[serde(default)]
@@ -1541,6 +1545,7 @@ impl Node {
             fill: None,
             stroke: None,
             gradient: None,
+            stroke_gradient: None,
             params: Vec::new(),
             timing: None,
             precomp: None,
@@ -1574,6 +1579,7 @@ impl Node {
             fill: None,
             stroke: None,
             gradient: None,
+            stroke_gradient: None,
             params: Vec::new(),
             timing: None,
             precomp: None,

@@ -63,7 +63,16 @@ impl ResolvedGradient {
 /// A node's gradient at the current time, or `None` without one (or with no
 /// stops). Non-finite numbers resolve to 0, never NaN (invariant 7).
 fn resolve_gradient(node: &Node, ctx: &mut EvalCtx) -> Option<ResolvedGradient> {
-    let g = node.gradient.as_ref()?;
+    resolve_ramp(node.gradient.as_ref()?, ctx)
+}
+
+/// `node`'s stroke gradient, if it has one.
+fn resolve_stroke_gradient(node: &Node, ctx: &mut EvalCtx) -> Option<ResolvedGradient> {
+    node.stroke.as_ref()?;
+    resolve_ramp(node.stroke_gradient.as_ref()?, ctx)
+}
+
+fn resolve_ramp(g: &crate::node::Gradient, ctx: &mut EvalCtx) -> Option<ResolvedGradient> {
     if g.stops.is_empty() {
         return None;
     }
@@ -564,7 +573,8 @@ fn walk(
                 opacity,
                 gradient,
             });
-            align_strokes(&mut scene.items, first);
+            let sg = resolve_stroke_gradient(node, ctx);
+            align_strokes(&mut scene.items, first, sg);
         }
         scene.places[place_at].1.bounds = bounds;
         ctx.exit_node(prev_node);
@@ -706,7 +716,10 @@ fn walk(
                     });
                 }
             }
-            align_strokes(&mut scene.items, first);
+            // Per-glyph animated text keeps the solid stroke, as it does its fill.
+            let sg = resolve_stroke_gradient(node, ctx).filter(|_| !animated);
+            let sg = if warp.is_some() { sg.map(|g| g.mapped(flat)) } else { sg };
+            align_strokes(&mut scene.items, first, sg);
         }
     }
 
@@ -899,11 +912,12 @@ fn walk(
     bounds
 }
 
-/// Turn each inside/outside stroke among `items[first..]` into its own filled
-/// item right after its owner: the outline stroked twice as wide, then cut to
-/// the shape (inside) or cut out of it (outside). Centred strokes are left for
-/// the renderers, so they never see an alignment.
-fn align_strokes(items: &mut Vec<RenderItem>, first: usize) {
+/// Turn each inside/outside or gradient stroke among `items[first..]` into
+/// its own filled item right after its owner: the outline stroked (twice as
+/// wide when aligned), then cut to the shape (inside) or out of it (outside),
+/// painted with `gradient` when given. Plain centred strokes are left for the
+/// renderers, so they never see an alignment or a stroke gradient.
+fn align_strokes(items: &mut Vec<RenderItem>, first: usize, gradient: Option<ResolvedGradient>) {
     use crate::node::StrokeAlign;
     use crate::pathfinder::{combine, BoolOp};
     let mut i = first;
@@ -913,20 +927,21 @@ fn align_strokes(items: &mut Vec<RenderItem>, first: usize) {
             i += 1;
             continue;
         };
-        if align == StrokeAlign::Center || item.image.is_some() {
+        if (align == StrokeAlign::Center && gradient.is_none()) || item.image.is_some() {
             i += 1;
             continue;
         }
         item.stroke = None;
         let mut style = item.stroke_style;
         style.align = StrokeAlign::Center;
-        let ring = kurbo::stroke(item.path.iter(), &style.kurbo(width * 2.0), &kurbo::StrokeOpts::default(), 0.1);
-        let op = if align == StrokeAlign::Inside { BoolOp::Intersect } else { BoolOp::Subtract };
+        let grow = if align == StrokeAlign::Center { 1.0 } else { 2.0 };
+        let ring = kurbo::stroke(item.path.iter(), &style.kurbo(width * grow), &kurbo::StrokeOpts::default(), 0.1);
         let path = match align {
-            StrokeAlign::Inside => combine(&[item.path.clone(), ring], op),
-            _ => combine(&[ring, item.path.clone()], op),
+            StrokeAlign::Center => ring,
+            StrokeAlign::Inside => combine(&[item.path.clone(), ring], BoolOp::Intersect),
+            StrokeAlign::Outside => combine(&[ring, item.path.clone()], BoolOp::Subtract),
         };
-        let piece = RenderItem { path, fill: Some(color), stroke: None, image: None, gradient: None, ..item.clone() };
+        let piece = RenderItem { path, fill: Some(color), stroke: None, image: None, gradient: gradient.clone(), ..item.clone() };
         items.insert(i + 1, piece);
         i += 2;
     }
@@ -1891,6 +1906,23 @@ mod tests {
 
         let scene = evaluate(&doc, 0.0);
         assert!((scene.items[0].opacity - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_gradient_stroke_becomes_a_gradient_filled_outline() {
+        use crate::node::{Gradient, GradientKind, GradientStop, Stroke};
+        use kurbo::Shape as _;
+        let mut n = Node::shape(1, "r", Shape::Rect { size: Value::constant(Vec2::new(100.0, 100.0)), radius: Value::constant(0.0) });
+        n.stroke = Some(Stroke { color: Value::constant(Color::rgb(0.0, 0.0, 1.0)), width: Value::constant(10.0), style: Default::default() });
+        let stop = |offset, r| GradientStop { offset, color: Value::constant(Color::rgb(r, 0.0, 0.0)) };
+        n.stroke_gradient = Some(Gradient { kind: GradientKind::Linear, start: Value::constant(Vec2::new(-50.0, 0.0)), end: Value::constant(Vec2::new(50.0, 0.0)), stops: vec![stop(0.0, 0.0), stop(1.0, 1.0)] });
+        let scene = evaluate(&Document::new(200.0, 200.0, Node::group(0, "root").with_child(n)), 0.0);
+        assert_eq!(scene.items.len(), 2);
+        let ring = &scene.items[1];
+        assert!(ring.stroke.is_none() && ring.gradient.is_some(), "the ramp paints the outline");
+        assert_ne!(ring.path.winding((48.0, 0.0).into()), 0, "centred: half inside");
+        assert_ne!(ring.path.winding((52.0, 0.0).into()), 0, "and half outside");
+        assert_eq!(ring.path.winding((0.0, 0.0).into()), 0);
     }
 
     #[test]
