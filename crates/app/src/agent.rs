@@ -83,6 +83,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         return Ok(Loaded { project, findings, dropped: report.dropped });
     }
     let mut project = Project::from_pbc(&text)?;
+    project.resolve_asset_paths(path.parent().unwrap_or(Path::new(".")));
     motion_render::attach_footage_sound(&mut project);
     Ok(Loaded { project, findings, dropped: Default::default() })
 }

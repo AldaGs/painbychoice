@@ -52,6 +52,7 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
     let text = std::fs::read_to_string(&input).map_err(|e| format!("{}: {e}", input.display()))?;
     let (mut project, _) = crate::app::parse_save(&text)?;
     project.migrate();
+    project.resolve_asset_paths(input.parent().unwrap_or(std::path::Path::new(".")));
     motion_render::attach_footage_sound(&mut project);
     let comp = comp.unwrap_or(project.root);
     let total = project.comp(comp).ok_or_else(|| format!("no composition {}", comp.0))?.duration_frames;

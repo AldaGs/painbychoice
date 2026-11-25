@@ -3676,8 +3676,11 @@ impl App {
 
     /// The project and layout as a `.pbc` file's text.
     fn save_json(&self) -> serde_json::Result<String> {
+        // Footage inside the project's folder is written relative to it, so
+        // the folder can move (the editor holds it resolved; see `open_text`).
+        let dir = self.project_path.as_deref().and_then(std::path::Path::parent);
         let project = SaveFile {
-            project: Some(self.project.clone()),
+            project: Some(dir.map_or_else(|| self.project.clone(), |d| self.project.relative_asset_paths(d))),
             document: None,
             layout: LayoutState {
                 dock: Some(self.dock.clone()),
@@ -3748,7 +3751,10 @@ impl App {
         let Some(path) = self.project_path.clone() else { return false };
         let Some(text) = self.disk.poll(&path) else { return false };
         let incoming = match crate::livelink::parse(&text) {
-            Ok(p) => p,
+            Ok(mut p) => {
+                p.resolve_asset_paths(path.parent().unwrap_or(std::path::Path::new(".")));
+                p
+            }
             // Half-written, or wrong: keep the editor's document. The write
             // that finishes or fixes it is polled again.
             Err(e) => {
@@ -3973,6 +3979,9 @@ impl App {
                 return false;
             }
         };
+        if let Some(dir) = path.as_deref().or(self.project_path.as_deref()).and_then(std::path::Path::parent) {
+            project.resolve_asset_paths(dir);
+        }
         motion_render::attach_footage_sound(&mut project);
         self.replace_project(project, path);
 

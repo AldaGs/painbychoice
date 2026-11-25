@@ -2666,6 +2666,31 @@ impl Project {
     ///
     /// [`Project::migrate`] is already called on the result — the one thing a
     /// caller must never forget, so it is not left to them.
+    /// Make every relative asset path absolute against `base`, the folder
+    /// the `.pbc` was read from, so a project folder (`p.pbc` beside
+    /// `assets/…`) travels. Absolute paths are left alone. Readers that hold
+    /// a file's path call this right after loading it.
+    pub fn resolve_asset_paths(&mut self, base: &std::path::Path) {
+        for a in self.assets.values_mut() {
+            if a.path.is_relative() {
+                a.path = base.join(&a.path);
+            }
+        }
+    }
+
+    /// A copy for saving into `base`: asset paths inside that folder are
+    /// written relative to it again, the inverse of
+    /// [`Project::resolve_asset_paths`]. Paths elsewhere stay absolute.
+    pub fn relative_asset_paths(&self, base: &std::path::Path) -> Project {
+        let mut p = self.clone();
+        for a in p.assets.values_mut() {
+            if let Ok(rel) = a.path.strip_prefix(base) {
+                a.path = rel.to_path_buf();
+            }
+        }
+        p
+    }
+
     pub fn from_pbc(text: &str) -> Result<Project, String> {
         /// Only the project half. Unknown fields (the editor's `layout`) are
         /// ignored rather than rejected, which is what lets the two readers
@@ -2711,6 +2736,28 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_asset_paths_resolve_beside_the_pbc_and_save_back_relative() {
+        let dir = std::env::temp_dir().join(format!("pbc-rel-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets/x.png"), b"png").unwrap();
+        let mut p = Project::single(Comp::new(10.0, 10.0, Node::group(0, "root")));
+        let id = crate::asset::AssetId(1);
+        p.assets.insert(id, crate::asset::Asset::image(id, "assets/x.png", 1.0, 1.0));
+        let abs = std::path::absolute("/elsewhere/y.png").unwrap();
+        p.assets.insert(crate::asset::AssetId(2), crate::asset::Asset::image(crate::asset::AssetId(2), abs.clone(), 1.0, 1.0));
+        std::fs::write(dir.join("p.pbc"), serde_json::json!({ "project": p }).to_string()).unwrap();
+
+        let mut back = Project::from_pbc(&std::fs::read_to_string(dir.join("p.pbc")).unwrap()).unwrap();
+        back.resolve_asset_paths(&dir);
+        assert!(back.assets[&id].path.exists(), "footage found beside the .pbc");
+        assert_eq!(back.assets[&crate::asset::AssetId(2)].path, abs, "absolute untouched");
+        let saved = back.relative_asset_paths(&dir);
+        assert_eq!(saved.assets[&id].path, std::path::PathBuf::from("assets/x.png"), "stays portable");
+        assert_eq!(saved.assets[&crate::asset::AssetId(2)].path, abs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     fn ids(n: &Node) -> Vec<u64> {
         n.children.iter().map(|c| c.id.0).collect()
